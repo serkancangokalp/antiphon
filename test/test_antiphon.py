@@ -1,0 +1,601 @@
+import sys, os
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "lib"))
+import antiphon
+
+import contextlib
+import io
+import json
+import subprocess
+import tempfile
+try:
+    import tomllib          # Python 3.11+
+except ModuleNotFoundError:  # the hooks run whatever bare `python3` resolves to
+    tomllib = None
+import unittest
+from unittest.mock import patch
+
+
+class AntiphonTest(unittest.TestCase):
+    def test_push_markers_only_at_line_start(self):
+        self.assertEqual(antiphon.PUSH_MARKERS["codex"].findall("@codex one"), ["one"])
+        self.assertEqual(antiphon.PUSH_MARKERS["claude"].findall("  @claude: two"), ["two"])
+        self.assertEqual(antiphon.PUSH_MARKERS["claude"].findall("example @claude three"), [])
+
+    def test_last_codex_reply(self):
+        lines = [
+            json.dumps({"type": "response_item", "payload": {
+                "type": "message", "role": "assistant",
+                "content": [{"type": "output_text", "text": "old"}],
+            }}),
+            json.dumps({"type": "response_item", "payload": {
+                "type": "message", "role": "assistant",
+                "content": [{"type": "output_text", "text": "@claude new"}],
+            }}),
+        ]
+        with patch.object(antiphon, "tail_lines", return_value=lines):
+            self.assertEqual(antiphon.last_codex_reply("rollout"), "@claude new")
+
+    def test_large_codex_rollout_reads_cwd_from_head(self):
+        with tempfile.NamedTemporaryFile(prefix="rollout-", suffix=".jsonl") as f:
+            f.write(b'{"cwd":"/tmp/project"}\n')
+            f.write(b'x' * (antiphon.TAIL_BYTES + 1))
+            f.flush()
+            os.utime(f.name, None)
+            with patch.object(antiphon.glob, "glob", return_value=[f.name]):
+                self.assertEqual(antiphon.codex_rollout_files("/tmp/project"),
+                                 [f.name])
+
+    def test_push_claude_target(self):
+        sent = []
+        written = []
+        input_data = {"cwd": "/tmp/project", "transcript_path": "/tmp/rollout"}
+        with patch.object(antiphon.os.path, "exists", return_value=True), \
+             patch.object(antiphon, "last_codex_reply", return_value="@claude test"), \
+             patch.object(antiphon, "read_cursor", return_value={}), \
+             patch.object(antiphon, "write_cursor",
+                          side_effect=lambda cwd, data: written.append(dict(data))), \
+             patch.object(antiphon, "send_to_claude",
+                          side_effect=lambda cwd, msg: (sent.append((cwd, msg)) or (True, ""))), \
+             patch.object(antiphon.sys, "stdin", io.StringIO(json.dumps(input_data))), \
+             contextlib.redirect_stderr(io.StringIO()):
+            self.assertEqual(antiphon.push("claude"), 0)
+        self.assertEqual(sent, [("/tmp/project", "test")])
+        self.assertEqual(written, [{"last_pushed_claude": "test"}])
+
+    def test_push_uses_separate_dedupe_cursors(self):
+        input_data = {"cwd": "/tmp/project", "transcript_path": "/tmp/rollout"}
+        with patch.object(antiphon.os.path, "exists", return_value=True), \
+             patch.object(antiphon, "last_codex_reply", return_value="@claude same"), \
+             patch.object(antiphon, "read_cursor",
+                          return_value={"last_pushed_claude": "same", "last_pushed_codex": "other"}), \
+             patch.object(antiphon, "send_to_claude") as send, \
+             patch.object(antiphon.sys, "stdin", io.StringIO(json.dumps(input_data))):
+            self.assertEqual(antiphon.push("claude"), 0)
+            send.assert_not_called()
+
+    def test_send_to_claude_uses_mcp_channel_socket(self):
+        class FakeSocket:
+            def __init__(self, *_):
+                self.sent = b""
+                self.received = False
+
+            def __enter__(self): return self
+            def __exit__(self, *_): return False
+            def settimeout(self, _): pass
+            def connect(self, path): self.path = path
+            def sendall(self, data): self.sent = data
+            def shutdown(self, _): pass
+            def recv(self, _):
+                if self.received: return b""
+                self.received = True
+                return b'{"ok": true, "message_id": "m1"}'
+
+        sock = FakeSocket()
+        with patch.object(antiphon.socket, "socket", return_value=sock):
+            self.assertEqual(antiphon.send_to_claude("/tmp/project", "test"), (True, ""))
+        self.assertEqual(sock.path, antiphon.claude_socket_path("/tmp/project"))
+        self.assertEqual(json.loads(sock.sent)["content"], "test")
+
+    def test_channel_path_is_project_specific(self):
+        self.assertNotEqual(antiphon.claude_socket_path("/tmp/a"),
+                            antiphon.claude_socket_path("/tmp/b"))
+
+    def test_channel_reply_goes_to_codex_queue_with_agent_label(self):
+        with patch.object(antiphon, "codex_session_id", return_value="session"), \
+             patch.object(antiphon, "send_to_codex", return_value=(True, "")) as send, \
+             patch.object(antiphon.sys, "stdin",
+                          io.StringIO('{"text":"reply"}')):
+            self.assertEqual(antiphon.reply(), 0)
+        send.assert_called_once_with("session", "[Antiphon channel] Claude: reply")
+
+    def test_hook_is_silent_and_only_injects_context(self):
+        """The hook prints nothing to the terminal: the summary goes into the context, the user is not disturbed."""
+        out = io.StringIO()
+        with patch.object(antiphon, "project_dir", return_value="/tmp/project"), \
+             patch.object(antiphon, "read_cursor", return_value={}), \
+             patch.object(antiphon, "write_cursor"), \
+             patch.object(antiphon, "build_summary", return_value=("summary", 123.0, 2)), \
+             patch.object(antiphon.sys, "stdin",
+                          io.StringIO('{"cwd": "/tmp/project"}')), \
+             contextlib.redirect_stdout(out):
+            self.assertEqual(antiphon.hook("claude"), 0)
+        output = json.loads(out.getvalue())
+        self.assertEqual(output["hookSpecificOutput"]["additionalContext"], "summary")
+        self.assertNotIn("systemMessage", output)
+
+    def test_status_does_not_crash_on_a_string_cursor(self):
+        out = io.StringIO()
+        with patch.object(antiphon, "project_dir", return_value="/tmp/project"), \
+             patch.object(antiphon, "claude_transcripts", return_value=[]), \
+             patch.object(antiphon, "codex_rollout_files", return_value=[]), \
+             patch.object(antiphon, "read_cursor",
+                          return_value={"codex_seen": 1.0, "last_pushed_claude": "message"}), \
+             patch.object(antiphon, "build_summary", return_value=("", 0.0, 0)), \
+             contextlib.redirect_stdout(out):
+            self.assertEqual(antiphon.status(), 0)
+        self.assertIn("cursor last_pushed_claude: message", out.getvalue())
+
+    def test_setup_writes_path_based_commands(self):
+        """Hooks must not stay pinned to an absolute file path, so the package can move
+        (or be installed globally) without breaking them. `.mcp.json` is the one
+        exception: its `env` legitimately carries the absolute project path, because
+        that's the only way the channel server (invoked as a bare `antiphon` command,
+        with no project argument) can know which project it serves. This test checks
+        the `command`/`args` of `.mcp.json` for path-independence and leaves `env` out
+        of that check."""
+        with tempfile.TemporaryDirectory() as project, \
+             patch.object(antiphon, "project_dir", return_value=project), \
+             contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(antiphon.setup(), 0)
+
+            with open(os.path.join(project, ".claude", "settings.json"),
+                      encoding="utf-8") as f:
+                claude = json.load(f)
+            with open(os.path.join(project, ".codex", "hooks.json"),
+                      encoding="utf-8") as f:
+                codex = json.load(f)
+            with open(os.path.join(project, ".mcp.json"), encoding="utf-8") as f:
+                mcp = json.load(f)
+            with open(os.path.join(project, ".claude", "settings.local.json"),
+                      encoding="utf-8") as f:
+                local = json.load(f)
+
+        configs = json.dumps([claude, codex])
+        self.assertNotIn("/", configs)  # no absolute paths
+        self.assertNotIn("python3 ", configs)
+        self.assertIn("antiphon hook claude", configs)
+        self.assertIn("antiphon push codex", configs)
+        self.assertIn("antiphon hook codex", configs)
+        self.assertIn("antiphon push claude", configs)
+
+        # .mcp.json's `command`/`args` must be PATH-resolved too — but its `env` is
+        # exempt: ANTIPHON_CWD is deliberately an absolute path (see docstring above).
+        mcp_server = mcp["mcpServers"]["antiphon"]
+        command_and_args = json.dumps([mcp_server["command"], mcp_server["args"]])
+        self.assertNotIn("/", command_and_args)
+        self.assertNotIn("python3", command_and_args)
+        self.assertEqual(mcp_server["command"], "antiphon")
+        self.assertEqual(mcp_server["args"], ["channel"])
+        self.assertEqual(mcp_server["env"], {"ANTIPHON_CWD": project})
+
+        self.assertEqual(local["enabledMcpjsonServers"], ["antiphon"])
+
+    def test_setup_registers_the_codex_side_mcp_server(self):
+        """Codex reads a project-local `.codex/config.toml`. Without an entry there,
+        Codex never sees `antiphon_read` — the README used to ask the user to add one
+        to `~/.codex/config.toml` by hand. setup owns this file like the other six."""
+        with tempfile.TemporaryDirectory() as project, \
+             patch.object(antiphon, "project_dir", return_value=project), \
+             contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(antiphon.setup(), 0)
+            with open(os.path.join(project, ".codex", "config.toml"),
+                      encoding="utf-8") as f:
+                config = f.read()
+
+        self.assertEqual(config.count("[mcp_servers.antiphon]"), 1)
+        self.assertIn('command = "antiphon"', config)
+        self.assertIn('args = ["mcp"]', config)
+        self.assertIn(f'ANTIPHON_CWD = "{project}"', config)
+
+    def test_setup_repairs_a_codex_config_aimed_at_the_wrong_server(self):
+        """The bug this file was written for: a hand-written entry naming the
+        `channel` server (Claude's, not Codex's) and a project directory left over
+        from before a rename. Codex then loads `reply_to_codex` instead of
+        `antiphon_read`. setup must repair it and leave other sections alone."""
+        with tempfile.TemporaryDirectory() as project:
+            os.makedirs(os.path.join(project, ".codex"))
+            with open(os.path.join(project, ".codex", "config.toml"), "w",
+                      encoding="utf-8") as f:
+                f.write('[mcp_servers.unrelated]\ncommand = "keep-me"\n\n'
+                        '[mcp_servers.antiphon]\ncommand = "antiphon"\n'
+                        'args = ["channel"]\n\n'
+                        '[mcp_servers.antiphon.env]\n'
+                        'ANTIPHON_CWD = "/gone/old-project-name"\n')
+
+            with patch.object(antiphon, "project_dir", return_value=project), \
+                 contextlib.redirect_stdout(io.StringIO()):
+                self.assertEqual(antiphon.setup(), 0)
+            with open(os.path.join(project, ".codex", "config.toml"),
+                      encoding="utf-8") as f:
+                config = f.read()
+
+        self.assertEqual(config.count("[mcp_servers.antiphon]"), 1)
+        self.assertIn('args = ["mcp"]', config)
+        self.assertNotIn('args = ["channel"]', config)
+        self.assertIn(f'ANTIPHON_CWD = "{project}"', config)
+        self.assertNotIn("/gone/old-project-name", config)
+        self.assertIn('command = "keep-me"', config)   # unrelated section survived
+
+    @unittest.skipUnless(tomllib, "tomllib needs Python 3.11+")
+    def test_generated_codex_config_parses_as_toml(self):
+        """The text assertions above pin the contract on every Python 3; where the
+        stdlib can parse TOML, also prove the file is structurally what Codex reads."""
+        with tempfile.TemporaryDirectory() as project, \
+             patch.object(antiphon, "project_dir", return_value=project), \
+             contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(antiphon.setup(), 0)
+            with open(os.path.join(project, ".codex", "config.toml"), "rb") as f:
+                config = tomllib.load(f)
+
+        server = config["mcp_servers"]["antiphon"]
+        self.assertEqual(server["command"], "antiphon")
+        self.assertEqual(server["args"], ["mcp"])
+        self.assertEqual(server["env"]["ANTIPHON_CWD"], project)
+
+    def test_setup_upgrades_legacy_absolute_path_hooks(self):
+        with tempfile.TemporaryDirectory() as project:
+            os.makedirs(os.path.join(project, ".claude"))
+            os.makedirs(os.path.join(project, ".codex"))
+            legacy = "/some/other/install/antiphon.py"
+            with open(os.path.join(project, ".claude", "settings.json"), "w",
+                      encoding="utf-8") as f:
+                json.dump({"hooks": {
+                    "UserPromptSubmit": [{"hooks": [{"type": "command", "command":
+                                                       f"python3 {legacy} kanca claude"}]}],
+                    "Stop": [{"hooks": [{"type": "command", "command":
+                                           f"python3 {legacy} it codex"}]}],
+                }}, f)
+            with open(os.path.join(project, ".codex", "hooks.json"), "w",
+                      encoding="utf-8") as f:
+                json.dump({"hooks": {
+                    "UserPromptSubmit": [{"hooks": [{"type": "command", "command":
+                                                       f"python3 {legacy} kanca codex"}]}],
+                    "Stop": [{"hooks": [{"type": "command", "command":
+                                           f"python3 {legacy} it claude"}]}],
+                }}, f)
+
+            with patch.object(antiphon, "project_dir", return_value=project), \
+                 contextlib.redirect_stdout(io.StringIO()):
+                self.assertEqual(antiphon.setup(), 0)
+
+            for rel in (".claude/settings.json", ".codex/hooks.json"):
+                with open(os.path.join(project, rel), encoding="utf-8") as f:
+                    content = f.read()
+                self.assertNotIn(legacy, content)
+                self.assertEqual(content.count("antiphon hook"), 1)
+                self.assertEqual(content.count("antiphon push"), 1)
+
+    # ---- Minor: the CLI must not answer a typo with a traceback ----
+
+    def test_cli_rejects_extra_arguments_with_a_usage_error(self):
+        """`antiphon status foo` used to be a raw TypeError traceback."""
+        script = os.path.join(os.path.dirname(__file__), "..", "lib", "antiphon.py")
+        result = subprocess.run([sys.executable, script, "status", "foo"],
+                                capture_output=True, text=True, timeout=60,
+                                stdin=subprocess.DEVNULL)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertNotIn("Traceback", result.stderr)
+        self.assertIn("status", result.stderr)
+
+    # ---- Ruling 6 correction: the self-injection guard is a label test ----
+
+    @staticmethod
+    def _claude_user_texts(text):
+        line = json.dumps({"type": "user", "timestamp": "2026-08-30T10:00:00.000Z",
+                           "message": {"content": text}})
+        with patch.object(antiphon, "claude_transcripts", return_value=["t.jsonl"]), \
+             patch.object(antiphon, "tail_lines", return_value=[line]):
+            return [e[2] for e in antiphon.claude_events("/tmp/project")]
+
+    @staticmethod
+    def _codex_user_texts(text):
+        line = json.dumps({"type": "response_item", "timestamp": "2026-08-30T10:00:00.000Z",
+                           "payload": {"type": "message", "role": "user",
+                                       "content": [{"type": "input_text", "text": text}]}})
+        with patch.object(antiphon, "codex_rollout_files", return_value=["r.jsonl"]), \
+             patch.object(antiphon, "tail_lines", return_value=[line]):
+            return [e[2] for e in antiphon.codex_events("/tmp/project")]
+
+    def test_a_user_message_naming_the_tool_is_not_swallowed(self):
+        """A bare substring test over the first 40 characters silently dropped a
+        genuine user message from the other side's summary — the worst possible
+        failure for a tool whose users type its own name."""
+        for text in ("antiphon is dropping messages",
+                     "quoting the label: [Antiphon bridge] Claude: hi"):
+            self.assertEqual(self._claude_user_texts(text), [text], text)
+            self.assertEqual(self._codex_user_texts(text), [text], text)
+
+    def test_pushed_messages_are_still_filtered_out(self):
+        """What the guard is actually for: messages this bridge pushed land in the
+        other side's transcript as `role: user` and must not echo back."""
+        labels = [antiphon.PUSH_LABEL, antiphon.CHANNEL_LABEL,
+                  "[antiphon BRIDGE] claude:"]
+        for label in labels:
+            text = f"{label} run the tests"
+            self.assertEqual(self._claude_user_texts(text), [], label)
+            self.assertEqual(self._codex_user_texts(text), [], label)
+
+    def test_push_and_reply_use_the_same_labels_the_guard_matches(self):
+        """The guard is derived from the constants push() and reply() send, so the
+        two can never drift apart."""
+        with patch.object(antiphon, "codex_session_id", return_value="session"), \
+             patch.object(antiphon, "send_to_codex", return_value=(True, "")) as send, \
+             patch.object(antiphon.sys, "stdin", io.StringIO('{"text":"reply"}')):
+            self.assertEqual(antiphon.reply(), 0)
+        sent = send.call_args.args[1]
+        self.assertTrue(sent.startswith(antiphon.CHANNEL_LABEL))
+        self.assertEqual(self._codex_user_texts(sent), [])
+
+    # ---- Important 2: upgrading a legacy hook must not leave a duplicate ----
+
+    @staticmethod
+    def _hook_commands(hooks):
+        return [entry.get("command")
+                for group in hooks for entry in group.get("hooks") or []]
+
+    def test_add_hook_collapses_a_legacy_entry_onto_an_already_migrated_one(self):
+        """A half-migrated config (one legacy entry, one already upgraded) used to
+        end up with two identical entries, so the hook fired twice per turn."""
+        command = antiphon.HOOK_COMMAND.format(side="claude")
+        hooks = [
+            {"hooks": [{"type": "command",
+                        "command": "python3 /old/install/antiphon.py kanca claude"}]},
+            {"hooks": [{"type": "command", "command": command}]},
+        ]
+        legacy = antiphon._legacy_commands("/x/lib/antiphon.py", "kanca", "claude")
+        self.assertTrue(antiphon._add_hook(hooks, command, legacy))
+        self.assertEqual(self._hook_commands(hooks), [command])
+
+    def test_add_hook_collapses_two_legacy_entries_upgrading_to_the_same_command(self):
+        command = antiphon.HOOK_COMMAND.format(side="claude")
+        hooks = [
+            {"hooks": [{"type": "command", "command": "python3 /a/antiphon.py kanca claude"}]},
+            {"hooks": [{"type": "command", "command": "python3 /b/antiphon.py kanca claude"}]},
+        ]
+        legacy = antiphon._legacy_commands("/x/lib/antiphon.py", "kanca", "claude")
+        self.assertTrue(antiphon._add_hook(hooks, command, legacy))
+        self.assertEqual(self._hook_commands(hooks), [command])
+
+    def test_add_hook_leaves_another_tool_alone(self):
+        command = antiphon.HOOK_COMMAND.format(side="claude")
+        hooks = [{"hooks": [{"type": "command", "command": "some-other-tool run"}]}]
+        self.assertTrue(antiphon._add_hook(hooks, command))
+        self.assertEqual(self._hook_commands(hooks), ["some-other-tool run", command])
+
+    def test_setup_never_creates_duplicates_from_a_mixed_state_config(self):
+        """README's promise: re-running setup migrates in place and never
+        duplicates — even when a config holds both an old and a new entry."""
+        with tempfile.TemporaryDirectory() as project:
+            os.makedirs(os.path.join(project, ".claude"))
+            with open(os.path.join(project, ".claude", "settings.json"), "w",
+                      encoding="utf-8") as f:
+                json.dump({"hooks": {
+                    "UserPromptSubmit": [
+                        {"hooks": [{"type": "command",
+                                    "command": "python3 /old/antiphon.py kanca claude"}]},
+                        {"hooks": [{"type": "command",
+                                    "command": "antiphon hook claude"}]},
+                    ],
+                    "Stop": [
+                        {"hooks": [{"type": "command",
+                                    "command": "python3 /a/antiphon.py it codex"}]},
+                        {"hooks": [{"type": "command",
+                                    "command": "python3 /b/antiphon.py it codex"}]},
+                    ],
+                }}, f)
+
+            with patch.object(antiphon, "project_dir", return_value=project), \
+                 contextlib.redirect_stdout(io.StringIO()):
+                self.assertEqual(antiphon.setup(), 0)
+
+            with open(os.path.join(project, ".claude", "settings.json"),
+                      encoding="utf-8") as f:
+                settings = json.load(f)
+            self.assertEqual(
+                self._hook_commands(settings["hooks"]["UserPromptSubmit"]),
+                ["antiphon hook claude"])
+            self.assertEqual(self._hook_commands(settings["hooks"]["Stop"]),
+                             ["antiphon push codex"])
+
+    # ---- Important 1: a rollout's cwd must match exactly, not by prefix ----
+
+    SIBLING_UUID = "11111111-2222-3333-4444-555555555555"
+    MINE_UUID = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
+
+    @staticmethod
+    def _write_rollout(directory, uuid, cwd, body=""):
+        """A rollout whose head line carries cwd where Codex really puts it."""
+        path = os.path.join(directory, f"rollout-2026-08-30T10-00-00-{uuid}.jsonl")
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(json.dumps({"timestamp": "2026-08-30T10:00:00.000Z",
+                                "type": "session_meta",
+                                "payload": {"session_id": uuid, "cwd": cwd,
+                                            "base_instructions": "You are Codex."}}) + "\n")
+            f.write(body)
+        return path
+
+    def test_codex_rollout_files_reject_a_prefix_colliding_sibling(self):
+        """`/Users/x/api` must not match a rollout recorded for `/Users/x/api-v2`
+        — an `@codex` push would land in the wrong project's Codex."""
+        with tempfile.TemporaryDirectory() as sessions:
+            day = os.path.join(sessions, "2026", "08", "30")
+            os.makedirs(day)
+            self._write_rollout(day, self.SIBLING_UUID, "/Users/x/api-v2")
+            mine = self._write_rollout(day, self.MINE_UUID, "/Users/x/api")
+            with patch.object(antiphon, "CODEX_SESSIONS", sessions):
+                self.assertEqual(antiphon.codex_rollout_files("/Users/x/api"), [mine])
+
+    def test_codex_session_id_is_none_when_only_a_sibling_project_is_open(self):
+        with tempfile.TemporaryDirectory() as sessions:
+            day = os.path.join(sessions, "2026", "08", "30")
+            os.makedirs(day)
+            self._write_rollout(day, self.SIBLING_UUID, "/Users/x/api-v2")
+            with patch.object(antiphon, "CODEX_SESSIONS", sessions):
+                self.assertIsNone(antiphon.codex_session_id("/Users/x/api"))
+
+    def test_codex_rollout_files_keep_the_substring_test_without_a_cwd_field(self):
+        """Behaviour is preserved for heads that carry no cwd field at all."""
+        with tempfile.TemporaryDirectory() as sessions:
+            day = os.path.join(sessions, "2026", "08", "30")
+            os.makedirs(day)
+            path = os.path.join(day, f"rollout-2026-08-30T10-00-00-{self.MINE_UUID}.jsonl")
+            with open(path, "w", encoding="utf-8") as f:
+                f.write("not json at all /Users/x/api\n")
+            with patch.object(antiphon, "CODEX_SESSIONS", sessions):
+                self.assertEqual(antiphon.codex_rollout_files("/Users/x/api"), [path])
+
+    # ---- Critical 2: finding this project's Claude transcript directory ----
+
+    def test_claude_slug_matches_claude_code_directory_naming(self):
+        """Claude Code replaces every non-alphanumeric character with `-`, not
+        just `/`. Each case below mirrors the shape of a real directory seen
+        under ~/.claude/projects: a plain project path, a nested scratchpad whose
+        own name already contains the encoded form of another path, a macOS
+        temporary directory, and a path with an underscore."""
+        cases = {
+            "/Users/ada/Documents/antiphon":
+                "-Users-ada-Documents-antiphon",
+            "/private/tmp/claude-501/-Users-ada-Documents-widgets"
+            "/a1b2c3d4-5e6f-7a8b-9c0d-1e2f3a4b5c6d/scratchpad":
+                "-private-tmp-claude-501--Users-ada-Documents-widgets"
+                "-a1b2c3d4-5e6f-7a8b-9c0d-1e2f3a4b5c6d-scratchpad",
+            "/private/var/folders/ab/cd3_ef_gh4ijklmnop5qrstuvwx0000gn/T/tmp.9XyZaBcDeF":
+                "-private-var-folders-ab-cd3-ef-gh4ijklmnop5qrstuvwx0000gn-T-tmp-9XyZaBcDeF",
+            "/Users/me/dev/my_app": "-Users-me-dev-my-app",
+        }
+        for cwd, expected in cases.items():
+            self.assertEqual(antiphon._claude_slug(cwd), expected, cwd)
+
+    def test_claude_transcripts_found_for_a_path_with_an_underscore(self):
+        """`~/dev/my_app` used to produce a slug matching no directory at all,
+        so Codex never saw anything Claude did — silently, forever."""
+        with tempfile.TemporaryDirectory() as projects:
+            directory = os.path.join(projects, "-Users-me-dev-my-app")
+            os.makedirs(directory)
+            transcript = self._write_claude_transcript(directory, "a.jsonl",
+                                                       "/Users/me/dev/my_app")
+            with patch.object(antiphon, "CLAUDE_PROJECTS", projects):
+                self.assertEqual(antiphon.claude_transcripts("/Users/me/dev/my_app"),
+                                 [transcript])
+
+    def test_claude_transcripts_do_not_scan_when_the_slug_hits(self):
+        """The common path must stay cheap: no directory scan when the slug
+        names a directory that exists."""
+        with tempfile.TemporaryDirectory() as projects:
+            directory = os.path.join(projects, "-tmp-plain")
+            os.makedirs(directory)
+            transcript = self._write_claude_transcript(directory, "a.jsonl", "/tmp/plain")
+            with patch.object(antiphon, "CLAUDE_PROJECTS", projects), \
+                 patch.object(antiphon, "_find_claude_project_dir") as scan:
+                self.assertEqual(antiphon.claude_transcripts("/tmp/plain"), [transcript])
+            scan.assert_not_called()
+
+    def test_claude_transcripts_fall_back_to_scanning_when_the_slug_misses(self):
+        """If the slug rule ever stops matching, identify the directory by the
+        cwd its transcripts actually carry rather than going silently blind."""
+        with tempfile.TemporaryDirectory() as projects:
+            decoy = os.path.join(projects, "-tmp-other")
+            os.makedirs(decoy)
+            self._write_claude_transcript(decoy, "b.jsonl", "/tmp/other")
+
+            renamed = os.path.join(projects, "a-rule-we-do-not-know")
+            os.makedirs(renamed)
+            transcript = self._write_claude_transcript(renamed, "a.jsonl", "/tmp/wanted")
+
+            with patch.object(antiphon, "CLAUDE_PROJECTS", projects):
+                self.assertEqual(antiphon.claude_transcripts("/tmp/wanted"), [transcript])
+
+    @staticmethod
+    def _write_claude_transcript(directory, name, cwd):
+        """A minimal Claude transcript: the cwd sits in the head, as it really does."""
+        path = os.path.join(directory, name)
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(json.dumps({"type": "last-prompt", "prompt": "hi"}) + "\n")
+            f.write(json.dumps({"type": "attachment", "cwd": cwd}) + "\n")
+        return path
+
+    # ---- Critical 1: a malformed config file must never be overwritten ----
+
+    def test_update_json_never_clobbers_an_unparseable_file(self):
+        """A settings file with a trailing comma (or a comment, or a BOM) must
+        survive untouched: rewriting it would silently drop the user's
+        permissions, env and every other tool's hooks."""
+        with tempfile.TemporaryDirectory() as project:
+            path = os.path.join(project, "settings.json")
+            original = '{\n  "permissions": {"allow": ["Bash(ls:*)"]},\n}\n'
+            with open(path, "w", encoding="utf-8") as f:
+                f.write(original)
+
+            with self.assertRaises(antiphon.ConfigFileError):
+                antiphon._update_json(path, lambda data: True)
+
+            with open(path, encoding="utf-8") as f:
+                self.assertEqual(f.read(), original)
+
+    def test_update_json_still_creates_a_missing_file(self):
+        """A missing file is not an error — that is the normal first install."""
+        with tempfile.TemporaryDirectory() as project:
+            path = os.path.join(project, "nested", "settings.json")
+            self.assertTrue(antiphon._update_json(
+                path, lambda data: data.setdefault("hooks", {}) is not None))
+            with open(path, encoding="utf-8") as f:
+                self.assertEqual(json.load(f), {"hooks": {}})
+
+    def test_setup_reports_failure_instead_of_destroying_a_broken_config(self):
+        """setup must not claim success while a file it could not read is left
+        alone: the user's own settings stay put, the other files still get
+        installed, and the exit code says something went wrong."""
+        with tempfile.TemporaryDirectory() as project:
+            os.makedirs(os.path.join(project, ".claude"))
+            broken = os.path.join(project, ".claude", "settings.json")
+            original = '{\n  "permissions": {"allow": ["Bash(ls:*)"]},\n}\n'
+            with open(broken, "w", encoding="utf-8") as f:
+                f.write(original)
+
+            out, err = io.StringIO(), io.StringIO()
+            with patch.object(antiphon, "project_dir", return_value=project), \
+                 contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+                code = antiphon.setup()
+
+            with open(broken, encoding="utf-8") as f:
+                self.assertEqual(f.read(), original)      # untouched
+            self.assertEqual(code, 1)                     # and setup says so
+            self.assertIn(broken, out.getvalue() + err.getvalue())
+            # one unreadable file does not skip the rest of the installation
+            self.assertTrue(os.path.exists(
+                os.path.join(project, ".codex", "hooks.json")))
+            self.assertTrue(os.path.exists(os.path.join(project, ".mcp.json")))
+
+    def test_cursor_keys_from_the_turkish_era_are_translated_in_place(self):
+        """A cursor written before the English rename carries Turkish keys; reading
+        it must translate them and persist the translation."""
+        with tempfile.TemporaryDirectory() as project:
+            os.makedirs(os.path.join(project, ".antiphon"))
+            path = os.path.join(project, ".antiphon", "cursor.json")
+            with open(path, "w", encoding="utf-8") as f:
+                json.dump({"codex_gordu": 12.0, "son_itilen_claude": "hello"}, f)
+
+            self.assertEqual(antiphon.read_cursor(project), {
+                "codex_seen": 12.0,
+                "last_pushed_claude": "hello",
+            })
+            with open(path, encoding="utf-8") as f:
+                self.assertEqual(json.load(f), {
+                    "codex_seen": 12.0,
+                    "last_pushed_claude": "hello",
+                })
+
+
+
+if __name__ == "__main__":
+    unittest.main()
