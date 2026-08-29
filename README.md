@@ -20,13 +20,20 @@ something. Nobody is woken up.
 
 ### Push — live wake
 
-| Direction | Mechanism |
-|---|---|
-| Claude → Codex | Claude `Stop` hook + `codex queue` |
-| Codex → Claude | Codex `Stop` hook + MCP Channel |
+| Direction | At the end of a turn | Mid-turn |
+|---|---|---|
+| Claude → Codex | `Stop` hook + `codex queue` | `reply_to_codex` tool |
+| Codex → Claude | `Stop` hook + MCP Channel | `antiphon_send` tool |
 
 A line starting with `@codex` or `@claude` in a reply reaches the other
 agent immediately, even if nobody is typing.
+
+Neither side has to wait for its turn to end. Either agent can hand work
+over mid-turn and keep going, so the other starts on it in parallel; the
+answer is collected later from the same turn with `antiphon_read` (Codex)
+or the channel event (Claude). Nothing blocks, and a message delivered by
+a tool is recorded, so ending the turn with the same `@claude` / `@codex`
+line does not send it twice.
 
 ### How identity is preserved
 
@@ -89,15 +96,16 @@ antiphon setup             # (re)install the project setup
 npm test                   # Python unit tests + real MCP protocol test
 ```
 
-`setup` registers the `antiphon_read` MCP tool for Codex in this project's
-`.codex/config.toml`, so there is nothing to add by hand. Note the entry
+`setup` registers Codex's MCP tools — `antiphon_read` and `antiphon_send`
+— in this project's `.codex/config.toml`, so there is nothing to add by
+hand. Note the entry
 names `args = ["mcp"]`: the `channel` server is Claude's side and hands out
 `reply_to_codex`. Aiming Codex at it would let Codex publish messages
 labelled as Claude's — exactly what this bridge exists to prevent — so
 `setup` rewrites that table whenever it is wrong, leaving the rest of the
 file alone.
 
-The bridge works without this entry; it only lets Codex query the bridge by hand when it suspects the pull hook has gone quiet.
+Without this entry the pull hook still delivers Claude's context at the start of each Codex turn, but Codex loses both tools: it can no longer check the bridge by hand, nor reach Claude before its turn ends.
 
 ## Limits
 

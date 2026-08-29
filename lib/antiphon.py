@@ -655,14 +655,31 @@ def reply(*_):
     if not session_id:
         print("reply: no running Codex session found", file=sys.stderr)
         return 1
-    ok, detail = send_to_codex(session_id, f"{CHANNEL_LABEL} {text.strip()}")
+    text = text.strip()
+    ok, detail = send_to_codex(session_id, f"{CHANNEL_LABEL} {text}")
     if not ok:
         print(f"reply: {detail}", file=sys.stderr)
         return 1
+    _record_delivery(cwd, "codex", text)
     return 0
 
 
+def _record_delivery(cwd, target, text):
+    """Remembers what was just delivered, under the key `push` dedupes on.
+
+    Without it a message sent mid-turn through a channel tool arrives twice:
+    once from the tool, once more when the same text ends the turn as an
+    `@claude` / `@codex` line."""
+    cursor = read_cursor(cwd)
+    cursor[f"last_pushed_{target}"] = text
+    write_cursor(cwd, cursor)
+
+
 # ---------- Codex MCP server ----------
+
+def _tool_error(message):
+    return {"content": [{"type": "text", "text": message}], "isError": True}
+
 
 TOOLS = [{
     "name": "antiphon_read",
@@ -671,6 +688,18 @@ TOOLS = [{
                     "required; this tool is the fallback — call it by hand if you suspect "
                     "the bridge has gone quiet."),
     "inputSchema": {"type": "object", "properties": {}},
+}, {
+    "name": "antiphon_send",
+    "description": ("Sends a message to the Claude Code session working in this project, "
+                    "without waiting for your turn to end. It arrives as your words, "
+                    "attributed to you, and wakes Claude immediately — so you can hand "
+                    "work over and carry on. It does not block: call `antiphon_read` "
+                    "later in the same turn to pick up whatever Claude did."),
+    "inputSchema": {
+        "type": "object",
+        "properties": {"text": {"type": "string", "description": "Message for Claude"}},
+        "required": ["text"],
+    },
 }]
 
 
@@ -678,6 +707,21 @@ def _mcp_result(mid, result):
     sys.stdout.write(json.dumps({"jsonrpc": "2.0", "id": mid, "result": result},
                                 ensure_ascii=False) + "\n")
     sys.stdout.flush()
+
+
+def _send_tool(cwd, text):
+    """Delivers `text` to Claude's channel now, and reports honestly if it can't.
+
+    A silent success would be the worst outcome: Codex would believe Claude had
+    been told, and neither side would notice the message never arrived."""
+    if not isinstance(text, str) or not text.strip():
+        return _tool_error("text must be a non-empty string")
+    text = text.strip()
+    ok, detail = send_to_claude(cwd, text)
+    if not ok:
+        return _tool_error(f"Not delivered to Claude: {detail}")
+    _record_delivery(cwd, "claude", text)
+    return {"content": [{"type": "text", "text": "Delivered to the Claude Code channel."}]}
 
 
 def mcp():
@@ -711,9 +755,11 @@ def mcp():
                     cursor["codex_seen"] = last
                     write_cursor(cwd, cursor)
                 output = text or "Nothing new on the Claude Code side since your last turn."
+                _mcp_result(mid, {"content": [{"type": "text", "text": output}]})
+            elif name == "antiphon_send":
+                _mcp_result(mid, _send_tool(cwd, (p.get("arguments") or {}).get("text")))
             else:
-                output = f"unknown tool: {name}"
-            _mcp_result(mid, {"content": [{"type": "text", "text": output}]})
+                _mcp_result(mid, _tool_error(f"unknown tool: {name}"))
         elif mid is not None:
             _mcp_result(mid, {})
     return 0
@@ -736,7 +782,11 @@ AGENTS_RULE = ("\n## The Antiphon bridge\n\n"
                "hook) or `[Antiphon channel] Claude:` (a direct reply through the channel) — "
                "either way, these are Claude's words, not the user's. When you want to hand "
                "Claude a task directly, put `@claude` at the start of a line in your reply; "
-               "only that line is sent to the running Claude session as an MCP Channel event.\n")
+               "only that line is sent to the running Claude session as an MCP Channel "
+               "event. To reach Claude without ending your turn, call the `antiphon_send` "
+               "tool instead: it delivers immediately, so Claude can start working while "
+               "you carry on, and `antiphon_read` picks up the answer later in the same "
+               "turn.\n")
 
 CLAUDE_RULE = ("\n## The Antiphon bridge\n\n"
                "You are working alongside another agent on this project. What happens on the "

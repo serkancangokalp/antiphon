@@ -73,6 +73,87 @@ class AntiphonTest(unittest.TestCase):
             self.assertEqual(antiphon.push("claude"), 0)
             send.assert_not_called()
 
+    # ---- the Codex-side MCP server ----
+
+    @staticmethod
+    def _run_mcp(project, *requests):
+        """Drives the stdio server with JSON-RPC lines; returns parsed responses."""
+        stdin = io.StringIO("".join(json.dumps(r) + "\n" for r in requests))
+        out = io.StringIO()
+        with patch.object(antiphon, "project_dir", return_value=project), \
+             patch.object(antiphon.sys, "stdin", stdin), \
+             contextlib.redirect_stdout(out):
+            antiphon.mcp()
+        return [json.loads(line) for line in out.getvalue().splitlines() if line.strip()]
+
+    @staticmethod
+    def _call(name, **arguments):
+        return {"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                "params": {"name": name, "arguments": arguments}}
+
+    def test_mcp_offers_codex_both_a_read_and_a_send_tool(self):
+        """Reading was live from the start; sending was not. Codex could only reach
+        Claude by ending its turn with `@claude`, so it could never hand over work
+        and keep going."""
+        self.assertEqual(sorted(t["name"] for t in antiphon.TOOLS),
+                         ["antiphon_read", "antiphon_send"])
+
+    def test_antiphon_send_delivers_the_text_to_the_claude_channel(self):
+        sent = []
+        with tempfile.TemporaryDirectory() as project, \
+             patch.object(antiphon, "send_to_claude",
+                          side_effect=lambda cwd, msg: (sent.append((cwd, msg)) or (True, ""))), \
+             patch.object(antiphon, "read_cursor", return_value={}), \
+             patch.object(antiphon, "write_cursor", return_value=True):
+            responses = self._run_mcp(project, self._call("antiphon_send", text="run the tests"))
+            self.assertEqual(sent, [(project, "run the tests")])
+        self.assertNotEqual(responses[0]["result"].get("isError"), True)
+
+    def test_antiphon_send_records_the_delivery_so_the_stop_hook_will_not_repeat_it(self):
+        """`push` skips a message equal to `last_pushed_claude`. Without this entry
+        the same text arrives twice when Codex calls the tool and then ends its turn
+        with the same `@claude` line."""
+        written = []
+        with tempfile.TemporaryDirectory() as project, \
+             patch.object(antiphon, "send_to_claude", return_value=(True, "")), \
+             patch.object(antiphon, "read_cursor", return_value={}), \
+             patch.object(antiphon, "write_cursor",
+                          side_effect=lambda cwd, data: written.append(dict(data))):
+            self._run_mcp(project, self._call("antiphon_send", text="run the tests"))
+        self.assertEqual(written, [{"last_pushed_claude": "run the tests"}])
+
+    def test_antiphon_send_reports_a_dead_channel_as_an_error(self):
+        """A silent success is the worst outcome here: Codex would believe Claude had
+        been told, and neither side would ever notice the message vanished."""
+        with tempfile.TemporaryDirectory() as project, \
+             patch.object(antiphon, "send_to_claude", return_value=(False, "channel is down")):
+            responses = self._run_mcp(project, self._call("antiphon_send", text="hi"))
+        result = responses[0]["result"]
+        self.assertIs(result.get("isError"), True)
+        self.assertIn("channel is down", result["content"][0]["text"])
+
+    def test_antiphon_send_refuses_empty_text(self):
+        with tempfile.TemporaryDirectory() as project, \
+             patch.object(antiphon, "send_to_claude") as send:
+            responses = self._run_mcp(project, self._call("antiphon_send", text="   "))
+            send.assert_not_called()
+        self.assertIs(responses[0]["result"].get("isError"), True)
+
+    def test_reply_records_the_delivery_so_the_stop_hook_will_not_repeat_it(self):
+        """The same defect mirrored on Claude's side: `reply_to_codex` delivered
+        without recording it, so ending the turn with the same `@codex` line sent
+        the message a second time."""
+        written = []
+        with patch.object(antiphon, "project_dir", return_value="/tmp/project"), \
+             patch.object(antiphon, "codex_session_id", return_value="sess"), \
+             patch.object(antiphon, "send_to_codex", return_value=(True, "")), \
+             patch.object(antiphon, "read_cursor", return_value={}), \
+             patch.object(antiphon, "write_cursor",
+                          side_effect=lambda cwd, data: written.append(dict(data))), \
+             patch.object(antiphon.sys, "stdin", io.StringIO(json.dumps({"text": "hello"}))):
+            self.assertEqual(antiphon.reply(), 0)
+        self.assertEqual(written, [{"last_pushed_codex": "hello"}])
+
     def test_send_to_claude_uses_mcp_channel_socket(self):
         class FakeSocket:
             def __init__(self, *_):

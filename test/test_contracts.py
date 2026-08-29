@@ -79,7 +79,8 @@ class CrossBoundaryContractTest(unittest.TestCase):
         the one the MCP server advertises."""
         mentioned = set(re.findall(r"`([a-z][a-z0-9_]*)`", antiphon.AGENTS_RULE))
         self.assertTrue(mentioned, "AGENTS_RULE mentions no tool name at all")
-        self.assertIn(antiphon.TOOLS[0]["name"], mentioned)
+        for tool in antiphon.TOOLS:
+            self.assertIn(tool["name"], mentioned)
 
 
 if __name__ == "__main__":
