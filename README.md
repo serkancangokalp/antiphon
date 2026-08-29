@@ -51,7 +51,7 @@ Install the command, either straight from the repository:
 
 or from npm:
 
-    npm i -g @serkancangokalp/antiphon
+    npm i -g antiphon
 
 Either way the command is `antiphon` — the package name only decides
 where it comes from. Then, in the project the two agents share:
@@ -73,7 +73,7 @@ Codex hooks once when Codex first shows them.
 ## Update
 
     npm i -g github:serkancangokalp/antiphon      # from the repository
-    npm i -g @serkancangokalp/antiphon@latest     # from npm
+    npm i -g antiphon@latest                      # from npm
 
     cd /your/project && antiphon setup
 

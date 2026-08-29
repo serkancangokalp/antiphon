@@ -1,5 +1,5 @@
 {
-  "name": "@serkancangokalp/antiphon",
+  "name": "antiphon",
   "version": "0.1.0",
   "type": "module",
   "description": "A bridge between Claude Code and Codex CLI: each side sees the other's context and can wake it, without ever faking the sender's identity.",
