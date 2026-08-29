@@ -45,7 +45,17 @@ Claude Code's interface shows this as an incoming channel event, and Claude trea
 Requires Node 18+ and Python 3. The Claude Code channel is a research
 preview and needs Claude Code 2.1.80 or newer.
 
-    npm i -g antiphon
+Install the command, either straight from the repository:
+
+    npm i -g github:serkancangokalp/antiphon
+
+or from npm:
+
+    npm i -g @serkancangokalp/antiphon
+
+Either way the command is `antiphon` — the package name only decides
+where it comes from. Then, in the project the two agents share:
+
     cd /your/project
     antiphon setup
     claude --dangerously-load-development-channels server:antiphon
@@ -62,7 +72,9 @@ Codex hooks once when Codex first shows them.
 
 ## Update
 
-    npm i -g antiphon@latest
+    npm i -g github:serkancangokalp/antiphon      # from the repository
+    npm i -g @serkancangokalp/antiphon@latest     # from npm
+
     cd /your/project && antiphon setup
 
 Re-running `setup` migrates hooks and instruction blocks written by older
