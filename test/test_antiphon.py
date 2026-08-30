@@ -2027,6 +2027,67 @@ class MalformedStateTest(unittest.TestCase):
         expected = antiphon.datetime.fromtimestamp(1700000000.0).strftime("%H:%M:%S")
         self.assertIn(f"cursor codex_seen: {expected}", out.getvalue())
 
+    def test_status_reports_the_cursors_real_position_not_a_fixed_window(self):
+        """`status` renders each heading as what that side would see *next*.
+        A fixed lookback window answers a different question: it would still
+        show a record the cursor has already moved past, as long as that
+        record falls inside the last six hours."""
+        now = time.strftime("%Y-%m-%dT%H:%M:%S.000Z", time.gmtime())
+        lines = [json.dumps({"type": "assistant", "timestamp": now,
+                             "message": {"content": [{"type": "text", "text": t}]}})
+                 for t in ("already seen", "not yet seen")]
+        sid = "4eecac24-1c21-47ad-ab11-a650708f3098"
+        with tempfile.TemporaryDirectory() as project:
+            path = os.path.join(project, sid + ".jsonl")
+            with open(path, "w", encoding="utf-8") as f:
+                f.write("\n".join(lines) + "\n")
+            gen = antiphon.source_generation(path)
+            seen_through = list(antiphon.read_records(path))[0][1]
+            cursor_path = os.path.join(project, ".antiphon", "cursor.json")
+            os.makedirs(os.path.dirname(cursor_path))
+            with open(cursor_path, "w", encoding="utf-8") as f:
+                json.dump({"codex_seen": {"v": 2, "sources":
+                           {sid: {"gen": gen, "offset": seen_through}}}}, f)
+            out = io.StringIO()
+            with patch.dict(os.environ, {}):
+                os.environ.pop("ANTIPHON_NAME", None)
+                with patch.object(antiphon, "project_dir", return_value=project), \
+                     patch.object(antiphon, "claude_transcripts", return_value=[path]), \
+                     patch.object(antiphon, "codex_rollout_files", return_value=[]), \
+                     contextlib.redirect_stdout(out):
+                    self.assertEqual(antiphon.status(), 0)
+        section = out.getvalue().split("=== what codex would see ===")[1]
+        self.assertIn("not yet seen", section)
+        self.assertNotIn("already seen", section,
+                         "the cursor already passed this record; a fixed "
+                         "lookback would still show it")
+
+    def test_cursor_entry_renders_a_v2_map_readably_and_a_malformed_one_literally(self):
+        """A raw Python repr here — the one command someone runs *because*
+        something is already wrong — is clipped and unreadable; the source
+        count and each source's own offset are the useful part. An entry that
+        is not a position, or a `sources` that is not a dict at all, must not
+        raise, and must not be reported as a source count that lies about
+        what is actually inside."""
+        value = {"v": 2, "sources": {
+            "4eecac24-1c21-47ad-ab11-a650708f3098": {"gen": "16777232:5:abc",
+                                                      "offset": 4096},
+            "01a04f6b-4485-7290-afbd-9eae74405ec8": {"gen": "16777232:9:def",
+                                                      "offset": 128},
+        }}
+        shown = antiphon._cursor_entry("codex_seen", value)
+        self.assertIn("2 sources", shown)
+        self.assertIn("4eecac24@4096", shown)
+        self.assertIn("01a04f6b@128", shown)
+
+        self.assertEqual(
+            antiphon._cursor_entry("codex_seen", {"v": 2, "sources": {}}), "—")
+
+        for broken in ({"v": 2, "sources": {"s1": 42}},
+                       {"v": 2, "sources": "not-a-dict"}):
+            self.assertEqual(antiphon._cursor_entry("codex_seen", broken),
+                             antiphon.truncate(str(broken), 80), repr(broken))
+
     # ---- a channel reply of the wrong shape ----
 
     def test_a_channel_reply_that_is_not_an_object_is_an_invalid_response(self):

@@ -2580,6 +2580,21 @@ def _cursor_entry(key, value):
             return datetime.fromtimestamp(value).strftime("%H:%M:%S")
         except (ValueError, OverflowError, OSError):
             pass
+    if key.endswith("_seen") and isinstance(value, dict) \
+            and isinstance(value.get("sources"), dict):
+        # A v2 position map. A raw repr here is a clipped, unreadable dict —
+        # the one command someone runs *because* something is already wrong
+        # deserves the source count and each source's own progress instead.
+        sources = value["sources"]
+        if not sources:
+            return "—"
+        parts = ["%s@%s" % (sid[:8], entry.get("offset"))
+                 for sid, entry in sorted(sources.items())
+                 if isinstance(entry, dict)]
+        if parts:
+            return truncate("%d sources: %s" % (len(sources), ", ".join(parts)), 80)
+        # `sources` held nothing shaped like a position: fall through below,
+        # shown literally rather than raising or claiming a count that lies.
     return truncate(str(value), 80) if value else "—"
 
 
@@ -2604,7 +2619,8 @@ def status():
     for k, v in (cursor or {}).items():
         print(f"cursor {k}: {_cursor_entry(k, v)}")
     for side in ("claude", "codex"):
-        text, _, count = build_summary(cwd, side, since=time.time() - LOOKBACK)
+        positions, since = positions_for(cursor, side)
+        text, _, count = build_summary(cwd, side, positions, since)
         print(f"\n=== what {side} would see ===")
         if count:
             print(notice_text(side, count))
