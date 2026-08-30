@@ -56,13 +56,16 @@ def auto_name(kind, session_id):
 
 
 def valid_name(name):
-    return bool(name) and bool(NAME_PATTERN.fullmatch(name))
+    """Both this and `valid_kind` are handed values that came out of JSON — a
+    tool argument, a marker, a record read off disk — so a non-string is
+    refused rather than passed to `fullmatch`, which raises on one."""
+    return isinstance(name, str) and bool(NAME_PATTERN.fullmatch(name))
 
 
 def valid_kind(kind):
     """`kind` is concatenated into a directory name; unvalidated, `../..` walks
     out of the project."""
-    return bool(kind) and bool(KIND_PATTERN.fullmatch(kind))
+    return isinstance(kind, str) and bool(KIND_PATTERN.fullmatch(kind))
 
 
 def valid_owner_key(key):

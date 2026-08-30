@@ -41,6 +41,15 @@ class PeerNameTest(unittest.TestCase):
         for name in ("ui\n", "ui\n\n", "a/b\n"):
             self.assertFalse(peers.valid_name(name), repr(name))
 
+    def test_a_name_or_kind_that_is_not_a_string_is_refused_not_raised(self):
+        """Both reach here from JSON — a tool argument, a marker, a record read
+        off disk. `re.fullmatch(42)` raises, and it would raise inside routing."""
+        for value in (42, [], {}, 3.5, True, object()):
+            self.assertFalse(peers.valid_name(value), repr(value))
+            self.assertFalse(peers.valid_kind(value), repr(value))
+        self.assertFalse(peers.valid_name(None))
+        self.assertFalse(peers.valid_kind(None))
+
     def test_valid_kind_allows_only_the_two_sides(self):
         """`kind` is concatenated into a directory name. Unvalidated, `../..`
         walks out of the project."""

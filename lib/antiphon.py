@@ -709,27 +709,19 @@ def push(target="codex"):
     before = dict(sent)
 
     def deliver(recipient, messages):
-        # Resolving a named peer belongs to a later task. Until it exists a named
-        # marker is refused out loud rather than delivered to whoever is around,
-        # and the unaddressed path behaves exactly as it always has.
-        if recipient is not None:
-            print(f"antiphon: {recipient!r} not delivered — routing to a named "
-                  "peer is not available yet", file=sys.stderr)
-            return False
         outgoing = "\n".join(messages)
         if target == "codex":
-            session_id = codex_session_id(cwd)
-            if not session_id:
-                print("antiphon: no Codex session found in this directory, not pushed",
-                      file=sys.stderr)
-                return False
-            ok, detail = send_to_codex(session_id, f"{PUSH_LABEL} {outgoing}")
+            ok, detail = send_to_codex(cwd, f"{PUSH_LABEL} {outgoing}", recipient)
         else:
-            ok, detail = send_to_claude(cwd, outgoing)
+            ok, detail = send_to_claude(cwd, outgoing, recipient)
+        named = f":{recipient}" if recipient else ""
         if ok:
-            print(f"antiphon: delivered to {target.title()} "
+            print(f"antiphon: delivered to {target.title()}{named} "
                   f"({len(outgoing)} characters)", file=sys.stderr)
         else:
+            # Returning False leaves this recipient's fingerprint where it was,
+            # so the line is offered again next turn instead of being recorded
+            # as delivered and lost.
             print(f"antiphon: delivery failed — {detail}", file=sys.stderr)
         return ok
 
@@ -743,8 +735,15 @@ def push(target="codex"):
     return 0
 
 
-def send_to_codex(session, message):
-    """Leaves a message with the running session via `codex queue`. Returns: (success, detail)."""
+def _queue_codex(session, message):
+    """Leaves a message with one Codex session via `codex queue`.
+
+    The transport, not the decision. `send_to_codex` picks the session; this
+    only carries. Keeping them apart is what lets a refusal be tested without
+    ever starting a process.
+
+    Returns: (success, detail).
+    """
     try:
         result = subprocess.run(
             ["codex", "queue", "--thread", session, "--message", message],
@@ -766,28 +765,100 @@ def claude_socket_path(cwd):
                         f"antiphon-channel-{key}.sock")
 
 
-def resolve_claude_target(cwd):
-    """Which Claude peer a message goes to. Returns (address, detail).
+def _legacy_target(cwd, kind):
+    """Where a message went before any of this existed.
+
+    Reached only when the registry holds nothing at all, which is the unnamed
+    single-pair case. An older channel server still serving the project-wide
+    socket is a working peer, and the newest rollout matching this directory is
+    still the one Codex session in it; upgrading must not cut either off.
+    """
+    if kind == "claude":
+        return claude_socket_path(cwd), ""
+    session = codex_session_id(cwd)
+    if not session:
+        return None, "not delivered: no Codex session found in this directory"
+    return session, ""
+
+
+def _peer_states(live):
+    """Every live peer, and whether anything could actually reach it.
+
+    A refusal that named only the peers would leave the reader wondering which
+    one to wait for. Naming the states answers that in the same breath.
+    """
+    return ", ".join(sorted(
+        "{}: {}".format(peer.get("name") or "?",
+                        "ready" if peer.get("address") is not None
+                        else "waiting for its first turn")
+        for peer in live))
+
+
+def resolve_target(cwd, kind, alias=None):
+    """Which peer a message goes to. Returns (address, detail).
 
     `address` is None when nothing can be delivered safely. The bridge does not
-    choose between peers: a choice made here is invisible to everyone, which is
-    the failure the registry exists to end. An agent picking a name is a
+    choose between peers and does not broadcast: a choice made here is invisible
+    to everyone, which is the failure the registry exists to end, and a message
+    sent to three agents starts three agents on it. An agent picking a name is a
     different thing — that choice is written in its own words and can be read
     back and disagreed with.
+
+    The count that decides a bare message is how many peers are **live**, never
+    how many are ready. Readiness is not permission to guess: a second peer
+    between its start and its first turn is as much a candidate as the one that
+    happens to be routable already, and picking the ready one would be choosing
+    by timing.
+
+    `read_peers` returns a Claude endpoint as it stands, and a Codex endpoint
+    with an address only when a session record under the *same owner key*
+    supplies one, so an address of `None` means the same thing on both sides:
+    live, and nothing can reach it yet.
     """
-    live = peers.read_peers(cwd, "claude")
-    if not live:
-        # Nothing registered: an older channel server may still be serving the
-        # project-wide path, and it is a working peer.
-        return claude_socket_path(cwd), ""
-    if len(live) == 1:
-        # A peer may now be live without being reachable, but only on the
-        # Codex side, so a live Claude peer still always carries a usable
-        # address; no silent fallback can hide behind a missing field.
-        return live[0]["address"], ""
+    if not peers.valid_kind(kind):
+        return None, f"not delivered: unknown peer kind {kind!r} (claude | codex)"
+
+    live = peers.read_peers(cwd, kind)
     names = ", ".join(sorted(p.get("name") or "?" for p in live))
-    return None, (f"not delivered: {len(live)} Claude peers are live ({names}); "
-                  "address one by name")
+
+    if alias is not None:
+        if not peers.valid_name(alias):
+            return None, (f"not delivered: {alias!r} is not a usable peer name"
+                          + (f"; live {kind} peers: {names}" if names else ""))
+        # Exact, or not at all. A near miss is a different peer.
+        match = [p for p in live if p.get("name") == alias]
+        if not match:
+            return None, (f"not delivered: no live {kind} peer named {alias!r}"
+                          + (f"; live peers: {names}" if names else ""))
+        if match[0].get("address") is None:
+            return None, (f"not delivered: {alias!r} is live but not yet routable "
+                          "— it has not run a turn yet")
+        return match[0]["address"], ""
+
+    if not live:
+        return _legacy_target(cwd, kind)
+    if len(live) > 1:
+        return None, (f"not delivered: {len(live)} {kind} peers are live "
+                      f"({_peer_states(live)}); address one by name")
+    if live[0].get("address") is None:
+        # Not the legacy path. That address belongs to the case where nothing is
+        # registered; reaching for it because the one registered peer is not
+        # ready would deliver to a session nobody named and look like success.
+        return None, (f"not delivered: {names} is live but not yet routable — "
+                      "it has not run a turn yet")
+    return live[0]["address"], ""
+
+
+def send_to_codex(cwd, message, alias=None):
+    """Sends a message to a Codex peer, chosen by `alias` or by there being one.
+
+    Returns (ok, detail). Nothing is started when the recipient cannot be
+    decided: the refusal happens before the transport is touched.
+    """
+    address, detail = resolve_target(cwd, "codex", alias)
+    if address is None:
+        return False, detail
+    return _queue_codex(address, message)
 
 
 # The channel server refuses anything larger. Checking here too means a sender
@@ -807,8 +878,8 @@ CONNECT_PATIENCE = 1.5            # seconds; a real outage still fails promptly
 CONNECT_RETRY_DELAY = 0.05
 
 
-def send_to_claude(cwd, text):
-    """Sends a Codex message to Claude Code's MCP Channel socket."""
+def send_to_claude(cwd, text, alias=None):
+    """Sends a Codex message to a Claude peer's MCP Channel socket."""
     request = {
         "content": text,
         "message_id": str(uuid.uuid4()),
@@ -822,7 +893,7 @@ def send_to_claude(cwd, text):
     while True:
         # Re-resolved every attempt: a named peer can register in the meantime,
         # which moves the address from the project-wide path to its own.
-        address, detail = resolve_claude_target(cwd)
+        address, detail = resolve_target(cwd, "claude", alias)
         if address is None:
             return False, detail      # waiting cannot make two peers into one
         sock = None
@@ -875,12 +946,8 @@ def reply(*_):
         print("reply: empty text", file=sys.stderr)
         return 1
     cwd = project_dir()
-    session_id = codex_session_id(cwd)
-    if not session_id:
-        print("reply: no running Codex session found", file=sys.stderr)
-        return 1
     text = text.strip()
-    ok, detail = send_to_codex(session_id, f"{CHANNEL_LABEL} {text}")
+    ok, detail = send_to_codex(cwd, f"{CHANNEL_LABEL} {text}")
     if not ok:
         print(f"reply: {detail}", file=sys.stderr)
         return 1

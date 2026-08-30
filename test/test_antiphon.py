@@ -13,6 +13,7 @@ try:
 except ModuleNotFoundError:  # the hooks run whatever bare `python3` resolves to
     tomllib = None
 import unittest
+from types import SimpleNamespace
 from unittest.mock import patch
 
 
@@ -173,7 +174,8 @@ class AntiphonTest(unittest.TestCase):
              patch.object(antiphon, "write_cursor",
                           side_effect=lambda cwd, data, kind: written.append(dict(data))), \
              patch.object(antiphon, "send_to_claude",
-                          side_effect=lambda cwd, msg: (sent.append((cwd, msg)) or (True, ""))), \
+                          side_effect=lambda cwd, msg, alias=None:
+                              sent.append((cwd, msg)) or (True, "")), \
              patch.object(antiphon.sys, "stdin", io.StringIO(json.dumps(input_data))), \
              contextlib.redirect_stderr(io.StringIO()):
             self.assertEqual(antiphon.push("claude"), 0)
@@ -231,7 +233,8 @@ class AntiphonTest(unittest.TestCase):
              patch.object(antiphon, "read_cursor", return_value={}), \
              patch.object(antiphon, "write_cursor"), \
              patch.object(antiphon, "send_to_claude",
-                          side_effect=lambda cwd, msg: (sent.append(msg) or (True, ""))), \
+                          side_effect=lambda cwd, msg, alias=None:
+                              sent.append(msg) or (True, "")), \
              patch.object(antiphon.sys, "stdin", io.StringIO(json.dumps(input_data))), \
              contextlib.redirect_stderr(err):
             self.assertEqual(antiphon.push("claude"), 0)
@@ -252,26 +255,39 @@ class AntiphonTest(unittest.TestCase):
             self.assertEqual(antiphon.push("claude"), 0)
         self.assertIn("@claude:api line carried no message", err.getvalue())
 
-    def test_a_named_marker_is_refused_until_routing_exists(self):
-        """Resolving a name is a later task. Refusing out loud is honest;
-        delivering it to whoever is around would not be."""
+    # A mock that stands in for a transport nobody should touch must raise, not
+    # record. A bare MagicMock socket answers `recv` with a truthy object for
+    # ever, so a wrong turn does not fail the test — it hangs the suite.
+    # Measured twice while mutating this very code.
+    UNTOUCHABLE = AssertionError("this message must touch no transport")
+
+    def test_a_named_marker_that_reaches_nobody_is_reported_not_redirected(self):
+        """A name that does not resolve is refused out loud. Delivering it to
+        whoever is around instead would be the silent misroute wearing a
+        recipient's name."""
         input_data = {"cwd": "/tmp/project", "transcript_path": "/tmp/rollout"}
         err = io.StringIO()
-        with patch.object(antiphon.os.path, "exists", return_value=True), \
-             patch.object(antiphon, "last_codex_reply", return_value="@claude:api run"), \
-             patch.object(antiphon, "read_cursor", return_value={}), \
-             patch.object(antiphon, "write_cursor") as write, \
-             patch.object(antiphon, "send_to_claude") as send, \
-             patch.object(antiphon.sys, "stdin", io.StringIO(json.dumps(input_data))), \
-             contextlib.redirect_stderr(err):
-            self.assertEqual(antiphon.push("claude"), 0)
-            send.assert_not_called()
-            write.assert_not_called()
-        self.assertIn("not available yet", err.getvalue())
+        with tempfile.TemporaryDirectory() as project:
+            input_data["cwd"] = project
+            with patch.object(antiphon.os.path, "exists", return_value=True), \
+                 patch.object(antiphon, "last_codex_reply",
+                              return_value="@claude:api run"), \
+                 patch.object(antiphon, "read_cursor", return_value={}), \
+                 patch.object(antiphon, "write_cursor") as write, \
+                 patch.object(antiphon.socket, "socket",
+                              side_effect=self.UNTOUCHABLE) as sock, \
+                 patch.object(antiphon.sys, "stdin",
+                              io.StringIO(json.dumps(input_data))), \
+                 contextlib.redirect_stderr(err):
+                self.assertEqual(antiphon.push("claude"), 0)
+                sock.assert_not_called()
+                write.assert_not_called()
         self.assertIn("api", err.getvalue())
+        self.assertIn("not delivered", err.getvalue())
 
-    def test_an_unaddressed_line_still_delivers_alongside_a_named_one(self):
-        """The refusal must not take the working path down with it."""
+    def test_a_refused_named_line_does_not_take_the_bare_one_down_with_it(self):
+        """Each recipient stands alone. A name that cannot be resolved must cost
+        that line and nothing else."""
         sent = []
         input_data = {"cwd": "/tmp/project", "transcript_path": "/tmp/rollout"}
         with patch.object(antiphon.os.path, "exists", return_value=True), \
@@ -280,7 +296,10 @@ class AntiphonTest(unittest.TestCase):
              patch.object(antiphon, "read_cursor", return_value={}), \
              patch.object(antiphon, "write_cursor"), \
              patch.object(antiphon, "send_to_claude",
-                          side_effect=lambda cwd, msg: (sent.append(msg) or (True, ""))), \
+                          side_effect=lambda cwd, msg, alias=None:
+                              (False, "not delivered: no live claude peer named "
+                                      f"{alias!r}") if alias
+                              else (sent.append(msg) or (True, ""))), \
              patch.object(antiphon.sys, "stdin", io.StringIO(json.dumps(input_data))), \
              contextlib.redirect_stderr(io.StringIO()):
             self.assertEqual(antiphon.push("claude"), 0)
@@ -315,7 +334,8 @@ class AntiphonTest(unittest.TestCase):
         sent = []
         with tempfile.TemporaryDirectory() as project, \
              patch.object(antiphon, "send_to_claude",
-                          side_effect=lambda cwd, msg: (sent.append((cwd, msg)) or (True, ""))), \
+                          side_effect=lambda cwd, msg, alias=None:
+                              sent.append((cwd, msg)) or (True, "")), \
              patch.object(antiphon, "read_cursor", return_value={}), \
              patch.object(antiphon, "write_cursor", return_value=True):
             responses = self._run_mcp(project, self._call("antiphon_send", text="run the tests"))
@@ -367,40 +387,7 @@ class AntiphonTest(unittest.TestCase):
             self.assertEqual(antiphon.reply(), 0)
         self.assertEqual(written, [{"last_pushed_codex": "hello"}])
 
-    # ---- choosing which Claude peer a message goes to ----
-
-    def test_one_live_claude_peer_is_delivered_to(self):
-        with tempfile.TemporaryDirectory() as project:
-            antiphon.peers.register(project, "claude", "ui", "/tmp/ui.sock")
-            address, detail = antiphon.resolve_claude_target(project)
-        self.assertEqual(address, "/tmp/ui.sock")
-        self.assertEqual(detail, "")
-
-    def test_several_live_peers_deliver_to_nobody_and_name_them_all(self):
-        """The bridge never guesses a recipient. Guessing is what the silent
-        misrouting was, and a cleverer guess is still a guess."""
-        with tempfile.TemporaryDirectory() as project:
-            antiphon.peers.register(project, "claude", "ui", "/tmp/ui.sock")
-            antiphon.peers.register(project, "claude", "api", "/tmp/api.sock")
-            address, detail = antiphon.resolve_claude_target(project)
-        self.assertIsNone(address)
-        self.assertIn("ui", detail)
-        self.assertIn("api", detail)
-
-    def test_a_codex_peer_does_not_count_as_a_claude_recipient(self):
-        with tempfile.TemporaryDirectory() as project:
-            antiphon.peers.register(project, "claude", "ui", "/tmp/ui.sock")
-            antiphon.peers.register(project, "codex", "build", "sess-1")
-            address, _ = antiphon.resolve_claude_target(project)
-        self.assertEqual(address, "/tmp/ui.sock")
-
-    def test_no_registered_peer_falls_back_to_the_project_socket(self):
-        """An older channel server still serving the project-wide path is still a
-        working peer; upgrading must not cut it off."""
-        with tempfile.TemporaryDirectory() as project:
-            address, detail = antiphon.resolve_claude_target(project)
-        self.assertEqual(address, antiphon.claude_socket_path(project))
-        self.assertEqual(detail, "")
+    # ---- choosing which peer a message goes to: see RoutingTest ----
 
     def test_send_to_claude_reports_the_ambiguity_instead_of_picking(self):
         with tempfile.TemporaryDirectory() as project:
@@ -491,8 +478,9 @@ class AntiphonTest(unittest.TestCase):
         chan = self._Channel(missing=2)
         with tempfile.TemporaryDirectory() as project, \
              patch.object(antiphon.socket, "socket", chan), \
-             patch.object(antiphon, "resolve_claude_target",
-                          side_effect=lambda cwd: ("/tmp/ui.sock", "")) as resolve:
+             patch.object(antiphon, "resolve_target",
+                          side_effect=lambda cwd, kind, alias=None:
+                              ("/tmp/ui.sock", "")) as resolve:
             ok, detail = antiphon.send_to_claude(project, "the first thing said")
         self.assertTrue(ok, detail)
         self.assertEqual(chan.connects, 3)
@@ -504,8 +492,9 @@ class AntiphonTest(unittest.TestCase):
         chan = self._Channel(missing=10_000)
         with tempfile.TemporaryDirectory() as project, \
              patch.object(antiphon.socket, "socket", chan), \
-             patch.object(antiphon, "resolve_claude_target",
-                          side_effect=lambda cwd: ("/tmp/ui.sock", "")):
+             patch.object(antiphon, "resolve_target",
+                          side_effect=lambda cwd, kind, alias=None:
+                              ("/tmp/ui.sock", "")):
             started = time.monotonic()
             ok, detail = antiphon.send_to_claude(project, "hello")
             elapsed = time.monotonic() - started
@@ -516,9 +505,9 @@ class AntiphonTest(unittest.TestCase):
     def test_an_ambiguous_target_is_not_retried(self):
         """Waiting cannot resolve ambiguity — more peers will not become fewer."""
         with tempfile.TemporaryDirectory() as project, \
-             patch.object(antiphon, "resolve_claude_target",
-                          side_effect=lambda cwd: (None, "not delivered: 2 peers")
-                          ) as resolve:
+             patch.object(antiphon, "resolve_target",
+                          side_effect=lambda cwd, kind, alias=None:
+                              (None, "not delivered: 2 peers")) as resolve:
             ok, detail = antiphon.send_to_claude(project, "hello")
         self.assertFalse(ok)
         self.assertIn("2 peers", detail)
@@ -529,8 +518,9 @@ class AntiphonTest(unittest.TestCase):
         chan = self._Channel(missing=0, reply=b"not json at all")
         with tempfile.TemporaryDirectory() as project, \
              patch.object(antiphon.socket, "socket", chan), \
-             patch.object(antiphon, "resolve_claude_target",
-                          side_effect=lambda cwd: ("/tmp/ui.sock", "")):
+             patch.object(antiphon, "resolve_target",
+                          side_effect=lambda cwd, kind, alias=None:
+                              ("/tmp/ui.sock", "")):
             ok, detail = antiphon.send_to_claude(project, "hello")
         self.assertFalse(ok)
         self.assertIn("invalid response", detail)
@@ -564,12 +554,12 @@ class AntiphonTest(unittest.TestCase):
                             antiphon.claude_socket_path("/tmp/b"))
 
     def test_channel_reply_goes_to_codex_queue_with_agent_label(self):
-        with patch.object(antiphon, "codex_session_id", return_value="session"), \
+        with patch.object(antiphon, "project_dir", return_value="/tmp/project"), \
              patch.object(antiphon, "send_to_codex", return_value=(True, "")) as send, \
              patch.object(antiphon.sys, "stdin",
                           io.StringIO('{"text":"reply"}')):
             self.assertEqual(antiphon.reply(), 0)
-        send.assert_called_once_with("session", "[Antiphon channel] Claude: reply")
+        send.assert_called_once_with("/tmp/project", "[Antiphon channel] Claude: reply")
 
     def test_hook_is_silent_and_only_injects_context(self):
         """The hook prints nothing to the terminal: the summary goes into the context, the user is not disturbed."""
@@ -849,7 +839,7 @@ class AntiphonTest(unittest.TestCase):
     def test_push_and_reply_use_the_same_labels_the_guard_matches(self):
         """The guard is derived from the constants push() and reply() send, so the
         two can never drift apart."""
-        with patch.object(antiphon, "codex_session_id", return_value="session"), \
+        with patch.object(antiphon, "project_dir", return_value="/tmp/project"), \
              patch.object(antiphon, "send_to_codex", return_value=(True, "")) as send, \
              patch.object(antiphon.sys, "stdin", io.StringIO('{"text":"reply"}')):
             self.assertEqual(antiphon.reply(), 0)
@@ -1551,6 +1541,367 @@ class CodexPeerWiringTest(unittest.TestCase):
         self.assertEqual(
             [entry["command"] for group in hooks["UserPromptSubmit"]
              for entry in group["hooks"]].count("antiphon hook codex"), 1)
+
+
+class RoutingTest(unittest.TestCase):
+    """Which peer a message goes to, and what happens when that cannot be said.
+
+    The bridge never chooses between peers and never broadcasts. A choice made
+    here is invisible to everyone, which is the failure the registry exists to
+    end; a message sent to three agents starts three agents on it. An agent
+    picking a name is a different thing — that choice is written in its own
+    words and can be read back and disagreed with.
+    """
+
+    UUID = "1d5a03e0-0548-4339-87c3-45c5dbf7e9d7"
+    OTHER = "2e6b14f1-1659-544a-98d4-56d6eca8fa48"
+
+    @staticmethod
+    def _codex_peer(project, alias, owner, session=None):
+        antiphon.peers.register(project, "codex", alias, None,
+                                pid=os.getpid(), owner_key=owner)
+        if session:
+            antiphon.peers.write_session(project, "codex", alias, session,
+                                         f"/t/{alias}.jsonl", owner)
+
+    # ---- an alias goes exactly where it says ----
+
+    def test_a_named_peer_is_resolved_by_its_alias(self):
+        with tempfile.TemporaryDirectory() as project:
+            antiphon.peers.register(project, "claude", "ui", "/tmp/ui.sock")
+            antiphon.peers.register(project, "claude", "api", "/tmp/api.sock")
+            self.assertEqual(antiphon.resolve_target(project, "claude", "api"),
+                             ("/tmp/api.sock", ""))
+
+    def test_an_alias_matches_exactly_or_not_at_all(self):
+        """No prefix, no nearest, no case folding. A near miss is a different
+        peer, and delivering to it is the guess this refuses to make."""
+        with tempfile.TemporaryDirectory() as project:
+            antiphon.peers.register(project, "claude", "api", "/tmp/api.sock")
+            for alias in ("ap", "api2", "API", "apiv2"):
+                address, detail = antiphon.resolve_target(project, "claude", alias)
+                self.assertIsNone(address, alias)
+                self.assertIn("api", detail)
+
+    def test_an_unknown_alias_reports_the_live_ones(self):
+        with tempfile.TemporaryDirectory() as project:
+            antiphon.peers.register(project, "claude", "ui", "/tmp/ui.sock")
+            address, detail = antiphon.resolve_target(project, "claude", "docs")
+        self.assertIsNone(address)
+        self.assertIn("docs", detail)
+        self.assertIn("ui", detail)
+
+    def test_an_alias_that_could_never_be_a_name_says_so(self):
+        with tempfile.TemporaryDirectory() as project:
+            antiphon.peers.register(project, "claude", "ui", "/tmp/ui.sock")
+            for alias in ("API!", "", "../etc", "a" * 40):
+                address, detail = antiphon.resolve_target(project, "claude", alias)
+                self.assertIsNone(address, repr(alias))
+                self.assertIn("usable peer name", detail)
+
+    def test_a_kind_that_is_not_a_side_resolves_to_nothing(self):
+        """`kind` reaches this from a marker and a tool argument. Falling through
+        to a legacy path for a side that does not exist would deliver somewhere
+        nobody asked for."""
+        with tempfile.TemporaryDirectory() as project:
+            for kind in ("ghost", "", None, "claude\n"):
+                address, detail = antiphon.resolve_target(project, kind)
+                self.assertIsNone(address, repr(kind))
+                self.assertIn("kind", detail)
+
+    def test_an_alias_or_kind_of_the_wrong_type_is_refused_not_raised(self):
+        """Both arrive from JSON: a tool argument today, anything tomorrow. A
+        traceback here would take the turn down over a bad field."""
+        with tempfile.TemporaryDirectory() as project:
+            antiphon.peers.register(project, "claude", "ui", "/tmp/ui.sock")
+            for value in (42, [], {}, 3.5):
+                address, detail = antiphon.resolve_target(project, "claude", value)
+                self.assertIsNone(address, repr(value))
+                self.assertIn("usable peer name", detail)
+                address, detail = antiphon.resolve_target(project, value)
+                self.assertIsNone(address, repr(value))
+                self.assertIn("kind", detail)
+
+    def test_an_alias_reaches_the_named_session_and_not_its_neighbour(self):
+        """Two peers, both ready. The alias decides, and it decides exactly."""
+        with tempfile.TemporaryDirectory() as project:
+            self._codex_peer(project, "build", "300:build", self.UUID)
+            self._codex_peer(project, "review", "301:review", self.OTHER)
+            self.assertEqual(antiphon.resolve_target(project, "codex", "review"),
+                             (self.OTHER, ""))
+            self.assertEqual(antiphon.resolve_target(project, "codex", "build"),
+                             (self.UUID, ""))
+
+    def test_a_named_push_queues_that_peers_session_and_no_other(self):
+        """End to end: the marker names `review`, and `codex queue` is handed
+        `review`\'s rollout id."""
+        queued = []
+        with tempfile.TemporaryDirectory() as project:
+            self._codex_peer(project, "build", "300:build", self.UUID)
+            self._codex_peer(project, "review", "301:review", self.OTHER)
+            payload = {"cwd": project, "transcript_path": "/tmp/transcript"}
+            with patch.object(antiphon.os.path, "exists", return_value=True), \
+                 patch.object(antiphon, "last_claude_reply",
+                              return_value="@codex:review ship it"), \
+                 patch.object(antiphon, "read_cursor", return_value={}), \
+                 patch.object(antiphon, "write_cursor"), \
+                 patch.object(antiphon, "_queue_codex",
+                              side_effect=lambda session, message:
+                                  queued.append((session, message)) or (True, "")), \
+                 patch.object(antiphon.sys, "stdin",
+                              io.StringIO(json.dumps(payload))), \
+                 contextlib.redirect_stderr(io.StringIO()):
+                self.assertEqual(antiphon.push("codex"), 0)
+        self.assertEqual([session for session, _ in queued], [self.OTHER])
+        self.assertIn("ship it", queued[0][1])
+
+    def test_an_unknown_alias_never_falls_back_to_the_legacy_path(self):
+        """The legacy address is for the case where nothing is registered at
+        all. Reaching for it because a *named* recipient was not found would
+        deliver to a session nobody asked for, and report success."""
+        # The transports raise rather than record. A bare mock socket answers
+        # `recv` with a truthy object for ever, so a wrong fallback here hangs
+        # the suite instead of failing it — measured, once.
+        touched = AssertionError("a refused recipient must touch no transport")
+        with tempfile.TemporaryDirectory() as project, \
+             patch.object(antiphon, "codex_session_id",
+                          return_value="sess-legacy") as rollout, \
+             patch.object(antiphon.socket, "socket", side_effect=touched) as sock, \
+             patch.object(antiphon.subprocess, "run", side_effect=touched) as run:
+            for kind in ("claude", "codex"):
+                address, detail = antiphon.resolve_target(project, kind, "ghost")
+                self.assertIsNone(address, kind)
+                self.assertIn("ghost", detail)
+            self.assertFalse(antiphon.send_to_codex(project, "hi", "ghost")[0])
+            self.assertFalse(antiphon.send_to_claude(project, "hi", "ghost")[0])
+            rollout.assert_not_called()
+            sock.assert_not_called()
+            run.assert_not_called()
+
+    def test_one_ready_codex_peer_resolves_to_its_merged_session(self):
+        """The bare path on the Codex side returns the id the hook recorded, not
+        whatever rollout happens to be newest on disk."""
+        with tempfile.TemporaryDirectory() as project:
+            self._codex_peer(project, "build", "300:build", self.UUID)
+            with patch.object(antiphon, "codex_session_id",
+                              return_value="sess-newest") as rollout:
+                self.assertEqual(antiphon.resolve_target(project, "codex"),
+                                 (self.UUID, ""))
+            rollout.assert_not_called()
+
+    def test_a_named_peer_that_is_not_routable_yet_says_so(self):
+        with tempfile.TemporaryDirectory() as project:
+            self._codex_peer(project, "build", "300:build")
+            address, detail = antiphon.resolve_target(project, "codex", "build")
+        self.assertIsNone(address)
+        self.assertIn("not yet routable", detail)
+        self.assertIn("build", detail)
+
+    # ---- a bare message is decided by how many are live, not how many are ready ----
+
+    def test_one_ready_peer_does_not_win_over_another_live_peer(self):
+        """Readiness is not permission to guess. `review` may simply be between
+        SessionStart and its first hook; a bare message must not go to `build`
+        because it happened to become routable first."""
+        with tempfile.TemporaryDirectory() as project:
+            self._codex_peer(project, "build", "300:build", self.UUID)
+            self._codex_peer(project, "review", "301:review")
+            address, detail = antiphon.resolve_target(project, "codex")
+        self.assertIsNone(address)
+        self.assertIn("build", detail)
+        self.assertIn("review", detail)
+        self.assertIn("ready", detail)
+        self.assertIn("waiting", detail)
+        self.assertNotIn("broadcast", detail.lower())
+
+    def test_several_peers_and_no_alias_is_refused_with_their_names(self):
+        with tempfile.TemporaryDirectory() as project:
+            antiphon.peers.register(project, "claude", "ui", "/tmp/ui.sock")
+            antiphon.peers.register(project, "claude", "api", "/tmp/api.sock")
+            address, detail = antiphon.resolve_target(project, "claude")
+        self.assertIsNone(address)
+        self.assertIn("ui", detail)
+        self.assertIn("api", detail)
+        self.assertIn("address one by name", detail)
+
+    def test_one_live_peer_that_is_waiting_does_not_fall_back_to_the_old_path(self):
+        """The legacy address belongs to the case where nothing is registered.
+        Reaching for it because the one registered peer is not ready yet would
+        deliver to a session nobody named, and look like success."""
+        with tempfile.TemporaryDirectory() as project:
+            self._codex_peer(project, "build", "300:build")
+            with patch.object(antiphon, "codex_session_id",
+                              return_value="9999") as legacy:
+                address, detail = antiphon.resolve_target(project, "codex")
+            legacy.assert_not_called()
+        self.assertIsNone(address)
+        self.assertIn("not yet routable", detail)
+
+    def test_one_peer_and_no_alias_is_delivered_to(self):
+        with tempfile.TemporaryDirectory() as project:
+            antiphon.peers.register(project, "claude", "ui", "/tmp/ui.sock")
+            self.assertEqual(antiphon.resolve_target(project, "claude"),
+                             ("/tmp/ui.sock", ""))
+
+    # ---- nothing registered: the unnamed pair, exactly as before ----
+
+    def test_nothing_registered_falls_back_to_the_project_socket(self):
+        """An older channel server still serving the project-wide path is still
+        a working peer; upgrading must not cut it off."""
+        with tempfile.TemporaryDirectory() as project:
+            self.assertEqual(antiphon.resolve_target(project, "claude"),
+                             (antiphon.claude_socket_path(project), ""))
+
+    def test_nothing_registered_falls_back_to_the_newest_codex_rollout(self):
+        with tempfile.TemporaryDirectory() as project, \
+             patch.object(antiphon, "codex_session_id", return_value="sess-1"):
+            self.assertEqual(antiphon.resolve_target(project, "codex"),
+                             ("sess-1", ""))
+
+    def test_no_codex_session_and_nothing_registered_is_refused(self):
+        with tempfile.TemporaryDirectory() as project, \
+             patch.object(antiphon, "codex_session_id", return_value=None):
+            address, detail = antiphon.resolve_target(project, "codex")
+        self.assertIsNone(address)
+        self.assertIn("no Codex session", detail)
+
+    def test_a_codex_peer_does_not_count_as_a_claude_recipient(self):
+        with tempfile.TemporaryDirectory() as project:
+            antiphon.peers.register(project, "claude", "ui", "/tmp/ui.sock")
+            self._codex_peer(project, "build", "300:build", self.UUID)
+            self.assertEqual(antiphon.resolve_target(project, "claude"),
+                             ("/tmp/ui.sock", ""))
+
+    # ---- a refusal costs nothing ----
+
+    def test_a_refused_send_opens_no_socket_and_starts_no_process(self):
+        """The refusal has to happen before any transport is touched. A socket
+        opened or a `codex queue` started for a message that is never sent is
+        a side effect nobody asked for, and on the Codex side it would be a
+        process spawned per refused turn."""
+        with tempfile.TemporaryDirectory() as project:
+            antiphon.peers.register(project, "claude", "ui", "/tmp/ui.sock")
+            antiphon.peers.register(project, "claude", "api", "/tmp/api.sock")
+            self._codex_peer(project, "build", "300:build", self.UUID)
+            self._codex_peer(project, "review", "301:review", self.OTHER)
+            touched = AssertionError("a refused message must touch no transport")
+            with patch.object(antiphon.socket, "socket", side_effect=touched) as sock, \
+                 patch.object(antiphon.subprocess, "run", side_effect=touched) as run:
+                claude_ok, claude_detail = antiphon.send_to_claude(project, "hi")
+                codex_ok, codex_detail = antiphon.send_to_codex(project, "hi")
+                sock.assert_not_called()
+                run.assert_not_called()
+        self.assertFalse(claude_ok)
+        self.assertFalse(codex_ok)
+        self.assertIn("address one by name", claude_detail)
+        self.assertIn("address one by name", codex_detail)
+
+    def test_the_low_level_queue_is_still_reachable_for_one_session(self):
+        """`_queue_codex` is the transport; `send_to_codex` is the decision. The
+        split is what lets the decision be tested without a subprocess."""
+        with patch.object(antiphon.subprocess, "run",
+                          return_value=SimpleNamespace(returncode=0, stdout="",
+                                                       stderr="")) as run:
+            self.assertEqual(antiphon._queue_codex("sess-1", "hello"), (True, ""))
+        self.assertEqual(run.call_args.args[0][:4],
+                         ["codex", "queue", "--thread", "sess-1"])
+
+    # ---- the Stop hook routes a named line ----
+
+    def test_a_named_push_carries_the_alias_down_to_the_send(self):
+        routed = []
+        with tempfile.TemporaryDirectory() as project:
+            antiphon.peers.register(project, "claude", "ui", "/tmp/ui.sock")
+            antiphon.peers.register(project, "claude", "api", "/tmp/api.sock")
+            payload = {"cwd": project, "transcript_path": "/tmp/rollout"}
+            with patch.object(antiphon.os.path, "exists", return_value=True), \
+                 patch.object(antiphon, "last_codex_reply",
+                              return_value="@claude:api run the tests"), \
+                 patch.object(antiphon, "read_cursor", return_value={}), \
+                 patch.object(antiphon, "write_cursor"), \
+                 patch.object(antiphon, "send_to_claude",
+                              side_effect=lambda cwd, text, alias=None:
+                                  routed.append((alias, text)) or (True, "")), \
+                 patch.object(antiphon.sys, "stdin",
+                              io.StringIO(json.dumps(payload))), \
+                 contextlib.redirect_stderr(io.StringIO()):
+                self.assertEqual(antiphon.push("claude"), 0)
+        self.assertEqual(routed, [("api", "run the tests")])
+
+    def test_an_alias_reaches_that_peers_own_socket_and_no_other(self):
+        """The whole point of the alias, checked at the transport: two live
+        peers, and the connection goes to the named one's address."""
+        connected = []
+
+        class Fake:
+            def settimeout(self, _): pass
+            def connect(self, address): connected.append(address)
+            def sendall(self, _): pass
+            def shutdown(self, _): pass
+            def recv(self, _): return b'{"ok": true}' if not connected[1:] else b""
+            def close(self): pass
+            def __enter__(self): return self
+            def __exit__(self, *_): return False
+
+        replies = [b'{"ok": true}', b""]
+
+        class Reading(Fake):
+            def recv(self, _):
+                return replies.pop(0) if replies else b""
+
+        with tempfile.TemporaryDirectory() as project:
+            antiphon.peers.register(project, "claude", "ui", "/tmp/ui.sock")
+            antiphon.peers.register(project, "claude", "api", "/tmp/api.sock")
+            with patch.object(antiphon.socket, "socket", lambda *a, **k: Reading()):
+                ok, detail = antiphon.send_to_claude(project, "hi", "api")
+        self.assertTrue(ok, detail)
+        self.assertEqual(connected, ["/tmp/api.sock"])
+
+    def test_only_the_recipient_that_was_delivered_advances_its_fingerprint(self):
+        """One line lands and one is refused. Recording the refused one would
+        lose it for ever — it would never be retried and never be seen."""
+        written = []
+        with tempfile.TemporaryDirectory() as project:
+            antiphon.peers.register(project, "claude", "ui", "/tmp/ui.sock")
+            payload = {"cwd": project, "transcript_path": "/tmp/rollout"}
+            with patch.object(antiphon.os.path, "exists", return_value=True), \
+                 patch.object(antiphon, "last_codex_reply",
+                              return_value="@claude:ui landed\n@claude:gone lost"), \
+                 patch.object(antiphon, "read_cursor", return_value={}), \
+                 patch.object(antiphon, "write_cursor",
+                              side_effect=lambda cwd, data, kind:
+                                  written.append(dict(data))), \
+                 patch.object(antiphon, "send_to_claude",
+                              side_effect=lambda cwd, text, alias=None:
+                                  (True, "") if alias == "ui" else (False, "no")), \
+                 patch.object(antiphon.sys, "stdin",
+                              io.StringIO(json.dumps(payload))), \
+                 contextlib.redirect_stderr(io.StringIO()):
+                self.assertEqual(antiphon.push("claude"), 0)
+        self.assertEqual(list(written[0]["last_pushed_claude"]), ["@ui"])
+
+    # ---- a bare tool call reports the ambiguity instead of picking ----
+
+    def test_a_bare_reply_returns_the_ambiguity_honestly(self):
+        err = io.StringIO()
+        with tempfile.TemporaryDirectory() as project:
+            self._codex_peer(project, "build", "300:build", self.UUID)
+            self._codex_peer(project, "review", "301:review", self.OTHER)
+            with patch.object(antiphon, "project_dir", return_value=project), \
+                 patch.object(antiphon.sys, "stdin",
+                              io.StringIO('{"text":"hello"}')), \
+                 contextlib.redirect_stderr(err):
+                self.assertEqual(antiphon.reply(), 1)
+        self.assertIn("build", err.getvalue())
+        self.assertIn("review", err.getvalue())
+
+    def test_the_send_tool_returns_the_ambiguity_honestly(self):
+        with tempfile.TemporaryDirectory() as project:
+            antiphon.peers.register(project, "claude", "ui", "/tmp/ui.sock")
+            antiphon.peers.register(project, "claude", "api", "/tmp/api.sock")
+            result = antiphon._send_tool(project, "hello")
+        self.assertTrue(result.get("isError"))
+        self.assertIn("api", result["content"][0]["text"])
 
 
 if __name__ == "__main__":
