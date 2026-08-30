@@ -82,6 +82,14 @@ class CrossBoundaryContractTest(unittest.TestCase):
         for tool in antiphon.TOOLS:
             self.assertIn(tool["name"], mentioned)
 
+    def test_every_lib_module_ships_in_the_package(self):
+        """`files` is an allowlist. A module missing from it vanishes from the
+        published tarball and breaks the CLI on install — never in a test here."""
+        listed = json.loads(read("package.json"))["files"]
+        for entry in sorted(os.listdir(os.path.join(ROOT, "lib"))):
+            if entry.endswith((".py", ".mjs")):
+                self.assertIn(f"lib/{entry}", listed, entry)
+
 
 if __name__ == "__main__":
     unittest.main()
