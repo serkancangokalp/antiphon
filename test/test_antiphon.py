@@ -799,6 +799,130 @@ class AntiphonTest(unittest.TestCase):
                                  "the identical instruction, said again in a "
                                  "new turn, must go out again")
 
+    def test_one_read_decides_both_the_reply_and_its_turn(self):
+        """`_claude_turn` must be the single source of both the reply text and
+        the turn key it is scoped under. Two independent reads are not
+        duplicate-safe: reviewer's repro grows the transcript between them, so
+        a second, later read can see a new boundary the first read never saw
+        — the text from turn A gets recorded under turn B's key, and a real
+        later send from turn B then hashes identically to that poisoned
+        record and is silently suppressed. A single call cannot disagree with
+        itself."""
+        with tempfile.TemporaryDirectory() as project:
+            payload = {"cwd": project, "transcript_path": "/tmp/transcript"}
+
+            def run():
+                with patch.object(antiphon.os.path, "exists", return_value=True), \
+                     patch.object(antiphon.sys, "stdin",
+                                  io.StringIO(json.dumps(payload))), \
+                     contextlib.redirect_stderr(io.StringIO()):
+                    return antiphon.push("codex")
+
+            with patch.object(antiphon, "_claude_turn",
+                              side_effect=[("@codex do SAME", "uuid-A"),
+                                           ("@codex do SAME", "uuid-B")]) as turn, \
+                 patch.object(antiphon, "send_to_codex",
+                              return_value=(True, "")) as send:
+                self.assertEqual(run(), 0)
+                self.assertEqual(turn.call_count, 1,
+                                 "exactly one read must decide both the "
+                                 "reply and the turn key it is scoped under")
+                send.assert_called_once()
+
+                # A second push, a different turn key from the same one read
+                # — never a second, independent read of the first.
+                self.assertEqual(run(), 0)
+                self.assertEqual(turn.call_count, 2)
+                self.assertEqual(send.call_count, 2,
+                                 "the same words under a different turn key "
+                                 "must still send")
+
+    # ---- push: a flat, pre-scoping fingerprint upgrades without resending ----
+    #
+    # A cursor slot can hold the flat, content-only digest a batch already
+    # carried before turn scoping shipped, or from an earlier push that
+    # resolved no turn key for this exact content. Comparing that flat value
+    # to the new scoped digest calls it new and resends a message that
+    # already went out once.
+
+    def test_a_flat_fingerprint_upgrades_without_resending(self):
+        with tempfile.TemporaryDirectory() as project:
+            transcript = os.path.join(project, "transcript.jsonl")
+            with open(transcript, "w", encoding="utf-8") as f:
+                f.write("\n".join([
+                    claude_prompt("ask", uuid="U1"),
+                    claude_assistant("@codex do SAME"),
+                ]) + "\n")
+            antiphon.write_cursor(
+                project,
+                {"last_pushed_codex": {"": antiphon.batch_fingerprint(["do SAME"])}},
+                "claude")
+
+            payload = {"cwd": project, "transcript_path": transcript}
+            with patch.object(antiphon, "send_to_codex",
+                              return_value=(True, "")) as send, \
+                 patch.object(antiphon.sys, "stdin",
+                              io.StringIO(json.dumps(payload))), \
+                 contextlib.redirect_stderr(io.StringIO()):
+                self.assertEqual(antiphon.push("codex"), 0)
+            send.assert_not_called()
+            record = antiphon.read_cursor(project, "claude")["last_pushed_codex"]
+            self.assertEqual(record[""],
+                             antiphon.batch_fingerprint(["U1", ["do SAME"]]),
+                             "the slot upgrades to the scoped digest in place")
+
+    def test_a_flat_fingerprint_upgrades_without_resending_a_named_recipient(self):
+        """Same upgrade, for a named `@alias` slot rather than the bare one."""
+        with tempfile.TemporaryDirectory() as project:
+            transcript = os.path.join(project, "transcript.jsonl")
+            with open(transcript, "w", encoding="utf-8") as f:
+                f.write("\n".join([
+                    claude_prompt("ask", uuid="U1"),
+                    claude_assistant("@codex:review do SAME"),
+                ]) + "\n")
+            antiphon.write_cursor(
+                project,
+                {"last_pushed_codex": {"@review": antiphon.batch_fingerprint(["do SAME"])}},
+                "claude")
+
+            payload = {"cwd": project, "transcript_path": transcript}
+            with patch.object(antiphon, "send_to_codex",
+                              return_value=(True, "")) as send, \
+                 patch.object(antiphon.sys, "stdin",
+                              io.StringIO(json.dumps(payload))), \
+                 contextlib.redirect_stderr(io.StringIO()):
+                self.assertEqual(antiphon.push("codex"), 0)
+            send.assert_not_called()
+            record = antiphon.read_cursor(project, "claude")["last_pushed_codex"]
+            self.assertEqual(record["@review"],
+                             antiphon.batch_fingerprint(["U1", ["do SAME"]]),
+                             "the named slot upgrades to the scoped digest too")
+
+    def test_a_non_matching_flat_fingerprint_still_sends(self):
+        """The upgrade path must not over-suppress: a stored flat digest for
+        different content is not this batch's own prior delivery, and must
+        not stand in the way of a genuinely new send."""
+        with tempfile.TemporaryDirectory() as project:
+            transcript = os.path.join(project, "transcript.jsonl")
+            with open(transcript, "w", encoding="utf-8") as f:
+                f.write("\n".join([
+                    claude_prompt("ask", uuid="U1"),
+                    claude_assistant("@codex do SAME"),
+                ]) + "\n")
+            antiphon.write_cursor(
+                project,
+                {"last_pushed_codex": {"": antiphon.batch_fingerprint(["something else"])}},
+                "claude")
+
+            payload = {"cwd": project, "transcript_path": transcript}
+            with patch.object(antiphon, "send_to_codex",
+                              return_value=(True, "")) as send, \
+                 patch.object(antiphon.sys, "stdin",
+                              io.StringIO(json.dumps(payload))), \
+                 contextlib.redirect_stderr(io.StringIO()):
+                self.assertEqual(antiphon.push("codex"), 0)
+            send.assert_called_once()
+
     def test_an_empty_marker_is_reported_even_beside_a_real_one(self):
         """A batch holding one empty marker and one real message is not empty, so
         a per-batch check let the empty line disappear without a word."""
@@ -5184,8 +5308,8 @@ class RoutingTest(unittest.TestCase):
             self._codex_peer(project, "review", "301:review", self.OTHER)
             payload = {"cwd": project, "transcript_path": "/tmp/transcript"}
             with patch.object(antiphon.os.path, "exists", return_value=True), \
-                 patch.object(antiphon, "last_claude_reply",
-                              return_value="@codex:review ship it"), \
+                 patch.object(antiphon, "_claude_turn",
+                              return_value=("@codex:review ship it", None)), \
                  patch.object(antiphon, "read_cursor", return_value={}), \
                  patch.object(antiphon, "write_cursor"), \
                  patch.object(antiphon, "_queue_codex",
@@ -5404,8 +5528,8 @@ class RoutingTest(unittest.TestCase):
             self._codex_peer(project, "build", "300:build", self.UUID)
             payload = {"cwd": project, "transcript_path": "/tmp/transcript"}
             with patch.object(antiphon.os.path, "exists", return_value=True), \
-                 patch.object(antiphon, "last_claude_reply",
-                              return_value="@codex ship it"), \
+                 patch.object(antiphon, "_claude_turn",
+                              return_value=("@codex ship it", None)), \
                  patch.object(antiphon, "read_cursor", return_value={}), \
                  patch.object(antiphon, "write_cursor") as write, \
                  patch.object(antiphon, "_queue_codex") as queued, \
@@ -5842,8 +5966,8 @@ class ToolRecipientTest(unittest.TestCase):
 
                 payload = {"cwd": project, "transcript_path": "/tmp/transcript"}
                 with patch.object(antiphon.os.path, "exists", return_value=True), \
-                     patch.object(antiphon, "last_claude_reply",
-                                  return_value="@codex:review ship"), \
+                     patch.object(antiphon, "_claude_turn",
+                                  return_value=("@codex:review ship", None)), \
                      patch.object(antiphon.sys, "stdin",
                                   io.StringIO(json.dumps(payload))), \
                      contextlib.redirect_stderr(io.StringIO()):
@@ -6106,8 +6230,8 @@ class SenderIdentityTest(unittest.TestCase):
             self._codex_peer(project, "build", "300:build", self.UUID)
             payload = {"cwd": project, "transcript_path": "/tmp/transcript"}
             with patch.object(antiphon.os.path, "exists", return_value=True), \
-                 patch.object(antiphon, "last_claude_reply",
-                              return_value="@codex:build ship it"), \
+                 patch.object(antiphon, "_claude_turn",
+                              return_value=("@codex:build ship it", None)), \
                  patch.object(antiphon, "read_cursor", return_value={}), \
                  patch.object(antiphon, "write_cursor"), \
                  patch.object(antiphon, "_queue_codex",
@@ -6295,8 +6419,8 @@ class ClaimedAliasTest(unittest.TestCase):
         queued = []
         payload = {"cwd": project, "transcript_path": "/tmp/transcript"}
         with patch.object(antiphon.os.path, "exists", return_value=True), \
-             patch.object(antiphon, "last_claude_reply",
-                          return_value="@codex:ui run it"), \
+             patch.object(antiphon, "_claude_turn",
+                          return_value=("@codex:ui run it", None)), \
              patch.object(antiphon, "read_cursor", return_value={}), \
              patch.object(antiphon, "write_cursor"), \
              patch.object(antiphon, "_queue_codex",
@@ -6342,9 +6466,9 @@ class ClaimedAliasTest(unittest.TestCase):
                  patch.object(antiphon.peers, "owner_key",
                               return_value=self.MINE) as walk, \
                  patch.object(antiphon.os.path, "exists", return_value=True), \
-                 patch.object(antiphon, "last_claude_reply",
-                              return_value="@codex:a one\n@codex:b two\n"
-                                           "@codex:c three"), \
+                 patch.object(antiphon, "_claude_turn",
+                              return_value=("@codex:a one\n@codex:b two\n"
+                                           "@codex:c three", None)), \
                  patch.object(antiphon, "read_cursor", return_value={}), \
                  patch.object(antiphon, "write_cursor"), \
                  patch.object(antiphon, "_queue_codex",

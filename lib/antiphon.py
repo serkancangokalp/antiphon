@@ -219,11 +219,24 @@ def deliver_batches(batches, sent, deliver, turn_key=""):
     `turn_key` scopes every fingerprint computed here to the turn `push`
     resolved it from; see `push_fingerprint`. The default keeps every other
     caller's content-only behaviour exactly as it was.
+
+    A slot can also hold the flat, content-only digest this exact batch
+    already carried before turn scoping shipped — written by an older
+    binary, or by an earlier push that resolved no turn key for this same
+    content. Once `turn_key` is non-empty that flat value can no longer equal
+    the scoped fingerprint, so comparing only against the new shape would
+    call already-delivered content new and resend it — measured: one
+    resend, then the slot converts. Recognised here the same way the
+    string-cursor migration is: matched against its own old shape, then
+    upgraded in place to the scoped digest without sending again.
     """
     for recipient, messages in batches.items():
         key = "" if recipient is None else f"@{recipient}"
         fingerprint = push_fingerprint(turn_key, messages)
         if sent.get(key) == fingerprint:
+            continue
+        if turn_key and sent.get(key) == batch_fingerprint(messages):
+            sent[key] = fingerprint
             continue
         if deliver(recipient, messages):
             sent[key] = fingerprint
@@ -1689,14 +1702,15 @@ def push(target="codex"):
         return 0
 
     if target == "codex":
-        reply_text = last_claude_reply(transcript)
-        # A second, independent read of the same window for the one thing
-        # `last_claude_reply`'s return value cannot carry without changing
-        # its contract: which turn produced the text. Cheap — the window is
-        # already `TAIL_BYTES`-bounded — and it lets `turn_key` agree with
-        # `reply_text` by construction rather than by trusting two calls to
-        # stay in step.
-        _, boundary_uuid = _claude_turn(transcript)
+        # One read decides both. A second, independent call to re-derive
+        # `boundary_uuid` looked cheap but was not safe: the transcript can
+        # grow between two reads, so the boundary the second read sees can
+        # differ from the one that actually produced `reply_text` — measured,
+        # a send from turn A gets recorded under turn B's key, and a later
+        # turn B that genuinely repeats the same words is then silently
+        # suppressed as an apparent duplicate. A single call guarantees the
+        # text and the key it is scoped under always name the same turn.
+        reply_text, boundary_uuid = _claude_turn(transcript)
         turn_key = boundary_uuid or ""
     else:
         # Only Codex's own Stop hook carries this id; Claude's hook has
