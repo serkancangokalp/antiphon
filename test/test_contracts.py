@@ -154,6 +154,22 @@ class CrossBoundaryContractTest(unittest.TestCase):
             self.assertIsNotNone(match, name)
             self.assertTrue(peers.valid_session_id(match.group(1)), name)
 
+    def test_every_surface_that_shows_the_event_shows_who_sent_it(self):
+        """Three places describe the same event to a reader: the channel
+        server's MCP instructions, the CLAUDE.md rule and the README. One of
+        them omitting `sender_alias` teaches an agent that the field is not
+        there, and it never passes it back as `to`."""
+        surfaces = {
+            "channel.mjs instructions": re.sub(r'"\s*\+\s*\n\s*"', "",
+                                               read("lib", "channel.mjs")),
+            "CLAUDE.md rule": antiphon.CLAUDE_RULE,
+            "README": read("README.md"),
+        }
+        for where, text in surfaces.items():
+            example = re.search(r"<channel source=.{0,200}?>", text, re.S)
+            self.assertIsNotNone(example, f"no example event in {where}")
+            self.assertIn("sender_alias", example.group(0), where)
+
     def test_both_tools_describe_their_recipient_argument_identically(self):
         """`antiphon_send` and `reply_to_codex` take the same argument for the
         same reason, one in Python and one in Node. Two descriptions that drift
