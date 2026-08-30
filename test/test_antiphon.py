@@ -3316,7 +3316,8 @@ class PagedDeliveryTest(_PagingIntegrationCase):
         self.assertIn("CLAUDE-NEXT", shown)
         self.assertIn("CODEX-NEXT", shown)
         self.assertIn("status preview ends here", shown)
-        self.assertIn("cursor claude leaky_pages: invalid cursor state", shown)
+        self.assertIn("cursor claude unknown cursor entry: opaque cursor state",
+                      shown)
         recovery_notice = antiphon.REPLAY_NOTICES["cursor_recovery"]
         claude_preview, codex_preview = shown.split(
             "=== what claude would see ===", 1)[1].split(
@@ -3744,22 +3745,6 @@ class MalformedStateTest(unittest.TestCase):
         self.assertNotIn("already seen", section,
                          "the cursor already passed this record; a fixed "
                          "lookback would still show it")
-
-    def test_cursor_entry_never_prints_a_legacy_raw_push_message(self):
-        """The pre-fingerprint `last_pushed_*` format stored the raw text of
-        the last pushed message. Status output is what people paste into
-        issues, so that text — the user's own words, possibly a secret — must
-        never be rendered. The fingerprint shape stays visible: it is a hash
-        and the dedup surface status always showed."""
-        raw = "@claude deploy with secret sk-abc123"
-        out = antiphon._cursor_entry("last_pushed_claude", raw)
-        self.assertNotIn("sk-abc123", out)
-        self.assertNotIn("@claude", out)
-        self.assertIn("legacy", out)
-        fp = {"": "6f" * 32}
-        shown = antiphon._cursor_entry("last_pushed_claude", fp)
-        self.assertIn("6f" * 32, shown, "the fingerprint surface survives")
-        self.assertEqual(antiphon._cursor_entry("last_pushed_codex", None), "—")
 
     def test_cursor_entry_renders_a_v2_map_readably_and_a_malformed_one_literally(self):
         """A raw Python repr here — the one command someone runs *because*
@@ -6039,13 +6024,18 @@ class StatusTest(unittest.TestCase):
                                          secret_generation, secret_prefix))
         digest_a = "a" * 64
         digest_b = "b" * 64
+        unknown_key = "%s/%s_seen" % (secret_path, secret_prefix)
         cursor = {
             "codex_pages": {"v": 3, "sources": {
                 "known-source": {"gen": "known-generation", "offset": 42},
             }},
             "last_pushed_claude": legacy_message,
-            "last_pushed_codex": {"": digest_a, "@review": digest_b},
-            "future_cursor_state": {
+            "last_pushed_codex": {
+                "": digest_a,
+                "@review": digest_b,
+                antiphon.LEGACY_SLOT: legacy_message,
+            },
+            unknown_key: {
                 "session_id": secret_uuid,
                 "transcript_path": secret_path,
                 "generation": secret_generation,
@@ -6068,9 +6058,10 @@ class StatusTest(unittest.TestCase):
         self.assertIn("cursor codex_pages: 1 source, at 42", text)
         self.assertIn("cursor last_pushed_claude: opaque cursor state", text)
         self.assertIn("cursor last_pushed_codex: opaque cursor state", text)
-        self.assertIn("cursor future_cursor_state: opaque cursor state", text)
+        self.assertIn("cursor unknown cursor entry: opaque cursor state", text)
         for secret in (secret_uuid, secret_prefix, secret_path,
-                       secret_generation, legacy_message, digest_a, digest_b):
+                       secret_generation, legacy_message, digest_a, digest_b,
+                       unknown_key):
             self.assertNotIn(secret, text, secret)
         self.assertEqual(after, before,
                          "unknown state is preserved for a newer writer")

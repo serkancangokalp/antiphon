@@ -2828,6 +2828,12 @@ def _peer_report(live):
     return lines
 
 
+_STATUS_SEEN_KEYS = frozenset(("claude_seen", "codex_seen"))
+_STATUS_PAGE_KEYS = frozenset(("claude_pages", "codex_pages"))
+_STATUS_CURSOR_KEYS = (_STATUS_SEEN_KEYS | _STATUS_PAGE_KEYS
+                       | {"last_pushed_claude", "last_pushed_codex"})
+
+
 def _cursor_entry(key, value):
     """How one cursor entry reads in `status`.
 
@@ -2836,7 +2842,7 @@ def _cursor_entry(key, value):
     values stay opaque here: a newer format may contain transcript paths,
     session ids or generation fingerprints that status must never print.
     """
-    if key.endswith("_seen") and isinstance(value, (int, float)) \
+    if key in _STATUS_SEEN_KEYS and isinstance(value, (int, float)) \
             and not isinstance(value, bool) and math.isfinite(value):
         if not value:
             return "—"
@@ -2844,8 +2850,9 @@ def _cursor_entry(key, value):
             return datetime.fromtimestamp(value).strftime("%H:%M:%S")
         except (ValueError, OverflowError, OSError):
             pass
-    if key.endswith("_seen") or key.endswith("_pages"):
-        expected = PAGE_CURSOR_VERSION if key.endswith("_pages") else CURSOR_VERSION
+    if key in _STATUS_SEEN_KEYS or key in _STATUS_PAGE_KEYS:
+        expected = (PAGE_CURSOR_VERSION if key in _STATUS_PAGE_KEYS
+                    else CURSOR_VERSION)
         if (isinstance(value, dict) and value.get("v") == expected
                 and isinstance(value.get("sources"), dict)
                 and all(_valid_position(entry)
@@ -2858,22 +2865,6 @@ def _cursor_entry(key, value):
             return truncate("%d %s, at %s"
                             % (len(sources), noun, progress), 80)
         return "invalid cursor state"
-    if key in ("last_pushed_claude", "last_pushed_codex"):
-        # These two shipped before structured paging and status has always
-        # rendered their delivery-deduplication summary. Keep that surface for
-        # the fingerprint shape only: the pre-fingerprint format stored the raw
-        # text of the last pushed message, and status output is what people
-        # paste into issues, so a legacy value must stay unprinted. Do not
-        # generalise the allowlist by prefix either — an unknown newer sibling
-        # may contain private path or session metadata.
-        if not value:
-            return "—"
-        if isinstance(value, dict) and all(
-                isinstance(v, str) and len(v) == 64
-                and all(c in "0123456789abcdef" for c in v)
-                for v in value.values()):
-            return truncate(str(value), 80)
-        return "legacy delivery record (rewritten on the next push)"
     return "opaque cursor state"
 
 
@@ -2923,7 +2914,9 @@ def status():
         cursor, _state = snapshots[side]
         label = side + " " if distinct else ""
         for key, value in (cursor or {}).items():
-            print(f"cursor {label}{key}: {_cursor_entry(key, value)}")
+            shown_key = (key if key in _STATUS_CURSOR_KEYS
+                         else "unknown cursor entry")
+            print(f"cursor {label}{shown_key}: {_cursor_entry(key, value)}")
     for side in ("claude", "codex"):
         cursor, cursor_state = snapshots[side]
         positions, since, replay_reason = positions_for(
