@@ -1436,9 +1436,9 @@ AGENTS_RULE = ("\n## The Antiphon bridge\n\n"
                "other side is injected into your context automatically at the start of each "
                "turn — you don't need to do anything else. If you suspect the bridge has gone "
                "quiet, you can call the `antiphon_read` tool by hand. That injected context is "
-               "project-wide awareness rather than mail addressed to you: it merges every "
-               "Claude transcript in this project under one label, so read it as what is "
-               "happening nearby.\n\n"
+               "project-wide awareness rather than mail addressed to you: it may merge "
+               "activity from several project transcripts under one Claude label, so read "
+               "it as what is happening nearby.\n\n"
                "When Claude wants to tell you something directly, you'll see it as a user "
                "message starting with `[Antiphon bridge] Claude:` (pushed from Claude's Stop "
                "hook) or `[Antiphon channel] Claude:` (a direct reply through the channel) — "
@@ -1465,8 +1465,8 @@ CLAUDE_RULE = ("\n## The Antiphon bridge\n\n"
                "You are working alongside another agent on this project. What happens on the "
                "other side is injected into your context at the start of each turn. That "
                "injected context is project-wide awareness rather than mail addressed to you: "
-               "it merges every Codex transcript in this project under one label, so read it "
-               "as what is happening nearby.\n\n"
+               "it may merge activity from several project transcripts under one Codex label, "
+               "so read it as what is happening nearby.\n\n"
                "Events that come directly from that agent are marked "
                "`<channel source=\"antiphon\" sender=\"codex\" sender_kind=\"agent\" "
                "sender_alias=\"...\">`; they "
@@ -1868,7 +1868,7 @@ def setup():
     print("\n— More than one terminal on either side? Name every one of them:")
     print("  ANTIPHON_NAME=ui claude --dangerously-load-development-channels server:antiphon")
     print("  ANTIPHON_NAME=build codex")
-    print("  An unnamed session still runs, but nothing can be addressed to it. Name the")
+    print("  An unnamed session still runs, but it cannot be addressed by name. Name the")
     print("  Codex terminals above all: an unnamed Codex session leaves no record at all,")
     print("  so once any Codex peer is named, an unaddressed message to Codex is refused")
     print("  rather than sent to a guess.")

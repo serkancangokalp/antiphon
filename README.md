@@ -21,11 +21,11 @@ The other side's recent messages enter your turn's context when you type
 something. Nobody is woken up.
 
 This path is project-wide awareness, not delivery. It is not addressed to
-anyone, and today it merges every transcript on a side under one generic
-`Claude` or `Codex` label — so with several terminals open, one agent's words
-can arrive looking like another's. Source-aware labelling is a tracked P1 item
-in [BACKLOG.md](BACKLOG.md). Until it lands, do not read pull context as a
-private line between two particular peers.
+anyone, and today it can merge activity from several project transcripts under
+one generic `Claude` or `Codex` label — so with several terminals open, one
+agent's words can arrive looking like another's. Source-aware labelling is a
+tracked P1 item in [BACKLOG.md](BACKLOG.md). Until it lands, do not read pull
+context as a private line between two particular peers.
 
 ### Push — addressed, live wake
 
@@ -115,10 +115,11 @@ it prints the addressing rule that currently applies:
 ```
 Peers:
   Claude ui — ready
-  Claude api — waiting for first turn
+  Claude api — ready
   Codex build — ready
+  Codex review — waiting for first turn
   → a bare @claude line is refused; address one: @claude:ui, @claude:api
-  → a bare @codex line is refused, because unnamed Codex sessions leave no record; address one: @codex:build
+  → a bare @codex line is refused, because unnamed Codex sessions leave no record; address one: @codex:build, @codex:review
 ```
 
 A peer that is `waiting for first turn` is still a candidate: readiness never
@@ -201,14 +202,15 @@ Without this entry the pull hook still delivers Claude's context at the start of
 
 The pull path is lossy today, and the loss is silent: the cursor advances past
 what was dropped, so nothing re-delivers it and nothing reports it. Against one
-turn it cuts, in this order:
+turn it cuts in this order:
 
-- the whole injected summary down to 2,600 characters, keeping the newest;
-- each non-tool event down to 420 characters;
-- the turn down to its newest 40 events;
-- whitespace to single spaces — code and SQL line breaks with it;
-- the search itself to the tail of each file, and to the newest 3 transcript
-  files per side.
+- discovery reads only the newest 3 transcript files per side and only the last
+  300,000 bytes of each;
+- selection keeps only the newest 40 events from what discovery found;
+- rendering collapses each non-tool event's whitespace to single spaces — code
+  and SQL line breaks with it — and cuts that event to 420 characters;
+- the whole rendered summary is cut to 2,600 characters, keeping its newest
+  lines.
 
 A message longer than any of those does not arrive truncated with a warning; the
 remainder is marked seen and is gone. Lossless oldest-first paging, with a
@@ -217,13 +219,17 @@ item in [BACKLOG.md](BACKLOG.md) — it is designed, not yet built. Until then, 
 not use the pull path to move anything you cannot afford to lose; send it
 directly instead.
 
-### The direct channel refuses rather than truncates
+### The Codex-to-Claude channel refuses rather than truncates
 
-A directly sent message — `antiphon_send`, `reply_to_codex`, or an `@`-marked
-line — is a separate path with a separate limit: 128 KiB, checked identically by
-the sender before transport and by the server on arrival. Over that, the send
-fails with an error you can see. It is never silently shortened, so ordinary
-long code and SQL travel intact. Carrying oversized content by reference instead
-of refusing it is a P1 item in [BACKLOG.md](BACKLOG.md).
+A message sent from Codex to Claude with `antiphon_send` or `@claude` uses the
+Unix-socket channel. Its serialized payload has a separate 128 KiB byte cap,
+checked by the sender before transport and by the server on arrival. Over that,
+the send fails with an error you can see; it is never silently shortened, so
+ordinary long code and SQL within the cap travel intact.
+
+The reverse Claude-to-Codex path uses `codex queue` and does not share that
+explicit Antiphon byte cap. It also has no oversized-message attachment
+protocol yet, so extremely large direct transfers in either direction remain a
+P1 item in [BACKLOG.md](BACKLOG.md).
 
 MIT.

@@ -330,6 +330,8 @@ class ShippedContractTest(unittest.TestCase):
                 ("the event limit", (str(antiphon.EVENT_LIMIT), "events")),
                 ("the transcript window",
                  (str(antiphon.RECENT_FILES), "transcript", "files")),
+                ("the per-file tail window",
+                 (f"{antiphon.TAIL_BYTES:,}", "bytes")),
                 ("the direct-channel cap",
                  (str(antiphon.MAX_CHANNEL_BYTES // 1024), "KiB"))):
             self.assertRegex(limits, r"\s+".join(map(re.escape, words)), what)
@@ -391,7 +393,7 @@ class ShippedContractTest(unittest.TestCase):
 
     def test_both_generated_rules_keep_the_ambient_pull_apart_from_a_direct_send(self):
         """One is addressed and reaches one peer; the other is project-wide
-        awareness that today merges every transcript under a generic label. An
+        awareness that today may merge several transcripts under a generic label. An
         agent that conflates them will read another peer's words as if they had
         been sent to it."""
         for where, text in (("AGENTS.md rule", antiphon.AGENTS_RULE),
