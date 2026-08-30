@@ -162,3 +162,25 @@ and are the recommended route for long content. If users need natural-language
 Stop blocks, add an explicit delimited syntax with tests for fenced code,
 embedded marker text, empty blocks and deduplication; never guess continuation
 from arbitrary following prose.
+
+## P1 — Re-run the host wrapper census before release
+
+`CLAUDE_HOST_WRAPPERS` and `CODEX_HOST_WRAPPERS` in `lib/antiphon.py` hold
+exactly what a census measured (2026-08-30), and nothing else. They will go
+stale as each host adds, renames or drops its own wrapper tags, and the
+obligation to re-measure must not live only in a planning document that ships
+nowhere. Re-run it before every release:
+
+- count every `role: user` text record whose text opens with `<`, split by
+  side, each one carrying its `promptSource` value (or its absence);
+- for every opening tag that turns up, decide host bookkeeping or a person's
+  own words before touching either set — a tag seen on only one side stays out
+  of the other's, the way `local-command-caveat` did until it was measured;
+- update the sets, the measurement comment above `CLAUDE_HOST_WRAPPERS`, and
+  this entry's date together, so none of the three can drift from the other
+  two.
+
+The asymmetry that governs a doubtful case: a tag missing from a set lets one
+stray host line leak into a summary — visible, and cheap to fix by adding it.
+A tag wrongly present deletes a person's message — silently, with nothing left
+behind to notice it happened. When the evidence is thin, leave the tag out.

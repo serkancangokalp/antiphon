@@ -244,6 +244,8 @@ def _is_self_injected(text):
 # it. A tag here that a person could type costs that person's whole message,
 # silently. Adding a plausible sibling by symmetry is how `local-command-caveat`
 # — measured only on the Claude side — first reached the Codex set.
+# Measured on 2026-08-30 over 1,575 Claude and 445 Codex `role: user` records;
+# see BACKLOG.md for when this census has to be re-run.
 CLAUDE_HOST_WRAPPERS = (
     "channel", "task-notification", "ide_opened_file",
     "command-name", "command-message",
@@ -268,7 +270,7 @@ MIXED_SOURCES = ("sdk",)
 
 def _wrapper_pattern(names):
     """`(?=[\\s>/])` makes it a whole tag name: `<channels of …>` is not `<channel>`."""
-    return re.compile(r"<(?:" + "|".join(names) + r")(?=[\s>/])")
+    return re.compile(r"<(?:" + "|".join(re.escape(name) for name in names) + r")(?=[\s>/])")
 
 
 CLAUDE_WRAPPER_OPENING = _wrapper_pattern(CLAUDE_HOST_WRAPPERS)
