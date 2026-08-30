@@ -28,7 +28,9 @@ server runs on Node.js with the official MCP SDK.
 """
 
 import glob
+import contextlib
 import errno
+import fcntl
 import hashlib
 import itertools
 import json
@@ -386,6 +388,95 @@ def state_path(cwd, kind):
     return os.path.join(cwd, ".antiphon", "cursor.json")
 
 
+CURSOR_LOCK_PATIENCE = 2.0        # seconds; a stuck holder must not hang a turn
+CURSOR_LOCK_RETRY_DELAY = 0.05
+
+
+@contextlib.contextmanager
+def cursor_lock(cwd, kind, patience=None):
+    """Serializes one peer's whole read-select-deliver-advance transaction.
+
+    Yields True when the lock was taken and False when it was not, having
+    already said on stderr why not. A caller that could not take it must
+    deliver nothing rather than proceed unserialized, and must exit non-zero:
+    on exit 0 the host sends stderr to a debug log and shows the person
+    nothing, so a leaked descriptor would deafen the bridge with no symptom.
+
+    Locking only the selection would not do. A takes the lock, picks a page and
+    releases before writing; B then reads a cursor that has not moved and picks
+    the same page. The exclusion has to cover the write and the advance too —
+    and every other writer of this file has to take the same lock, or it can
+    write back a snapshot from before the advance.
+
+    This is a lock beside the cursor, never the project-wide registry lock.
+    That one serializes every claim, refresh, prune and release in the project,
+    and holding it across a model-facing write would make an unrelated peer's
+    start, stop or refresh queue behind this peer's context page. Named peers
+    each own a separate cursor file, so a lock beside each one gives exactly
+    the exclusion required without coupling their lifetimes — for a named
+    install. The default, unnamed install has no name to split on: `state_path`
+    returns the same file for `claude` and for `codex` alike, so this lock
+    guards both sides of the project at once. A caller that holds it for long
+    is not only making its own peer wait; it is making **the other agent**
+    wait, on a bridge with no name in play to tell them apart.
+
+    The wait is bounded because the hook runs on a person's every prompt: a
+    holder that is stuck rather than dead would otherwise hang the turn. A
+    holder that dies has its `flock` released by the kernel, so a crash frees
+    the lock rather than wedging the project.
+
+    Not reentrant. `flock` is held per open file description, so a second
+    attempt from this same process on a fresh descriptor blocks exactly as
+    another process would. Nothing called while this is held may take it again.
+    """
+    if patience is None:
+        # Read at call time, not bound in the signature, so the constant stays
+        # the single place this is set — and a test can lower it.
+        patience = CURSOR_LOCK_PATIENCE
+    path = state_path(cwd, kind) + ".lock"
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        fd = os.open(path, os.O_CREAT | os.O_RDWR, 0o600)
+    except OSError as exc:
+        # The lock file could not even be opened — a directory that is not
+        # writable, or not a directory at all.
+        print(f"antiphon: no delivery lock at {path}: {exc}", file=sys.stderr)
+        yield False
+        return
+    held = False
+    deadline = time.monotonic() + patience
+    try:
+        while True:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                held = True
+                break
+            except BlockingIOError:
+                # The only errno that means "somebody else has it".
+                if time.monotonic() >= deadline:
+                    # Neutral on purpose: this fires for callers that deliver
+                    # context and for callers that only record a push, and
+                    # "context not delivered" was a lie for the second kind.
+                    # The caller knows what it was trying to do and says so
+                    # itself, on its own line.
+                    print("antiphon: another delivery for this peer is still "
+                          f"running after {patience:g}s", file=sys.stderr)
+                    break
+                time.sleep(CURSOR_LOCK_RETRY_DELAY)
+            except OSError as exc:
+                # ENOTSUP, EIO, ENOLCK: a filesystem whose lock manager cannot
+                # answer. Retrying that for the full patience and then giving
+                # up quietly would turn a broken mount into a bridge that
+                # stopped delivering for no stated reason.
+                print(f"antiphon: cannot lock {path}: {exc}", file=sys.stderr)
+                break
+        yield held
+    finally:
+        if held:
+            fcntl.flock(fd, fcntl.LOCK_UN)
+        os.close(fd)
+
+
 def sender_side(target):
     """The side a message addressed to `target` is being sent from."""
     return "codex" if target == "claude" else "claude"
@@ -418,10 +509,13 @@ def read_cursor(cwd, kind):
         # whatever a person was in the middle of looking at.
         return {}
 
-    translated = _translate_cursor_keys(data)
-    if translated != data:
-        write_cursor(cwd, translated, kind)
-    return translated
+    # Translated for the caller and not written back. This runs inside the
+    # delivery hold, and `flock` is per open file description, so taking the
+    # lock here would block this process against itself; writing without it
+    # would let a read put back a snapshot from before somebody's advance.
+    # The translation is idempotent, so the next write from a locked path
+    # persists it and nothing behaves differently until then.
+    return _translate_cursor_keys(data)
 
 
 def cursor_time(cursor, key, default=None):
@@ -482,6 +576,50 @@ def write_cursor(cwd, data, kind):
         except OSError:
             pass
         return False
+
+
+def update_cursor(cwd, kind, mutate):
+    """Read-modify-write one peer's cursor inside its lock.
+
+    Every writer of `cursor.json` goes through here. The file holds both the
+    `_seen` timestamps and the push fingerprints, and each writer rewrites the
+    whole object, so a snapshot read outside the lock and written inside it
+    silently reverts whatever happened in between — measured: an advance from
+    1.0 to 2.0 undone by a push that had read the file first.
+
+    `mutate` is called with the freshly read cursor and returns the object to
+    write. There are three outcomes, and only the middle one means anything
+    was lost: `False` if the lock could not be taken (nothing was read,
+    changed or written), `True` with nothing written when `mutate` changed
+    nothing, and `True` after a real write otherwise.
+
+    A `mutate` that changes nothing writes nothing. It is handed a copy that
+    nothing else holds, so it may edit in place; the value read from disk is
+    kept intact to compare against. Two reads would have been cheaper and
+    wrong: a caller cannot see whether `read_cursor` returns a fresh object,
+    and under a test double that returns the same one, an in-place edit makes
+    every write look unnecessary.
+
+    `mutate` is expected to return a dict — the docstring above says "it may
+    edit in place", and a lambda built for `.update(...)`'s return value
+    returns `None` instead. Written as-is, that overwrites the cursor with
+    `null`: every `_seen` timestamp and every push fingerprint gone, silently,
+    and `updated == before` never catches it because `None != {}`. Refused
+    here instead, because this is the one funnel every writer shares.
+    """
+    with cursor_lock(cwd, kind) as locked:
+        if not locked:
+            return False
+        before = read_cursor(cwd, kind)
+        updated = mutate(json.loads(json.dumps(before)))
+        if not isinstance(updated, dict):
+            print(f"antiphon: mutate returned {type(updated).__name__}, not a "
+                  f"dict; refusing to overwrite {state_path(cwd, kind)}",
+                  file=sys.stderr)
+            return False
+        if updated == before:
+            return True
+        return write_cursor(cwd, updated, kind)
 
 
 def truncate(s, n):
@@ -858,28 +996,50 @@ def hook(side="claude"):
         # summary nobody was shown has not been seen.
         return 0
 
-    cursor = read_cursor(cwd, side)
-    key = f"{side}_seen"
-    start = cursor_time(cursor, key)
-    text, last, _ = build_summary(cwd, side, start)
-    if text and last:
-        cursor[key] = last
-        write_cursor(cwd, cursor, side)
+    with cursor_lock(cwd, side) as locked:
+        if not locked:
+            # `cursor_lock` has already said why on stderr, but its message is
+            # deliberately neutral about what was lost — this is the detail
+            # only this caller knows. Non-zero so the person actually sees it:
+            # on exit 0 that line reaches a debug log and nothing else, and a
+            # bridge that stopped delivering would look exactly like a
+            # counterpart with nothing to say.
+            print("antiphon: context not delivered this turn", file=sys.stderr)
+            return 1
+        cursor = read_cursor(cwd, side)
+        key = f"{side}_seen"
+        start = cursor_time(cursor, key)
+        text, last, _ = build_summary(cwd, side, start)
+        if not text:
+            return 0
 
-    if not text:
+        # The hook prints nothing to the terminal. The counter used to say
+        # "message" but it was counting the other side's transcript events;
+        # incoming channel messages already show up via their own notices.
+        # Context is injected silently.
+        if not _deliver(json.dumps({
+            "hookSpecificOutput": {
+                "hookEventName": "UserPromptSubmit",
+                "additionalContext": text,
+            }
+        }, ensure_ascii=False)):
+            # The page never left this process, so it has not been delivered
+            # and the cursor stays where it was. The next turn offers it again.
+            print("antiphon: could not write this turn's context", file=sys.stderr)
+            return 1
+        if last:
+            cursor[key] = last
+            if not write_cursor(cwd, cursor, side):
+                # The page WAS delivered, so the exit code stays 0: a non-zero
+                # exit suppresses plain-text stdout as context, and whether it
+                # also suppresses `additionalContext` is undocumented and
+                # unmeasured. Risking the page we just handed over to report a
+                # cursor failure would trade a visible repeat for a silent
+                # loss. The symptom of this branch is the same context
+                # arriving every turn.
+                print(f"antiphon: delivered, but could not record it in "
+                      f"{state_path(cwd, side)}", file=sys.stderr)
         return 0
-
-    # The hook prints nothing to the terminal. The counter used to say
-    # "message" but it was counting the other side's transcript events;
-    # incoming channel messages already show up via their own notices.
-    # Context is injected silently.
-    print(json.dumps({
-        "hookSpecificOutput": {
-            "hookEventName": "UserPromptSubmit",
-            "additionalContext": text,
-        }
-    }, ensure_ascii=False))
-    return 0
 
 
 def notice_text(side, count):
@@ -980,12 +1140,7 @@ def push(target="codex"):
         return 0
 
     side = sender_side(target)
-    cursor = read_cursor(cwd, side)
     key = f"last_pushed_{target}"
-    sent, already = migrate_pushed(cursor.get(key), batches.get(None) or [])
-    if already:
-        sent[""] = batch_fingerprint(batches[None])
-    before = dict(sent)
 
     # Once for the turn, not once per recipient. Who is speaking cannot change
     # between two lines of one reply, and working it out again for each would
@@ -1013,13 +1168,69 @@ def push(target="codex"):
             print(f"antiphon: delivery failed — {detail}", file=sys.stderr)
         return ok
 
-    updated = forget_superseded(deliver_batches(batches, sent, deliver))
-    # Written only when something actually moved: a delivery landed, or the old
-    # string format was recognised and needs recording in the new one. A turn
-    # that delivered nothing leaves the cursor file alone.
-    if updated != before or already:
-        cursor[key] = updated
-        write_cursor(cwd, cursor, side)
+    # The send happens here, outside any lock — reversing an earlier ruling
+    # that held it inside, on the grounds that read-check-send-record is one
+    # transaction. Measurement overturned that: holding this peer's cursor
+    # lock across a send that hangs was measured at a 5,008 ms hold, against a
+    # concurrent reader's own patience of 2,038 ms — it gave up and delivered
+    # no context at all. `_queue_codex` allows 15 s per recipient and
+    # `send_to_claude` up to 1.5 s of connect patience plus a 5 s socket
+    # timeout, both well past `CURSOR_LOCK_PATIENCE` (2.0 s): a waiter does not
+    # wait behind a slow send, it is *guaranteed* to give up. And for the
+    # default unnamed install this was never only this peer's lock —
+    # `state_path` returns the one cursor file both `claude` and `codex` share
+    # — so a slow push on one side was blocking the *other agent's* context
+    # delivery, not merely delaying a retry of its own.
+    #
+    # So the dedupe decision and the send both run against a read taken
+    # without the lock. A stale read can at worst send a message that was
+    # already sent — a duplicate, the trade this project makes everywhere else
+    # — never a drop. `deliver_batches` below sends whatever `raw_sent`
+    # doesn't already recognise and mutates it in place with the fingerprints
+    # of what actually went out.
+    raw_sent, already = migrate_pushed(read_cursor(cwd, side).get(key),
+                                       batches.get(None) or [])
+    before_send = dict(raw_sent)
+    if already:
+        # The exact bare message already went out under the old string
+        # format; nothing left to send for it, but the migration to the new
+        # shape still needs recording.
+        raw_sent[""] = batch_fingerprint(batches[None])
+    updated = forget_superseded(deliver_batches(batches, raw_sent, deliver))
+    # The delta: only the slots this call actually resolved — never the whole
+    # map computed from the read above. Writing that map back, whole, would
+    # reintroduce exactly the lost update the cursor lock exists to prevent:
+    # a cursor snapshot must never be carried across the lock boundary, only
+    # a fact about what this call just did.
+    delivered = {slot: fingerprint for slot, fingerprint in updated.items()
+                if before_send.get(slot) != fingerprint}
+    if not delivered:
+        return 0                      # nothing sent, nothing to record
+
+    def mutate(cursor):
+        # `cursor` is what `update_cursor` just read under the lock, moments
+        # ago — the only cursor state this may build on. `delivered` is
+        # applied on top of *this*, never on top of `raw_sent` above, which
+        # may already be stale by the time this runs.
+        fresh, _ = migrate_pushed(cursor.get(key), [])
+        merged = dict(fresh)
+        merged.update(delivered)
+        cursor[key] = forget_superseded(merged)
+        return cursor
+
+    if not update_cursor(cwd, side, mutate):
+        # The message already left this process — `deliver` above said so on
+        # its own line. What failed is only the bookkeeping, so the
+        # consequence is a possible duplicate next turn, never a second copy
+        # of a drop that already happened: say exactly that, and let it be
+        # seen. `push` injects nothing into anyone's context, so returning
+        # non-zero here costs nobody the page a hook's non-zero would.
+        missed = ", ".join(sorted(
+            "(unaddressed)" if slot == "" else slot[1:] for slot in delivered))
+        print(f"antiphon: sent to {target} but could not record delivery for "
+              f"{missed} in {state_path(cwd, side)}; a duplicate send is "
+              "possible next turn, not a drop", file=sys.stderr)
+        return 1
     return 0
 
 
@@ -1307,15 +1518,18 @@ def _record_delivery(cwd, target, text, alias=None):
     would resend the last unaddressed message once.
     """
     side = sender_side(target)
-    cursor = read_cursor(cwd, side)
     key = f"last_pushed_{target}"
-    held = cursor.get(key)
-    sent = dict(held) if isinstance(held, dict) else {}
-    if isinstance(held, str):
-        sent[LEGACY_SLOT] = held
-    sent["" if alias is None else f"@{alias}"] = batch_fingerprint([text])
-    cursor[key] = forget_superseded(sent)
-    write_cursor(cwd, cursor, side)
+
+    def mutate(cursor):
+        held = cursor.get(key)
+        sent = dict(held) if isinstance(held, dict) else {}
+        if isinstance(held, str):
+            sent[LEGACY_SLOT] = held
+        sent["" if alias is None else f"@{alias}"] = batch_fingerprint([text])
+        cursor[key] = forget_superseded(sent)
+        return cursor
+
+    update_cursor(cwd, side, mutate)
 
 
 def register_peer(*_):
@@ -1408,10 +1622,29 @@ TOOLS = [{
 }]
 
 
+def _deliver(line):
+    """Write one model-facing line to stdout and get it out of this process.
+
+    Returns whether that succeeded. Neither host acknowledges hook output or a
+    tool result, so nothing here can learn whether the model was actually shown
+    the text; "delivered" means only what is locally observable — the write and
+    the flush both returned. That is the whole reason a cursor is advanced
+    after this and never before, and why the contract is at-least-once: a crash
+    in the window redelivers a page, which both agents can see, where advancing
+    first would drop it in silence.
+    """
+    try:
+        sys.stdout.write(line + "\n")
+        sys.stdout.flush()
+    except (OSError, ValueError):
+        return False
+    return True
+
+
 def _mcp_result(mid, result):
-    sys.stdout.write(json.dumps({"jsonrpc": "2.0", "id": mid, "result": result},
-                                ensure_ascii=False) + "\n")
-    sys.stdout.flush()
+    """Writes one JSON-RPC response; returns whether it left this process."""
+    return _deliver(json.dumps({"jsonrpc": "2.0", "id": mid, "result": result},
+                               ensure_ascii=False))
 
 
 def _send_tool(cwd, text, to=None, sender=None):
@@ -1574,14 +1807,39 @@ def _mcp_serve(cwd, alias=None):
             p = p if isinstance(p, dict) else {}
             name = p.get("name")
             if name == "antiphon_read":
-                cursor = read_cursor(cwd, "codex")
-                start = cursor_time(cursor, "codex_seen")
-                text, last, _ = build_summary(cwd, "codex", start)
-                if text and last:
-                    cursor["codex_seen"] = last
-                    write_cursor(cwd, cursor, "codex")
-                output = text or "Nothing new on the Claude Code side since your last turn."
-                _mcp_result(mid, {"content": [{"type": "text", "text": output}]})
+                with cursor_lock(cwd, "codex") as locked:
+                    if not locked:
+                        # A JSON-RPC request must always be answered: a tool
+                        # call with no response leaves the caller waiting on a
+                        # request that never completes. It is an error result,
+                        # not content — this tool's content is the other side's
+                        # words, and a plain string here would read as some.
+                        _mcp_result(mid, _tool_error(
+                            "another read is in flight; nothing was read and "
+                            "nothing was marked seen — try again in a moment"))
+                    else:
+                        cursor = read_cursor(cwd, "codex")
+                        start = cursor_time(cursor, "codex_seen")
+                        text, last, _ = build_summary(cwd, "codex", start)
+                        output = text or ("Nothing new on the Claude Code side "
+                                          "since your last turn.")
+                        # Answer first, mark seen second — the same order as the
+                        # hook, for the same reason: a result that was never
+                        # written is a page the model never saw.
+                        delivered = _mcp_result(
+                            mid, {"content": [{"type": "text", "text": output}]})
+                        if delivered and text and last:
+                            cursor["codex_seen"] = last
+                            if not write_cursor(cwd, cursor, "codex"):
+                                # Symmetric with the hook: the page was
+                                # delivered, so the tool result already went
+                                # out and this stays a diagnostic rather than
+                                # a second, failing response — the model
+                                # would just see the same context again next
+                                # turn.
+                                print("antiphon: delivered, but could not "
+                                      f"record it in {state_path(cwd, 'codex')}",
+                                      file=sys.stderr)
             elif name == "antiphon_send":
                 arguments = p.get("arguments")
                 arguments = arguments if isinstance(arguments, dict) else {}
