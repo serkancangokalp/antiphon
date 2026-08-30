@@ -923,6 +923,37 @@ class AntiphonTest(unittest.TestCase):
                      "<ide_opened_file>lib/antiphon.py</ide_opened_file>",
                      "<local-command-caveat>Caveat: …</local-command-caveat>"):
             self.assertEqual(self._claude_user_texts(text), [], text)
+        # Every entry in the set, named here literally rather than read off
+        # CLAUDE_HOST_WRAPPERS: a loop that iterates the constant itself stops
+        # testing an entry the instant it is removed, which is exactly the
+        # mutation this guards against — it would go on passing, vacuously,
+        # over whatever remained. `channel` above is only ever shown under
+        # `promptSource="system"`, which settles the case before the wrapper
+        # set is even consulted; `command-message` and `bash-stdout` were
+        # refused by no test at all. The equality check below fails loudly if
+        # this list and the real constant ever drift apart, in either
+        # direction — a tag added to the constant with no matching case here
+        # is caught the same way a tag quietly removed is.
+        every_claude_wrapper = ("channel", "task-notification", "ide_opened_file",
+                                "command-name", "command-message",
+                                "local-command-caveat", "local-command-stdout",
+                                "bash-input", "bash-stdout")
+        self.assertEqual(sorted(every_claude_wrapper),
+                         sorted(antiphon.CLAUDE_HOST_WRAPPERS),
+                         "CLAUDE_HOST_WRAPPERS changed without this test being updated")
+        for tag in every_claude_wrapper:
+            text = "<%s>host wrote this</%s>" % (tag, tag)
+            self.assertEqual(self._claude_user_texts(text), [], tag)
+
+    def test_the_bridges_own_delivery_is_refused_without_isMeta(self):
+        """Every measured `<channel …>` record also carries isMeta, which is
+        filtered earlier — but isMeta is the host's implementation detail, and
+        the bridge reading its own delivery back and pushing it to the side
+        that sent it is the one failure it cannot afford. The wrapper entry is
+        the guard that does not depend on the host."""
+        text = ('<channel source="antiphon" sender="codex" '
+                'sender_kind="agent">run the tests</channel>')
+        self.assertEqual(self._claude_user_texts(text), [])
 
     def test_a_host_record_is_refused_under_the_source_that_carries_it(self):
         """Measured: `<task-notification>` records carry `promptSource=sdk`, not
@@ -1005,6 +1036,23 @@ class AntiphonTest(unittest.TestCase):
                      "<subagent_notification>done</subagent_notification>",
                      "<command-name>/agents</command-name>"):
             self.assertEqual(self._codex_user_texts(text), [], text)
+        # Every entry in the set, named here literally rather than read off
+        # CODEX_HOST_WRAPPERS, for the same reason as the Claude-side test
+        # above: a loop over the live constant stops testing an entry the
+        # instant it is removed. `command-message`, `local-command-stdout`,
+        # `bash-input` and `bash-stdout` were refused by no test above. The
+        # equality check catches either side drifting from the other.
+        every_codex_wrapper = ("task-notification", "recommended_plugins",
+                               "realtime_delegation", "subagent_notification",
+                               "environment_context", "command-name",
+                               "command-message", "local-command-stdout",
+                               "bash-input", "bash-stdout")
+        self.assertEqual(sorted(every_codex_wrapper),
+                         sorted(antiphon.CODEX_HOST_WRAPPERS),
+                         "CODEX_HOST_WRAPPERS changed without this test being updated")
+        for tag in every_codex_wrapper:
+            text = "<%s>host wrote this</%s>" % (tag, tag)
+            self.assertEqual(self._codex_user_texts(text), [], tag)
 
     def test_an_attachment_is_not_a_host_record(self):
         """`<image>` was measured on real Codex rollouts and is a person's
@@ -1016,6 +1064,13 @@ class AntiphonTest(unittest.TestCase):
         """The mirror of the Claude-side test: `ide_opened_file` is Claude
         Code's record, and a Codex user typing it is still a Codex user."""
         text = "<ide_opened_file>what does this one mean?</ide_opened_file>"
+        self.assertEqual(self._codex_user_texts(text), [text])
+
+    def test_a_host_tag_inside_a_message_proves_nothing(self):
+        """`.match`, never `.search`: a wrapper tag halfway down a person's
+        message is that person quoting the host, not the host writing."""
+        text = "here's the bug: <command-name>/mcp</command-name> prints twice"
+        self.assertEqual(self._claude_user_texts(text), [text])
         self.assertEqual(self._codex_user_texts(text), [text])
 
     # ---- Important 3: events arrive in the order they were written ----
@@ -1082,6 +1137,8 @@ class AntiphonTest(unittest.TestCase):
             self.assertEqual(texts, ["zebra, in the first file",
                                      "apple, in the second"], discovery)
 
+    # ---- a multi-block message is joined without losing content ----
+
     def test_a_block_boundary_survives_the_join(self):
         """Two blocks joined by a space silently become one paragraph."""
         line = json.dumps({"type": "user", "promptSource": "typed",
@@ -1134,6 +1191,39 @@ class AntiphonTest(unittest.TestCase):
              patch.object(antiphon, "tail_lines", return_value=[line]):
             self.assertEqual([e[2] for e in antiphon.codex_events("/tmp/project")],
                              ["here is the query\n\nSELECT 1;"])
+
+    def test_the_codex_join_does_not_become_a_per_block_strip(self):
+        """The Codex-side analogue of `test_the_join_does_not_become_a_per_block_strip`.
+        Indentation and a trailing newline inside a block are content. A
+        generator that strips each block to test it for emptiness deletes them
+        on the way past, and nothing downstream can put them back."""
+        line = json.dumps({"type": "response_item",
+                           "timestamp": "2026-08-30T10:00:00.000Z",
+                           "payload": {"type": "message", "role": "user",
+                                       "content": [
+                                           {"type": "input_text",
+                                            "text": "def f():\n    return 1\n"},
+                                           {"type": "input_text",
+                                            "text": "  indented note"}]}})
+        with patch.object(antiphon, "codex_rollout_files", return_value=["r.jsonl"]), \
+             patch.object(antiphon, "tail_lines", return_value=[line]):
+            texts = [e[2] for e in antiphon.codex_events("/tmp/project")]
+        self.assertEqual(texts, ["def f():\n    return 1\n\n\n  indented note"])
+
+    def test_an_empty_codex_block_adds_no_boundary(self):
+        """The Codex-side analogue of `test_an_empty_block_adds_no_boundary`. A
+        blank block is not a paragraph break of its own."""
+        line = json.dumps({"type": "response_item",
+                           "timestamp": "2026-08-30T10:00:00.000Z",
+                           "payload": {"type": "message", "role": "user",
+                                       "content": [
+                                           {"type": "input_text", "text": "one"},
+                                           {"type": "input_text", "text": "   "},
+                                           {"type": "input_text", "text": "two"}]}})
+        with patch.object(antiphon, "codex_rollout_files", return_value=["r.jsonl"]), \
+             patch.object(antiphon, "tail_lines", return_value=[line]):
+            self.assertEqual([e[2] for e in antiphon.codex_events("/tmp/project")],
+                             ["one\n\ntwo"])
 
     # ---- Important 2: upgrading a legacy hook must not leave a duplicate ----
 
