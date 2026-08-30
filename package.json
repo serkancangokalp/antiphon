@@ -5,8 +5,8 @@
   "description": "A bridge between Claude Code and Codex CLI: each side sees the other's context and can wake it, without ever faking the sender's identity.",
   "license": "MIT",
   "bin": { "antiphon": "bin/antiphon.mjs" },
-  "files": ["bin/", "lib/antiphon.py", "lib/channel.mjs", "lib/peers.py", "README.md", "LICENSE"],
-  "engines": { "node": ">=18" },
+  "files": ["bin/", "lib/antiphon.py", "lib/channel.mjs", "lib/peers.py", "README.md", "BACKLOG.md", "LICENSE"],
+  "engines": { "node": ">=20" },
   "repository": { "type": "git", "url": "git+https://github.com/serkancangokalp/antiphon.git" },
   "scripts": {
     "test": "python3 -m unittest discover -s test && node test/channel.test.mjs"

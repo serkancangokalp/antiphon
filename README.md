@@ -1,14 +1,16 @@
 # Antiphon
 
-**Two terminals, two separate agents, an open-identity bridge.** While Claude Code and Codex CLI work in the same project, each sees the other's context and can wake the other when it needs to, without ever faking who the message is from.
+**Two agents in one project, an open-identity bridge.** Claude Code and Codex CLI work side by side — one terminal each, or several on each side — and each sees the other's context and can wake the other when it needs to, without ever faking who the message is from.
 
-Antiphon doesn't dispatch work. It only carries messages between the two sides while preserving whether they came from the human user, from Claude, or from Codex.
+Antiphon doesn't dispatch work. It only carries messages between the sides while preserving whether they came from the human user, from Claude, or from Codex.
+
+With one terminal per side there is nothing to configure beyond `antiphon setup`: peers go unnamed, messages have only one place to go, and the rest of this page is background. Naming becomes necessary the moment a second session opens on either side — see [Many peers](#many-peers).
 
 ## How it works
 
-No shared log is kept. Both CLIs already write their own transcripts; Antiphon reads and derives from them, marking in `.antiphon/cursor.json` which messages each side has already seen.
+No shared log is kept. Both CLIs already write their own transcripts; Antiphon reads and derives from them, recording which messages each peer has already seen. An unnamed peer keeps its cursor at `.antiphon/cursor.json`; a named one owns `.antiphon/peers/<side>-<name>/cursor.json`, so two sessions on the same side never advance each other's place.
 
-### Pull — context, no wake
+### Pull — shared context, no wake
 
 | Direction | Mechanism |
 |---|---|
@@ -18,7 +20,14 @@ No shared log is kept. Both CLIs already write their own transcripts; Antiphon r
 The other side's recent messages enter your turn's context when you type
 something. Nobody is woken up.
 
-### Push — live wake
+This path is project-wide awareness, not delivery. It is not addressed to
+anyone, and today it merges every transcript on a side under one generic
+`Claude` or `Codex` label — so with several terminals open, one agent's words
+can arrive looking like another's. Source-aware labelling is a tracked P1 item
+in [BACKLOG.md](BACKLOG.md). Until it lands, do not read pull context as a
+private line between two particular peers.
+
+### Push — addressed, live wake
 
 | Direction | At the end of a turn | Mid-turn |
 |---|---|---|
@@ -27,6 +36,10 @@ something. Nobody is woken up.
 
 A line starting with `@codex` or `@claude` in a reply reaches the other
 agent immediately, even if nobody is typing.
+
+Every push is addressed to exactly one peer and is never broadcast. When the
+recipient cannot be shown to be the only candidate, the send is refused rather
+than guessed.
 
 Neither side has to wait for its turn to end. Either agent can hand work
 over mid-turn and keep going, so the other starts on it in parallel; the
@@ -49,10 +62,75 @@ A Codex → Claude message never pastes text into the terminal and never imperso
 
 Claude Code's interface shows this as an incoming channel event, and Claude treats the message as the words of the Codex agent, not of the human user. It sends its reply back with the `reply_to_codex` MCP tool, passing `sender_alias` as `to` whenever it is non-null. A bare reply is refused as soon as any named Codex peer is registered: an unnamed Codex session leaves no registry record, so one visible peer cannot be shown to be the only one running. A `null` `sender_alias` is a peer with no name — it cannot be addressed by name, and a bare reply reaches it only in a project where nothing is registered.
 
+Nothing pairs peers up. There is no automatic Claude↔Codex partnership, and no reply correlation: a message is routed only by the name written on it.
+
+## Many peers
+
+A name is an environment variable read at startup, so it goes in front of the
+command:
+
+    ANTIPHON_NAME=ui claude --dangerously-load-development-channels server:antiphon
+    ANTIPHON_NAME=api claude --dangerously-load-development-channels server:antiphon
+    ANTIPHON_NAME=build codex
+    ANTIPHON_NAME=review codex
+
+Once named, a peer is addressed explicitly — by marker at the start of a line,
+or by the `to` argument of the tool that sends without ending the turn:
+
+| From | Marker | Tool |
+|---|---|---|
+| Codex → Claude | `@claude:ui` | `antiphon_send(to="ui", text=…)` |
+| Claude → Codex | `@codex:build` | `reply_to_codex(to="build", text=…)` |
+
+There is no way to reach several peers at once. A send is delivered to the one
+peer named on it, and to nobody else.
+
+### When a bare message is refused
+
+The two sides fail closed on different rules, because they leave different
+traces:
+
+- **To Claude.** A bare `@claude` works while exactly one Claude peer is live.
+  From the second one on, it is refused and you must name one.
+- **To Codex.** A bare `@codex` is refused as soon as *any* named Codex peer is
+  registered — even if it is the only one you can see. A Codex session started
+  without a name leaves no registry record at all, so a second, unnamed one
+  cannot be ruled out, and the bridge will not guess between a peer it can see
+  and one it cannot.
+
+That asymmetry is why **every terminal in a multi-peer project must be named,
+Codex terminals above all**. Mixing named and unnamed sessions is the one
+configuration that can leave a message impossible to answer: the unnamed peer
+is live, it can send, and there is no name to send a reply back to.
+
+### Seeing who is live
+
+    antiphon status
+
+Beyond transcripts and cursors, `status` lists every registered peer with the
+side it runs on, the name it took, and its state — `ready` once it has an
+address to receive on, or `waiting for first turn` before that. Under the list
+it prints the addressing rule that currently applies:
+
+```
+Peers:
+  Claude ui — ready
+  Claude api — waiting for first turn
+  Codex build — ready
+  → a bare @claude line is refused; address one: @claude:ui, @claude:api
+  → a bare @codex line is refused, because unnamed Codex sessions leave no record; address one: @codex:build
+```
+
+A peer that is `waiting for first turn` is still a candidate: readiness never
+decides who a message goes to, so it cannot silently hand routing to whichever
+session happened to start first. With nothing registered — the unnamed single
+pair — the block is empty, because there is nobody to choose between.
+
 ## Install
 
-Requires Node 18+ and Python 3. The Claude Code channel is a research
-preview and needs Claude Code 2.1.80 or newer.
+Requires Node 20+ and Python 3.9+. The Claude Code channel is a research
+preview and needs Claude Code 2.1.80 or newer; recent Claude Code releases
+set their own, higher, Node floor, so check theirs as well.
 
 Install the command, either straight from the repository:
 
@@ -92,7 +170,7 @@ versions in place; it never creates duplicates.
 ## Commands
 
 ```bash
-antiphon status            # transcript, cursor and channel status
+antiphon status            # transcripts, cursors, live peers and channel status
 antiphon summary [side]    # show the context that would be injected
 antiphon setup             # (re)install the project setup
 npm test                   # Python unit tests + real MCP protocol test
@@ -105,7 +183,8 @@ names `args = ["mcp"]`: the `channel` server is Claude's side and hands out
 `reply_to_codex`. Aiming Codex at it would let Codex publish messages
 labelled as Claude's — exactly what this bridge exists to prevent — so
 `setup` rewrites that table whenever it is wrong, leaving the rest of the
-file alone.
+file alone. The same table forwards `ANTIPHON_NAME` into the tool process,
+because Codex does not pass the parent environment through on its own.
 
 Without this entry the pull hook still delivers Claude's context at the start of each Codex turn, but Codex loses both tools: it can no longer check the bridge by hand, nor reach Claude before its turn ends.
 
@@ -116,8 +195,35 @@ Without this entry the pull hook still delivers Claude's context at the start of
 - Channels is currently a research preview; it requires a claude.ai login or a Console API key. It isn't supported on the Bedrock, Vertex, or Foundry providers. A Team/Enterprise admin may need to enable the feature.
 - The Codex hook asks for re-approval the first time it's used and whenever the hook file changes.
 - Matching is done on the same project's absolute directory.
-- Once a message has been seen, the cursor advances and the same content is never injected twice.
-- Context transfer has a budget of roughly 2600 characters; the newest messages are kept.
 - Unix sockets only — there is no Windows support.
+
+### Passive pull loses content, permanently
+
+The pull path is lossy today, and the loss is silent: the cursor advances past
+what was dropped, so nothing re-delivers it and nothing reports it. Against one
+turn it cuts, in this order:
+
+- the whole injected summary down to 2,600 characters, keeping the newest;
+- each non-tool event down to 420 characters;
+- the turn down to its newest 40 events;
+- whitespace to single spaces — code and SQL line breaks with it;
+- the search itself to the tail of each file, and to the newest 3 transcript
+  files per side.
+
+A message longer than any of those does not arrive truncated with a warning; the
+remainder is marked seen and is gone. Lossless oldest-first paging, with a
+per-peer cursor that only advances over records actually delivered, is the P0
+item in [BACKLOG.md](BACKLOG.md) — it is designed, not yet built. Until then, do
+not use the pull path to move anything you cannot afford to lose; send it
+directly instead.
+
+### The direct channel refuses rather than truncates
+
+A directly sent message — `antiphon_send`, `reply_to_codex`, or an `@`-marked
+line — is a separate path with a separate limit: 128 KiB, checked identically by
+the sender before transport and by the server on arrival. Over that, the send
+fails with an error you can see. It is never silently shortened, so ordinary
+long code and SQL travel intact. Carrying oversized content by reference instead
+of refusing it is a P1 item in [BACKLOG.md](BACKLOG.md).
 
 MIT.

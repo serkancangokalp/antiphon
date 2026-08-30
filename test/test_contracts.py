@@ -242,5 +242,175 @@ class CrossBoundaryContractTest(unittest.TestCase):
                          antiphon.MAX_CHANNEL_BYTES)
 
 
+def section(text, heading):
+    """The body of one `## heading` section of a markdown document.
+
+    Prose contracts are checked against the section that owns them, not the
+    whole file: a number that survives only in an unrelated paragraph is drift
+    that happens to still match."""
+    match = re.search(rf"^## {re.escape(heading)}\s*$(.*?)(?=^## |\Z)",
+                      text, re.M | re.S)
+    return match.group(1) if match else None
+
+
+NODE_FLOOR = re.compile(r"^\s*>=\s*v?(\d+)(?:\.(\d+))?(?:\.(\d+))?\s*$")
+
+
+def node_floor(spec):
+    """The lowest Node version a plain `>=X.Y.Z` range admits, as a tuple.
+
+    Returns None for anything that is not a simple floor. Callers must fail on
+    None rather than skip: an unparsed range is a range nobody is checking."""
+    match = NODE_FLOOR.match(spec)
+    if not match:
+        return None
+    return tuple(int(part or 0) for part in match.groups())
+
+
+class ShippedContractTest(unittest.TestCase):
+    """Promises made in prose, checked against the code that has to keep them.
+
+    Same failure mode as the cross-boundary contracts above — two places
+    spelling one fact — with one side unexecutable. Nothing runs a README, so a
+    number that stops being true stays on the page, and the next reader trusts
+    it. Each assertion here reads its number from the real source."""
+
+    def test_the_declared_node_floor_admits_everything_npm_installs(self):
+        """`engines.node` is a promise made to whoever types `npm i -g antiphon`;
+        the lockfile decides what they actually get. When a transitive dependency
+        raises its own floor above ours the promise is already broken: a default
+        install only warns, and an `engine-strict` install fails outright."""
+        package = json.loads(read("package.json"))
+        declared = node_floor(package["engines"]["node"])
+        self.assertIsNotNone(declared,
+                             f"engines.node is not a plain floor: "
+                             f"{package['engines']['node']}")
+
+        locked = json.loads(read("package-lock.json"))["packages"]
+        checked = 0
+        for name, meta in sorted(locked.items()):
+            if not name:                  # the root entry restates our own claim
+                continue
+            spec = (meta.get("engines") or {}).get("node")
+            if not spec:
+                continue
+            needed = node_floor(spec)
+            self.assertIsNotNone(needed, f"{name} engines.node unparsed: {spec}")
+            checked += 1
+            self.assertLessEqual(
+                needed, declared,
+                f"{name}@{meta.get('version')} requires node {spec}, but the "
+                f"package promises {package['engines']['node']}")
+        self.assertTrue(checked, "no locked dependency declares a node engine")
+
+    def test_the_readme_names_the_floors_the_package_is_installed_under(self):
+        """A reader decides whether to try the thing from the README, and finds
+        out what it really needs from npm. Two numbers, one fact."""
+        readme = read("README.md")
+        major = node_floor(json.loads(read("package.json"))["engines"]["node"])[0]
+        self.assertIn(f"Node {major}+", readme)
+        stale = set(re.findall(r"Node (\d+)\+", readme)) - {str(major)}
+        self.assertFalse(stale, f"the README also claims Node {stale}")
+        self.assertRegex(readme, r"Python 3\.\d+\+",
+                         "the README must name the Python floor it was tested "
+                         "at, not a bare `Python 3`")
+
+    def test_the_limits_section_quotes_the_numbers_the_pull_path_uses(self):
+        """Every cut the passive pull makes is permanent — the cursor advances
+        past what was dropped. A reader can only weigh that risk against real
+        numbers, so each one is read back off the constant that enforces it."""
+        limits = section(read("README.md"), "Limits")
+        self.assertIsNotNone(limits, "the README has no Limits section")
+        # `\s+` rather than a literal space: prose gets rewrapped, and a number
+        # that moved to the next line is still stated next to its noun. What is
+        # being pinned is the pairing, not the line breaks around it.
+        for what, words in (
+                ("the summary budget", (f"{antiphon.SUMMARY_BUDGET:,}", "characters")),
+                ("the per-event cut", (str(antiphon.EVENT_BUDGET), "characters")),
+                ("the event limit", (str(antiphon.EVENT_LIMIT), "events")),
+                ("the transcript window",
+                 (str(antiphon.RECENT_FILES), "transcript", "files")),
+                ("the direct-channel cap",
+                 (str(antiphon.MAX_CHANNEL_BYTES // 1024), "KiB"))):
+            self.assertRegex(limits, r"\s+".join(map(re.escape, words)), what)
+
+    def test_the_limits_section_does_not_promise_the_pull_path_is_already_fixed(self):
+        """The paging work is designed, not written. A Limits section that reads
+        as though it were done is worse than one that never mentioned it: it
+        retires the reader's suspicion about the one path that still loses
+        content silently."""
+        limits = section(read("README.md"), "Limits")
+        self.assertNotRegex(limits, r"(?i)\blossless\b(?![^.]*\bBACKLOG)",
+                            "Limits calls the current path lossless")
+        self.assertIn("BACKLOG.md", limits,
+                      "Limits must send the reader to the tracked work")
+
+    def test_an_npm_reader_can_open_the_backlog_the_readme_points_at(self):
+        """`files` is an allowlist. A pointer into a file that never entered the
+        tarball is a dead end for exactly the readers who installed the way the
+        README told them to."""
+        self.assertIn("BACKLOG.md", json.loads(read("package.json"))["files"])
+
+    def test_the_readme_shows_how_to_start_each_kind_of_named_peer(self):
+        """Naming is not a flag on a command, it is an environment variable read
+        at startup, and getting it wrong is invisible: the session comes up fine
+        and simply cannot be addressed."""
+        readme = read("README.md")
+        for command in ("ANTIPHON_NAME=ui claude",
+                        "ANTIPHON_NAME=api claude",
+                        "ANTIPHON_NAME=build codex",
+                        "ANTIPHON_NAME=review codex"):
+            self.assertIn(command, readme, command)
+
+    def test_the_multi_peer_section_addresses_both_sides_by_name(self):
+        """The two sides are addressed with the same syntax and refuse on
+        different rules. A section that showed only one of them would leave the
+        reader to assume the other matches."""
+        multi = section(read("README.md"), "Many peers")
+        self.assertIsNotNone(multi, "the README has no multi-peer section")
+        self.assertIn("@claude:ui", multi)
+        self.assertIn("@codex:build", multi)
+
+    def test_every_surface_rules_broadcast_out_rather_than_leaving_it_open(self):
+        """Refusing is the whole design. An agent that has not been told a send
+        can be refused reads a quiet failure as a broken bridge and stops using
+        the addressed form."""
+        for where, text in (("README", read("README.md")),
+                            ("AGENTS.md rule", antiphon.AGENTS_RULE),
+                            ("CLAUDE.md rule", antiphon.CLAUDE_RULE)):
+            self.assertRegex(text, r"never broadcast", where)
+            self.assertRegex(text, r"is refused|are refused", where)
+
+    def test_both_generated_rules_tell_a_peer_how_to_become_addressable(self):
+        """An agent that finds itself unaddressable can say so, but only if it
+        knows what would have made it addressable. The rule is the only place it
+        will read that."""
+        for where, text in (("AGENTS.md rule", antiphon.AGENTS_RULE),
+                            ("CLAUDE.md rule", antiphon.CLAUDE_RULE)):
+            self.assertIn("ANTIPHON_NAME", text, where)
+
+    def test_both_generated_rules_keep_the_ambient_pull_apart_from_a_direct_send(self):
+        """One is addressed and reaches one peer; the other is project-wide
+        awareness that today merges every transcript under a generic label. An
+        agent that conflates them will read another peer's words as if they had
+        been sent to it."""
+        for where, text in (("AGENTS.md rule", antiphon.AGENTS_RULE),
+                            ("CLAUDE.md rule", antiphon.CLAUDE_RULE)):
+            self.assertIn("project-wide", text, where)
+
+    def test_setup_tells_the_operator_to_name_every_terminal(self):
+        """The closing guidance is the last thing printed before anyone starts a
+        session, and the only place the launch line appears at the moment it is
+        about to be typed. A named Claude beside an unnamed Codex cannot be
+        replied to at all."""
+        with tempfile.TemporaryDirectory() as project, \
+             patch.object(antiphon, "project_dir", return_value=project):
+            printed = io.StringIO()
+            with contextlib.redirect_stdout(printed):
+                self.assertEqual(antiphon.setup(), 0)
+        guidance = printed.getvalue()
+        self.assertRegex(guidance, r"ANTIPHON_NAME=\S+ claude ")
+        self.assertRegex(guidance, r"ANTIPHON_NAME=\S+ codex")
+
 if __name__ == "__main__":
     unittest.main()

@@ -48,8 +48,18 @@ CODEX_SESSIONS = os.path.join(HOME, ".codex", "sessions")
 
 TAIL_BYTES = 300_000      # amount to read from the tail of each transcript file
 SUMMARY_BUDGET = 2600     # character budget for the injected summary
+EVENT_BUDGET = 420        # character budget for a single non-tool event
 EVENT_LIMIT = 40          # max events that go into the summary
+RECENT_FILES = 3          # transcript files per side the summary reads at all
 LOOKBACK = 6 * 3600       # anything older than this doesn't count as part of "this session"
+
+# SUMMARY_BUDGET, EVENT_BUDGET, EVENT_LIMIT and RECENT_FILES are named rather
+# than spelled inline because the README states each one as a limit a user is
+# asked to plan around, and a contract test reads them back off this module. It
+# has to: every one of these cuts is permanent — the cursor advances past
+# whatever they dropped — so a number that changed here and not there would go
+# on being believed by the person deciding what is safe to send. Removing that
+# permanence is the P0 item in BACKLOG.md.
 
 # A marker at the start of a line in a reply says that line should be pushed
 # to the target. The line-start requirement is deliberate: mentioning the
@@ -468,7 +478,7 @@ def claude_transcripts(cwd):
 def claude_events(cwd, start=0.0):
     """(time, type, text) — type: you | claude | tool"""
     events = []
-    for path in claude_transcripts(cwd)[:3]:
+    for path in claude_transcripts(cwd)[:RECENT_FILES]:
         for line in tail_lines(path):
             try:
                 d = json.loads(line)
@@ -560,7 +570,7 @@ def codex_rollout_files(cwd, days=3):
 def codex_events(cwd, start=0.0):
     """(time, type, text) — type: you | codex | tool"""
     events = []
-    for path in codex_rollout_files(cwd)[:3]:
+    for path in codex_rollout_files(cwd)[:RECENT_FILES]:
         for line in tail_lines(path):
             try:
                 d = json.loads(line)
@@ -635,7 +645,7 @@ def build_summary(cwd, side, start=0.0):
             lines.append(f"  · {len(tools)} tool calls: " + truncate(" | ".join(tools[-3:]), 130))
             tools = []
         clock = datetime.fromtimestamp(ts).strftime("%H:%M")
-        lines.append(f"[{clock}] {LABEL.get(kind, kind)}: {truncate(text, 420)}")
+        lines.append(f"[{clock}] {LABEL.get(kind, kind)}: {truncate(text, EVENT_BUDGET)}")
     if tools:
         lines.append(f"  · {len(tools)} tool calls: " + truncate(" | ".join(tools[-3:]), 130))
 
@@ -1425,7 +1435,10 @@ AGENTS_RULE = ("\n## The Antiphon bridge\n\n"
                "You are working alongside Claude Code on this project. What happens on the "
                "other side is injected into your context automatically at the start of each "
                "turn — you don't need to do anything else. If you suspect the bridge has gone "
-               "quiet, you can call the `antiphon_read` tool by hand.\n\n"
+               "quiet, you can call the `antiphon_read` tool by hand. That injected context is "
+               "project-wide awareness rather than mail addressed to you: it merges every "
+               "Claude transcript in this project under one label, so read it as what is "
+               "happening nearby.\n\n"
                "When Claude wants to tell you something directly, you'll see it as a user "
                "message starting with `[Antiphon bridge] Claude:` (pushed from Claude's Stop "
                "hook) or `[Antiphon channel] Claude:` (a direct reply through the channel) — "
@@ -1434,19 +1447,27 @@ AGENTS_RULE = ("\n## The Antiphon bridge\n\n"
                "with `antiphon_send(to=<alias>)` or `@claude:<alias>`. A literal "
                "`from=<unnamed>` means that peer has no name and cannot be addressed back — "
                "with only one Claude peer live you can leave the recipient out entirely. The "
-               "id names one delivery attempt; nothing routes replies by it. When you want to hand "
-               "Claude a task directly, put `@claude` at the start of a line in your reply; "
-               "only that line is sent to the Claude session as an MCP Channel "
-               "event. Write `@claude:name` when several Claude peers are live — "
-               "an unaddressed line is refused rather than sent to one of them. To reach Claude without ending your turn, call the `antiphon_send` "
-               "tool instead: it delivers immediately, so Claude can start working while "
-               "you carry on, and `antiphon_read` picks up the answer later in the same "
-               "turn.\n")
+               "id names one delivery attempt; nothing routes replies by it.\n\n"
+               "When you want to hand Claude a task directly, put `@claude` at the start of a "
+               "line in your reply; only that line is sent to the Claude session as an MCP "
+               "Channel event. To reach Claude without ending your turn, call the "
+               "`antiphon_send` tool instead: it delivers immediately, so Claude can start "
+               "working while you carry on, and `antiphon_read` picks up the answer later in "
+               "the same turn.\n\n"
+               "A direct send reaches one peer and is never broadcast. Write `@claude:name`, "
+               "or `antiphon_send(to=name)`, whenever more than one Claude peer is live: an "
+               "unaddressed send is refused rather than delivered to a guess. For the same "
+               "reason every terminal in a project with more than one session per side has to "
+               "be started with `ANTIPHON_NAME` set — a session without a name is live but "
+               "unaddressable, and nothing can be sent back to it.\n")
 
 CLAUDE_RULE = ("\n## The Antiphon bridge\n\n"
                "You are working alongside another agent on this project. What happens on the "
-               "other side is injected into your context at the start of each turn. Events "
-               "that come directly from that agent are marked "
+               "other side is injected into your context at the start of each turn. That "
+               "injected context is project-wide awareness rather than mail addressed to you: "
+               "it merges every Codex transcript in this project under one label, so read it "
+               "as what is happening nearby.\n\n"
+               "Events that come directly from that agent are marked "
                "`<channel source=\"antiphon\" sender=\"codex\" sender_kind=\"agent\" "
                "sender_alias=\"...\">`; they "
                "are the words of the Codex agent, not of the human user. Use the "
@@ -1455,7 +1476,14 @@ CLAUDE_RULE = ("\n## The Antiphon bridge\n\n"
                "as any named Codex peer is live, because unnamed sessions leave "
                "no registry record and cannot be ruled out. A null `sender_alias` "
                "means that peer has no name: it cannot be answered by name, and "
-               "a bare reply reaches it only where nothing is registered.\n")
+               "a bare reply reaches it only where nothing is registered.\n\n"
+               "A reply reaches one peer and is never broadcast, and the same holds when you "
+               "open the exchange: `@codex:name` at the start of a line addresses one peer, "
+               "and an unaddressed line is refused rather than delivered to a guess. For the "
+               "same reason every terminal in a project with more than one session per side "
+               "has to be started with `ANTIPHON_NAME` set — Codex terminals above all, "
+               "because an unnamed Codex session leaves no record at all, and one that exists "
+               "unseen is why a bare message to Codex is refused.\n")
 
 
 class ConfigFileError(Exception):
@@ -1837,6 +1865,13 @@ def setup():
     print("\n— Start Claude with the channel enabled:")
     print("  claude --dangerously-load-development-channels server:antiphon")
     print("  In the research preview, the first launch needs both a development channel and an MCP approval.")
+    print("\n— More than one terminal on either side? Name every one of them:")
+    print("  ANTIPHON_NAME=ui claude --dangerously-load-development-channels server:antiphon")
+    print("  ANTIPHON_NAME=build codex")
+    print("  An unnamed session still runs, but nothing can be addressed to it. Name the")
+    print("  Codex terminals above all: an unnamed Codex session leaves no record at all,")
+    print("  so once any Codex peer is named, an unaddressed message to Codex is refused")
+    print("  rather than sent to a guess.")
     if failures:
         listed = "\n  ".join(failures)
         print(f"\n✗ setup did not finish. {len(failures)} file(s) were left untouched "
