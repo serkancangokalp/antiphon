@@ -90,6 +90,25 @@ agent said another agent's words.
 - Add an explicit filtering policy only if users ask for it; do not silently
   infer Claude↔Codex pairs from matching aliases.
 
+## P1 — Relayed human words are not the reader's own user
+
+`build_summary` labels the other side's human as `YOU`. The block header says
+which side it came from, but the line itself reads `[11:04] YOU: rewrite the
+migration`, and nothing tells the reading agent that this is a person talking
+to *somebody else*. An agent that treats it as its own user's instruction has
+been handed authority nobody gave it — in a bridge whose whole invariant is
+preserving who said something.
+
+Provenance and authority are different questions, and this label answers only
+the first. The fix is to say both: relay the words under a label that names them
+as relayed, and state once, where the reader cannot miss it, that they are
+context rather than a direct instruction. The existing header and footer already
+carry that tone; the per-line label is the part that lies.
+
+Worth settling with it: whether the relayed label should also carry the speaking
+peer's alias when one is set, and whether an agent should ever act on a relayed
+instruction without its own user confirming.
+
 ## P1 — Large direct-message attachments
 
 The direct channel has a separate, honest 128 KiB byte cap. Keep it until an
@@ -154,6 +173,88 @@ and the channel server's ancestor chain reached that pid. Before using it:
   a Claude-only automatic name would restore the asymmetry this release removed;
 - keep an explicit `ANTIPHON_NAME` as the deliberate override and test upgrade,
   collision and mixed-version behaviour.
+
+## P2 — Cross-vendor managed workers
+
+A user should be able to tell a live Claude session “have Codex do this”, or a
+live Codex session “have Claude review this”, without manually opening another
+terminal and without making the foreign agent look like a native subagent. The
+right abstraction is an **Antiphon-managed foreign worker**: the parent agent
+can delegate to it and follow its lifecycle, but every event and result still
+names the actual Claude or Codex session that produced it. This preserves the
+bridge's identity invariant; an absent or ambiguous worker is refused rather
+than guessed.
+
+The first safe shape is:
+
+- expose a small `delegate`, `status`, `result` and `cancel` lifecycle, with a
+  stable task id and explicit worker session id;
+- return immediately after acceptance by default, so the parent can continue
+  working and collect the result later;
+- label every update and artifact as coming from the foreign worker, never as
+  the parent agent's own reasoning or work;
+- give every write-capable task its own Git worktree; a worker must not edit in
+  the parent session's checkout or race another worker over the same files;
+- never give the worker a broader permission class than the delegating session
+  or an explicit human grant, and never let a worker approve the parent's
+  permission requests, merge its own work, or silently widen its sandbox;
+- default the cross-agent hop budget to one. Nested delegation is refused unless
+  the user explicitly opts into a higher bounded value, so
+  Claude → Codex → Claude cannot become an invisible recursive loop;
+- make `blocked`, `completed`, `failed`, `cancelled` and timeout outcomes
+  explicit, and return reviewable evidence such as the diff and test results
+  with a completed write task.
+
+This must be implemented as an Antiphon lifecycle over host adapters, not by
+pretending that either host natively spawned the other vendor's model. Each host
+already has its own same-vendor nesting story, and neither is a cross-vendor
+contract: Claude Code documents that a subagent inherits the main conversation's
+MCP tools and may itself spawn subagents up to a configurable depth
+(`CLAUDE_CODE_MAX_SUBAGENT_SPAWN_DEPTH`, set to `1` to turn nesting off), and on
+this machine Codex CLI 0.151.0 advertises `multi_agent` as a stable feature while
+the generated App Server schema mentioning `spawnAgent` is still experimental.
+Neither establishes a stable way for one vendor to spawn the other's model, and
+this feature must not depend on one without version detection and a tested
+fallback. The bounded-depth precedent is worth copying rather than reinventing:
+a documented, configurable limit is exactly the shape the hop budget above takes.
+
+### Decisions still required
+
+- Whether `delegate` may target an already-running named peer, always creates a
+  fresh managed worker, or exposes both modes explicitly.
+- Whether managed workers are one-task ephemeral sessions or can be resumed,
+  and what expiry, cleanup and storage quotas apply.
+- Which host adapters are supported first, and whether an unavailable native
+  worker API may fall back to a documented CLI/SDK subprocess.
+- Which task classes may run without another user confirmation, and who may
+  accept a worker's patch or merge it after deterministic checks pass.
+- Whether a synchronous wait mode is worth exposing in addition to the safer
+  asynchronous default.
+
+No claim is made yet that a Claude worker can appear in Codex's native agent UI,
+or that a Codex worker can appear in Claude Code's native subagent UI. That UX
+would be optional integration work; the portable contract is Antiphon's own
+named worker, task lifecycle and evidence trail.
+
+## Observed, not adopted — Claude Code's per-session messaging socket
+
+Measured on one macOS machine, 2026-08-30: a Claude Code session exports
+`CLAUDE_CODE_MESSAGING_SOCKET`, `CLAUDE_CODE_MESSAGING_TOKEN` and
+`CLAUDE_CODE_SESSION_ID` into the processes it starts, including hooks and
+stdio MCP servers. The socket path pointed at a real Unix domain socket under a
+temporary directory, the token was a 32-character string, and the session id was
+a UUID. Nothing was connected to and no token value was read.
+
+This is recorded because it is easy to find and tempting to use, and because the
+temptation should be answered once rather than every time somebody notices it.
+It is not documented, its path is named after a process id, and it exists on one
+side of a bridge whose entire purpose is the asymmetry between two hosts —
+Codex CLI has no equivalent. A published package that made an undocumented
+internal interface its transport would break silently on the first release that
+moved it, and the failure would look like the bridge going quiet.
+
+If a first-party, documented agent-to-agent transport ever ships on both sides,
+this is the entry to revisit. Until then Antiphon owns its own sockets.
 
 ## P2 — Multi-line Stop markers
 
