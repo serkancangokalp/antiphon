@@ -2468,16 +2468,12 @@ class PositionCursorTest(unittest.TestCase):
                 resumed_events, _resumed = antiphon.claude_events(project, positions)
         self.assertEqual(resumed_events, [], "already-read content is not repeated")
 
-    def test_a_source_with_no_entry_under_a_v2_cursor_is_bounded_by_the_lookback(self):
-        """A v2 map used to hand back `since=None`, so `_start_offset` fell to
-        `else 0` for any source with no recorded entry -- an old session
-        resumed, or a fourth transcript rotating into the newest three -- and
-        its entire history entered the event pool. Measured: a fresh source
-        plus an eight-day-old 200-record source produced 39 of 40 kept slots
-        from the stale one. `positions_for` must still hand back the lookback
-        as a floor even for an otherwise-valid v2 map; a source *with* an
-        entry never consults it, whether that entry is trusted or not, so
-        steady state is unchanged."""
+    def test_every_discovered_source_under_v2_replays_from_byte_zero(self):
+        """A v2 map records how far old code scanned, not what it delivered.
+        None of its offsets can seed the separate v3 delivered-prefix cursor:
+        both the previously known source and a newly discovered source start
+        from byte zero, including records older than the normal lookback, and
+        the page carries the explicit legacy-upgrade replay reason."""
         known_sid = "4eecac24-1c21-47ad-ab11-a650708f3098"
         new_sid = "01a04f6b-4485-7290-afbd-9eae74405ec8"
         old_ts = "2020-01-01T00:00:00.000Z"
@@ -2497,6 +2493,7 @@ class PositionCursorTest(unittest.TestCase):
             cursor = {"claude_seen": {"v": 2, "sources":
                       {known_sid: {"gen": gen, "offset": size}}}}
             positions, since, replay = antiphon.positions_for(cursor, "claude")
+            self.assertIsNone(since)
             with patch.object(antiphon, "claude_transcripts",
                               return_value=[known_path, new_path]):
                 events, _reached = antiphon.claude_events(d, positions, since)
