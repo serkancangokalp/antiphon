@@ -306,6 +306,9 @@ class AntiphonTest(unittest.TestCase):
                 "@claude CURRENT before child\nchild\nclosing")
 
     def test_a_matched_span_ends_only_at_its_own_complete(self):
+        """A foreign complete does not end the span (complete(B)); its own
+        complete(A) does — nothing after it, including a later turn's own
+        marker, belongs to this reply."""
         lines = [
             codex_task_started("A"),
             codex_msg("outer 1"),
@@ -313,11 +316,14 @@ class AntiphonTest(unittest.TestCase):
             codex_msg("child"),
             codex_task_complete("B"),
             codex_msg("@claude outer 2"),
+            codex_task_complete("A"),
+            codex_task_started("C"),
+            codex_msg("@claude AFTER"),
         ]
         with patch.object(antiphon, "tail_lines", return_value=lines):
-            self.assertEqual(
-                antiphon.last_codex_reply("rollout", "A"),
-                "outer 1\nchild\n@claude outer 2")
+            result = antiphon.last_codex_reply("rollout", "A")
+        self.assertEqual(result, "outer 1\nchild\n@claude outer 2")
+        self.assertNotIn("AFTER", result)
 
     def test_without_an_id_the_newest_start_wins(self):
         lines = [
@@ -332,6 +338,9 @@ class AntiphonTest(unittest.TestCase):
                              "child\nclosing")
 
     def test_a_blank_turn_id_is_no_id(self):
+        """Anything short of a non-empty string never reaches the matching
+        branch — including JSON types a hand-edited or malformed payload
+        could carry (a number, a bool, a list, a dict)."""
         lines = [
             codex_msg("before"),
             codex_task_started("B"),
@@ -340,7 +349,7 @@ class AntiphonTest(unittest.TestCase):
             codex_msg("closing"),
         ]
         with patch.object(antiphon, "tail_lines", return_value=lines):
-            for blank in ("", None):
+            for blank in ("", None, 42, True, ["A"], {"id": "A"}):
                 self.assertEqual(antiphon.last_codex_reply("rollout", blank),
                                  "child\nclosing", repr(blank))
 
