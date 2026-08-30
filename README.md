@@ -39,13 +39,15 @@ line does not send it twice.
 
 A Claude → Codex message reaches Codex tagged either `[Antiphon bridge] Claude:` (pushed from Claude's Stop hook) or `[Antiphon channel] Claude:` (a direct reply sent through the channel, via the `reply_to_codex` tool) — either way, Codex sees these as Claude's words, not the human user's.
 
+The tag is followed by `[from=<alias> id=<uuid>]`, naming which Claude peer spoke so a reply can be addressed back to it. A session started without `ANTIPHON_NAME` shows `from=<unnamed>`: it has no name to be addressed by, and the angle brackets keep that apart from a peer actually called `unnamed`. The id names one delivery attempt — it is not a correlation id, and nothing routes replies by it.
+
 A Codex → Claude message never pastes text into the terminal and never impersonates user input. The local MCP server sends Claude Code a `notifications/claude/channel` event. Its metadata looks like:
 
 ```xml
-<channel source="antiphon" sender="codex" sender_kind="agent" message_id="...">
+<channel source="antiphon" sender="codex" sender_kind="agent" sender_alias="build" message_id="...">
 ```
 
-Claude Code's interface shows this as an incoming channel event, and Claude treats the message as the words of the Codex agent, not of the human user. It sends its reply back with the `reply_to_codex` MCP tool.
+Claude Code's interface shows this as an incoming channel event, and Claude treats the message as the words of the Codex agent, not of the human user. It sends its reply back with the `reply_to_codex` MCP tool, passing `sender_alias` as `to` when several Codex peers are live. `sender_alias` is `null` for a peer with no name.
 
 ## Install
 

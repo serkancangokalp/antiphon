@@ -56,10 +56,22 @@ const transport = new StdioClientTransport({
   stderr: "inherit",
 });
 const client = new Client({ name: "antiphon-test", version: "1.0.0" });
-let resolveNotification;
-const notificationReceived = new Promise((resolve) => {
-  resolveNotification = resolve;
-});
+const notifications = [];
+function nextNotification() {
+  const seen = notifications.length;
+  return new Promise((resolve, reject) => {
+    const started = Date.now();
+    const poll = setInterval(() => {
+      if (notifications.length > seen) {
+        clearInterval(poll);
+        resolve(notifications[seen]);
+      } else if (Date.now() - started > 2_000) {
+        clearInterval(poll);
+        reject(new Error("channel notification timeout"));
+      }
+    }, 10);
+  });
+}
 
 function sendToSocket(payload) {
   return new Promise((resolve, reject) => {
@@ -448,7 +460,7 @@ try {
   const onMessage = transport.onmessage;
   transport.onmessage = (message) => {
     if (message.method === "notifications/claude/channel") {
-      resolveNotification(message);
+      notifications.push(message);
     }
     onMessage(message);
   };
@@ -494,21 +506,53 @@ try {
   assert.equal(bare.content[0].text, "Channel reply delivered to Codex.",
     "one live peer distinguishes nothing, so the general wording stands");
 
-  const ack = await sendToSocket({ content: "identity test", message_id: "m-test" });
+  // This server started unnamed, so it registered under a generated `peerId`.
+  // That name is a registry key, not something Codex could address a reply to,
+  // so it must not appear as a sender anywhere the other side can read.
+  // Only this channel server's own record: the project also holds the Codex
+  // peer planted above, and including it would let the assertion pass while
+  // proving nothing about the generated key.
+  const generated = registeredPeers(projectDir)
+    .filter((peer) => peer.kind === "claude" && /^claude-[0-9a-f]{3}$/.test(peer.name))
+    .map((peer) => peer.name);
+  assert.equal(generated.length, 1,
+    "the unnamed channel server must have registered under a generated key");
+  const queued = readFileSync(queueLog, "utf8");
+  assert.match(queued, /\[from=<unnamed> id=/,
+    "an unnamed session says so rather than sending its generated key");
+  for (const name of generated) {
+    assert.ok(!queued.includes(`from=${name}`),
+      `the generated registry key leaked into a queued message: ${name}`);
+  }
+
+  // Claimed before sending, so this reads its own event rather than whichever
+  // notification happened to arrive first.
+  const pendingIdentity = nextNotification();
+  const ack = await sendToSocket({ content: "identity test", message_id: "m-test",
+                                   sender_alias: "build" });
   assert.deepEqual(ack, { ok: true, message_id: "m-test" });
-  const received = await Promise.race([
-    notificationReceived,
-    new Promise((_, reject) => setTimeout(
-      () => reject(new Error("channel notification timeout")),
-      1_000,
-    )),
-  ]);
+  const received = await pendingIdentity;
   assert.equal(received.params.content, "identity test");
   assert.deepEqual(received.params.meta, {
     sender: "codex",
     sender_kind: "agent",
+    sender_alias: "build",
     message_id: "m-test",
   });
+
+  // The alias crossed a socket, so it is a claim rather than a fact. Anything
+  // that is not a name the registry would accept reaches the agent as null —
+  // never as text it might read as a name to reply to.
+  for (const claimed of ["Not A Name", "a b", "a]b", 42, null, ["ui"], "",
+                         "a".repeat(40)]) {
+    const pending = nextNotification();
+    await sendToSocket({ content: `claim ${JSON.stringify(claimed)}`,
+                         sender_alias: claimed });
+    const seen = await pending;
+    assert.equal(seen.params.meta.sender_alias, null,
+      `an unusable alias must not reach the agent: ${JSON.stringify(claimed)}`);
+  }
+
   console.log("MCP channel integration: ok");
 } finally {
   // Each step runs even if an earlier one throws. A close that fails would

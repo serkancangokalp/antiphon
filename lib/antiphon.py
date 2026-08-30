@@ -214,6 +214,57 @@ def _is_self_injected(text):
     return text.lstrip().lower().startswith(_SELF_INJECTION_PREFIXES)
 
 
+def sender_alias(candidate=None):
+    """The alias to attribute an outgoing message to, or None.
+
+    Only a valid, explicit `ANTIPHON_NAME` counts. An automatic name identifies
+    a session in a listing but is not something the other side can put in a
+    reply, so passing one on would invite an answer addressed to nobody. A
+    session without one says so; it does not invent a name.
+
+    `candidate` is for a caller that already knows the answer — `channel.mjs`
+    hands its own name to the reply subprocess rather than leaving it to be
+    worked out again. It is validated here all the same: a value that arrives
+    from somewhere else is not evidence about who this is.
+    """
+    name = peers.explicit_name() if candidate is None else candidate
+    return name if peers.valid_name(name) else None
+
+
+def delivery_id():
+    """An id for one delivery attempt.
+
+    It says which attempt, and nothing more. It is deliberately not a
+    correlation id: holding one logical id across a retry needs pending-delivery
+    state this release does not have, and calling it correlation would promise
+    reply routing that is not implemented.
+    """
+    return str(uuid.uuid4())
+
+
+# What an unaddressable sender renders as. Angle brackets are chosen precisely
+# because `valid_name` cannot produce them: `unnamed` on its own is a perfectly
+# legal `ANTIPHON_NAME`, so a bare `from=unnamed` would mean either "this peer
+# has no name" or "this peer is called unnamed", and the reader could not tell
+# which — one of them is addressable and the other is not.
+NO_ALIAS = "<unnamed>"
+
+
+def queue_label(alias, message_id):
+    """`[from=<alias> id=<uuid>]` for the paths that carry only text.
+
+    `codex queue` takes a message and no metadata, so what the socket puts in
+    `meta` has to be visible here. It goes **after** the bridge or channel
+    prefix, never before: those prefixes anchor the self-injection filter and
+    the echo guard, and a message that no longer starts with one would be read
+    back as new traffic and delivered again.
+
+    `alias` is already validated, so it cannot close this bracket and open
+    another.
+    """
+    return f"[from={alias or NO_ALIAS} id={message_id}]"
+
+
 # ---------- helpers ----------
 
 def project_dir():
@@ -753,10 +804,15 @@ def push(target="codex"):
 
     def deliver(recipient, messages):
         outgoing = "\n".join(messages)
+        # A new id per attempt, and the alias of whoever is ending this turn.
+        who, attempt = sender_alias(), delivery_id()
         if target == "codex":
-            ok, detail = send_to_codex(cwd, f"{PUSH_LABEL} {outgoing}", recipient)
+            ok, detail = send_to_codex(
+                cwd, f"{PUSH_LABEL} {queue_label(who, attempt)} {outgoing}",
+                recipient)
         else:
-            ok, detail = send_to_claude(cwd, outgoing, recipient)
+            ok, detail = send_to_claude(cwd, outgoing, recipient,
+                                        sender_alias=who, message_id=attempt)
         named = f":{recipient}" if recipient else ""
         if ok:
             print(f"antiphon: delivered to {target.title()}{named} "
@@ -921,11 +977,17 @@ CONNECT_PATIENCE = 1.5            # seconds; a real outage still fails promptly
 CONNECT_RETRY_DELAY = 0.05
 
 
-def send_to_claude(cwd, text, alias=None):
-    """Sends a Codex message to a Claude peer's MCP Channel socket."""
+def send_to_claude(cwd, text, alias=None, sender_alias=None, message_id=None):
+    """Sends a Codex message to a Claude peer's MCP Channel socket.
+
+    `sender_alias` and `message_id` travel in the payload and become the
+    notification's metadata, so the receiving agent can see who spoke and
+    address a reply deliberately.
+    """
     request = {
         "content": text,
-        "message_id": str(uuid.uuid4()),
+        "message_id": message_id or delivery_id(),
+        "sender_alias": sender_alias,
     }
     payload = json.dumps(request, ensure_ascii=False).encode()
     if len(payload) > MAX_CHANNEL_BYTES:
@@ -999,7 +1061,10 @@ def reply(*_):
         return 1
     cwd = project_dir()
     text = text.strip()
-    ok, detail = send_to_codex(cwd, f"{CHANNEL_LABEL} {text}", to)
+    # `channel.mjs` passes the peer name it validated for itself.
+    who = sender_alias(input_data.get("sender_alias"))
+    label = queue_label(who, delivery_id())
+    ok, detail = send_to_codex(cwd, f"{CHANNEL_LABEL} {label} {text}", to)
     if not ok:
         print(f"reply: {detail}", file=sys.stderr)
         return 1
@@ -1144,7 +1209,8 @@ def _send_tool(cwd, text, to=None):
     if to is not None and not isinstance(to, str):
         return _tool_error("to must be a string naming one live Claude peer")
     text = text.strip()
-    ok, detail = send_to_claude(cwd, text, to)
+    ok, detail = send_to_claude(cwd, text, to, sender_alias=sender_alias(),
+                                message_id=delivery_id())
     if not ok:
         return _tool_error(f"Not delivered to Claude: {detail}")
     _record_delivery(cwd, "claude", text, to)
@@ -1330,9 +1396,13 @@ CLAUDE_RULE = ("\n## The Antiphon bridge\n\n"
                "You are working alongside another agent on this project. What happens on the "
                "other side is injected into your context at the start of each turn. Events "
                "that come directly from that agent are marked "
-               "`<channel source=\"antiphon\" sender=\"codex\" sender_kind=\"agent\">`; they "
+               "`<channel source=\"antiphon\" sender=\"codex\" sender_kind=\"agent\" "
+               "sender_alias=\"...\">`; they "
                "are the words of the Codex agent, not of the human user. Use the "
-               "`reply_to_codex` tool to answer them.\n")
+               "`reply_to_codex` tool to answer them, passing `sender_alias` back "
+               "as `to` — with several Codex peers live an unaddressed reply is "
+               "refused rather than guessed. A null `sender_alias` means that peer "
+               "has no name and cannot be answered by name.\n")
 
 
 class ConfigFileError(Exception):
