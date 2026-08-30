@@ -412,8 +412,13 @@ def cursor_lock(cwd, kind, patience=None):
     That one serializes every claim, refresh, prune and release in the project,
     and holding it across a model-facing write would make an unrelated peer's
     start, stop or refresh queue behind this peer's context page. Named peers
-    already own separate cursor files, so a lock beside each cursor gives
-    exactly the exclusion required without coupling their lifetimes.
+    each own a separate cursor file, so a lock beside each one gives exactly
+    the exclusion required without coupling their lifetimes — for a named
+    install. The default, unnamed install has no name to split on: `state_path`
+    returns the same file for `claude` and for `codex` alike, so this lock
+    guards both sides of the project at once. A caller that holds it for long
+    is not only making its own peer wait; it is making **the other agent**
+    wait, on a bridge with no name in play to tell them apart.
 
     The wait is bounded because the hook runs on a person's every prompt: a
     holder that is stuck rather than dead would otherwise hang the turn. A
@@ -449,9 +454,13 @@ def cursor_lock(cwd, kind, patience=None):
             except BlockingIOError:
                 # The only errno that means "somebody else has it".
                 if time.monotonic() >= deadline:
+                    # Neutral on purpose: this fires for callers that deliver
+                    # context and for callers that only record a push, and
+                    # "context not delivered" was a lie for the second kind.
+                    # The caller knows what it was trying to do and says so
+                    # itself, on its own line.
                     print("antiphon: another delivery for this peer is still "
-                          f"running after {patience:g}s; context not delivered "
-                          "this turn", file=sys.stderr)
+                          f"running after {patience:g}s", file=sys.stderr)
                     break
                 time.sleep(CURSOR_LOCK_RETRY_DELAY)
             except OSError as exc:
@@ -579,8 +588,10 @@ def update_cursor(cwd, kind, mutate):
     1.0 to 2.0 undone by a push that had read the file first.
 
     `mutate` is called with the freshly read cursor and returns the object to
-    write. Returns whether the write succeeded, or False if the lock could not
-    be taken — in which case nothing was read, changed or written.
+    write. There are three outcomes, and only the middle one means anything
+    was lost: `False` if the lock could not be taken (nothing was read,
+    changed or written), `True` with nothing written when `mutate` changed
+    nothing, and `True` after a real write otherwise.
 
     A `mutate` that changes nothing writes nothing. It is handed a copy that
     nothing else holds, so it may edit in place; the value read from disk is
@@ -588,12 +599,24 @@ def update_cursor(cwd, kind, mutate):
     wrong: a caller cannot see whether `read_cursor` returns a fresh object,
     and under a test double that returns the same one, an in-place edit makes
     every write look unnecessary.
+
+    `mutate` is expected to return a dict — the docstring above says "it may
+    edit in place", and a lambda built for `.update(...)`'s return value
+    returns `None` instead. Written as-is, that overwrites the cursor with
+    `null`: every `_seen` timestamp and every push fingerprint gone, silently,
+    and `updated == before` never catches it because `None != {}`. Refused
+    here instead, because this is the one funnel every writer shares.
     """
     with cursor_lock(cwd, kind) as locked:
         if not locked:
             return False
         before = read_cursor(cwd, kind)
         updated = mutate(json.loads(json.dumps(before)))
+        if not isinstance(updated, dict):
+            print(f"antiphon: mutate returned {type(updated).__name__}, not a "
+                  f"dict; refusing to overwrite {state_path(cwd, kind)}",
+                  file=sys.stderr)
+            return False
         if updated == before:
             return True
         return write_cursor(cwd, updated, kind)
@@ -975,10 +998,13 @@ def hook(side="claude"):
 
     with cursor_lock(cwd, side) as locked:
         if not locked:
-            # `cursor_lock` has already said why on stderr. Non-zero so the
-            # person actually sees it: on exit 0 that line reaches a debug log
-            # and nothing else, and a bridge that stopped delivering would look
-            # exactly like a counterpart with nothing to say.
+            # `cursor_lock` has already said why on stderr, but its message is
+            # deliberately neutral about what was lost — this is the detail
+            # only this caller knows. Non-zero so the person actually sees it:
+            # on exit 0 that line reaches a debug log and nothing else, and a
+            # bridge that stopped delivering would look exactly like a
+            # counterpart with nothing to say.
+            print("antiphon: context not delivered this turn", file=sys.stderr)
             return 1
         cursor = read_cursor(cwd, side)
         key = f"{side}_seen"
@@ -1804,7 +1830,16 @@ def _mcp_serve(cwd, alias=None):
                             mid, {"content": [{"type": "text", "text": output}]})
                         if delivered and text and last:
                             cursor["codex_seen"] = last
-                            write_cursor(cwd, cursor, "codex")
+                            if not write_cursor(cwd, cursor, "codex"):
+                                # Symmetric with the hook: the page was
+                                # delivered, so the tool result already went
+                                # out and this stays a diagnostic rather than
+                                # a second, failing response — the model
+                                # would just see the same context again next
+                                # turn.
+                                print("antiphon: delivered, but could not "
+                                      f"record it in {state_path(cwd, 'codex')}",
+                                      file=sys.stderr)
             elif name == "antiphon_send":
                 arguments = p.get("arguments")
                 arguments = arguments if isinstance(arguments, dict) else {}

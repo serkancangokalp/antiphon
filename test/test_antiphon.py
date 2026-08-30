@@ -2105,6 +2105,21 @@ class CodexPeerWiringTest(unittest.TestCase):
             self.assertTrue(antiphon.update_cursor(project, "codex", lambda c: c))
             self.assertEqual(os.stat(path).st_mtime_ns, before)
 
+    def test_update_cursor_refuses_a_mutate_that_returns_no_dict(self):
+        """The docstring says `mutate` may edit in place, and
+        `lambda c: c.update({...})` returns `None` — the exact shape that
+        invites. Writing that overwrites every `_seen` timestamp and every
+        push fingerprint with `null`, silently."""
+        with tempfile.TemporaryDirectory() as project, self._named(""), \
+             contextlib.redirect_stderr(io.StringIO()) as err:
+            antiphon.write_cursor(project, {"codex_seen": 2.0}, "codex")
+            ok = antiphon.update_cursor(
+                project, "codex", lambda c: c.update({"codex_seen": 3.0}))
+            self.assertFalse(ok)
+            self.assertEqual(antiphon.read_cursor(project, "codex"),
+                             {"codex_seen": 2.0}, "the cursor must survive intact")
+        self.assertIn("dict", err.getvalue())
+
     # ---- item 1: push sends without the lock, and records through it ----
 
     def test_push_sends_while_the_peers_lock_is_held_by_someone_else(self):
