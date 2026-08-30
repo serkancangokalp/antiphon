@@ -400,6 +400,16 @@ class ShippedContractTest(unittest.TestCase):
                             "detail, discovery and backward paging still lose")
         self.assertIn("BACKLOG.md", limits,
                       "Limits must send the reader to the tracked work")
+        # The retired cuts must not survive elsewhere in the same package as a
+        # present-tense bug. This exact contradiction shipped once: P0 declared
+        # the 2,600/420 cuts gone while a P1 paragraph three sections later
+        # still called one "the 2,600-character pull bug".
+        for doc in ("README.md", "BACKLOG.md"):
+            text = read(doc)
+            self.assertNotRegex(text, r"(?i)pull bug", doc)
+            self.assertNotRegex(
+                text, r"(?i)(2,600|420)[^.\n]*\b(keeps|cuts|is cut|loses)\b",
+                f"{doc} still describes a retired cut in the present tense")
 
     def test_an_npm_reader_can_open_the_backlog_the_readme_points_at(self):
         """`files` is an allowlist. A pointer into a file that never entered the

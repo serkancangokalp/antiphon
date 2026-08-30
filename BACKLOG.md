@@ -106,8 +106,9 @@ oversized message has a recoverable path:
 - show pending storage in `antiphon status` and clean it without deleting an
   unread message silently.
 
-This is separate from the 2,600-character pull bug. Ordinary long SQL and code
-already fit under 128 KiB when sent through a channel tool.
+This is separate from passive pull, whose old 2,600-character trim is retired
+— pull now pages complete records. Ordinary long SQL and code already fit
+under 128 KiB when sent through a channel tool.
 
 ## P1 — `antiphon doctor`
 
