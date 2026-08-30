@@ -12,9 +12,22 @@ try:
     import tomllib          # Python 3.11+
 except ModuleNotFoundError:  # the hooks run whatever bare `python3` resolves to
     tomllib = None
+import re
 import unittest
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import Mock, patch
+
+# The suite describes a project, not the terminal it happens to run in.
+# `ANTIPHON_NAME` moves cursors and sockets, so `ANTIPHON_NAME=ui npm test` —
+# a reasonable thing to run now — would otherwise exercise a different layout
+# than a bare run. Tests that want a name set one with `patch.dict`.
+os.environ.pop("ANTIPHON_NAME", None)
+
+
+def read_source(*parts):
+    with open(os.path.join(os.path.dirname(__file__), "..", *parts),
+              encoding="utf-8") as f:
+        return f.read()
 
 
 class AntiphonTest(unittest.TestCase):
@@ -353,7 +366,10 @@ class AntiphonTest(unittest.TestCase):
              patch.object(antiphon, "write_cursor",
                           side_effect=lambda cwd, data, kind: written.append(dict(data))):
             self._run_mcp(project, self._call("antiphon_send", text="run the tests"))
-        self.assertEqual(written, [{"last_pushed_claude": "run the tests"}])
+        self.assertEqual(written, [{"last_pushed_claude":
+                                    {"": antiphon.batch_fingerprint(["run the tests"])}}],
+                         "recorded in the unaddressed slot, in the shape the "
+                         "Stop hook compares against")
 
     def test_antiphon_send_reports_a_dead_channel_as_an_error(self):
         """A silent success is the worst outcome here: Codex would believe Claude had
@@ -385,7 +401,8 @@ class AntiphonTest(unittest.TestCase):
                           side_effect=lambda cwd, data, kind: written.append(dict(data))), \
              patch.object(antiphon.sys, "stdin", io.StringIO(json.dumps({"text": "hello"}))):
             self.assertEqual(antiphon.reply(), 0)
-        self.assertEqual(written, [{"last_pushed_codex": "hello"}])
+        self.assertEqual(written, [{"last_pushed_codex":
+                                    {"": antiphon.batch_fingerprint(["hello"])}}])
 
     # ---- choosing which peer a message goes to: see RoutingTest ----
 
@@ -559,7 +576,8 @@ class AntiphonTest(unittest.TestCase):
              patch.object(antiphon.sys, "stdin",
                           io.StringIO('{"text":"reply"}')):
             self.assertEqual(antiphon.reply(), 0)
-        send.assert_called_once_with("/tmp/project", "[Antiphon channel] Claude: reply")
+        send.assert_called_once_with("/tmp/project",
+                                     "[Antiphon channel] Claude: reply", None)
 
     def test_hook_is_silent_and_only_injects_context(self):
         """The hook prints nothing to the terminal: the summary goes into the context, the user is not disturbed."""
@@ -1902,6 +1920,374 @@ class RoutingTest(unittest.TestCase):
             result = antiphon._send_tool(project, "hello")
         self.assertTrue(result.get("isError"))
         self.assertIn("api", result["content"][0]["text"])
+
+
+class ToolRecipientTest(unittest.TestCase):
+    """`to` on both channel tools, and the dedupe that has to follow it.
+
+    A tool delivery and the `@alias` line that ends the same turn are the same
+    message twice. The Stop hook already remembers per recipient; a tool that
+    remembered only "the last thing sent" would either resend its own message or
+    erase somebody else's record on the way past.
+    """
+
+    UUID = "1d5a03e0-0548-4339-87c3-45c5dbf7e9d7"
+    OTHER = "2e6b14f1-1659-544a-98d4-56d6eca8fa48"
+
+    @staticmethod
+    def _codex_peer(project, alias, owner, session):
+        antiphon.peers.register(project, "codex", alias, None,
+                                pid=os.getpid(), owner_key=owner)
+        antiphon.peers.write_session(project, "codex", alias, session,
+                                     f"/t/{alias}.jsonl", owner)
+
+    @staticmethod
+    def _reply(project, payload):
+        err = io.StringIO()
+        with patch.object(antiphon, "project_dir", return_value=project), \
+             patch.object(antiphon.sys, "stdin", io.StringIO(json.dumps(payload))), \
+             contextlib.redirect_stderr(err):
+            code = antiphon.reply()
+        return code, err.getvalue()
+
+    # ---- the schemas say what `to` is for ----
+
+    def test_the_send_tool_takes_an_optional_recipient(self):
+        schema = next(t for t in antiphon.TOOLS
+                      if t["name"] == "antiphon_send")["inputSchema"]
+        self.assertEqual(schema["properties"]["to"]["type"], "string")
+        self.assertEqual(schema["required"], ["text"],
+                         "one live peer needs no alias; requiring one would "
+                         "break every single-peer project")
+        self.assertEqual(schema["properties"]["to"]["description"],
+                         antiphon.TO_DESCRIPTION)
+
+    def test_the_tool_descriptions_do_not_promise_a_single_peer(self):
+        """`reply_to_codex` used to say it answered "the Codex agent that
+        contacted this channel". Nothing correlates an incoming message with a
+        reply target, so that sentence described a routing rule that does not
+        exist — and an agent reading it would never think to pass `to`."""
+        send = next(t for t in antiphon.TOOLS
+                    if t["name"] == "antiphon_send")["description"]
+        # The Node string is written across lines with `+`. Collapse it first,
+        # and fail loudly if the description cannot be found at all — a regex
+        # that quietly matches nothing would let any wording through.
+        node = re.sub(r'"\s*\+\s*\n\s*"', "", read_source("lib", "channel.mjs"))
+        found = re.search(r'description:\s*\n?\s*"(Send[^"]*)"', node)
+        self.assertIsNotNone(found, "reply_to_codex description not found")
+        reply = found.group(1)
+        for text in (send, reply):
+            self.assertIn("peer", text)
+            self.assertIn("to", text)
+            self.assertNotIn("that contacted this channel", text)
+        self.assertNotIn("the Claude Code session working in this project", send)
+
+    # ---- sending to a named peer ----
+
+    def test_the_send_tool_delivers_to_the_peer_it_names(self):
+        connected = []
+
+        class Fake:
+            def settimeout(self, _): pass
+            def connect(self, address): connected.append(address)
+            def sendall(self, _): pass
+            def shutdown(self, _): pass
+            def recv(self, _): return b'{"ok": true}' if len(connected) == 1 \
+                                     and not getattr(self, "done", False) else b""
+            def close(self): pass
+            def __enter__(self): return self
+            def __exit__(self, *_): return False
+
+        replies = [b'{"ok": true}', b""]
+
+        class Reading(Fake):
+            def recv(self, _):
+                return replies.pop(0) if replies else b""
+
+        with tempfile.TemporaryDirectory() as project:
+            antiphon.peers.register(project, "claude", "ui", "/tmp/ui.sock")
+            antiphon.peers.register(project, "claude", "api", "/tmp/api.sock")
+            with patch.object(antiphon.socket, "socket", lambda *a, **k: Reading()), \
+                 patch.object(antiphon, "_record_delivery"):
+                result = antiphon._send_tool(project, "hello", "api")
+        self.assertNotIn("isError", result)
+        self.assertEqual(connected, ["/tmp/api.sock"])
+
+    def test_the_send_tool_reports_an_unroutable_recipient_as_an_error(self):
+        """Invalid, unknown, waiting and ambiguous all reach the caller as tool
+        errors. A silent success would be the worst outcome: Codex would believe
+        Claude had been told."""
+        touched = AssertionError("a refused send must touch no transport")
+        cases = [("ghost", "no live claude peer"), ("API!", "usable peer name"),
+                 (None, "address one by name")]
+        with tempfile.TemporaryDirectory() as project:
+            antiphon.peers.register(project, "claude", "ui", "/tmp/ui.sock")
+            antiphon.peers.register(project, "claude", "api", "/tmp/api.sock")
+            with patch.object(antiphon.socket, "socket", side_effect=touched):
+                for alias, expected in cases:
+                    result = antiphon._send_tool(project, "hello", alias)
+                    self.assertTrue(result.get("isError"), repr(alias))
+                    self.assertIn(expected, result["content"][0]["text"])
+
+    def test_a_recipient_that_is_not_a_string_is_refused_before_anything_else(self):
+        """`to` arrives from JSON, so it can be any type at all."""
+        touched = AssertionError("a malformed argument must touch no transport")
+        with tempfile.TemporaryDirectory() as project:
+            antiphon.peers.register(project, "claude", "ui", "/tmp/ui.sock")
+            with patch.object(antiphon.socket, "socket", side_effect=touched):
+                for value in (42, [], {}, 3.5, True):
+                    result = antiphon._send_tool(project, "hello", value)
+                    self.assertTrue(result.get("isError"), repr(value))
+                    self.assertIn("to must be a string",
+                                  result["content"][0]["text"], repr(value))
+
+    def test_the_reply_tool_delivers_to_the_codex_peer_it_names(self):
+        queued = []
+        with tempfile.TemporaryDirectory() as project:
+            self._codex_peer(project, "build", "300:build", self.UUID)
+            self._codex_peer(project, "review", "301:review", self.OTHER)
+            with patch.object(antiphon, "_queue_codex",
+                              side_effect=lambda session, message:
+                                  queued.append(session) or (True, "")):
+                code, err = self._reply(project, {"text": "ship", "to": "review"})
+        self.assertEqual(code, 0, err)
+        self.assertEqual(queued, [self.OTHER])
+
+    def test_the_reply_tool_refuses_what_it_cannot_route(self):
+        touched = AssertionError("a refused reply must start no process")
+        with tempfile.TemporaryDirectory() as project:
+            self._codex_peer(project, "build", "300:build", self.UUID)
+            self._codex_peer(project, "review", "301:review", self.OTHER)
+            with patch.object(antiphon.subprocess, "run", side_effect=touched):
+                for payload, expected in (({"text": "x", "to": "ghost"}, "ghost"),
+                                          ({"text": "x"}, "address one by name"),
+                                          ({"text": "x", "to": 42}, "to")):
+                    code, err = self._reply(project, payload)
+                    self.assertEqual(code, 1, repr(payload))
+                    self.assertIn(expected, err)
+
+    def test_a_named_reply_to_a_waiting_peer_starts_no_process(self):
+        """`review` is live and between its start and its first turn. Saying so
+        is the answer; queueing to whoever is ready is not."""
+        touched = AssertionError("a waiting peer must start no process")
+        with tempfile.TemporaryDirectory() as project:
+            antiphon.peers.register(project, "codex", "review", None,
+                                    pid=os.getpid(), owner_key="301:review")
+            with patch.object(antiphon.subprocess, "run", side_effect=touched):
+                code, err = self._reply(project, {"text": "x", "to": "review"})
+        self.assertEqual(code, 1)
+        self.assertIn("not yet routable", err)
+        self.assertIn("review", err)
+
+    def test_a_successful_send_names_the_peer_it_reached(self):
+        with tempfile.TemporaryDirectory() as project:
+            antiphon.peers.register(project, "claude", "api", "/tmp/api.sock")
+            with patch.object(antiphon, "send_to_claude", return_value=(True, "")):
+                named = antiphon._send_tool(project, "hello", "api")
+                bare = antiphon._send_tool(project, "hello again")
+        self.assertIn("api", named["content"][0]["text"])
+        self.assertIn("channel", bare["content"][0]["text"])
+
+    # ---- the dedupe follows the recipient ----
+
+    def _pushed(self, project, target="claude"):
+        return antiphon.read_cursor(project,
+                                    antiphon.sender_side(target)).get(
+                                        f"last_pushed_{target}") or {}
+
+    def test_a_named_tool_delivery_is_not_repeated_by_the_stop_hook(self):
+        """The same text, sent mid-turn to `api` and then ending the turn as an
+        `@claude:api` line, is one message."""
+        with tempfile.TemporaryDirectory() as project:
+            antiphon.peers.register(project, "claude", "api", "/tmp/api.sock")
+            with patch.object(antiphon, "send_to_claude", return_value=(True, "")):
+                antiphon._send_tool(project, "run the tests", "api")
+            payload = {"cwd": project, "transcript_path": "/tmp/rollout"}
+            with patch.object(antiphon.os.path, "exists", return_value=True), \
+                 patch.object(antiphon, "last_codex_reply",
+                              return_value="@claude:api run the tests"), \
+                 patch.object(antiphon, "send_to_claude") as send, \
+                 patch.object(antiphon.sys, "stdin",
+                              io.StringIO(json.dumps(payload))), \
+                 contextlib.redirect_stderr(io.StringIO()):
+                self.assertEqual(antiphon.push("claude"), 0)
+                send.assert_not_called()
+
+    def test_a_named_reply_is_not_repeated_by_the_stop_hook(self):
+        """The Codex direction of the same rule, and the proof that the alias
+        really reaches `_record_delivery`: a record written under the wrong key
+        would let this through."""
+        queued = []
+        with tempfile.TemporaryDirectory() as project:
+            self._codex_peer(project, "build", "300:build", self.UUID)
+            self._codex_peer(project, "review", "301:review", self.OTHER)
+            with patch.object(antiphon, "_queue_codex",
+                              side_effect=lambda session, message:
+                                  queued.append(session) or (True, "")):
+                code, err = self._reply(project, {"text": "ship", "to": "review"})
+                self.assertEqual(code, 0, err)
+
+                payload = {"cwd": project, "transcript_path": "/tmp/transcript"}
+                with patch.object(antiphon.os.path, "exists", return_value=True), \
+                     patch.object(antiphon, "last_claude_reply",
+                                  return_value="@codex:review ship"), \
+                     patch.object(antiphon.sys, "stdin",
+                                  io.StringIO(json.dumps(payload))), \
+                     contextlib.redirect_stderr(io.StringIO()):
+                    self.assertEqual(antiphon.push("codex"), 0)
+            record = self._pushed(project, "codex")
+        self.assertEqual(queued, [self.OTHER], "the Stop hook must not send it again")
+        self.assertEqual(sorted(record), ["@review"],
+                         "and no other recipient's slot was touched")
+
+    def test_a_named_tool_delivery_does_not_erase_another_recipients_record(self):
+        """The old record was a single string, so a delivery to `api` replaced
+        what `ui` had already been sent — and `ui` got it a second time."""
+        with tempfile.TemporaryDirectory() as project:
+            antiphon.peers.register(project, "claude", "ui", "/tmp/ui.sock")
+            antiphon.peers.register(project, "claude", "api", "/tmp/api.sock")
+            with patch.object(antiphon, "send_to_claude", return_value=(True, "")):
+                antiphon._send_tool(project, "for ui", "ui")
+                antiphon._send_tool(project, "for api", "api")
+            record = self._pushed(project)
+        self.assertEqual(sorted(record), ["@api", "@ui"])
+        self.assertEqual(record["@ui"], antiphon.batch_fingerprint(["for ui"]))
+
+    def test_an_unaddressed_tool_delivery_keeps_its_own_slot(self):
+        with tempfile.TemporaryDirectory() as project:
+            antiphon.peers.register(project, "claude", "ui", "/tmp/ui.sock")
+            with patch.object(antiphon, "send_to_claude", return_value=(True, "")):
+                antiphon._send_tool(project, "bare", None)
+                antiphon._send_tool(project, "named", "ui")
+            record = self._pushed(project)
+        self.assertEqual(sorted(record), ["", "@ui"])
+        self.assertEqual(record[""], antiphon.batch_fingerprint(["bare"]))
+
+    def test_a_named_delivery_leaves_the_legacy_record_alone(self):
+        """The legacy value is the last *unaddressed* delivery. A turn that only
+        sends named lines has not superseded it, and dropping it there would
+        resend that message the next time somebody writes a bare line."""
+        with tempfile.TemporaryDirectory() as project:
+            antiphon.peers.register(project, "claude", "api", "/tmp/api.sock")
+            antiphon.write_cursor(project, {"last_pushed_claude": "old text"},
+                                  "codex")
+            with patch.object(antiphon, "send_to_claude", return_value=(True, "")):
+                antiphon._send_tool(project, "first", "api")
+            payload = {"cwd": project, "transcript_path": "/tmp/rollout"}
+            with patch.object(antiphon.os.path, "exists", return_value=True), \
+                 patch.object(antiphon, "last_codex_reply",
+                              return_value="@claude:api second"), \
+                 patch.object(antiphon, "send_to_claude",
+                              return_value=(True, "")), \
+                 patch.object(antiphon.sys, "stdin",
+                              io.StringIO(json.dumps(payload))), \
+                 contextlib.redirect_stderr(io.StringIO()):
+                self.assertEqual(antiphon.push("claude"), 0)
+            record = self._pushed(project)
+        self.assertIn(antiphon.LEGACY_SLOT, record,
+                      "a named turn supersedes nothing unaddressed")
+        _, already = antiphon.migrate_pushed(record, ["old text"])
+        self.assertTrue(already, "so the old delivery is still recognised")
+
+    def test_an_unaddressed_delivery_supersedes_the_legacy_record(self):
+        """Once the unaddressed slot holds a digest, the old value describes the
+        same thing worse. Keeping both would leave a record nothing clears."""
+        with tempfile.TemporaryDirectory() as project:
+            antiphon.peers.register(project, "claude", "ui", "/tmp/ui.sock")
+            antiphon.write_cursor(project, {"last_pushed_claude": "old text"},
+                                  "codex")
+            with patch.object(antiphon, "send_to_claude", return_value=(True, "")):
+                antiphon._send_tool(project, "new bare message")
+            record = self._pushed(project)
+        self.assertEqual(sorted(record), [""])
+        self.assertEqual(record[""],
+                         antiphon.batch_fingerprint(["new bare message"]))
+
+    # ---- what arrives from outside is not trusted to be shaped ----
+
+    def test_tool_arguments_that_are_not_an_object_do_not_crash_the_server(self):
+        """`params` and `arguments` come off the wire. `.get` on a list is an
+        AttributeError, and it would end the MCP server mid-session."""
+        out = io.StringIO()
+        requests = [{"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                     "params": {"name": "antiphon_send", "arguments": [1, 2]}},
+                    {"jsonrpc": "2.0", "id": 2, "method": "tools/call",
+                     "params": [1, 2]},
+                    [1, 2], "a string", 42, None,
+                    {"jsonrpc": "2.0", "id": 3, "method": "tools/list"}]
+        stdin = io.StringIO("".join(json.dumps(r) + "\n" for r in requests))
+        with tempfile.TemporaryDirectory() as project, \
+             patch.dict(os.environ, {}), \
+             patch.object(antiphon, "project_dir", return_value=project), \
+             patch.object(antiphon.sys, "stdin", stdin), \
+             contextlib.redirect_stdout(out):
+            os.environ.pop("ANTIPHON_NAME", None)
+            antiphon.mcp()
+        replies = [json.loads(line) for line in out.getvalue().splitlines()
+                   if line.strip()]
+        self.assertEqual([r["id"] for r in replies], [1, 2, 3],
+                         "the session survives both and keeps serving")
+        self.assertTrue(replies[0]["result"].get("isError"))
+
+    def test_a_named_turn_does_not_lose_a_cursor_from_before_this_format(self):
+        """No tool call anywhere: an upgraded install whose first new event is a
+        named Stop line. The old value is the only record of the last bare
+        message, and writing the named one over it would resend that message."""
+        with tempfile.TemporaryDirectory() as project:
+            antiphon.peers.register(project, "claude", "api", "/tmp/api.sock")
+            antiphon.write_cursor(project, {"last_pushed_claude": "old text"},
+                                  "codex")
+            payload = {"cwd": project, "transcript_path": "/tmp/rollout"}
+
+            def stop(reply, send):
+                with patch.object(antiphon.os.path, "exists", return_value=True), \
+                     patch.object(antiphon, "last_codex_reply", return_value=reply), \
+                     patch.object(antiphon, "send_to_claude", send), \
+                     patch.object(antiphon.sys, "stdin",
+                                  io.StringIO(json.dumps(payload))), \
+                     contextlib.redirect_stderr(io.StringIO()):
+                    self.assertEqual(antiphon.push("claude"), 0)
+
+            stop("@claude:api named only", lambda *a, **k: (True, ""))
+            must_not_send = Mock(side_effect=AssertionError(
+                "the old bare message must not be delivered a second time"))
+            stop("@claude old text", must_not_send)
+
+    def test_stdin_that_is_valid_json_but_not_an_object_does_not_raise(self):
+        """A hook or tool handed `[]` or `"x"` must fail as a bad request, not
+        as a traceback out of somebody's Stop hook."""
+        for body in ("[]", '"just a string"', "42", "null"):
+            with tempfile.TemporaryDirectory() as project, \
+                 patch.object(antiphon, "project_dir", return_value=project), \
+                 patch.object(antiphon, "read_cursor", return_value={}), \
+                 patch.object(antiphon, "write_cursor"), \
+                 patch.object(antiphon, "build_summary",
+                              return_value=("", None, 0)), \
+                 contextlib.redirect_stdout(io.StringIO()), \
+                 contextlib.redirect_stderr(io.StringIO()):
+                with patch.object(antiphon.sys, "stdin", io.StringIO(body)):
+                    self.assertEqual(antiphon.reply(), 1, body)
+                with patch.object(antiphon.sys, "stdin", io.StringIO(body)):
+                    self.assertEqual(antiphon.hook("claude"), 0, body)
+                with patch.object(antiphon.sys, "stdin", io.StringIO(body)):
+                    self.assertEqual(antiphon.push("claude"), 0, body)
+
+    def test_a_cursor_from_before_this_format_is_not_thrown_away(self):
+        """The old cursor held the joined text, and it is still what the Stop
+        hook compares against. Dropping it on the first tool call would resend
+        the last unaddressed message once — a duplicate nobody asked for."""
+        with tempfile.TemporaryDirectory() as project:
+            antiphon.peers.register(project, "claude", "api", "/tmp/api.sock")
+            antiphon.write_cursor(project, {"last_pushed_claude": "old text"},
+                                  "codex")
+            with patch.object(antiphon, "send_to_claude", return_value=(True, "")):
+                antiphon._send_tool(project, "new", "api")
+            record = self._pushed(project)
+            self.assertIn("@api", record)
+            kept, already = antiphon.migrate_pushed(record, ["old text"])
+            self.assertTrue(already, "the old delivery is still recognised")
+            self.assertNotIn(antiphon.LEGACY_SLOT, kept,
+                             "and it does not linger in the record it produces")
 
 
 if __name__ == "__main__":

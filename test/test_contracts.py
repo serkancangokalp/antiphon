@@ -21,6 +21,12 @@ import tempfile
 import unittest
 from unittest.mock import patch
 
+# The suite describes a project, not the terminal it happens to run in.
+# `ANTIPHON_NAME` moves cursors and sockets, so `ANTIPHON_NAME=ui npm test` —
+# a reasonable thing to run now — would otherwise exercise a different layout
+# than a bare run. Tests that want a name set one with `patch.dict`.
+os.environ.pop("ANTIPHON_NAME", None)
+
 ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 
 
@@ -147,6 +153,17 @@ class CrossBoundaryContractTest(unittest.TestCase):
             match = antiphon.SESSION_ID.search(name)
             self.assertIsNotNone(match, name)
             self.assertTrue(peers.valid_session_id(match.group(1)), name)
+
+    def test_both_tools_describe_their_recipient_argument_identically(self):
+        """`antiphon_send` and `reply_to_codex` take the same argument for the
+        same reason, one in Python and one in Node. Two descriptions that drift
+        apart is how an agent learns a rule that is not true on its side."""
+        node = read("lib", "channel.mjs")
+        collapsed = re.sub(r'"\s*\+\s*\n\s*"', "", node)
+        self.assertIn(antiphon.TO_DESCRIPTION, collapsed,
+                      "channel.mjs must carry the same sentence verbatim")
+        self.assertIn('required: ["text"]', node,
+                      "and must not make it required on its side alone")
 
     def test_both_sides_agree_on_the_channel_message_limit(self):
         """The sender refuses before transport and the server refuses on arrival.

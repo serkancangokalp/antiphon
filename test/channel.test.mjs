@@ -19,10 +19,16 @@ import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js"
 const projectDir = await mkdtemp(join(tmpdir(), "antiphon-test-"));
 const projectKey = createHash("sha256").update(projectDir).digest("hex").slice(0, 20);
 const socketPath = join(process.env.TMPDIR || "/tmp", `antiphon-channel-${projectKey}.sock`);
+// `projectKey` above is the unnamed seed, so this server has to start unnamed
+// too. Inheriting the host's `ANTIPHON_NAME` would move its socket somewhere
+// else and leave the test waiting on a path nobody serves — and running
+// `ANTIPHON_NAME=ui npm test` is a perfectly reasonable thing to do now.
+const mainEnv = { ...process.env, ANTIPHON_CWD: projectDir };
+delete mainEnv.ANTIPHON_NAME;
 const transport = new StdioClientTransport({
   command: "node",
   args: ["lib/channel.mjs"],
-  env: { ...process.env, ANTIPHON_CWD: projectDir },
+  env: mainEnv,
   stderr: "inherit",
 });
 const client = new Client({ name: "antiphon-test", version: "1.0.0" });
@@ -425,6 +431,26 @@ try {
 
   const tools = await client.listTools();
   assert.equal(tools.tools[0].name, "reply_to_codex");
+  const schema = tools.tools[0].inputSchema;
+  assert.equal(schema.properties.to.type, "string");
+  assert.deepEqual(schema.required, ["text"],
+    "one live peer needs no alias; requiring one would break every single-peer project");
+
+  // `to` has to survive the hop into the Python process. Only the resolver
+  // there can produce this sentence, so seeing the alias in the error proves
+  // the argument arrived rather than being dropped on the way.
+  await assert.rejects(
+    () => client.callTool({ name: "reply_to_codex",
+                            arguments: { text: "hi", to: "nobody-here" } }),
+    /nobody-here/,
+    "the alias must reach the Python resolver",
+  );
+  await assert.rejects(
+    () => client.callTool({ name: "reply_to_codex",
+                            arguments: { text: "hi", to: 42 } }),
+    /to must be a string/,
+    "a malformed argument is refused before the process is started",
+  );
 
   const ack = await sendToSocket({ content: "identity test", message_id: "m-test" });
   assert.deepEqual(ack, { ok: true, message_id: "m-test" });

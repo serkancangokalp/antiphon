@@ -121,12 +121,23 @@ def batch_fingerprint(messages):
         messages, ensure_ascii=False, separators=(",", ":")).encode()).hexdigest()
 
 
+# Where a pre-digest cursor value is parked when a record has to be written
+# beside it. `\0` cannot appear in a peer name, so it can never be mistaken for
+# a recipient slot — `""` is the unaddressed one and every other is `@alias`.
+LEGACY_SLOT = "\0legacy"
+
+
 def migrate_pushed(sent, unaddressed):
     """(record, already_delivered) for a cursor that may hold the old format.
 
     The old format stored the joined text rather than a digest, so comparing it
     against a digest is always unequal and would resend the last message once on
-    upgrade. It is compared in its own form instead.
+    upgrade. It is compared in its own form instead — either as the whole value,
+    or parked in `LEGACY_SLOT` beside a record that had to be written next to
+    it. It is only given up when something really supersedes it: a matching bare
+    batch here, or a new unaddressed delivery via `forget_superseded`. It cannot
+    be converted into a digest, because a batch of two lines and one line that
+    joins to the same string are different things.
 
     Any other shape — a list, a number, a hand-edited mistake — starts over as
     an empty record rather than raising. `dict()` on a list is a TypeError, and
@@ -134,10 +145,34 @@ def migrate_pushed(sent, unaddressed):
     place a malformed file should be able to reach.
     """
     if isinstance(sent, str):
-        return {}, bool(unaddressed) and sent == "\n".join(unaddressed)
+        if bool(unaddressed) and sent == "\n".join(unaddressed):
+            return {}, True           # the caller sets `""` in its place
+        # Not superseded: this turn may be named-only, or the bare batch may be
+        # a different message, or its delivery may fail. Parked rather than
+        # dropped, because it is the only record that the last bare message
+        # already went, and losing it sends that message a second time.
+        return {LEGACY_SLOT: sent}, False
     if isinstance(sent, dict):
-        return dict(sent), False
+        record = dict(sent)
+        legacy = record.get(LEGACY_SLOT)
+        already = (bool(unaddressed) and isinstance(legacy, str)
+                   and legacy == "\n".join(unaddressed))
+        if already:
+            record.pop(LEGACY_SLOT)   # the caller is about to set `""` instead
+        return record, already
     return {}, False
+
+
+def forget_superseded(record):
+    """Drops the legacy value once the unaddressed slot holds a digest.
+
+    Until then it is kept. It describes the last *unaddressed* delivery, so a
+    turn that sent only named lines has superseded nothing, and clearing it
+    there would resend that message the next time somebody writes a bare line.
+    """
+    if "" in record:
+        record.pop(LEGACY_SLOT, None)
+    return record
 
 
 def deliver_batches(batches, sent, deliver):
@@ -566,6 +601,10 @@ def hook(side="claude"):
         input_data = json.load(sys.stdin)
     except (json.JSONDecodeError, ValueError):
         input_data = {}
+    if not isinstance(input_data, dict):
+        # `[]` and `"x"` are valid JSON. `.get` on either raises, and out of a
+        # Stop hook that is a traceback in somebody's terminal.
+        input_data = {}
     cwd = os.path.abspath(input_data.get("cwd") or project_dir())
     event = input_data.get("hook_event_name") or "UserPromptSubmit"
 
@@ -676,6 +715,10 @@ def push(target="codex"):
         input_data = json.load(sys.stdin)
     except (json.JSONDecodeError, ValueError):
         input_data = {}
+    if not isinstance(input_data, dict):
+        # `[]` and `"x"` are valid JSON. `.get` on either raises, and out of a
+        # Stop hook that is a traceback in somebody's terminal.
+        input_data = {}
     if input_data.get("stop_hook_active"):
         return 0                          # don't re-enter a turn we triggered ourselves
     cwd = os.path.abspath(input_data.get("cwd") or project_dir())
@@ -725,7 +768,7 @@ def push(target="codex"):
             print(f"antiphon: delivery failed — {detail}", file=sys.stderr)
         return ok
 
-    updated = deliver_batches(batches, sent, deliver)
+    updated = forget_superseded(deliver_batches(batches, sent, deliver))
     # Written only when something actually moved: a delivery landed, or the old
     # string format was recognised and needs recording in the new one. A turn
     # that delivered nothing leaves the cursor file alone.
@@ -941,29 +984,55 @@ def reply(*_):
         input_data = json.load(sys.stdin)
     except (json.JSONDecodeError, ValueError):
         input_data = {}
+    if not isinstance(input_data, dict):
+        # `[]` and `"x"` are valid JSON. `.get` on either raises, and out of a
+        # Stop hook that is a traceback in somebody's terminal.
+        input_data = {}
     text = input_data.get("text")
     if not isinstance(text, str) or not text.strip():
         print("reply: empty text", file=sys.stderr)
         return 1
+    to = input_data.get("to")
+    if to is not None and not isinstance(to, str):
+        print("reply: to must be a string naming one live Codex peer",
+              file=sys.stderr)
+        return 1
     cwd = project_dir()
     text = text.strip()
-    ok, detail = send_to_codex(cwd, f"{CHANNEL_LABEL} {text}")
+    ok, detail = send_to_codex(cwd, f"{CHANNEL_LABEL} {text}", to)
     if not ok:
         print(f"reply: {detail}", file=sys.stderr)
         return 1
-    _record_delivery(cwd, "codex", text)
+    _record_delivery(cwd, "codex", text, to)
     return 0
 
 
-def _record_delivery(cwd, target, text):
-    """Remembers what was just delivered, under the key `push` dedupes on.
+def _record_delivery(cwd, target, text, alias=None):
+    """Remembers what was just delivered, in the shape `push` dedupes on.
 
     Without it a message sent mid-turn through a channel tool arrives twice:
     once from the tool, once more when the same text ends the turn as an
-    `@claude` / `@codex` line."""
+    `@claude` / `@codex` line.
+
+    Per recipient, in the same `""` / `"@alias"` scheme `deliver_batches` uses.
+    This used to write a bare string over the whole record, so a delivery to
+    `api` erased what `ui` had already been sent and `ui` received it again.
+
+    A record from before that scheme is carried forward rather than dropped.
+    It holds the joined text, not a digest, so it cannot be converted — a batch
+    of two lines and one line joining to the same string are different things —
+    and it is kept in its own form for `migrate_pushed` to compare. Dropping it
+    would resend the last unaddressed message once.
+    """
     side = sender_side(target)
     cursor = read_cursor(cwd, side)
-    cursor[f"last_pushed_{target}"] = text
+    key = f"last_pushed_{target}"
+    held = cursor.get(key)
+    sent = dict(held) if isinstance(held, dict) else {}
+    if isinstance(held, str):
+        sent[LEGACY_SLOT] = held
+    sent["" if alias is None else f"@{alias}"] = batch_fingerprint([text])
+    cursor[key] = forget_superseded(sent)
     write_cursor(cwd, cursor, side)
 
 
@@ -1018,6 +1087,13 @@ def _tool_error(message):
     return {"content": [{"type": "text", "text": message}], "isError": True}
 
 
+# The same sentence on both sides of the bridge. A contract test compares them,
+# because two tool descriptions saying different things about one argument is
+# how an agent learns a rule that is not true.
+TO_DESCRIPTION = ("Alias of the peer to send to. Optional while the target is "
+                  "unambiguous; when several peers are live it is required, and "
+                  "the send is refused rather than guessed.")
+
 TOOLS = [{
     "name": "antiphon_read",
     "description": ("Returns what happened on the Claude Code side since your last turn. "
@@ -1027,14 +1103,19 @@ TOOLS = [{
     "inputSchema": {"type": "object", "properties": {}},
 }, {
     "name": "antiphon_send",
-    "description": ("Sends a message to the Claude Code session working in this project, "
+    "description": ("Sends a message to a Claude Code peer working in this project, "
                     "without waiting for your turn to end. It arrives as your words, "
                     "attributed to you, and wakes Claude immediately — so you can hand "
                     "work over and carry on. It does not block: call `antiphon_read` "
-                    "later in the same turn to pick up whatever Claude did."),
+                    "later in the same turn to pick up whatever Claude did. Name the "
+                    "peer with `to` when more than one is live; with a single peer "
+                    "you can leave it out."),
     "inputSchema": {
         "type": "object",
-        "properties": {"text": {"type": "string", "description": "Message for Claude"}},
+        "properties": {
+            "text": {"type": "string", "description": "Message for Claude"},
+            "to": {"type": "string", "description": TO_DESCRIPTION},
+        },
         "required": ["text"],
     },
 }]
@@ -1046,19 +1127,33 @@ def _mcp_result(mid, result):
     sys.stdout.flush()
 
 
-def _send_tool(cwd, text):
-    """Delivers `text` to Claude's channel now, and reports honestly if it can't.
+def _send_tool(cwd, text, to=None):
+    """Delivers `text` to a Claude peer now, and reports honestly if it can't.
 
     A silent success would be the worst outcome: Codex would believe Claude had
-    been told, and neither side would notice the message never arrived."""
+    been told, and neither side would notice the message never arrived. So
+    every way this can fail — an alias that is not a name, one nobody answers
+    to, one that is live but not routable yet, or no alias where two peers are
+    live — comes back as a tool error before any transport is opened.
+
+    `to` is passed to the resolver exactly as given: an alias matches one peer
+    or none.
+    """
     if not isinstance(text, str) or not text.strip():
         return _tool_error("text must be a non-empty string")
+    if to is not None and not isinstance(to, str):
+        return _tool_error("to must be a string naming one live Claude peer")
     text = text.strip()
-    ok, detail = send_to_claude(cwd, text)
+    ok, detail = send_to_claude(cwd, text, to)
     if not ok:
         return _tool_error(f"Not delivered to Claude: {detail}")
-    _record_delivery(cwd, "claude", text)
-    return {"content": [{"type": "text", "text": "Delivered to the Claude Code channel."}]}
+    _record_delivery(cwd, "claude", text, to)
+    # Naming the peer back is what lets the sender notice it addressed the wrong
+    # one. With a single peer there is nothing to distinguish, so the old
+    # wording stands.
+    where = f"peer {to!r}" if to else "channel"
+    return {"content": [{"type": "text",
+                         "text": f"Delivered to the Claude Code {where}."}]}
 
 
 def register_codex_peer(cwd):
@@ -1166,6 +1261,10 @@ def _mcp_serve(cwd):
             request = json.loads(line)
         except json.JSONDecodeError:
             continue
+        if not isinstance(request, dict):
+            # Valid JSON, and not a request. Skipping it costs this line; a
+            # traceback would cost the session and every tool with it.
+            continue
         method, mid = request.get("method"), request.get("id")
         if method == "initialize":
             _mcp_result(mid, {
@@ -1176,7 +1275,11 @@ def _mcp_serve(cwd):
         elif method == "tools/list":
             _mcp_result(mid, {"tools": TOOLS})
         elif method == "tools/call":
-            p = request.get("params") or {}
+            # `params` and `arguments` come off the wire, so neither is trusted
+            # to be an object. `.get` on a list raises, and it would end the
+            # session rather than the request.
+            p = request.get("params")
+            p = p if isinstance(p, dict) else {}
             name = p.get("name")
             if name == "antiphon_read":
                 cursor = read_cursor(cwd, "codex")
@@ -1188,7 +1291,10 @@ def _mcp_serve(cwd):
                 output = text or "Nothing new on the Claude Code side since your last turn."
                 _mcp_result(mid, {"content": [{"type": "text", "text": output}]})
             elif name == "antiphon_send":
-                _mcp_result(mid, _send_tool(cwd, (p.get("arguments") or {}).get("text")))
+                arguments = p.get("arguments")
+                arguments = arguments if isinstance(arguments, dict) else {}
+                _mcp_result(mid, _send_tool(cwd, arguments.get("text"),
+                                            arguments.get("to")))
             else:
                 _mcp_result(mid, _tool_error(f"unknown tool: {name}"))
         elif mid is not None:
@@ -1213,8 +1319,9 @@ AGENTS_RULE = ("\n## The Antiphon bridge\n\n"
                "hook) or `[Antiphon channel] Claude:` (a direct reply through the channel) — "
                "either way, these are Claude's words, not the user's. When you want to hand "
                "Claude a task directly, put `@claude` at the start of a line in your reply; "
-               "only that line is sent to the running Claude session as an MCP Channel "
-               "event. To reach Claude without ending your turn, call the `antiphon_send` "
+               "only that line is sent to the Claude session as an MCP Channel "
+               "event. Write `@claude:name` when several Claude peers are live — "
+               "an unaddressed line is refused rather than sent to one of them. To reach Claude without ending your turn, call the `antiphon_send` "
                "tool instead: it delivers immediately, so Claude can start working while "
                "you carry on, and `antiphon_read` picks up the answer later in the same "
                "turn.\n")

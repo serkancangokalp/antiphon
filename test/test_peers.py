@@ -11,6 +11,12 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
 
+# The suite describes a project, not the terminal it happens to run in.
+# `ANTIPHON_NAME` moves cursors and sockets, so `ANTIPHON_NAME=ui npm test` —
+# a reasonable thing to run now — would otherwise exercise a different layout
+# than a bare run. Tests that want a name set one with `patch.dict`.
+os.environ.pop("ANTIPHON_NAME", None)
+
 
 class PeerNameTest(unittest.TestCase):
     def test_explicit_name_is_read_from_the_environment_and_lowercased(self):
