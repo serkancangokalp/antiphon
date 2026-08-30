@@ -2875,5 +2875,178 @@ class ClaimedAliasTest(unittest.TestCase):
         self.assertEqual(peer["pid"], os.getpid())
 
 
+class StatusTest(unittest.TestCase):
+    """What `status` tells a person who is deciding who to address.
+
+    It answers one question — who is here and can I reach them — so it says
+    that and nothing that only looks like an answer. A socket path and a
+    rollout UUID are transport detail: they help nobody choose a recipient,
+    and they go on screen and into whatever the reader pastes afterwards.
+    """
+
+    UUID = "1d5a03e0-0548-4339-87c3-45c5dbf7e9d7"
+
+    def _status(self, project, summary=("", None, 0), **patches):
+        out = io.StringIO()
+        with patch.object(antiphon, "project_dir", return_value=project), \
+             patch.object(antiphon, "build_summary", return_value=summary), \
+             contextlib.redirect_stdout(out):
+            for name, value in patches.items():
+                pass
+            code = antiphon.status()
+        return code, out.getvalue()
+
+    @staticmethod
+    def _codex_peer(project, alias, owner, session=None):
+        antiphon.peers.register(project, "codex", alias, None,
+                                pid=os.getpid(), owner_key=owner)
+        if session:
+            antiphon.peers.write_session(project, "codex", alias, session,
+                                         f"/t/{alias}.jsonl", owner)
+
+    def test_status_names_peers_and_their_state_in_words(self):
+        with tempfile.TemporaryDirectory() as project:
+            antiphon.peers.register(project, "claude", "ui", "/tmp/ui.sock",
+                                    pid=os.getpid())
+            self._codex_peer(project, "build", "300:build")
+            _, text = self._status(project)
+        self.assertIn("Peers:", text)
+        self.assertIn("Claude ui — ready", text)
+        self.assertIn("Codex build — waiting for first turn", text)
+
+    def test_status_never_prints_an_address_a_path_or_a_session_id(self):
+        """None of it helps choose a recipient, and all of it leaks."""
+        with tempfile.TemporaryDirectory() as project:
+            antiphon.peers.register(project, "claude", "ui",
+                                    "/tmp/antiphon-secret-ui.sock",
+                                    pid=os.getpid())
+            self._codex_peer(project, "build", "300:build", self.UUID)
+            with patch.object(antiphon, "claude_transcripts",
+                              return_value=["/home/me/.claude/projects/x/"
+                                            "a1b2c3d4-dead-beef-cafe-0123456789ab.jsonl"]), \
+                 patch.object(antiphon, "codex_rollout_files",
+                              return_value=[f"/home/me/.codex/sessions/"
+                                            f"rollout-2026-08-30T00-00-00-{self.UUID}.jsonl"]):
+                _, text = self._status(project)
+        for secret in ("antiphon-secret-ui.sock", ".sock", self.UUID,
+                       "a1b2c3d4-dead-beef-cafe-0123456789ab", ".jsonl",
+                       antiphon.claude_socket_path(project)):
+            self.assertNotIn(secret, text, secret)
+        self.assertIn("1 files", text, "the counts are still there")
+
+    def test_status_lists_peers_in_a_stable_order(self):
+        """Read twice, the same twice. `read_peers` orders by start time, which
+        reshuffles the list every time a session restarts."""
+        with tempfile.TemporaryDirectory() as project:
+            for alias in ("zeta", "alpha", "mid"):
+                antiphon.peers.register(project, "claude", alias,
+                                        f"/tmp/{alias}.sock", pid=os.getpid())
+            _, first = self._status(project)
+            _, second = self._status(project)
+        names = [line.strip() for line in first.splitlines()
+                 if line.startswith("  Claude ")]
+        self.assertEqual(names, ["Claude alpha — ready", "Claude mid — ready",
+                                 "Claude zeta — ready"])
+        self.assertEqual(first, second)
+
+    def test_status_omits_the_peer_list_when_nothing_is_registered(self):
+        with tempfile.TemporaryDirectory() as project:
+            _, text = self._status(project)
+        self.assertNotIn("Peers:", text)
+
+    def test_status_drops_a_peer_whose_process_is_gone(self):
+        with tempfile.TemporaryDirectory() as project:
+            antiphon.peers.register(project, "claude", "ui", "/tmp/ui.sock",
+                                    pid=999999)
+            with patch.object(antiphon.peers, "alive", return_value=False):
+                _, text = self._status(project)
+        self.assertNotIn("Peers:", text)
+        self.assertNotIn("ui", text)
+
+    # ---- the channel line ----
+
+    def test_a_registered_claude_peer_is_never_reported_as_down(self):
+        """A named session serves its own socket, not the project-wide one.
+        Probing the legacy path would call a working channel dead."""
+        with tempfile.TemporaryDirectory() as project:
+            antiphon.peers.register(project, "claude", "ui", "/tmp/ui.sock",
+                                    pid=os.getpid())
+            with patch.object(antiphon.os.path, "exists", return_value=False):
+                _, text = self._status(project)
+        self.assertIn("Claude channel:     live", text)
+
+    def test_with_nothing_registered_the_legacy_socket_still_decides(self):
+        with tempfile.TemporaryDirectory() as project:
+            with patch.object(antiphon.os.path, "exists", return_value=True):
+                _, live = self._status(project)
+            with patch.object(antiphon.os.path, "exists", return_value=False):
+                _, down = self._status(project)
+        self.assertIn("Claude channel:     live", live)
+        self.assertIn("Claude channel:     down", down)
+
+    # ---- how to address, and when that even comes up ----
+
+    def test_one_claude_peer_raises_no_question_of_addressing(self):
+        with tempfile.TemporaryDirectory() as project:
+            antiphon.peers.register(project, "claude", "ui", "/tmp/ui.sock",
+                                    pid=os.getpid())
+            _, text = self._status(project)
+        self.assertNotIn("@claude:", text)
+
+    def test_several_claude_peers_say_how_to_address_one(self):
+        with tempfile.TemporaryDirectory() as project:
+            antiphon.peers.register(project, "claude", "ui", "/tmp/ui.sock",
+                                    pid=os.getpid())
+            antiphon.peers.register(project, "claude", "api", "/tmp/api.sock",
+                                    pid=os.getppid())
+            _, text = self._status(project)
+        self.assertIn("@claude:ui", text)
+        self.assertIn("@claude:api", text)
+
+    def test_an_unnamed_claude_peer_is_shown_as_unaddressable(self):
+        """It is live and it is listed, but there is no name to send to. Saying
+        so — with what to do about it — is the only useful thing here."""
+        with tempfile.TemporaryDirectory() as project:
+            antiphon.peers.register(project, "claude", "ui", "/tmp/ui.sock",
+                                    pid=os.getpid())
+            antiphon.peers.register(project, "claude", antiphon.peers.UNNAMED,
+                                    "/tmp/bare.sock", pid=os.getppid())
+            _, text = self._status(project)
+        self.assertIn(f"Claude {antiphon.peers.UNNAMED} — ready", text)
+        self.assertIn("cannot be addressed", text)
+        self.assertIn("ANTIPHON_NAME", text)
+        self.assertNotIn(f"@claude:{antiphon.peers.UNNAMED}", text)
+
+    def test_even_one_named_codex_peer_says_a_bare_line_is_refused(self):
+        """One record cannot rule out the unnamed sessions that leave none."""
+        with tempfile.TemporaryDirectory() as project:
+            self._codex_peer(project, "build", "300:build", self.UUID)
+            _, text = self._status(project)
+        self.assertIn("@codex:build", text)
+
+    def test_readiness_never_narrows_the_choice(self):
+        """A peer waiting for its first turn is still a candidate. Letting
+        readiness decide would hand routing to whichever started first."""
+        with tempfile.TemporaryDirectory() as project:
+            antiphon.peers.register(project, "claude", "ui", "/tmp/ui.sock",
+                                    pid=os.getpid())
+            antiphon.peers.register(project, "claude", "api", "/tmp/api.sock",
+                                    pid=os.getppid())
+            self._codex_peer(project, "build", "300:build", self.UUID)
+            self._codex_peer(project, "review", "301:review")   # not ready
+            _, text = self._status(project)
+        self.assertIn("@claude:api", text)
+        self.assertIn("@codex:build", text)
+        self.assertIn("@codex:review", text)
+
+    def test_status_still_returns_zero_and_still_previews_both_sides(self):
+        with tempfile.TemporaryDirectory() as project:
+            code, text = self._status(project, summary=("some news", 5.0, 2))
+        self.assertEqual(code, 0)
+        self.assertIn("=== what claude would see ===", text)
+        self.assertIn("=== what codex would see ===", text)
+        self.assertIn("some news", text)
+
+
 if __name__ == "__main__":
     unittest.main()

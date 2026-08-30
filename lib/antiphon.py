@@ -1848,15 +1848,73 @@ def setup():
 
 # ---------- status, for humans ----------
 
+def _peer_report(cwd):
+    """The `Peers:` block and the addressing hints under it, as lines.
+
+    Empty when nothing is registered, which is the unnamed single pair: there
+    is nobody to choose between, so there is nothing to say.
+
+    Sorted by side and then name. `read_peers` orders by start time, which is
+    right for resolution and wrong here — a list that reshuffles whenever a
+    session restarts is a list nobody can read twice.
+    """
+    live = {kind: sorted(peers.read_peers(cwd, kind),
+                         key=lambda peer: peer.get("name") or "")
+            for kind in ("claude", "codex")}
+    if not (live["claude"] or live["codex"]):
+        return []
+
+    lines = ["", "Peers:"]
+    for kind in ("claude", "codex"):
+        for peer in live[kind]:
+            # In words, and never the address itself. Whoever is reading this is
+            # deciding who to address; a socket path or a rollout id answers
+            # none of that, and puts both on screen and into whatever they
+            # paste next.
+            state = ("ready" if peer.get("address") is not None
+                     else "waiting for first turn")
+            lines.append(f"  {kind.title()} {peer.get('name')} — {state}")
+
+    def addressable(kind):
+        return [p.get("name") for p in live[kind]
+                if peers.valid_name(p.get("name"))]
+
+    # Readiness never narrows either list. A peer between its start and its
+    # first turn is as much a candidate as one that happens to be routable
+    # already, and letting readiness decide would hand routing to whichever
+    # started first.
+    if len(live["claude"]) > 1:
+        named = ", ".join(f"@claude:{name}" for name in addressable("claude"))
+        lines.append(f"  → a bare @claude line is refused; address one: {named}")
+        if any(p.get("name") == peers.UNNAMED for p in live["claude"]):
+            lines.append("  → one Claude peer has no name and cannot be "
+                         "addressed; restart it with ANTIPHON_NAME set to "
+                         "reach it while others are live")
+    if live["codex"]:
+        # Even one. A Codex session registers only when it was given a name, so
+        # a single record cannot rule out the unnamed ones that leave none.
+        named = ", ".join(f"@codex:{name}" for name in addressable("codex"))
+        lines.append(f"  → a bare @codex line is refused, because unnamed Codex "
+                     f"sessions leave no record; address one: {named}")
+    return lines
+
+
 def status():
     cwd = project_dir()
     print(f"project: {cwd}\n")
     c = claude_transcripts(cwd)
     x = codex_rollout_files(cwd)
-    print(f"Claude transcripts: {len(c)} files" + (f" (newest: {os.path.basename(c[0])})" if c else " — none"))
-    print(f"Codex rollouts:     {len(x)} files" + (f" (newest: {os.path.basename(x[0])})" if x else " — none"))
-    socket_path = claude_socket_path(cwd)
-    print(f"Claude channel:     {'live' if os.path.exists(socket_path) else 'down'} ({socket_path})")
+    print(f"Claude transcripts: {len(c)} files" + ("" if c else " — none"))
+    print(f"Codex rollouts:     {len(x)} files" + ("" if x else " — none"))
+    # Derived from the registry when anything is registered: a named session
+    # serves its own socket, so probing the project-wide path would report a
+    # working channel as down. The path itself is never printed either way.
+    registered = peers.read_peers(cwd, "claude")
+    channel = ("live" if registered
+               else "live" if os.path.exists(claude_socket_path(cwd)) else "down")
+    print(f"Claude channel:     {channel}")
+    for line in _peer_report(cwd):
+        print(line)
     cursor = read_cursor(cwd, "claude")
     for k, v in (cursor or {}).items():
         if k.endswith("_seen") and isinstance(v, (int, float)):
