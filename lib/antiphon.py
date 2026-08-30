@@ -582,16 +582,18 @@ def update_cursor(cwd, kind, mutate):
     write. Returns whether the write succeeded, or False if the lock could not
     be taken — in which case nothing was read, changed or written.
 
-    A `mutate` that changes nothing writes nothing. Two reads under one hold
-    cost less than a rewrite of the whole file on every turn end, and leaving
-    the bytes alone keeps `write_cursor`'s failure paths out of the ordinary
-    case where there was nothing to record.
+    A `mutate` that changes nothing writes nothing. It is handed a copy that
+    nothing else holds, so it may edit in place; the value read from disk is
+    kept intact to compare against. Two reads would have been cheaper and
+    wrong: a caller cannot see whether `read_cursor` returns a fresh object,
+    and under a test double that returns the same one, an in-place edit makes
+    every write look unnecessary.
     """
     with cursor_lock(cwd, kind) as locked:
         if not locked:
             return False
         before = read_cursor(cwd, kind)
-        updated = mutate(read_cursor(cwd, kind))
+        updated = mutate(json.loads(json.dumps(before)))
         if updated == before:
             return True
         return write_cursor(cwd, updated, kind)

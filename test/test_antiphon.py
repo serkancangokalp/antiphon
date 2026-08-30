@@ -207,7 +207,7 @@ class AntiphonTest(unittest.TestCase):
             input_data = {"cwd": project, "transcript_path": "/tmp/rollout"}
             with patch.object(antiphon.os.path, "exists", return_value=True), \
                  patch.object(antiphon, "last_codex_reply", return_value="@claude test"), \
-                 patch.object(antiphon, "read_cursor", side_effect=lambda *a, **k: {}), \
+                 patch.object(antiphon, "read_cursor", return_value={}), \
                  patch.object(antiphon, "write_cursor",
                               side_effect=lambda cwd, data, kind: written.append(dict(data))), \
                  patch.object(antiphon, "send_to_claude",
@@ -248,7 +248,7 @@ class AntiphonTest(unittest.TestCase):
             with patch.object(antiphon.os.path, "exists", return_value=True), \
                  patch.object(antiphon, "last_codex_reply", return_value="@claude same"), \
                  patch.object(antiphon, "read_cursor",
-                              side_effect=lambda *a, **k: {"last_pushed_claude": "same"}), \
+                              return_value={"last_pushed_claude": "same"}), \
                  patch.object(antiphon, "write_cursor",
                               side_effect=lambda cwd, data, kind: written.append(dict(data))), \
                  patch.object(antiphon, "send_to_claude") as send, \
@@ -454,7 +454,7 @@ class AntiphonTest(unittest.TestCase):
         written = []
         with tempfile.TemporaryDirectory() as project, \
              patch.object(antiphon, "send_to_claude", return_value=(True, "")), \
-             patch.object(antiphon, "read_cursor", side_effect=lambda *a, **k: {}), \
+             patch.object(antiphon, "read_cursor", return_value={}), \
              patch.object(antiphon, "write_cursor",
                           side_effect=lambda cwd, data, kind: written.append(dict(data))):
             self._run_mcp(project, self._call("antiphon_send", text="run the tests"))
@@ -492,7 +492,7 @@ class AntiphonTest(unittest.TestCase):
              patch.object(antiphon, "project_dir", return_value=project), \
              patch.object(antiphon, "codex_session_id", return_value="sess"), \
              patch.object(antiphon, "send_to_codex", return_value=(True, "")), \
-             patch.object(antiphon, "read_cursor", side_effect=lambda *a, **k: {}), \
+             patch.object(antiphon, "read_cursor", return_value={}), \
              patch.object(antiphon, "write_cursor",
                           side_effect=lambda cwd, data, kind: written.append(dict(data))), \
              patch.object(antiphon.sys, "stdin", io.StringIO(json.dumps({"text": "hello"}))):
@@ -2914,7 +2914,7 @@ class RoutingTest(unittest.TestCase):
             with patch.object(antiphon.os.path, "exists", return_value=True), \
                  patch.object(antiphon, "last_codex_reply",
                               return_value="@claude:ui landed\n@claude:gone lost"), \
-                 patch.object(antiphon, "read_cursor", side_effect=lambda *a, **k: {}), \
+                 patch.object(antiphon, "read_cursor", return_value={}), \
                  patch.object(antiphon, "write_cursor",
                               side_effect=lambda cwd, data, kind:
                                   written.append(dict(data))), \
