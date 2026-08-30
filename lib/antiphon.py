@@ -1848,19 +1848,40 @@ def setup():
 
 # ---------- status, for humans ----------
 
-def _peer_report(cwd):
+def _file_count(number):
+    """`none`, `1 file`, `2 files` — the way a person would write it."""
+    if not number:
+        return "none"
+    return f"{number} file" if number == 1 else f"{number} files"
+
+
+def _live_by_kind(cwd):
+    """One reading of the registry, grouped by side and sorted by name.
+
+    One reading, because everything on screen has to describe the same moment.
+    Read separately, a session that starts or stops between two reads makes the
+    halves contradict each other — a live channel above an empty peer list, or
+    a peer listed under a channel reported down. It also scans and prunes once
+    instead of three times for one screen.
+
+    Sorted by name rather than left in `read_peers` order. That order is by
+    start time, which is right for resolution and wrong for a list a person
+    reads: one that reshuffles whenever a session restarts cannot be read
+    twice.
+    """
+    grouped = {"claude": [], "codex": []}
+    for peer in peers.read_peers(cwd):
+        grouped.setdefault(peer.get("kind"), []).append(peer)
+    return {kind: sorted(found, key=lambda peer: peer.get("name") or "")
+            for kind, found in grouped.items()}
+
+
+def _peer_report(live):
     """The `Peers:` block and the addressing hints under it, as lines.
 
     Empty when nothing is registered, which is the unnamed single pair: there
     is nobody to choose between, so there is nothing to say.
-
-    Sorted by side and then name. `read_peers` orders by start time, which is
-    right for resolution and wrong here — a list that reshuffles whenever a
-    session restarts is a list nobody can read twice.
     """
-    live = {kind: sorted(peers.read_peers(cwd, kind),
-                         key=lambda peer: peer.get("name") or "")
-            for kind in ("claude", "codex")}
     if not (live["claude"] or live["codex"]):
         return []
 
@@ -1904,16 +1925,17 @@ def status():
     print(f"project: {cwd}\n")
     c = claude_transcripts(cwd)
     x = codex_rollout_files(cwd)
-    print(f"Claude transcripts: {len(c)} files" + ("" if c else " — none"))
-    print(f"Codex rollouts:     {len(x)} files" + ("" if x else " — none"))
-    # Derived from the registry when anything is registered: a named session
-    # serves its own socket, so probing the project-wide path would report a
-    # working channel as down. The path itself is never printed either way.
-    registered = peers.read_peers(cwd, "claude")
-    channel = ("live" if registered
+    print(f"Claude transcripts: {_file_count(len(c))}")
+    print(f"Codex rollouts:     {_file_count(len(x))}")
+    # One snapshot for the channel line and the peer list both. Derived from the
+    # registry when anything is registered: a named session serves its own
+    # socket, so probing the project-wide path would report a working channel as
+    # down. The path itself is never printed either way.
+    live = _live_by_kind(cwd)
+    channel = ("live" if live["claude"]
                else "live" if os.path.exists(claude_socket_path(cwd)) else "down")
     print(f"Claude channel:     {channel}")
-    for line in _peer_report(cwd):
+    for line in _peer_report(live):
         print(line)
     cursor = read_cursor(cwd, "claude")
     for k, v in (cursor or {}).items():

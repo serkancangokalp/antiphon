@@ -2886,13 +2886,11 @@ class StatusTest(unittest.TestCase):
 
     UUID = "1d5a03e0-0548-4339-87c3-45c5dbf7e9d7"
 
-    def _status(self, project, summary=("", None, 0), **patches):
+    def _status(self, project, summary=("", None, 0)):
         out = io.StringIO()
         with patch.object(antiphon, "project_dir", return_value=project), \
              patch.object(antiphon, "build_summary", return_value=summary), \
              contextlib.redirect_stdout(out):
-            for name, value in patches.items():
-                pass
             code = antiphon.status()
         return code, out.getvalue()
 
@@ -2932,7 +2930,46 @@ class StatusTest(unittest.TestCase):
                        "a1b2c3d4-dead-beef-cafe-0123456789ab", ".jsonl",
                        antiphon.claude_socket_path(project)):
             self.assertNotIn(secret, text, secret)
-        self.assertIn("1 files", text, "the counts are still there")
+        self.assertIn("1 file", text, "the counts are still there")
+        self.assertNotIn("1 files", text, "and one of something is not plural")
+
+    def test_the_counts_are_written_the_way_a_person_writes_them(self):
+        with tempfile.TemporaryDirectory() as project:
+            with patch.object(antiphon, "claude_transcripts", return_value=["a"]), \
+                 patch.object(antiphon, "codex_rollout_files",
+                              return_value=["a", "b"]):
+                _, text = self._status(project)
+            self.assertIn("Claude transcripts: 1 file", text)
+            self.assertIn("Codex rollouts:     2 files", text)
+            with patch.object(antiphon, "claude_transcripts", return_value=[]), \
+                 patch.object(antiphon, "codex_rollout_files", return_value=[]):
+                _, empty = self._status(project)
+        self.assertIn("Claude transcripts: none", empty)
+        self.assertNotIn("0 file", empty)
+
+    def test_status_reads_the_registry_once(self):
+        """Three reads mean three scans and three prunes for one screen."""
+        with tempfile.TemporaryDirectory() as project:
+            antiphon.peers.register(project, "claude", "ui", "/tmp/ui.sock",
+                                    pid=os.getpid())
+            with patch.object(antiphon.peers, "read_peers",
+                              wraps=antiphon.peers.read_peers) as read:
+                self._status(project)
+        self.assertEqual(read.call_count, 1)
+
+    def test_a_peer_that_leaves_mid_report_cannot_split_the_output(self):
+        """Read twice, a session that stops in between makes the two halves
+        contradict each other: a live channel above an empty peer list, or a
+        peer listed under a channel reported down. One snapshot, one story."""
+        peer = {"kind": "claude", "name": "ui", "pid": os.getpid(),
+                "address": "/tmp/ui.sock", "started_at": 1.0}
+        with tempfile.TemporaryDirectory() as project, \
+             patch.object(antiphon.peers, "read_peers",
+                          side_effect=[[peer], [], [], []]):
+            _, text = self._status(project)
+        self.assertIn("Claude channel:     live", text)
+        self.assertIn("Claude ui — ready", text,
+                      "the channel and the list must describe one moment")
 
     def test_status_lists_peers_in_a_stable_order(self):
         """Read twice, the same twice. `read_peers` orders by start time, which
