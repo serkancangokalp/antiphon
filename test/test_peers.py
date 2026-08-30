@@ -1074,10 +1074,52 @@ class UnnamedKeyTest(unittest.TestCase):
         and what `@claude:` may carry; the key is only what a directory may be
         called. Nothing a user can write reaches the second."""
         self.assertFalse(peers.valid_name(peers.UNNAMED))
-        self.assertTrue(peers.valid_key(peers.UNNAMED))
+        self.assertTrue(peers.valid_key("claude", peers.UNNAMED))
         for name in ("ui", "my-build", "claude-abc"):
             self.assertTrue(peers.valid_name(name), name)
-            self.assertTrue(peers.valid_key(name), name)
+            self.assertTrue(peers.valid_key("claude", name), name)
+            self.assertTrue(peers.valid_key("codex", name), name)
+
+    def test_the_reserved_key_belongs_to_the_Claude_side_only(self):
+        """It is how an unnamed Claude *endpoint* is represented, and that is
+        all it is. An unnamed Codex session deliberately has no record at all:
+        it never registers, which is precisely why one visible Codex peer
+        cannot be shown to be the only one. A record under this key on that
+        side would be a live peer nobody could ever name."""
+        self.assertFalse(peers.valid_key("codex", peers.UNNAMED))
+        self.assertTrue(peers.valid_key("claude", peers.UNNAMED))
+
+    def test_a_codex_peer_may_not_take_the_reserved_key(self):
+        with tempfile.TemporaryDirectory() as project:
+            for address in (None, "rollout-a"):
+                ok, detail = peers.register(project, "codex", peers.UNNAMED,
+                                            address, pid=os.getpid(),
+                                            owner_key="300:x")
+                self.assertFalse(ok, repr(address))
+                self.assertIn("name", detail)
+            self.assertEqual(peers.read_peers(project), [])
+
+    def test_a_hand_written_codex_record_under_the_key_is_ignored(self):
+        """`_scan` checks the directory it found the record in, so a record
+        placed there by hand is not read into a peer either."""
+        with tempfile.TemporaryDirectory() as project:
+            directory = peers.peer_dir(project, "codex", peers.UNNAMED)
+            os.makedirs(directory)
+            with open(os.path.join(directory, "endpoint.json"), "w",
+                      encoding="utf-8") as f:
+                json.dump({"kind": "codex", "name": peers.UNNAMED,
+                           "pid": os.getpid(), "address": "rollout-a"}, f)
+            self.assertEqual(peers.read_peers(project), [])
+
+    def test_a_codex_session_record_under_the_key_is_refused(self):
+        with tempfile.TemporaryDirectory() as project:
+            ok, detail = peers.write_session(project, "codex", peers.UNNAMED,
+                                             "1d5a03e0-0548-4339-87c3-45c5dbf7e9d7",
+                                             "/t/r.jsonl", "300:x")
+            self.assertFalse(ok)
+            self.assertIn("codex", detail)
+            self.assertIsNone(peers.read_session(project, "codex", peers.UNNAMED))
+            self.assertFalse(os.path.exists(peers.peers_dir(project)))
 
     def test_no_alias_a_user_could_choose_can_collide_with_it(self):
         """The check is exact, never a prefix or a shape. `claude-abc` is a name
@@ -1125,7 +1167,7 @@ class UnnamedKeyTest(unittest.TestCase):
             self.assertNotEqual(hostile, peers.UNNAMED)
             if hostile == "unnamed":
                 continue              # a legal alias, and a different peer
-            self.assertFalse(peers.valid_key(hostile), hostile)
+            self.assertFalse(peers.valid_key("claude", hostile), hostile)
 
 
 if __name__ == "__main__":

@@ -75,14 +75,22 @@ def valid_name(name):
     return isinstance(name, str) and bool(NAME_PATTERN.fullmatch(name))
 
 
-def valid_key(name):
-    """Whether `name` may be a peer's place in the registry.
+def valid_key(kind, name):
+    """Whether `name` may be this kind of peer's place in the registry.
 
-    Every public alias may, and so may the one reserved key that no alias can
-    be. Directory names and record fields are checked with this; addressing is
-    checked with `valid_name`, which is the narrower of the two.
+    Every public alias may, on either side. The reserved key may only on the
+    Claude side, because that is the only thing it represents: an unnamed
+    channel server, which registers because it serves a socket somebody has to
+    be able to find. An unnamed Codex session deliberately has no record at all
+    — that is exactly why one visible Codex peer cannot be shown to be the only
+    one running — so a record under this key there would be a live peer nobody
+    could ever name, and it would make every bare message ambiguous while being
+    unreachable itself.
+
+    Directory names and record fields are checked with this; addressing is
+    checked with `valid_name`, which is narrower still.
     """
-    return name == UNNAMED or valid_name(name)
+    return valid_name(name) or (kind == "claude" and name == UNNAMED)
 
 
 def valid_kind(kind):
@@ -232,7 +240,7 @@ def _session_address(cwd, peer):
     comes off disk, and `../..` would read a record from outside the project.
     """
     kind, name = peer.get("kind"), peer.get("name")
-    if not (valid_kind(kind) and valid_key(name)):
+    if not (valid_kind(kind) and valid_key(kind, name)):
         return None
     owner = _owner_of(peer)
     session = _read_record(_session_file(cwd, kind, name))
@@ -287,7 +295,7 @@ def _prune(cwd, kind, name, dead_pid):
     record would leave a live peer invisible. The directory stays, so a peer
     returning under the same name finds its cursor where it left it.
     """
-    if not (valid_kind(kind) and valid_key(name)):
+    if not (valid_kind(kind) and valid_key(kind, name)):
         return
     with _registry_lock(cwd):
         held = _read_record(_peer_file(cwd, kind, name))
@@ -325,7 +333,7 @@ def _scan(cwd):
     records = []
     for entry in entries:
         kind, _, name = entry.partition("-")
-        if not (valid_kind(kind) and valid_key(name)):
+        if not (valid_kind(kind) and valid_key(kind, name)):
             continue
         record = _read_record(os.path.join(peers_dir(cwd), entry, "endpoint.json"))
         if record is None:
@@ -405,8 +413,8 @@ def register(cwd, kind, name, address, pid=None, owner_key=None):
     """
     if not valid_kind(kind):
         return False, f"invalid peer kind {kind!r}: expected 'claude' or 'codex'"
-    if not valid_key(name):
-        return False, (f"invalid peer name {name!r}: "
+    if not valid_key(kind, name):
+        return False, (f"invalid peer name {name!r} for a {kind} peer: "
                        "expected [a-z0-9][a-z0-9_-]{0,31}")
     if address is None:
         if kind != "codex":
@@ -475,7 +483,7 @@ def register(cwd, kind, name, address, pid=None, owner_key=None):
 
 def unregister(cwd, kind, name, pid=None):
     """Releases a name, but only if this owner still holds it."""
-    if not (valid_kind(kind) and valid_key(name)):
+    if not (valid_kind(kind) and valid_key(kind, name)):
         return
     owner = _pid_of({"pid": pid}) if pid is not None else os.getpid()
     if owner is None:
@@ -494,7 +502,7 @@ def unregister(cwd, kind, name, pid=None):
 
 def read_session(cwd, kind, name):
     """The hook's record for an alias as a dict, or None."""
-    if not (valid_kind(kind) and valid_key(name)):
+    if not (valid_kind(kind) and valid_key(kind, name)):
         return None
     return _read_record(_session_file(cwd, kind, name))
 
@@ -518,7 +526,7 @@ def write_session(cwd, kind, name, session_id, transcript, owner):
     No pid is written. The hook has usually exited by the time anyone reads
     this, and a pid it left behind would mark the peer dead on the next read.
     """
-    if not (valid_kind(kind) and valid_key(name)):
+    if not (valid_kind(kind) and valid_key(kind, name)):
         return False, f"invalid peer {kind!r}/{name!r}"
     if not valid_session_id(session_id):
         return False, (f"invalid session id {session_id!r}: expected a canonical "
