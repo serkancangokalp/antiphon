@@ -1469,14 +1469,21 @@ def last_claude_reply(transcript_path):
         except json.JSONDecodeError:
             continue
 
+    # Measured `origin.kind` values for a mid-turn `isMeta` record that
+    # carries neither `sourceToolUseID` nor `turnCompanion`. This is an
+    # allowlist, not a denylist: an unmeasured kind, a missing `origin`, and
+    # `"channel"` itself (the bridge's own injection) all stay boundaries.
+    MID_TURN_ORIGIN_KINDS = {"coordinator", "task-notification"}
+
     def is_boundary(d):
         if d.get("type") != "user":
             return False
         if d.get("isMeta"):
-            # A mid-turn Skill-load or companion record shares isMeta with a
-            # `<channel>` injection, but carries one of these two fields —
-            # the injection carries neither and still starts a turn.
-            return not (d.get("sourceToolUseID") or d.get("turnCompanion"))
+            if d.get("sourceToolUseID") or d.get("turnCompanion"):
+                return False
+            origin = d.get("origin")
+            kind = origin.get("kind") if isinstance(origin, dict) else None
+            return kind not in MID_TURN_ORIGIN_KINDS
         content = (d.get("message") or {}).get("content")
         return not (isinstance(content, list) and content
                     and all(isinstance(c, dict) and c.get("type") == "tool_result"

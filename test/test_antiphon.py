@@ -73,9 +73,9 @@ def claude_tool_result():
 
 def claude_meta_user(text, **extra):
     """A `user` record marked `isMeta` — the host's own bookkeeping shares
-    this record type with a real turn boundary. `extra` carries whichever
-    of `sourceToolUseID` / `turnCompanion` sets a mid-turn record apart, or
-    neither for a `<channel>` injection."""
+    this record type with a real turn boundary. `extra` carries whichever of
+    `sourceToolUseID` / `turnCompanion` / a top-level `origin` dict sets a
+    mid-turn record apart, or none of them for a `<channel>` injection."""
     return json.dumps(dict({"type": "user", "isMeta": True,
                             "message": {"content": text}}, **extra))
 
@@ -460,18 +460,58 @@ class AntiphonTest(unittest.TestCase):
 
     def test_a_channel_injection_still_starts_a_turn(self):
         """A `<channel>` injection is `isMeta` too, but carries neither
-        `sourceToolUseID` nor `turnCompanion` — host bookkeeping of a
-        different kind, and it remains a boundary."""
-        lines = [
-            claude_prompt("do the thing"),
-            claude_assistant("@codex OLD"),
+        `sourceToolUseID` nor `turnCompanion`, nor an `origin.kind` on the
+        continuation allowlist — host bookkeeping of a different kind, and
+        it remains a boundary. Checked in both shapes actually seen: older
+        records carry no `origin` key at all; the current CLI stamps
+        `origin: {"kind": "channel", ...}` on the same record."""
+        injections = [
             claude_meta_user('<channel source="antiphon" sender="codex" '
                              'sender_kind="agent">ping</channel>'),
-            claude_assistant("reply to channel"),
+            claude_meta_user('<channel source="antiphon" sender="codex" '
+                             'sender_kind="agent">ping</channel>',
+                             origin={"kind": "channel", "server": "antiphon"}),
+        ]
+        for injection in injections:
+            lines = [
+                claude_prompt("do the thing"),
+                claude_assistant("@codex OLD"),
+                injection,
+                claude_assistant("reply to channel"),
+            ]
+            with patch.object(antiphon, "tail_lines", return_value=lines):
+                self.assertEqual(antiphon.last_claude_reply("transcript"),
+                                 "reply to channel", injection)
+
+    def test_a_marker_before_a_coordinator_event_survives(self):
+        """Measured on real transcripts: a top-level `origin.kind` of
+        `"coordinator"` is a mid-turn event (63 across 484 transcripts, 56
+        of them landing directly between two assistant records) with
+        neither `sourceToolUseID` nor `turnCompanion` set."""
+        lines = [
+            claude_prompt("do the thing"),
+            claude_assistant("@codex BEFORE"),
+            claude_meta_user("coordinator event contents",
+                             origin={"kind": "coordinator"}),
+            claude_assistant("AFTER"),
         ]
         with patch.object(antiphon, "tail_lines", return_value=lines):
             self.assertEqual(antiphon.last_claude_reply("transcript"),
-                             "reply to channel")
+                             "@codex BEFORE\nAFTER")
+
+    def test_a_marker_before_a_task_notification_survives(self):
+        """Same allowlist, the other measured `origin.kind`: `"task-
+        notification"` (2 across 484 transcripts, 1 landing mid-turn)."""
+        lines = [
+            claude_prompt("do the thing"),
+            claude_assistant("@codex BEFORE"),
+            claude_meta_user("task notification contents",
+                             origin={"kind": "task-notification"}),
+            claude_assistant("AFTER"),
+        ]
+        with patch.object(antiphon, "tail_lines", return_value=lines):
+            self.assertEqual(antiphon.last_claude_reply("transcript"),
+                             "@codex BEFORE\nAFTER")
 
     def test_large_codex_rollout_reads_cwd_from_head(self):
         with tempfile.NamedTemporaryFile(prefix="rollout-", suffix=".jsonl") as f:
