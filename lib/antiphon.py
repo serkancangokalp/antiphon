@@ -728,6 +728,8 @@ def register_peer(*_):
         data = json.load(sys.stdin)
     except (json.JSONDecodeError, ValueError):
         data = {}
+    if not isinstance(data, dict):
+        data = {}                     # valid JSON of the wrong shape is not a payload
     kind, name, address = data.get("kind"), data.get("name"), data.get("address")
     if kind not in ("claude", "codex") or not isinstance(address, str):
         print("register_peer: kind and address are required", file=sys.stderr)
@@ -736,6 +738,26 @@ def register_peer(*_):
     if not ok:
         print(f"register_peer: {detail}", file=sys.stderr)
         return 1
+    return 0
+
+
+def unregister_peer(*_):
+    """Releases a claim the channel server made but could not honour.
+
+    A record whose socket never came up is a lie the registry would keep
+    telling: senders would be handed an address nothing serves.
+    """
+    try:
+        data = json.load(sys.stdin)
+    except (json.JSONDecodeError, ValueError):
+        data = {}
+    if not isinstance(data, dict):
+        data = {}
+    kind, name = data.get("kind"), data.get("name")
+    if kind not in ("claude", "codex"):
+        print("unregister_peer: kind is required", file=sys.stderr)
+        return 1
+    peers.unregister(project_dir(), kind, name, pid=data.get("pid"))
     return 0
 
 
@@ -1260,6 +1282,7 @@ def print_summary(side="claude"):
 COMMANDS = {
     "setup": setup, "status": status, "hook": hook, "summary": print_summary,
     "push": push, "reply": reply, "mcp": mcp, "register_peer": register_peer,
+    "unregister_peer": unregister_peer,
     # Legacy aliases for old local installs, kept during the transition period.
     "kur": setup, "durum": status, "kanca": hook, "ozet": print_summary,
     "it": push, "yanit": reply,

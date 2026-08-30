@@ -79,9 +79,17 @@ def _peer_file(cwd, kind, name):
 
 
 @contextlib.contextmanager
-def _peer_lock(cwd, kind, name):
-    """Serializes claim, refresh, prune and release for one peer name."""
-    directory = peer_dir(cwd, kind, name)
+def _registry_lock(cwd):
+    """Serializes every claim, refresh, prune and release in this project.
+
+    One lock for the whole registry rather than one per name: a claim has to
+    check the name *and* the address, and two claims holding different per-name
+    locks would not be serialized against each other at all. Contention is a
+    handful of sessions, so a single lock costs nothing and removes the ordering
+    problem entirely. It is not reentrant, so nothing called while it is held may
+    take it again.
+    """
+    directory = peers_dir(cwd)
     os.makedirs(directory, exist_ok=True)
     fd = os.open(os.path.join(directory, ".lock"), os.O_CREAT | os.O_RDWR, 0o600)
     try:
@@ -141,7 +149,7 @@ def _prune(cwd, kind, name, dead_pid):
     """
     if not (valid_kind(kind) and valid_name(name)):
         return
-    with _peer_lock(cwd, kind, name):
+    with _registry_lock(cwd):
         held = _read_record(_peer_file(cwd, kind, name))
         held_pid = _pid_of(held) if held else None
         if held_pid is None or held_pid != dead_pid:
@@ -155,21 +163,28 @@ def _prune(cwd, kind, name, dead_pid):
             pass
 
 
+def _scan(cwd):
+    """Every readable record, unlocked and unpruned. Safe to call under the lock."""
+    try:
+        entries = sorted(os.listdir(peers_dir(cwd)))
+    except OSError:
+        return []
+    records = []
+    for entry in entries:
+        record = _read_record(os.path.join(peers_dir(cwd), entry, "endpoint.json"))
+        if record is not None:
+            records.append(record)
+    return records
+
+
 def read_peers(cwd, kind=None):
     """Live peers, newest first. Records left by dead processes are removed.
 
     A record that cannot be parsed is skipped rather than raised: a half-written
     entry must never take the bridge down with it.
     """
-    try:
-        entries = sorted(os.listdir(peers_dir(cwd)))
-    except OSError:
-        return []
     found = []
-    for entry in entries:
-        peer = _read_record(os.path.join(peers_dir(cwd), entry, "endpoint.json"))
-        if peer is None:
-            continue
+    for peer in _scan(cwd):
         peer_pid = _pid_of(peer)
         if peer_pid is None:
             continue                  # identifies nobody; not a peer, not prunable
@@ -209,12 +224,25 @@ def register(cwd, kind, name, address, pid=None):
     owner = _pid_of({"pid": pid}) if pid is not None else os.getpid()
     if owner is None:
         return False, f"invalid owner pid {pid!r}: expected a positive integer"
-    with _peer_lock(cwd, kind, name):
+    with _registry_lock(cwd):
+        for other in _scan(cwd):
+            other_pid = _pid_of(other)
+            if other_pid is None or other_pid == owner or not alive(other_pid):
+                continue
+            if other.get("kind") != kind:
+                continue                  # a rollout id and a socket path never collide
+            if other.get("name") == name:
+                return False, f"peer name {name!r} is already held by pid {other_pid}"
+            if other.get("address") == address:
+                # The contended resource is the address, not the name. Two
+                # sessions that both found a socket path free would bind it in
+                # turn and register under different automatic names carrying the
+                # same address, and a message addressed to either would reach
+                # whichever actually held the socket.
+                return False, (f"address {address!r} is already served by peer "
+                               f"{other.get('name')!r} (pid {other_pid})")
         path = _peer_file(cwd, kind, name)
-        held = _read_record(path)
-        held_pid = _pid_of(held) if held else None
-        if held_pid is not None and held_pid != owner and alive(held_pid):
-            return False, f"peer name {name!r} is already held by pid {held_pid}"
+        os.makedirs(os.path.dirname(path), exist_ok=True)
         record = {"kind": kind, "name": name, "pid": owner,
                   "address": address, "started_at": time.time()}
         tmp = f"{path}.{os.getpid()}.tmp"
@@ -231,7 +259,7 @@ def unregister(cwd, kind, name, pid=None):
     owner = _pid_of({"pid": pid}) if pid is not None else os.getpid()
     if owner is None:
         return
-    with _peer_lock(cwd, kind, name):
+    with _registry_lock(cwd):
         path = _peer_file(cwd, kind, name)
         held = _read_record(path)
         held_pid = _pid_of(held) if held else None

@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
 import { spawn } from "node:child_process";
-import { existsSync } from "node:fs";
+import { existsSync, readdirSync, readFileSync } from "node:fs";
 import { mkdtemp, rm } from "node:fs/promises";
 import { connect } from "node:net";
 import { once } from "node:events";
@@ -104,28 +104,50 @@ async function twoNamedPeersKeepSeparateSockets() {
   }
 }
 
-async function anUnnamedSecondSessionRefusesToTakeTheSocket() {
+function registeredPeers(dir) {
+  const root = join(dir, ".antiphon", "peers");
+  if (!existsSync(root)) return [];
+  return readdirSync(root)
+    .map((entry) => join(root, entry, "endpoint.json"))
+    .filter((path) => existsSync(path))
+    .map((path) => JSON.parse(readFileSync(path, "utf8")));
+}
+
+async function onlyOneUnnamedSessionGetsTheChannel(startTogether) {
+  // Started together, both sessions can see the socket path free at the same
+  // moment. Nothing after that point may let the loser bind: it would unlink
+  // the winner's live socket, and both would register under different automatic
+  // names carrying the same address, so a message addressed to either would
+  // reach whichever actually held it. The registry claim is atomic, so exactly
+  // one gets through however the two interleave.
   const dir = await mkdtemp(join(tmpdir(), "antiphon-unnamed-"));
   const first = spawnChannel(dir, "");
-  // Wait for the first to be serving before the second starts: that is the real
-  // shape of the mistake — a second terminal opened in a project that already
-  // has one — and it is the case the guard has to catch.
-  assert.ok(await waitFor(() => existsSync(first.socketPath)), first.stderr());
+  if (!startTogether) {
+    assert.ok(await waitFor(() => existsSync(first.socketPath)), first.stderr());
+  }
   const second = spawnChannel(dir, "");
   try {
-    assert.ok(await waitFor(() => /already serves/.test(second.stderr())),
-      `second session should refuse the socket, said: ${second.stderr()}`);
-    assert.match(second.stderr(), /ANTIPHON_NAME/,
-      "the warning must say how to run both");
-    assert.ok(existsSync(first.socketPath), "the first session keeps its socket");
+    assert.ok(await waitFor(() => registeredPeers(dir).length === 1
+      && /cannot be reached|already serves/.test(first.stderr() + second.stderr())),
+      `expected exactly one peer and one refusal:\n${first.stderr()}\n${second.stderr()}`);
 
-    // The refusing session must also leave the socket alone on the way out.
-    // Unlinking the path unconditionally in shutdown is what let a session that
+    const peers = registeredPeers(dir);
+    assert.equal(peers.length, 1, "two sessions must not both hold the address");
+    assert.ok(existsSync(peers[0].address), "the registered address must be served");
+    assert.match(first.stderr() + second.stderr(), /ANTIPHON_NAME/,
+      "the refusal must say how to run both");
+
+    // The refused session must leave the socket alone on the way out too:
+    // unlinking the path unconditionally in shutdown is what let a session that
     // never owned the socket delete it for the one that did.
-    second.child.kill("SIGTERM");
-    await once(second.child, "exit");
-    assert.ok(existsSync(first.socketPath),
+    const loser = /cannot be reached|already serves/.test(second.stderr())
+      ? second : first;
+    loser.child.kill("SIGTERM");
+    await once(loser.child, "exit");
+    assert.ok(existsSync(peers[0].address),
       "a session that never bound the socket must not remove it when it exits");
+    assert.equal(registeredPeers(dir).length, 1,
+      "the refused session must not have left a claim behind");
   } finally {
     first.child.kill("SIGKILL");
     second.child.kill("SIGKILL");
@@ -134,7 +156,8 @@ async function anUnnamedSecondSessionRefusesToTakeTheSocket() {
 }
 
 await twoNamedPeersKeepSeparateSockets();
-await anUnnamedSecondSessionRefusesToTakeTheSocket();
+await onlyOneUnnamedSessionGetsTheChannel(false);   // a second terminal, later
+await onlyOneUnnamedSessionGetsTheChannel(true);    // both started together
 console.log("per-peer sockets: ok");
 
 try {

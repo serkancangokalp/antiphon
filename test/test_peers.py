@@ -230,6 +230,45 @@ class PeerRegistryTest(unittest.TestCase):
             self.assertIn("claude", detail)
             self.assertEqual(peers.read_peers(project), [])
 
+    def test_one_address_cannot_be_claimed_by_two_live_peers(self):
+        """The socket path is the contended resource, not the name. Two sessions
+        that both found the path free would bind it in turn and register under
+        different automatic names carrying the same address — the registry would
+        then show two peers while a message addressed to either reached whichever
+        actually held the socket."""
+        with tempfile.TemporaryDirectory() as project:
+            first, _ = peers.register(project, "claude", "ui", "/tmp/shared.sock",
+                                      pid=os.getpid())
+            second, detail = peers.register(project, "claude", "api", "/tmp/shared.sock",
+                                            pid=os.getppid())
+            self.assertTrue(first)
+            self.assertFalse(second, "a second live peer must not share an address")
+            self.assertIn("ui", detail, "the reason must name the holder")
+            self.assertEqual([p["name"] for p in peers.read_peers(project)], ["ui"])
+
+    def test_an_address_freed_by_a_dead_peer_can_be_claimed(self):
+        with tempfile.TemporaryDirectory() as project:
+            peers.register(project, "claude", "ui", "/tmp/shared.sock", pid=999999)
+            with patch.object(peers, "alive", return_value=False):
+                peers.read_peers(project)
+            ok, detail = peers.register(project, "claude", "api", "/tmp/shared.sock")
+            self.assertTrue(ok, detail)
+
+    def test_the_same_peer_may_refresh_its_own_address(self):
+        with tempfile.TemporaryDirectory() as project:
+            peers.register(project, "claude", "ui", "/tmp/shared.sock", pid=os.getpid())
+            ok, detail = peers.register(project, "claude", "ui", "/tmp/shared.sock",
+                                        pid=os.getpid())
+            self.assertTrue(ok, detail)
+
+    def test_different_kinds_may_hold_the_same_address_string(self):
+        """A Codex address is a rollout id, not a socket path; the two namespaces
+        never collide and must not be made to."""
+        with tempfile.TemporaryDirectory() as project:
+            peers.register(project, "claude", "ui", "shared-string")
+            ok, detail = peers.register(project, "codex", "build", "shared-string")
+            self.assertTrue(ok, detail)
+
     def test_unregister_releases_only_your_own_name(self):
         with tempfile.TemporaryDirectory() as project:
             peers.register(project, "claude", "ui", "/tmp/ui.sock", pid=os.getpid())
