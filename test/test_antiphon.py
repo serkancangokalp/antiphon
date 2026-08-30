@@ -3,6 +3,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "lib"))
 import antiphon
 
 import contextlib
+import fcntl
 import io
 import json
 import subprocess
@@ -1714,6 +1715,23 @@ class MalformedStateTest(unittest.TestCase):
             return self.reply
 
 
+class _Recording(io.StringIO):
+    """A stdout that notes, in the caller's list, when it is written to.
+
+    Paired with a `write_cursor` that appends to the same list, it shows which
+    of the two happened first — which is the whole property under test.
+    """
+
+    def __init__(self, record):
+        super().__init__()
+        self._record = record
+
+    def write(self, chunk):
+        if chunk.strip():
+            self._record.append("write")
+        return super().write(chunk)
+
+
 class CodexPeerWiringTest(unittest.TestCase):
     """The two Codex writers, wired to the processes that actually run them.
 
@@ -1762,6 +1780,41 @@ class CodexPeerWiringTest(unittest.TestCase):
              contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
             code = antiphon.hook(side)
         return code, out.getvalue(), err.getvalue(), written
+
+    def _deliver_hook(self, project, stdout, record=None, name="",
+                      summary=("## something happened", 1000.0, 1), side="claude"):
+        """One prompt through the hook, against a real project directory, with a
+        stdout of the test's choosing.
+
+        Each cursor advance appends "advance" to `record`, so a stdout that
+        appends "write" to the same list shows the order of the two.
+        """
+        record = record if record is not None else []
+        payload = {"cwd": project, "hook_event_name": "UserPromptSubmit"}
+        with self._named(name), \
+             patch.object(antiphon.sys, "stdin", io.StringIO(json.dumps(payload))), \
+             patch.object(antiphon, "build_summary", return_value=summary), \
+             patch.object(antiphon, "read_cursor", return_value={}), \
+             patch.object(antiphon, "write_cursor",
+                          side_effect=lambda *a, **k: record.append("advance")), \
+             contextlib.redirect_stdout(stdout):
+            return antiphon.hook(side)
+
+    def _hold_lock(self, cursor_path):
+        """Holds one peer's delivery lock the way another process would.
+
+        `flock` is held per open file description, not per process, so a lock
+        taken on this descriptor blocks a `LOCK_NB` attempt on a descriptor the
+        code under test opens separately — even though both live here. That is
+        what makes an in-process test of the contention path honest, and it was
+        measured on this machine rather than assumed.
+        """
+        path = cursor_path + ".lock"
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        fd = os.open(path, os.O_CREAT | os.O_RDWR, 0o600)
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        self.addCleanup(os.close, fd)
+        return fd
 
     @staticmethod
     def _run_mcp(project, *requests, name=None, owner="300:x"):
