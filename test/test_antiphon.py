@@ -209,7 +209,7 @@ class AntiphonTest(unittest.TestCase):
                  patch.object(antiphon, "last_codex_reply", return_value="@claude test"), \
                  patch.object(antiphon, "read_cursor", return_value={}), \
                  patch.object(antiphon, "write_cursor",
-                              side_effect=lambda cwd, data, kind: written.append(dict(data))), \
+                              side_effect=lambda cwd, data, kind: written.append(dict(data)) or True), \
                  patch.object(antiphon, "send_to_claude",
                               side_effect=lambda cwd, msg, alias=None, **_:
                                   sent.append((cwd, msg)) or (True, "")), \
@@ -250,7 +250,7 @@ class AntiphonTest(unittest.TestCase):
                  patch.object(antiphon, "read_cursor",
                               return_value={"last_pushed_claude": "same"}), \
                  patch.object(antiphon, "write_cursor",
-                              side_effect=lambda cwd, data, kind: written.append(dict(data))), \
+                              side_effect=lambda cwd, data, kind: written.append(dict(data)) or True), \
                  patch.object(antiphon, "send_to_claude") as send, \
                  patch.object(antiphon.sys, "stdin", io.StringIO(json.dumps(input_data))), \
                  contextlib.redirect_stderr(io.StringIO()):
@@ -2105,6 +2105,56 @@ class CodexPeerWiringTest(unittest.TestCase):
             self.assertTrue(antiphon.update_cursor(project, "codex", lambda c: c))
             self.assertEqual(os.stat(path).st_mtime_ns, before)
 
+    # ---- item 1: push sends without the lock, and records through it ----
+
+    def test_push_sends_while_the_peers_lock_is_held_by_someone_else(self):
+        """This is the failure the whole-branch review measured: routed through
+        the lock, a `push` behind a stuck holder sent nothing at all. The send
+        must succeed regardless of who holds the lock; only the record after
+        it may wait — and fail.
+
+        `push(target="claude")` sends from Codex's side, so it dedupes and
+        records in the *Codex* cursor (`sender_side("claude") == "codex"`) —
+        that is the file this test holds the lock on."""
+        sent = []
+        with tempfile.TemporaryDirectory() as project, self._named(""):
+            self._hold_lock(antiphon.state_path(project, "codex"))
+            input_data = {"cwd": project, "transcript_path": "/tmp/rollout"}
+            with patch.object(antiphon.os.path, "exists", return_value=True), \
+                 patch.object(antiphon, "last_codex_reply",
+                              return_value="@claude go"), \
+                 patch.object(antiphon, "send_to_claude",
+                              side_effect=lambda cwd, msg, alias=None, **_:
+                                  sent.append(msg) or (True, "")), \
+                 patch.object(antiphon, "CURSOR_LOCK_PATIENCE", 0.1), \
+                 patch.object(antiphon.sys, "stdin",
+                              io.StringIO(json.dumps(input_data))), \
+                 contextlib.redirect_stderr(io.StringIO()):
+                code = antiphon.push("claude")
+            self.assertEqual(sent, ["go"], "the send must not wait on this "
+                             "peer's cursor lock at all")
+            self.assertNotEqual(code, 0, "a send that could not be recorded "
+                                "has to be reported, not silenced")
+            self.assertNotIn("last_pushed_claude",
+                             antiphon.read_cursor(project, "codex"),
+                             "nothing is recorded while the lock is held")
+
+    def test_record_delivery_writes_nothing_while_the_lock_is_held(self):
+        """`_record_delivery` sends nothing itself, so it has no excuse to
+        route around the lock the way a bare `write_cursor(cwd,
+        mutate(read_cursor(cwd, side)), side)` would.
+
+        `target="codex"` records in the *Claude* cursor
+        (`sender_side("codex") == "claude"`) — the file this test locks."""
+        with tempfile.TemporaryDirectory() as project, self._named(""):
+            self._hold_lock(antiphon.state_path(project, "claude"))
+            with patch.object(antiphon, "CURSOR_LOCK_PATIENCE", 0.1), \
+                 contextlib.redirect_stderr(io.StringIO()):
+                antiphon._record_delivery(project, "codex", "hello")
+            self.assertEqual(antiphon.read_cursor(project, "claude"), {},
+                             "a writer that bypassed the lock would have "
+                             "written the fingerprint anyway")
+
     @staticmethod
     def _run_mcp(project, *requests, name=None, owner="300:x"):
         stdin = io.StringIO("".join(json.dumps(r) + "\n" for r in requests))
@@ -2917,7 +2967,7 @@ class RoutingTest(unittest.TestCase):
                  patch.object(antiphon, "read_cursor", return_value={}), \
                  patch.object(antiphon, "write_cursor",
                               side_effect=lambda cwd, data, kind:
-                                  written.append(dict(data))), \
+                                  written.append(dict(data)) or True), \
                  patch.object(antiphon, "send_to_claude",
                               side_effect=lambda cwd, text, alias=None, **_:
                                   (True, "") if alias == "ui" else (False, "no")), \

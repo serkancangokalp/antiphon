@@ -1142,34 +1142,69 @@ def push(target="codex"):
             print(f"antiphon: delivery failed — {detail}", file=sys.stderr)
         return ok
 
+    # The send happens here, outside any lock — reversing an earlier ruling
+    # that held it inside, on the grounds that read-check-send-record is one
+    # transaction. Measurement overturned that: holding this peer's cursor
+    # lock across a send that hangs was measured at a 5,008 ms hold, against a
+    # concurrent reader's own patience of 2,038 ms — it gave up and delivered
+    # no context at all. `_queue_codex` allows 15 s per recipient and
+    # `send_to_claude` up to 1.5 s of connect patience plus a 5 s socket
+    # timeout, both well past `CURSOR_LOCK_PATIENCE` (2.0 s): a waiter does not
+    # wait behind a slow send, it is *guaranteed* to give up. And for the
+    # default unnamed install this was never only this peer's lock —
+    # `state_path` returns the one cursor file both `claude` and `codex` share
+    # — so a slow push on one side was blocking the *other agent's* context
+    # delivery, not merely delaying a retry of its own.
+    #
+    # So the dedupe decision and the send both run against a read taken
+    # without the lock. A stale read can at worst send a message that was
+    # already sent — a duplicate, the trade this project makes everywhere else
+    # — never a drop. `deliver_batches` below sends whatever `raw_sent`
+    # doesn't already recognise and mutates it in place with the fingerprints
+    # of what actually went out.
+    raw_sent, already = migrate_pushed(read_cursor(cwd, side).get(key),
+                                       batches.get(None) or [])
+    before_send = dict(raw_sent)
+    if already:
+        # The exact bare message already went out under the old string
+        # format; nothing left to send for it, but the migration to the new
+        # shape still needs recording.
+        raw_sent[""] = batch_fingerprint(batches[None])
+    updated = forget_superseded(deliver_batches(batches, raw_sent, deliver))
+    # The delta: only the slots this call actually resolved — never the whole
+    # map computed from the read above. Writing that map back, whole, would
+    # reintroduce exactly the lost update the cursor lock exists to prevent:
+    # a cursor snapshot must never be carried across the lock boundary, only
+    # a fact about what this call just did.
+    delivered = {slot: fingerprint for slot, fingerprint in updated.items()
+                if before_send.get(slot) != fingerprint}
+    if not delivered:
+        return 0                      # nothing sent, nothing to record
+
     def mutate(cursor):
-        # `cursor` is what update_cursor just read under the lock — never the
-        # stale value a read before the lock would have carried in, which is
-        # how a delivery's advance used to come back undone.
-        sent, already = migrate_pushed(cursor.get(key), batches.get(None) or [])
-        if already:
-            sent[""] = batch_fingerprint(batches[None])
-        before = dict(sent)
-        updated = forget_superseded(deliver_batches(batches, sent, deliver))
-        # Changed only when something actually moved: a delivery landed, or the
-        # old string format was recognised and needs recording in the new one.
-        # A turn that delivered nothing leaves this key alone.
-        if updated != before or already:
-            cursor[key] = updated
+        # `cursor` is what `update_cursor` just read under the lock, moments
+        # ago — the only cursor state this may build on. `delivered` is
+        # applied on top of *this*, never on top of `raw_sent` above, which
+        # may already be stale by the time this runs.
+        fresh, _ = migrate_pushed(cursor.get(key), [])
+        merged = dict(fresh)
+        merged.update(delivered)
+        cursor[key] = forget_superseded(merged)
         return cursor
 
-    # The actual send happens inside `mutate`, which runs while `update_cursor`
-    # holds this peer's cursor lock — on purpose. The dedupe decision (what has
-    # already gone out) and the record of it cannot be separated: releasing the
-    # lock between them would let two pushes both pass the dedupe check and
-    # send the same message twice, which is exactly the failure dedupe exists
-    # to prevent. The cost is real — a slow or hung send holds the lock for up
-    # to its own timeout, and a concurrent `hook` or `antiphon_read` for this
-    # same peer waits behind it, up to `CURSOR_LOCK_PATIENCE`, before giving up
-    # on delivering context that turn. Splitting the delivery cursor from the
-    # push fingerprints into separate files with separate locks would remove
-    # this coupling; deferred to the plan that next migrates this file's shape.
-    update_cursor(cwd, side, mutate)
+    if not update_cursor(cwd, side, mutate):
+        # The message already left this process — `deliver` above said so on
+        # its own line. What failed is only the bookkeeping, so the
+        # consequence is a possible duplicate next turn, never a second copy
+        # of a drop that already happened: say exactly that, and let it be
+        # seen. `push` injects nothing into anyone's context, so returning
+        # non-zero here costs nobody the page a hook's non-zero would.
+        missed = ", ".join(sorted(
+            "(unaddressed)" if slot == "" else slot[1:] for slot in delivered))
+        print(f"antiphon: sent to {target} but could not record delivery for "
+              f"{missed} in {state_path(cwd, side)}; a duplicate send is "
+              "possible next turn, not a drop", file=sys.stderr)
+        return 1
     return 0
 
 
