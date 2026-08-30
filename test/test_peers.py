@@ -244,6 +244,22 @@ class PeerRegistryTest(unittest.TestCase):
             self.assertIn("claude", detail)
             self.assertEqual(peers.read_peers(project), [])
 
+    def test_a_name_that_looks_like_a_kind_prefix_gets_its_own_directory(self):
+        """The prefix is applied unconditionally, so `ui` and `claude-ui` are two
+        different peers with two different directories. Stripping the prefix when
+        a name happens to start with the kind is what would collide them."""
+        with tempfile.TemporaryDirectory() as project:
+            plain, _ = peers.register(project, "claude", "ui", "/tmp/a.sock",
+                                      pid=os.getpid())
+            prefixed, detail = peers.register(project, "claude", "claude-ui",
+                                              "/tmp/b.sock", pid=os.getpid())
+            self.assertTrue(plain)
+            self.assertTrue(prefixed, detail)
+            self.assertNotEqual(peers.peer_dir(project, "claude", "ui"),
+                                peers.peer_dir(project, "claude", "claude-ui"))
+            self.assertEqual(sorted(p["name"] for p in peers.read_peers(project)),
+                             ["claude-ui", "ui"])
+
     def test_one_address_cannot_be_claimed_by_two_live_peers(self):
         """The socket path is the contended resource, not the name. Two sessions
         that both found the path free would bind it in turn and register under
