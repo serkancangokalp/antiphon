@@ -53,10 +53,6 @@ CLAUDE_PROJECTS = os.path.join(HOME, ".claude", "projects")
 CODEX_SESSIONS = os.path.join(HOME, ".codex", "sessions")
 
 TAIL_BYTES = 300_000      # amount to read from the tail of each transcript file
-# Retained until the documentation task replaces the old public limit contract;
-# neither value cuts passive pull content after paging is enabled.
-SUMMARY_BUDGET = 2600
-EVENT_BUDGET = 420
 EVENT_LIMIT = 40          # completed source records per page
 PAGE_BUDGET = 8_000       # UTF-8 bytes in an ordinary complete page envelope
 RECENT_FILES = 3          # transcript files per side the summary reads at all
@@ -2001,10 +1997,17 @@ TO_DESCRIPTION = ("Alias of the peer to send to. Required whenever the recipient
 
 TOOLS = [{
     "name": "antiphon_read",
-    "description": ("Returns what happened on the Claude Code side since your last turn. "
-                    "This normally arrives automatically via the hook, no extra effort "
-                    "required; this tool is the fallback — call it by hand if you suspect "
-                    "the bridge has gone quiet."),
+    "description": ("Returns one page of what happened on the Claude Code side since "
+                    "your last turn, oldest first. When the page ends with "
+                    "`has_more: true`, more completed records are already waiting: call "
+                    "this tool again, or let later turns drain them. `has_more: false` "
+                    "covers only the transcripts discovery can currently see, not all "
+                    "project history. If the next record alone is larger than an "
+                    "ordinary page, this tool refuses it instead of truncating: nothing "
+                    "is read or marked seen, and the next automatic prompt hook — whose "
+                    "host can spill an oversized record to a file — delivers it whole. "
+                    "Pages normally arrive automatically via the hook; reach for this "
+                    "tool to drain a backlog or when the bridge seems quiet."),
     "inputSchema": {"type": "object", "properties": {}},
 }, {
     "name": "antiphon_send",
@@ -2294,8 +2297,16 @@ SECTION_HEADING = "## The Antiphon bridge"
 AGENTS_RULE = ("\n## The Antiphon bridge\n\n"
                "You are working alongside Claude Code on this project. What happens on the "
                "other side is injected into your context automatically at the start of each "
-               "turn — you don't need to do anything else. If you suspect the bridge has gone "
-               "quiet, you can call the `antiphon_read` tool by hand. That injected context is "
+               "turn — you don't need to do anything else. It arrives as one page of "
+               "completed records, oldest first; a `has_more: true` line means more is "
+               "already waiting, so call the `antiphon_read` tool again (or let later turns "
+               "drain it) until it reports `has_more: false` — which covers only the "
+               "currently discovered transcripts, not all project history. A page carrying "
+               "a replay notice is re-delivering history after an upgrade or cursor "
+               "recovery and can contain duplicates; it is complete when the notice "
+               "disappears. If the single next record is larger than an ordinary page, "
+               "`antiphon_read` refuses it — nothing is read or marked seen — and the next "
+               "automatic prompt hook delivers it whole. That injected context is "
                "project-wide awareness rather than mail addressed to you: it may merge "
                "activity from several project transcripts under one Claude label, so read "
                "it as what is happening nearby.\n\n"

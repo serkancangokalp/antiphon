@@ -8,72 +8,57 @@ refuses ambiguity rather than guessing or broadcasting.
 
 ## P0 — Lossless, paged context transfer
 
-### Problem
+This item is now a phase ledger rather than one open problem: the delivery and
+paging mechanics shipped, and what remains open is named below instead of
+hiding under a general "lossless" claim.
 
-The current pull path does more than keep one prompt small:
+### Shipped before the paging plan
 
-- `SUMMARY_BUDGET` keeps roughly 2,600 characters;
-- each non-tool event is cut to 420 characters;
-- whitespace, including code and SQL line breaks, is collapsed;
-- only 40 events, the transcript tail, and a small set of recent transcript
-  files are considered;
-- the timestamp cursor advances past content omitted by those cuts.
+Provenance-safe parsers (a user message beginning with `<` is no longer
+mistaken for bridge metadata), the byte-offset reader and per-source cursor
+with generation fingerprints, the delivery lock beside each peer cursor, and
+the write-and-flush-before-advance transaction.
 
-The result is permanent, invisible loss. During development of named peers, a
-real Claude task report was visibly cut by this path and its omitted remainder
-was nevertheless marked seen. Raising only `SUMMARY_BUDGET` would not fix the
-420-character cut, flattened formatting, tail window, ordering, or cursor.
+### Completed by the paging plan
 
-### Decision
+- Oldest-first atomic pages of completed source records: an ordinary full page
+  targets 8,000 UTF-8 bytes and at most 40 records, and a record is never
+  split across pages.
+- The non-tool 420-character cut and the 2,600-character summary trim are
+  gone; whitespace, indentation and line structure are preserved exactly.
+- `has_more` is visible on every page, explicitly scoped to the currently
+  discovered sources.
+- An oversized record is handed whole to the automatic hooks, whose hosts
+  were measured (2026-08-30, Claude Code 2.1.251 and Codex CLI 0.151.0) to
+  spill above 10,000 characters and expose a path; both 400,251-character
+  probes matched their spill files by SHA-256. Codex's MCP tool result did
+  **not** meet that assumption — the transport kept the bytes but the model
+  could identify neither content nor a saved path — so `antiphon_read`
+  refuses an oversized record without advancing, and the next automatic hook
+  delivers it. That is a measured host behaviour, not an inference about its
+  internal truncation.
+- A rolling-upgrade-safe v3 page key: the legacy v2 value is preserved
+  byte-for-byte for still-running old processes and is never trusted as a
+  delivered frontier. Any present legacy key, and any malformed or unreadable
+  existing cursor, conservatively replays the currently discovered sources
+  from byte zero — measured at 69 Claude-source and 53 Codex-source pages on
+  the reviewed snapshots — with a fixed replay reason visible on every page
+  until the final persisted one clears it.
 
-Keep each model injection bounded, but remove any lifetime limit on what can be
-transferred:
+### Still open, by name
 
-- start with an inline page target near 8,000 characters, measured against both
-  real hosts rather than treated as a permanent magic number;
-- select completed source records oldest-first and stop only at record
-  boundaries;
-- preserve text blocks, order, whitespace, code and SQL exactly;
-- advance a per-peer cursor only through records written and flushed to that
-  peer; delivery is at-least-once, so a crash may repeat but never skip;
-- include `has_more` and let the hook and `antiphon_read` drain later pages;
-- let a single record larger than the inline page pass whole so the host can
-  spill it to a file and expose its path;
-- give compressed tool events a stable id and a one-call full-content retrieval
-  path;
-- have each side's hook maintain a durable source catalog keyed by side and host
-  session id, independent of peer aliases and endpoint liveness; pruning a dead
-  peer must not make its unread transcript disappear, and the newest-three scan
-  may prioritize migration discovery but never define completeness;
-- replace timestamp-only cursors with source generation, byte offset and record
-  hash anchors that detect truncation, replacement and rotation;
-- use a lock beside each peer cursor, not the project-wide registry lock;
-- read a registry-supplied transcript only through a descriptor-safe walk under
-  trusted transcript roots; never follow a symlink or reopen a checked name;
-- migrate old cursors conservatively, preferring a duplicate over a gap, and
-  expose backward paging for history an older version already marked seen.
-
-### Acceptance
-
-- A multi-line SQL statement and a multi-block code message arrive byte-for-byte
-  in order.
-- More than one page drains across repeated reads with no missing record.
-- A failed or interrupted injection leaves the cursor before that page.
-- One record larger than the inline target remains fully retrievable through
-  the host spill path.
-- An event larger than the current transcript tail and a transcript outside the
-  newest three are still found when their source is known.
-- A catalogued source remains pageable after its endpoint closes, and a
-  pre-catalog migration inventories older matching sources without treating the
-  newest three as the complete set.
-- A user message beginning with `<` is not mistaken for bridge metadata.
-- Rotation, same-timestamp events, concurrent hook/tool reads, migration, and
-  path traversal all have regression tests on Python 3.9 and the current Python.
-- Real Claude Code and Codex hook tests confirm inline and spill behavior.
-
-This item replaces the README's current “roughly 2600 characters; newest
-messages are kept” contract. It does not set hook output to unlimited: unbounded
-context in one model call is unsafe and unnecessary when paging is lossless.
+- Stable event ids and full tool-call retrieval: tool calls remain compressed
+  one-line summaries with no `antiphon_read(id)` route.
+- The durable source catalog and the degraded-discovery marker: discovery
+  still reads the newest 3 transcripts per side, and `has_more: false` cannot
+  distinguish complete discovery from that window.
+- Backward paging into history an older version already marked seen.
+- The last-record content anchor (an in-place rewrite that keeps inode,
+  length and first line still resumes silently).
+- Descriptor-safe reading of registry-supplied transcript paths.
+- Direct-channel spill for the 128 KiB `antiphon_send` cap.
+- Retirement of the preserved v2 sibling key once pre-v3 processes and
+  rollback support are no longer needed.
 
 ## P1 — Source-aware multi-peer pull context
 
