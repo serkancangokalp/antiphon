@@ -229,6 +229,12 @@ def _is_self_injected(text):
     return text.lstrip().lower().startswith(_SELF_INJECTION_PREFIXES)
 
 
+def _join_text_blocks(blocks):
+    """Join present text blocks without treating whitespace as absence."""
+    return "\n\n".join(block for block in blocks
+                        if isinstance(block, str) and block != "")
+
+
 # A host writes records of its own into the same transcript a person types
 # into: slash commands, their output, task notifications, and this bridge's
 # own deliveries. They are recognised by what they are — the host's
@@ -999,16 +1005,12 @@ def claude_events(cwd, positions=None, since=None):
                 elif isinstance(content, list):
                     # The break between two blocks is content: joined by a
                     # space, a sentence and the code block under it become one
-                    # run-on line and nothing says where either ended. The
-                    # emptiness test strips; the joined block never does, or
-                    # the indentation goes with it.
-                    text = "\n\n".join(
+                    # run-on line and nothing says where either ended.
+                    text = _join_text_blocks(
                         c.get("text", "") for c in content
-                        if isinstance(c, dict) and c.get("type") == "text"
-                        and c.get("text", "").strip())
-                text = text.strip()
+                        if isinstance(c, dict) and c.get("type") == "text")
                 # tool results and host records are not the user's own words
-                if (text
+                if (text != ""
                         and not _is_host_record(text, CLAUDE_WRAPPER_OPENING,
                                                 d.get("promptSource"))
                         and not _is_self_injected(text)):
@@ -1016,10 +1018,12 @@ def claude_events(cwd, positions=None, since=None):
                                   Event(ts, "you", text, sid, gen, start, end)))
             elif kind == "assistant":
                 for c in content if isinstance(content, list) else []:
-                    if c.get("type") == "text" and c.get("text", "").strip():
-                        events.append((ts, path, next(position),
-                                      Event(ts, "claude", c["text"].strip(),
-                                            sid, gen, start, end)))
+                    if c.get("type") == "text":
+                        text = c.get("text")
+                        if isinstance(text, str) and text != "":
+                            events.append((ts, path, next(position),
+                                          Event(ts, "claude", text,
+                                                sid, gen, start, end)))
                     elif c.get("type") == "tool_use":
                         i = c.get("input") or {}
                         detail = i.get("file_path") or i.get("command") or i.get("pattern") or ""
@@ -1132,12 +1136,10 @@ def codex_events(cwd, positions=None, since=None):
             kind, p = d.get("type"), d.get("payload") or {}
             if kind == "response_item" and p.get("type") == "message":
                 role = p.get("role")
-                text = "\n\n".join(
-                    block for block in
-                    ((c.get("text") or c.get("input_text") or "")
-                     for c in p.get("content") or [] if isinstance(c, dict))
-                    if block.strip()).strip()
-                if not text or role == "developer":
+                text = _join_text_blocks(
+                    (c.get("text") or c.get("input_text") or "")
+                    for c in p.get("content") or [] if isinstance(c, dict))
+                if text == "" or role == "developer":
                     continue
                 if role == "user":
                     # No `promptSource` on this side: a Codex rollout records no

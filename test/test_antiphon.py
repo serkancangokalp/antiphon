@@ -1266,8 +1266,8 @@ class AntiphonTest(unittest.TestCase):
             texts = [e[2] for e in events]
         self.assertEqual(texts, ["def f():\n    return 1\n\n\n  indented note"])
 
-    def test_an_empty_block_adds_no_boundary(self):
-        """A blank block is not a paragraph break of its own."""
+    def test_raw_whitespace_in_a_claude_block_is_content(self):
+        """Whitespace-only blocks are content, not absent blocks."""
         line = json.dumps({"type": "user", "promptSource": "typed",
                            "timestamp": "2026-08-30T10:00:00.000Z",
                            "message": {"content": [
@@ -1277,7 +1277,7 @@ class AntiphonTest(unittest.TestCase):
         with patch.object(antiphon, "claude_transcripts", return_value=["t.jsonl"]), \
              patch.object(antiphon, "read_records", side_effect=_as_records([line])):
             events, _ = antiphon.claude_events("/tmp/project")
-            self.assertEqual([e[2] for e in events], ["one\n\ntwo"])
+            self.assertEqual([e.text for e in events], ["one\n\n   \n\ntwo"])
 
     def test_the_codex_parser_keeps_its_block_boundaries(self):
         line = json.dumps({"type": "response_item",
@@ -1313,9 +1313,8 @@ class AntiphonTest(unittest.TestCase):
             texts = [e[2] for e in events]
         self.assertEqual(texts, ["def f():\n    return 1\n\n\n  indented note"])
 
-    def test_an_empty_codex_block_adds_no_boundary(self):
-        """The Codex-side analogue of `test_an_empty_block_adds_no_boundary`. A
-        blank block is not a paragraph break of its own."""
+    def test_raw_whitespace_in_a_codex_block_is_content(self):
+        """The Codex-side analogue: whitespace-only blocks are content."""
         line = json.dumps({"type": "response_item",
                            "timestamp": "2026-08-30T10:00:00.000Z",
                            "payload": {"type": "message", "role": "user",
@@ -1326,7 +1325,71 @@ class AntiphonTest(unittest.TestCase):
         with patch.object(antiphon, "codex_rollout_files", return_value=["r.jsonl"]), \
              patch.object(antiphon, "read_records", side_effect=_as_records([line])):
             events, _ = antiphon.codex_events("/tmp/project")
-            self.assertEqual([e[2] for e in events], ["one\n\ntwo"])
+            self.assertEqual([e.text for e in events], ["one\n\n   \n\ntwo"])
+
+    def _events_from_real_jsonl(self, side, record):
+        with tempfile.TemporaryDirectory() as directory:
+            path = os.path.join(directory, f"{side}.jsonl")
+            with open(path, "w", encoding="utf-8") as stream:
+                stream.write(json.dumps(record) + "\n")
+            if side == "claude":
+                with patch.object(antiphon, "claude_transcripts", return_value=[path]):
+                    events, _ = antiphon.claude_events(directory)
+            else:
+                with patch.object(antiphon, "codex_rollout_files", return_value=[path]):
+                    events, _ = antiphon.codex_events(directory)
+        return [event.text for event in events]
+
+    def test_claude_user_text_keeps_raw_whitespace(self):
+        value = "  SELECT\n    id\n"
+        self.assertEqual(self._events_from_real_jsonl(
+            "claude", {
+                "type": "user",
+                "promptSource": "typed",
+                "timestamp": "2026-08-30T10:00:00.000Z",
+                "message": {"content": [
+                    {"type": "text", "text": ""},
+                    {"type": "text", "text": value},
+                ]},
+            }), [value])
+
+    def test_claude_assistant_text_keeps_raw_whitespace(self):
+        value = "  SELECT\n    id\n"
+        self.assertEqual(self._events_from_real_jsonl(
+            "claude", {
+                "type": "assistant",
+                "timestamp": "2026-08-30T10:00:00.000Z",
+                "message": {"content": [
+                    {"type": "text", "text": ""},
+                    {"type": "text", "text": value},
+                ]},
+            }), [value])
+
+    def test_codex_user_text_keeps_raw_whitespace(self):
+        value = "  SELECT\n    id\n"
+        self.assertEqual(self._events_from_real_jsonl(
+            "codex", {
+                "type": "response_item",
+                "timestamp": "2026-08-30T10:00:00.000Z",
+                "payload": {"type": "message", "role": "user",
+                            "content": [
+                                {"type": "input_text", "text": ""},
+                                {"type": "input_text", "text": value},
+                            ]},
+            }), [value])
+
+    def test_codex_assistant_text_keeps_raw_whitespace(self):
+        value = "  SELECT\n    id\n"
+        self.assertEqual(self._events_from_real_jsonl(
+            "codex", {
+                "type": "response_item",
+                "timestamp": "2026-08-30T10:00:00.000Z",
+                "payload": {"type": "message", "role": "assistant",
+                            "content": [
+                                {"type": "input_text", "text": ""},
+                                {"type": "input_text", "text": value},
+                            ]},
+            }), [value])
 
     # ---- Important 2: upgrading a legacy hook must not leave a duplicate ----
 
