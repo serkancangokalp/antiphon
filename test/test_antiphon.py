@@ -785,12 +785,16 @@ class AntiphonTest(unittest.TestCase):
                  contextlib.redirect_stdout(io.StringIO()):
                 self.assertEqual(antiphon.setup(), 0)
 
-            for rel in (".claude/settings.json", ".codex/hooks.json"):
+            # One per event, not one per file: the Codex hook is installed
+            # under SessionStart as well as UserPromptSubmit, and upgrading a
+            # legacy entry must still leave exactly one copy under each.
+            for rel, hook_copies in ((".claude/settings.json", 1),
+                                     (".codex/hooks.json", 2)):
                 with open(os.path.join(project, rel), encoding="utf-8") as f:
                     content = f.read()
                 self.assertNotIn(legacy, content)
-                self.assertEqual(content.count("antiphon hook"), 1)
-                self.assertEqual(content.count("antiphon push"), 1)
+                self.assertEqual(content.count("antiphon hook"), hook_copies, rel)
+                self.assertEqual(content.count("antiphon push"), 1, rel)
 
     # ---- Minor: the CLI must not answer a typo with a traceback ----
 
@@ -1153,6 +1157,400 @@ class AntiphonTest(unittest.TestCase):
                     "last_pushed_claude": "hello",
                 })
 
+
+
+class CodexPeerWiringTest(unittest.TestCase):
+    """The two Codex writers, wired to the processes that actually run them.
+
+    The MCP server registers an endpoint when it starts and releases it when it
+    stops; the hook records which session is behind the alias on every event it
+    sees. Everything here is a layer over a bridge that already works unnamed,
+    so no failure in it may cost a session its tools or its context.
+    """
+
+    UUID = "1d5a03e0-0548-4339-87c3-45c5dbf7e9d7"
+    OTHER = "2e6b14f1-1659-544a-98d4-56d6eca8fa48"
+
+    @staticmethod
+    @contextlib.contextmanager
+    def _named(name):
+        """`ANTIPHON_NAME` as this session would really see it — set, or absent."""
+        with patch.dict(os.environ, {}):
+            os.environ.pop("ANTIPHON_NAME", None)
+            if name:
+                os.environ["ANTIPHON_NAME"] = name
+            yield
+
+    def _register(self, project, name="build", owner="300:x"):
+        err = io.StringIO()
+        with self._named(name), \
+             patch.object(antiphon.peers, "owner_key", return_value=owner), \
+             contextlib.redirect_stderr(err):
+            alias = antiphon.register_codex_peer(project)
+        return alias, err.getvalue()
+
+    def _hook(self, project, event=None, session_id=None, name="build",
+              owner="300:x", side="codex", summary=("", None, 0)):
+        payload = {"cwd": project, "transcript_path": "/t/r.jsonl"}
+        if event is not None:
+            payload["hook_event_name"] = event
+        if session_id is not None:
+            payload["session_id"] = session_id
+        out, err, written = io.StringIO(), io.StringIO(), []
+        with self._named(name), \
+             patch.object(antiphon.sys, "stdin", io.StringIO(json.dumps(payload))), \
+             patch.object(antiphon.peers, "owner_key", return_value=owner), \
+             patch.object(antiphon, "build_summary", return_value=summary), \
+             patch.object(antiphon, "read_cursor", return_value={}), \
+             patch.object(antiphon, "write_cursor",
+                          side_effect=lambda cwd, data, kind: written.append(kind)), \
+             contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            code = antiphon.hook(side)
+        return code, out.getvalue(), err.getvalue(), written
+
+    @staticmethod
+    def _run_mcp(project, *requests, name=None, owner="300:x"):
+        stdin = io.StringIO("".join(json.dumps(r) + "\n" for r in requests))
+        out, err = io.StringIO(), io.StringIO()
+        with patch.dict(os.environ, {}):
+            os.environ.pop("ANTIPHON_NAME", None)
+            if name:
+                os.environ["ANTIPHON_NAME"] = name
+            with patch.object(antiphon, "project_dir", return_value=project), \
+                 patch.object(antiphon.sys, "stdin", stdin), \
+                 patch.object(antiphon.peers, "owner_key", return_value=owner), \
+                 contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+                antiphon.mcp()
+        return ([json.loads(line) for line in out.getvalue().splitlines()
+                 if line.strip()], err.getvalue())
+
+    # ---- the server claims its alias ----
+
+    def test_a_named_server_claims_its_alias_and_is_told_which_one(self):
+        """`mcp()` releases what this returns, so it has to be what was won."""
+        with tempfile.TemporaryDirectory() as project:
+            alias, err = self._register(project)
+            self.assertEqual(alias, "build")
+            self.assertEqual(err, "")
+            peer = antiphon.peers.read_peers(project, "codex")[0]
+        self.assertEqual(peer["pid"], os.getpid())
+        self.assertEqual(peer["owner"], "300:x")
+        self.assertIsNone(peer["address"], "live, and nothing can reach it yet")
+
+    def test_an_unnamed_server_says_nothing_and_asks_nobody_who_it_is(self):
+        """The unchanged single-peer case. Nothing was asked for, so there is
+        nothing to warn about — and no reason to walk a process tree either."""
+        with tempfile.TemporaryDirectory() as project:
+            with self._named(None), \
+                 patch.object(antiphon.peers, "owner_key") as walk, \
+                 contextlib.redirect_stderr(io.StringIO()) as err:
+                self.assertIsNone(antiphon.register_codex_peer(project))
+            walk.assert_not_called()
+            self.assertEqual(err.getvalue(), "")
+            self.assertEqual(antiphon.peers.read_peers(project), [])
+
+    def test_an_unusable_alias_names_the_rule_it_broke_and_asks_nobody(self):
+        """They typed it. Silence would let them believe `@codex:Build!` works.
+
+        And a name that can never be registered is not worth a process walk: the
+        answer cannot change what happens next."""
+        with tempfile.TemporaryDirectory() as project:
+            with self._named("Build!"), \
+                 patch.object(antiphon.peers, "owner_key") as walk, \
+                 contextlib.redirect_stderr(io.StringIO()) as err:
+                self.assertIsNone(antiphon.register_codex_peer(project))
+            walk.assert_not_called()
+        self.assertIn("a-z0-9", err.getvalue())
+
+    def test_an_alias_that_cannot_be_identified_says_so(self):
+        with tempfile.TemporaryDirectory() as project:
+            alias, err = self._register(project, owner=None)
+        self.assertIsNone(alias)
+        self.assertIn("build", err)
+        self.assertIn("named routing disabled", err)
+
+    def test_a_registry_that_cannot_be_written_disables_naming_and_says_so(self):
+        with tempfile.TemporaryDirectory() as project, \
+             patch.object(antiphon.peers, "register",
+                          side_effect=OSError("read-only file system")):
+            alias, err = self._register(project)
+        self.assertIsNone(alias)
+        self.assertIn("named routing disabled", err)
+        self.assertIn("read-only file system", err)
+
+    def test_a_claim_refused_by_a_live_holder_returns_nothing(self):
+        with tempfile.TemporaryDirectory() as project:
+            antiphon.peers.register(project, "codex", "build", None,
+                                    pid=os.getppid(), owner_key="300:first")
+            alias, err = self._register(project, owner="301:second")
+        self.assertIsNone(alias, "nothing was claimed, so nothing may be released")
+        self.assertIn("build", err)
+
+    # ---- the server's lifetime ----
+
+    def test_the_server_registers_before_it_reads_a_request(self):
+        """A server that registered only once a message arrived would be
+        invisible for exactly the window in which somebody is deciding who to
+        address."""
+        order = []
+
+        class Watching(io.StringIO):
+            def __iter__(self):
+                order.append("read")
+                return super().__iter__()
+
+        with tempfile.TemporaryDirectory() as project, \
+             patch.object(antiphon, "project_dir", return_value=project), \
+             patch.object(antiphon, "register_codex_peer",
+                          side_effect=lambda cwd: order.append("register") or "build"), \
+             patch.object(antiphon.peers, "unregister",
+                          side_effect=lambda *a, **k: order.append("release")), \
+             patch.object(antiphon.sys, "stdin", Watching("")), \
+             contextlib.redirect_stdout(io.StringIO()):
+            antiphon.mcp()
+        self.assertEqual(order, ["register", "read", "release"])
+
+    def test_the_server_releases_exactly_the_alias_it_won(self):
+        """Not the alias it was asked for. A server refused `build` and then
+        releasing `build` on the way out would be releasing somebody else's."""
+        with tempfile.TemporaryDirectory() as project, \
+             patch.object(antiphon, "project_dir", return_value=project), \
+             patch.object(antiphon, "register_codex_peer", return_value="review"), \
+             patch.object(antiphon.peers, "unregister") as release, \
+             patch.object(antiphon.sys, "stdin", io.StringIO("")), \
+             contextlib.redirect_stdout(io.StringIO()):
+            antiphon.mcp()
+        release.assert_called_once_with(project, "codex", "review", pid=os.getpid())
+
+    def test_a_server_that_claimed_nothing_releases_nothing(self):
+        """`unregister` is pid-guarded as well, but a process that never won the
+        alias has no business asking about it: the guard is the second line of
+        defence, not the first."""
+        with tempfile.TemporaryDirectory() as project, \
+             patch.object(antiphon, "project_dir", return_value=project), \
+             patch.object(antiphon, "register_codex_peer", return_value=None), \
+             patch.object(antiphon.peers, "unregister") as release, \
+             patch.object(antiphon.sys, "stdin", io.StringIO("")), \
+             contextlib.redirect_stdout(io.StringIO()):
+            antiphon.mcp()
+        release.assert_not_called()
+
+    def test_the_server_releases_its_own_claim_on_the_way_out(self):
+        with tempfile.TemporaryDirectory() as project:
+            self._run_mcp(project, name="build")
+            self.assertEqual(antiphon.peers.read_peers(project), [])
+
+    def test_a_refused_server_releases_nothing_on_its_way_out(self):
+        """Two servers, one alias. The loser must not delete the winner's record
+        as it exits — that would hand the name to whoever asked next and take a
+        working peer down with it."""
+        with tempfile.TemporaryDirectory() as project:
+            antiphon.peers.register(project, "codex", "build", None,
+                                    pid=os.getppid(), owner_key="300:first")
+            endpoint = os.path.join(
+                antiphon.peers.peer_dir(project, "codex", "build"), "endpoint.json")
+            with open(endpoint, "rb") as f:
+                before = f.read()
+            self._run_mcp(project, name="build", owner="301:second")
+            with open(endpoint, "rb") as f:
+                self.assertEqual(f.read(), before, "the holder is untouched")
+
+    def test_a_broken_registry_does_not_cost_the_session_its_tools(self):
+        """Named routing is decoration on a bridge that already works. It may
+        fail; it may not take `initialize` or `tools/list` down with it."""
+        with tempfile.TemporaryDirectory() as project, \
+             patch.object(antiphon.peers, "register",
+                          side_effect=OSError("disk gone")), \
+             patch.object(antiphon.peers, "unregister",
+                          side_effect=OSError("disk gone")):
+            replies, _ = self._run_mcp(
+                project,
+                {"jsonrpc": "2.0", "id": 1, "method": "initialize"},
+                {"jsonrpc": "2.0", "id": 2, "method": "tools/list"},
+                name="build")
+        self.assertEqual([r["id"] for r in replies], [1, 2])
+        self.assertIn("tools", replies[1]["result"])
+
+    # ---- the hook records the session ----
+
+    def test_every_codex_event_refreshes_the_session(self):
+        """A missed SessionStart then costs one turn of routability rather than
+        the whole session's."""
+        for event in ("SessionStart", "UserPromptSubmit", None):
+            with tempfile.TemporaryDirectory() as project:
+                self._register(project)
+                self._hook(project, event=event, session_id=self.UUID)
+                peer = antiphon.peers.read_peers(project, "codex")[0]
+                self.assertEqual(peer["address"], self.UUID, repr(event))
+
+    def test_only_a_user_prompt_produces_context(self):
+        """Nothing else has a prompt for context to attach to, and a wrapper
+        naming an event that did not happen is worse than silence."""
+        for event in ("SessionStart", "Notification", "SomethingNewInCodex"):
+            with tempfile.TemporaryDirectory() as project:
+                code, out, _, _ = self._hook(project, event=event,
+                                             session_id=self.UUID,
+                                             summary=("news", 5.0, 1))
+                self.assertEqual(code, 0, event)
+                self.assertEqual(out, "", event)
+
+    def test_a_silent_event_never_reads_the_summary_at_all(self):
+        """Producing no output is not enough. A summary that is read and not
+        shown is a summary somebody could later mark as seen — the loss this
+        bridge exists to prevent, arriving one refactor later."""
+        payload = {"cwd": "/tmp/project", "hook_event_name": "SessionStart",
+                   "session_id": self.UUID}
+        with self._named("build"), \
+             patch.object(antiphon.sys, "stdin", io.StringIO(json.dumps(payload))), \
+             patch.object(antiphon.peers, "owner_key", return_value="300:x"), \
+             patch.object(antiphon, "record_codex_session"), \
+             patch.object(antiphon, "build_summary") as summary, \
+             patch.object(antiphon, "read_cursor") as cursor, \
+             patch.object(antiphon, "write_cursor") as write, \
+             contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(antiphon.hook("codex"), 0)
+        summary.assert_not_called()
+        cursor.assert_not_called()
+        write.assert_not_called()
+
+    def test_a_silent_event_does_not_advance_the_cursor(self):
+        """The summary it would mark as seen was never shown to anybody."""
+        with tempfile.TemporaryDirectory() as project:
+            _, _, _, written = self._hook(project, event="SessionStart",
+                                          session_id=self.UUID,
+                                          summary=("news", 5.0, 1))
+            self.assertEqual(written, [], "nothing was read, so nothing is seen")
+            _, out, _, written = self._hook(project, event="UserPromptSubmit",
+                                            session_id=self.UUID,
+                                            summary=("news", 5.0, 1))
+        self.assertEqual(written, ["codex"])
+        self.assertIn("news", out)
+
+    def test_a_missing_event_name_is_treated_as_a_prompt(self):
+        """An older Codex sends no event name, and the only hook it installs is
+        the prompt one. Guessing silence there would cost every injection."""
+        with tempfile.TemporaryDirectory() as project:
+            _, out, _, _ = self._hook(project, event=None, session_id=self.UUID,
+                                      summary=("news", 5.0, 1))
+        self.assertIn("news", out)
+
+    def test_the_claude_hook_touches_no_part_of_the_codex_registry(self):
+        """Claude's alias is settled by its socket, and `ANTIPHON_NAME` is
+        shared by both sides of one terminal. A Claude hook that walked the
+        process tree or wrote a session record would be describing a peer it is
+        not."""
+        payload = {"cwd": "/tmp/project", "hook_event_name": "UserPromptSubmit",
+                   "session_id": self.UUID}
+        with self._named("build"), \
+             patch.object(antiphon.sys, "stdin", io.StringIO(json.dumps(payload))), \
+             patch.object(antiphon.peers, "owner_key") as walk, \
+             patch.object(antiphon.peers, "write_session") as write_session, \
+             patch.object(antiphon, "build_summary", return_value=("", None, 0)), \
+             patch.object(antiphon, "read_cursor", return_value={}), \
+             patch.object(antiphon, "write_cursor"), \
+             contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(antiphon.hook("claude"), 0)
+        walk.assert_not_called()
+        write_session.assert_not_called()
+
+    def test_the_hook_still_injects_context_when_the_registry_is_broken(self):
+        with tempfile.TemporaryDirectory() as project, \
+             patch.object(antiphon.peers, "write_session",
+                          side_effect=OSError("disk gone")):
+            _, out, err, _ = self._hook(project, event="UserPromptSubmit",
+                                        session_id=self.UUID,
+                                        summary=("news", 5.0, 1))
+        self.assertIn("news", out)
+        self.assertIn("disk gone", err)
+
+    def test_a_hook_with_no_session_id_records_nothing_and_still_injects(self):
+        with tempfile.TemporaryDirectory() as project:
+            self._register(project)
+            _, out, _, _ = self._hook(project, event="UserPromptSubmit",
+                                      session_id=None, summary=("news", 5.0, 1))
+            self.assertIsNone(antiphon.peers.read_peers(project, "codex")[0]["address"])
+        self.assertIn("news", out)
+
+    def test_a_second_owners_hook_cannot_repoint_a_live_alias(self):
+        """The first session keeps working and the second one is told."""
+        with tempfile.TemporaryDirectory() as project:
+            antiphon.peers.register(project, "codex", "build", None,
+                                    pid=os.getppid(), owner_key="300:first")
+            antiphon.peers.write_session(project, "codex", "build", self.UUID,
+                                         "/t/first.jsonl", "300:first")
+            _, _, err, _ = self._hook(project, event="UserPromptSubmit",
+                                      session_id=self.OTHER, owner="301:second")
+            peer = antiphon.peers.read_peers(project, "codex")[0]
+        self.assertEqual(peer["address"], self.UUID, "the first session is untouched")
+        self.assertIn("build", err)
+
+    def test_the_hook_may_run_before_the_server_registers(self):
+        with tempfile.TemporaryDirectory() as project:
+            self._hook(project, event="SessionStart", session_id=self.UUID)
+            self.assertEqual(antiphon.peers.read_peers(project), [],
+                             "a session record alone is not a peer")
+            self._register(project)
+            peer = antiphon.peers.read_peers(project, "codex")[0]
+        self.assertEqual(peer["address"], self.UUID)
+
+    def test_the_server_may_register_before_the_hook_runs(self):
+        with tempfile.TemporaryDirectory() as project:
+            self._register(project)
+            self.assertIsNone(antiphon.peers.read_peers(project, "codex")[0]["address"])
+            self._hook(project, event="SessionStart", session_id=self.UUID)
+            peer = antiphon.peers.read_peers(project, "codex")[0]
+        self.assertEqual(peer["address"], self.UUID)
+
+    # ---- setup installs the hook under both events ----
+
+    @staticmethod
+    def _codex_hooks(project):
+        with open(os.path.join(project, ".codex", "hooks.json"),
+                  encoding="utf-8") as f:
+            return json.load(f)["hooks"]
+
+    def test_setup_installs_the_codex_hook_under_both_events(self):
+        with tempfile.TemporaryDirectory() as project, \
+             patch.object(antiphon, "project_dir", return_value=project), \
+             contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(antiphon.setup(), 0)
+            hooks = self._codex_hooks(project)
+        for event in ("SessionStart", "UserPromptSubmit"):
+            commands = [entry["command"] for group in hooks[event]
+                        for entry in group["hooks"]]
+            self.assertEqual(commands.count("antiphon hook codex"), 1, event)
+        self.assertNotIn("SessionEnd", hooks,
+                         "it can be delayed or missed; nothing may rely on it")
+
+    def test_rerunning_setup_adds_no_second_copy_under_either_event(self):
+        with tempfile.TemporaryDirectory() as project, \
+             patch.object(antiphon, "project_dir", return_value=project), \
+             contextlib.redirect_stdout(io.StringIO()):
+            antiphon.setup()
+            antiphon.setup()
+            hooks = self._codex_hooks(project)
+        for event in ("SessionStart", "UserPromptSubmit"):
+            commands = [entry["command"] for group in hooks[event]
+                        for entry in group["hooks"]]
+            self.assertEqual(commands.count("antiphon hook codex"), 1, event)
+
+    def test_setup_adds_session_start_to_a_config_that_predates_it(self):
+        """An install from before this change has only the prompt hook. It gains
+        the new event without gaining a second copy of the old one."""
+        with tempfile.TemporaryDirectory() as project:
+            os.makedirs(os.path.join(project, ".codex"))
+            with open(os.path.join(project, ".codex", "hooks.json"), "w",
+                      encoding="utf-8") as f:
+                json.dump({"hooks": {"UserPromptSubmit": [{"hooks": [
+                    {"type": "command", "command": "antiphon hook codex"}]}]}}, f)
+            with patch.object(antiphon, "project_dir", return_value=project), \
+                 contextlib.redirect_stdout(io.StringIO()):
+                antiphon.setup()
+            hooks = self._codex_hooks(project)
+        self.assertEqual(sum(len(g["hooks"]) for g in hooks["SessionStart"]), 1)
+        self.assertEqual(
+            [entry["command"] for group in hooks["UserPromptSubmit"]
+             for entry in group["hooks"]].count("antiphon hook codex"), 1)
 
 
 if __name__ == "__main__":

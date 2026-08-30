@@ -7,7 +7,7 @@ Usage:
   antiphon setup               # installs the hook on both sides
   antiphon status              # shows what's happening on both sides (for humans)
   antiphon summary [side]      # the text that side would see (claude | codex)
-  antiphon hook <side>         # UserPromptSubmit hook (reads JSON from stdin)
+  antiphon hook <side>         # prompt and session hook (reads JSON from stdin)
   antiphon push <target>       # Stop hook: pushes `@codex` / `@claude` lines
   antiphon reply               # sends a Claude Channel reply to Codex (stdin JSON)
   antiphon channel             # long-lived Node.js MCP Channel server (started by Claude Code)
@@ -18,9 +18,10 @@ reads and derives from them. That way there's no write race, no stale record,
 and no second source of truth. The only persistent state is a cursor tracking
 how far each side has read.
 
-Both sides are symmetric: Claude Code and Codex CLI speak the same
-`UserPromptSubmit` hook contract (the same input fields, the same output
-wrapper), so a single `hook` function serves both.
+Both sides are symmetric: Claude Code and Codex CLI speak the same hook
+contract (the same input fields, the same output wrapper), so a single `hook`
+function serves both. Only `UserPromptSubmit` injects context; Codex also runs
+it at `SessionStart`, where the session id arrives and nothing is injected.
 
 The pull and hook layer uses the Python standard library; the Claude Channel
 server runs on Node.js with the official MCP SDK.
@@ -551,11 +552,13 @@ def build_summary(cwd, side, start=0.0):
 # ---------- hook (both sides share the same contract) ----------
 
 def hook(side="claude"):
-    """UserPromptSubmit hook: injects the other side's summary into the context.
+    """Injects the other side's summary into the context, and on the Codex side
+    records which session is behind this alias.
 
     `side` is which CLI this hook is running inside ('claude' | 'codex').
-    Claude Code and Codex CLI speak the same input fields (`cwd`) and the same
-    output wrapper, so a single `hook` function serves both."""
+    Claude Code and Codex CLI speak the same input fields (`cwd`,
+    `hook_event_name`, `session_id`) and the same output wrapper, so a single
+    `hook` function serves both."""
     if side not in OTHER_SIDE:
         print(f"hook: unknown side {side!r} (claude | codex)", file=sys.stderr)
         return 1
@@ -564,6 +567,21 @@ def hook(side="claude"):
     except (json.JSONDecodeError, ValueError):
         input_data = {}
     cwd = os.path.abspath(input_data.get("cwd") or project_dir())
+    event = input_data.get("hook_event_name") or "UserPromptSubmit"
+
+    if side == "codex":
+        # On every event, not only `SessionStart`. A missed one then costs a
+        # turn of routability rather than the whole session's.
+        record_codex_session(cwd, input_data.get("session_id"),
+                             input_data.get("transcript_path"))
+
+    if event != "UserPromptSubmit":
+        # Only a prompt has something for context to attach to. Anything else —
+        # `SessionStart`, or an event this version has never heard of — records
+        # and returns without a word, rather than emitting a wrapper naming an
+        # event that did not happen. The cursor stays where it was too: a
+        # summary nobody was shown has not been seen.
+        return 0
 
     cursor = read_cursor(cwd, side)
     key = f"{side}_seen"
@@ -976,9 +994,103 @@ def _send_tool(cwd, text):
     return {"content": [{"type": "text", "text": "Delivered to the Claude Code channel."}]}
 
 
+def register_codex_peer(cwd):
+    """Registers this MCP server: alias, pid, owner key, and no address yet.
+
+    Returns the alias it actually holds, or None. `mcp()` releases exactly what
+    this returns, so a server that was refused the alias holds nothing and
+    cannot delete the holder's record on its way out — that would hand the name
+    to whoever asked next and take a working peer down with it.
+
+    Three outcomes and only one of them is silent. A session with no alias is
+    the unchanged single-peer case: nothing was asked for, so there is nothing
+    to warn about, and no reason to walk a process tree either. A session that
+    asked for an alias and cannot have one has to be told — somebody typed
+    `ANTIPHON_NAME=build` and would otherwise believe `@codex:build` works while
+    it silently never will.
+    """
+    alias = peers.explicit_name()
+    if not alias:
+        return None
+    if not peers.valid_name(alias):
+        print(f"antiphon: ANTIPHON_NAME={alias!r} is not a usable name "
+              "([a-z0-9][a-z0-9_-]{0,31}); named routing is off for this session "
+              "and the single unnamed peer still works.", file=sys.stderr)
+        return None
+    try:
+        owner = peers.owner_key()
+        if not owner:
+            print("antiphon: named routing disabled — could not identify the "
+                  f"owning Codex process, so {alias!r} cannot be addressed. The "
+                  "bare single-peer fallback still works.", file=sys.stderr)
+            return None
+        ok, detail = peers.register(cwd, "codex", alias, None,
+                                    pid=os.getpid(), owner_key=owner)
+    except Exception as error:
+        # Named routing is a layer over a bridge that already works without it.
+        # Nothing here may cost this session its tools, so every failure is
+        # caught — and every one is named in full, so a bug shows up loudly
+        # instead of being swallowed as a shrug.
+        print(f"antiphon: named routing disabled — the peer registry could not "
+              f"be written ({type(error).__name__}: {error}). The bare "
+              "single-peer fallback still works.", file=sys.stderr)
+        return None
+    if not ok:
+        print(f"antiphon: {detail}", file=sys.stderr)
+        return None
+    return alias
+
+
+def record_codex_session(cwd, session_id, transcript):
+    """Writes the hook's half: which session is behind this alias.
+
+    Returns whether it wrote. Silent when this session has no usable alias or
+    cannot identify itself — the server already said so once at start-up, which
+    is the right number of times to say it, and repeating it on every turn would
+    be noise. A refusal is different: it means somebody else holds the alias
+    right now, and that stays true and stays worth saying.
+    """
+    alias = peers.explicit_name()
+    if not (peers.valid_name(alias) and session_id):
+        return False
+    try:
+        owner = peers.owner_key()
+        if not owner:
+            return False
+        ok, detail = peers.write_session(cwd, "codex", alias, session_id,
+                                         transcript, owner)
+    except Exception as error:
+        print(f"antiphon: {alias!r} could not be recorded "
+              f"({type(error).__name__}: {error}); it is not addressable this "
+              "turn. The bare single-peer fallback still works.", file=sys.stderr)
+        return False
+    if not ok:
+        print(f"antiphon: {detail}", file=sys.stderr)
+    return ok
+
+
 def mcp():
     """The MCP stdio server Codex connects to."""
     cwd = project_dir()
+    alias = register_codex_peer(cwd)
+    try:
+        return _mcp_serve(cwd)
+    finally:
+        if alias:
+            try:
+                # Only what this process actually claimed, and `unregister` is
+                # pid-guarded on top of that. A `SIGKILL` leaves the record
+                # behind, which is what pid-based pruning in `read_peers` is
+                # for: the clean path releases the name at once, the fallback
+                # catches the rest.
+                peers.unregister(cwd, "codex", alias, pid=os.getpid())
+            except OSError:
+                pass
+
+
+def _mcp_serve(cwd):
+    """The request loop, split out so `mcp()` reads as what it now is: a
+    lifetime around it."""
     for line in sys.stdin:
         line = line.strip()
         if not line:
@@ -1151,7 +1263,10 @@ def _dedupe_hooks(hooks, command):
 
 
 def _add_hook(hooks, command, legacy_commands=None, label=None):
-    """Adds the command to the UserPromptSubmit list; does nothing if it's already there.
+    """Adds the command to one event's list; does nothing if it's already there.
+
+    `hooks` is the list for a single event, so the same command installed under
+    two events is two calls and stays exactly one entry under each.
 
     If `legacy_commands` is given, upgrade those first — otherwise, once the
     side argument gets added, the old entry would stick around and the hook
@@ -1330,6 +1445,20 @@ def setup():
 
     install(codex_target, codex_mutate,
             "Codex hook installed", "Codex hook already installed")
+
+    # The Codex session id arrives at SessionStart, so the same command is
+    # installed there too. Under both events is also the fallback: if
+    # SessionStart is missed — an older CLI, a config predating this — the first
+    # prompt records the session instead, and a peer becomes routable one turn
+    # later rather than never. SessionEnd is deliberately not installed: it can
+    # be delayed or missed, so nothing may depend on it.
+    def codex_session_mutate(data):
+        hooks = data.setdefault("hooks", {}).setdefault("SessionStart", [])
+        return _add_hook(hooks, codex_command, label="Antiphon bridge")
+
+    install(codex_target, codex_session_mutate,
+            "Codex session hook installed (SessionStart)",
+            "Codex session hook already installed")
 
     # --- Codex side: push to Claude (Stop hook) ---
     reverse_push_command = PUSH_COMMAND.format(target="claude")
