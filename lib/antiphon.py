@@ -607,14 +607,38 @@ def claude_socket_path(cwd):
                         f"antiphon-channel-{key}.sock")
 
 
+def resolve_claude_target(cwd):
+    """Which Claude peer a message goes to. Returns (address, detail).
+
+    `address` is None when nothing can be delivered safely. The bridge does not
+    choose between peers: a choice made here is invisible to everyone, which is
+    the failure the registry exists to end. An agent picking a name is a
+    different thing — that choice is written in its own words and can be read
+    back and disagreed with.
+    """
+    live = peers.read_peers(cwd, "claude")
+    if not live:
+        # Nothing registered: an older channel server may still be serving the
+        # project-wide path, and it is a working peer.
+        return claude_socket_path(cwd), ""
+    if len(live) == 1:
+        return live[0].get("address") or claude_socket_path(cwd), ""
+    names = ", ".join(sorted(p.get("name") or "?" for p in live))
+    return None, (f"not delivered: {len(live)} Claude peers are live ({names}); "
+                  "address one by name")
+
+
 def send_to_claude(cwd, text):
     """Sends a Codex message to Claude Code's MCP Channel socket."""
+    address, detail = resolve_claude_target(cwd)
+    if address is None:
+        return False, detail
     request = {
         "content": text,
         "message_id": str(uuid.uuid4()),
     }
     last_error = None
-    for path in (claude_socket_path(cwd),):
+    for path in (address,):
         try:
             with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as sock:
                 sock.settimeout(5)

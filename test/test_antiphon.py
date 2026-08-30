@@ -154,6 +154,50 @@ class AntiphonTest(unittest.TestCase):
             self.assertEqual(antiphon.reply(), 0)
         self.assertEqual(written, [{"last_pushed_codex": "hello"}])
 
+    # ---- choosing which Claude peer a message goes to ----
+
+    def test_one_live_claude_peer_is_delivered_to(self):
+        with tempfile.TemporaryDirectory() as project:
+            antiphon.peers.register(project, "claude", "ui", "/tmp/ui.sock")
+            address, detail = antiphon.resolve_claude_target(project)
+        self.assertEqual(address, "/tmp/ui.sock")
+        self.assertEqual(detail, "")
+
+    def test_several_live_peers_deliver_to_nobody_and_name_them_all(self):
+        """The bridge never guesses a recipient. Guessing is what the silent
+        misrouting was, and a cleverer guess is still a guess."""
+        with tempfile.TemporaryDirectory() as project:
+            antiphon.peers.register(project, "claude", "ui", "/tmp/ui.sock")
+            antiphon.peers.register(project, "claude", "api", "/tmp/api.sock")
+            address, detail = antiphon.resolve_claude_target(project)
+        self.assertIsNone(address)
+        self.assertIn("ui", detail)
+        self.assertIn("api", detail)
+
+    def test_a_codex_peer_does_not_count_as_a_claude_recipient(self):
+        with tempfile.TemporaryDirectory() as project:
+            antiphon.peers.register(project, "claude", "ui", "/tmp/ui.sock")
+            antiphon.peers.register(project, "codex", "build", "sess-1")
+            address, _ = antiphon.resolve_claude_target(project)
+        self.assertEqual(address, "/tmp/ui.sock")
+
+    def test_no_registered_peer_falls_back_to_the_project_socket(self):
+        """An older channel server still serving the project-wide path is still a
+        working peer; upgrading must not cut it off."""
+        with tempfile.TemporaryDirectory() as project:
+            address, detail = antiphon.resolve_claude_target(project)
+        self.assertEqual(address, antiphon.claude_socket_path(project))
+        self.assertEqual(detail, "")
+
+    def test_send_to_claude_reports_the_ambiguity_instead_of_picking(self):
+        with tempfile.TemporaryDirectory() as project:
+            antiphon.peers.register(project, "claude", "ui", "/tmp/ui.sock")
+            antiphon.peers.register(project, "claude", "api", "/tmp/api.sock")
+            ok, detail = antiphon.send_to_claude(project, "hello")
+        self.assertFalse(ok)
+        self.assertIn("ui", detail)
+        self.assertIn("not delivered", detail.lower())
+
     def test_send_to_claude_uses_mcp_channel_socket(self):
         class FakeSocket:
             def __init__(self, *_):
