@@ -214,21 +214,41 @@ def _is_self_injected(text):
     return text.lstrip().lower().startswith(_SELF_INJECTION_PREFIXES)
 
 
-def sender_alias(candidate=None):
-    """The alias to attribute an outgoing message to, or None.
+def sender_alias(candidate):
+    """A candidate alias if it could be one, else None.
 
-    Only a valid, explicit `ANTIPHON_NAME` counts. An automatic name identifies
-    a session in a listing but is not something the other side can put in a
-    reply, so passing one on would invite an answer addressed to nobody. A
-    session without one says so; it does not invent a name.
-
-    `candidate` is for a caller that already knows the answer — `channel.mjs`
-    hands its own name to the reply subprocess rather than leaving it to be
-    worked out again. It is validated here all the same: a value that arrives
-    from somewhere else is not evidence about who this is.
+    A pure check, with no fallback to the environment. Every caller is handed
+    its candidate by whatever actually established it — the registry claim, or
+    the channel server that holds it — and reaching for `ANTIPHON_NAME` here
+    would put back the assumption the callers exist to replace.
     """
-    name = peers.explicit_name() if candidate is None else candidate
-    return name if peers.valid_name(name) else None
+    return candidate if peers.valid_name(candidate) else None
+
+
+def claimed_alias(cwd, kind):
+    """This session's alias, but only if this session really holds it.
+
+    `ANTIPHON_NAME` is a request, not a claim. Two sessions can be started with
+    the same one and exactly one wins the registry. The loser publishing it
+    anyway would attribute its words to the winner, and a reply addressed back
+    would reach a session that never spoke — the misidentification the registry
+    exists to end, arriving through the label meant to prevent it.
+
+    So the alias is published only when the live record under it belongs to
+    this session, matched on the owner key. Anything that cannot be shown —
+    no key, no record, a record from another owner, a record written before
+    owner keys existed — yields None. A wrong identity is worse than none.
+    """
+    alias = sender_alias(peers.explicit_name())
+    if not alias:
+        return None                   # nothing asked for; nothing to check
+    owner = peers.owner_key()
+    if not owner:
+        return None
+    for peer in peers.read_peers(cwd, kind):
+        if peer.get("name") == alias:
+            return alias if peer.get("owner") == owner else None
+    return None
 
 
 def delivery_id():
@@ -802,10 +822,14 @@ def push(target="codex"):
         sent[""] = batch_fingerprint(batches[None])
     before = dict(sent)
 
+    # Once for the turn, not once per recipient. Who is speaking cannot change
+    # between two lines of one reply, and working it out again for each would
+    # walk the process tree again for an answer that is already known.
+    who = claimed_alias(cwd, side)
+
     def deliver(recipient, messages):
         outgoing = "\n".join(messages)
-        # A new id per attempt, and the alias of whoever is ending this turn.
-        who, attempt = sender_alias(), delivery_id()
+        attempt = delivery_id()       # but each attempt is its own attempt
         if target == "codex":
             ok, detail = send_to_codex(
                 cwd, f"{PUSH_LABEL} {queue_label(who, attempt)} {outgoing}",
@@ -1119,7 +1143,11 @@ def register_peer(*_):
     if kind not in ("claude", "codex") or not isinstance(address, str):
         print("register_peer: kind and address are required", file=sys.stderr)
         return 1
-    ok, detail = peers.register(project_dir(), kind, name, address, pid=data.get("pid"))
+    # The owner key this subprocess can see is the CLI root above the channel
+    # server, which is what a Stop hook in the same session computes too. It is
+    # how that hook later shows the alias is genuinely this session's.
+    ok, detail = peers.register(project_dir(), kind, name, address,
+                                pid=data.get("pid"), owner_key=peers.owner_key())
     if not ok:
         print(f"register_peer: {detail}", file=sys.stderr)
         return 1
@@ -1192,7 +1220,7 @@ def _mcp_result(mid, result):
     sys.stdout.flush()
 
 
-def _send_tool(cwd, text, to=None):
+def _send_tool(cwd, text, to=None, sender=None):
     """Delivers `text` to a Claude peer now, and reports honestly if it can't.
 
     A silent success would be the worst outcome: Codex would believe Claude had
@@ -1202,14 +1230,16 @@ def _send_tool(cwd, text, to=None):
     live — comes back as a tool error before any transport is opened.
 
     `to` is passed to the resolver exactly as given: an alias matches one peer
-    or none.
+    or none. `sender` is the alias this server actually won at start-up, not
+    what the environment asked for: a server refused its name holds nothing and
+    says nothing.
     """
     if not isinstance(text, str) or not text.strip():
         return _tool_error("text must be a non-empty string")
     if to is not None and not isinstance(to, str):
         return _tool_error("to must be a string naming one live Claude peer")
     text = text.strip()
-    ok, detail = send_to_claude(cwd, text, to, sender_alias=sender_alias(),
+    ok, detail = send_to_claude(cwd, text, to, sender_alias=sender_alias(sender),
                                 message_id=delivery_id())
     if not ok:
         return _tool_error(f"Not delivered to Claude: {detail}")
@@ -1302,7 +1332,9 @@ def mcp():
     cwd = project_dir()
     alias = register_codex_peer(cwd)
     try:
-        return _mcp_serve(cwd)
+        # The alias this process won, carried in rather than re-derived: the
+        # environment cannot tell whether the claim succeeded.
+        return _mcp_serve(cwd, alias)
     finally:
         if alias:
             try:
@@ -1316,7 +1348,7 @@ def mcp():
                 pass
 
 
-def _mcp_serve(cwd):
+def _mcp_serve(cwd, alias=None):
     """The request loop, split out so `mcp()` reads as what it now is: a
     lifetime around it."""
     for line in sys.stdin:
@@ -1360,7 +1392,7 @@ def _mcp_serve(cwd):
                 arguments = p.get("arguments")
                 arguments = arguments if isinstance(arguments, dict) else {}
                 _mcp_result(mid, _send_tool(cwd, arguments.get("text"),
-                                            arguments.get("to")))
+                                            arguments.get("to"), alias))
             else:
                 _mcp_result(mid, _tool_error(f"unknown tool: {name}"))
         elif mid is not None:

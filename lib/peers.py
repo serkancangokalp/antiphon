@@ -410,7 +410,7 @@ def register(cwd, kind, name, address, pid=None, owner_key=None):
             if other.get("name") == name:
                 if other_pid == owner_pid:
                     continue              # this process refreshing its own record
-                if owner_key and _owner_of(other) == owner_key:
+                if kind == "codex" and owner_key and _owner_of(other) == owner_key:
                     # Codex can bring up a second MCP server for one CLI session
                     # before the first has exited. Judged by pid alone the
                     # newcomer looks like an intruder, and the session locks
@@ -418,6 +418,13 @@ def register(cwd, kind, name, address, pid=None, owner_key=None):
                     # reaped. A shared key excuses a differing pid; a dead owner
                     # is already gone above, so it never excuses a missing
                     # process.
+                    #
+                    # Codex only, on purpose. A Claude endpoint is a socket
+                    # this process is serving, and two channel servers under one
+                    # CLI root would otherwise let the second overwrite the
+                    # first's record while the first's socket is still the one
+                    # answering — the registry would then describe a server
+                    # nobody reaches. A rollout id is not owned that way.
                     continue
                 return False, f"peer name {name!r} is already held by pid {other_pid}"
             if address is not None and _address_of(other) == address:

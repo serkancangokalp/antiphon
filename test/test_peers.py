@@ -615,7 +615,9 @@ class AddresslessEndpointTest(unittest.TestCase):
         """Codex can bring up a second MCP server for one CLI session before the
         first has exited. Judged by pid alone the newcomer looks like an
         intruder, and the session locks itself out of its own alias until its
-        predecessor is reaped."""
+        predecessor is reaped.
+
+        """
         with tempfile.TemporaryDirectory() as project:
             peers.register(project, "codex", "build", None,
                            pid=os.getppid(), owner_key="300:a")
@@ -647,6 +649,31 @@ class AddresslessEndpointTest(unittest.TestCase):
                                                   owner_key="300:a")
             self.assertFalse(same_session, "one session, two aliases, one address")
             self.assertIn("build", detail)
+
+    def test_a_second_claude_server_in_one_session_does_not_take_the_socket(self):
+        """The same-owner exception is for Codex alone. A Claude endpoint is a
+        socket this process is serving: two channel servers under one CLI root
+        would otherwise let the second overwrite the first's record while the
+        first's socket is still the one answering, and the registry would
+        describe a server nobody reaches."""
+        with tempfile.TemporaryDirectory() as project:
+            peers.register(project, "claude", "ui", "/tmp/ui.sock",
+                           pid=os.getppid(), owner_key="300:a")
+            ok, detail = peers.register(project, "claude", "ui", "/tmp/ui.sock",
+                                        pid=os.getpid(), owner_key="300:a")
+            self.assertFalse(ok, "the live holder stays")
+            self.assertIn("ui", detail)
+            live = peers.read_peers(project, "claude")
+        self.assertEqual([p["pid"] for p in live], [os.getppid()])
+
+    def test_an_addressless_codex_server_may_still_take_over(self):
+        """Both shapes a Codex server can be in keep working."""
+        with tempfile.TemporaryDirectory() as project:
+            peers.register(project, "codex", "build", None,
+                           pid=os.getppid(), owner_key="300:a")
+            ok, detail = peers.register(project, "codex", "build", None,
+                                        pid=os.getpid(), owner_key="300:a")
+            self.assertTrue(ok, detail)
 
     def test_a_keyless_record_keeps_its_alias_against_a_keyed_claimant(self):
         """A record written before owner keys existed carries none, so a

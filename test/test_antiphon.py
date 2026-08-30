@@ -2306,6 +2306,7 @@ class SenderIdentityTest(unittest.TestCase):
     """
 
     UUID = "1d5a03e0-0548-4339-87c3-45c5dbf7e9d7"
+    OWNER = "300:mine"
 
     @staticmethod
     @contextlib.contextmanager
@@ -2316,6 +2317,22 @@ class SenderIdentityTest(unittest.TestCase):
                 os.environ["ANTIPHON_NAME"] = name
             yield
 
+    @contextlib.contextmanager
+    def _holding(self, project, kind, name):
+        """The sender's own claim. An alias is published only by the session
+        the registry says holds it, so a label test has to establish that the
+        same way the real paths do."""
+        if name and antiphon.peers.valid_name(name):
+            if kind == "codex":
+                self._codex_peer(project, name, self.OWNER, self.UUID)
+            else:
+                antiphon.peers.register(project, "claude", name,
+                                        f"/tmp/{name}.sock", pid=os.getpid(),
+                                        owner_key=self.OWNER)
+        with self._named(name), \
+             patch.object(antiphon.peers, "owner_key", return_value=self.OWNER):
+            yield
+
     @staticmethod
     def _codex_peer(project, alias, owner, session):
         antiphon.peers.register(project, "codex", alias, None,
@@ -2324,12 +2341,14 @@ class SenderIdentityTest(unittest.TestCase):
                                      f"/t/{alias}.jsonl", owner)
 
     def _tool_send(self, name, to="ui"):
+        """The MCP server passes the alias it won at start-up; the tool
+        publishes that and never consults the environment."""
         with tempfile.TemporaryDirectory() as project:
             antiphon.peers.register(project, "claude", "ui", "/tmp/ui.sock")
             with patch.object(antiphon, "send_to_claude",
                               return_value=(True, "")) as send, \
-                 patch.object(antiphon, "_record_delivery"), self._named(name):
-                antiphon._send_tool(project, "run the tests", to)
+                 patch.object(antiphon, "_record_delivery"):
+                antiphon._send_tool(project, "run the tests", to, name)
         return send.call_args
 
     def _stop_to_claude(self, name, line="@claude:ui run the tests"):
@@ -2344,7 +2363,8 @@ class SenderIdentityTest(unittest.TestCase):
                               return_value=(True, "")) as send, \
                  patch.object(antiphon.sys, "stdin",
                               io.StringIO(json.dumps(payload))), \
-                 contextlib.redirect_stderr(io.StringIO()), self._named(name):
+                 contextlib.redirect_stderr(io.StringIO()), \
+                 self._holding(project, "codex", name):
                 self.assertEqual(antiphon.push("claude"), 0)
         return send.call_args
 
@@ -2352,7 +2372,9 @@ class SenderIdentityTest(unittest.TestCase):
         queued = []
         with tempfile.TemporaryDirectory() as project:
             self._codex_peer(project, "build", "300:build", self.UUID)
-            body = {"text": "ship it"}
+            # The channel server hands the reply the alias it holds; there is
+            # no environment fallback for it to fall back to.
+            body = {"text": "ship it", "sender_alias": name}
             body.update(payload or {})
             with patch.object(antiphon, "project_dir", return_value=project), \
                  patch.object(antiphon, "_queue_codex",
@@ -2360,7 +2382,7 @@ class SenderIdentityTest(unittest.TestCase):
                                   queued.append(message) or (True, "")), \
                  patch.object(antiphon.sys, "stdin",
                               io.StringIO(json.dumps(body))), \
-                 contextlib.redirect_stderr(io.StringIO()), self._named(name):
+                 contextlib.redirect_stderr(io.StringIO()):
                 self.assertEqual(antiphon.reply(), 0)
         return queued[0]
 
@@ -2379,7 +2401,8 @@ class SenderIdentityTest(unittest.TestCase):
                                   queued.append(message) or (True, "")), \
                  patch.object(antiphon.sys, "stdin",
                               io.StringIO(json.dumps(payload))), \
-                 contextlib.redirect_stderr(io.StringIO()), self._named(name):
+                 contextlib.redirect_stderr(io.StringIO()), \
+                 self._holding(project, "claude", name):
                 self.assertEqual(antiphon.push("codex"), 0)
         return queued[0]
 
@@ -2485,11 +2508,235 @@ class SenderIdentityTest(unittest.TestCase):
         self.assertIn("[from=api id=",
                       self._reply_text("ui", {"sender_alias": "api"}))
 
+    def test_an_explicit_null_from_the_channel_is_not_second_guessed(self):
+        """A channel server that lost its claim sends null on purpose. Reading
+        the environment instead would put its name straight back on."""
+        with self._named("ui"):
+            self.assertIn("[from=<unnamed> id=",
+                          self._reply_text("ui", {"sender_alias": None}))
+
     def test_an_unusable_alias_from_the_channel_is_not_taken_on_trust(self):
         self.assertIn("[from=<unnamed> id=",
                       self._reply_text(None, {"sender_alias": "Not A Name"}))
         self.assertIn("[from=<unnamed> id=",
                       self._reply_text(None, {"sender_alias": 42}))
+
+
+class ClaimedAliasTest(unittest.TestCase):
+    """An alias may be published only by the session that actually holds it.
+
+    A valid `ANTIPHON_NAME` is a request, not a claim. Two sessions can be
+    started with the same one and exactly one wins the registry. The loser
+    publishing it anyway would attribute its words to the winner, and a reply
+    addressed back would reach a session that never spoke — the silent
+    misidentification this whole registry exists to end, arriving through the
+    label that was meant to prevent it.
+    """
+
+    UUID = "1d5a03e0-0548-4339-87c3-45c5dbf7e9d7"
+    MINE, THEIRS = "300:mine", "301:theirs"
+
+    @staticmethod
+    @contextlib.contextmanager
+    def _named(name):
+        with patch.dict(os.environ, {}):
+            os.environ.pop("ANTIPHON_NAME", None)
+            if name:
+                os.environ["ANTIPHON_NAME"] = name
+            yield
+
+    def _claude_endpoint(self, project, owner):
+        directory = antiphon.peers.peer_dir(project, "claude", "ui")
+        os.makedirs(directory, exist_ok=True)
+        with open(os.path.join(directory, "endpoint.json"), "w",
+                  encoding="utf-8") as f:
+            json.dump({"kind": "claude", "name": "ui", "pid": os.getpid(),
+                       "address": "/tmp/ui.sock", "owner": owner,
+                       "started_at": 1.0}, f)
+
+    def _codex_endpoint(self, project, owner):
+        antiphon.peers.register(project, "codex", "ui", None,
+                                pid=os.getpid(), owner_key=owner)
+        antiphon.peers.write_session(project, "codex", "ui", self.UUID,
+                                     "/t/ui.jsonl", owner)
+
+    def _stop_to_claude(self, project):
+        """Codex's Stop hook: the sender is the Codex peer."""
+        payload = {"cwd": project, "transcript_path": "/tmp/rollout"}
+        with patch.object(antiphon.os.path, "exists", return_value=True), \
+             patch.object(antiphon, "last_codex_reply",
+                          return_value="@claude:ui run it"), \
+             patch.object(antiphon, "read_cursor", return_value={}), \
+             patch.object(antiphon, "write_cursor"), \
+             patch.object(antiphon, "send_to_claude",
+                          return_value=(True, "")) as send, \
+             patch.object(antiphon.sys, "stdin",
+                          io.StringIO(json.dumps(payload))), \
+             contextlib.redirect_stderr(io.StringIO()):
+            self.assertEqual(antiphon.push("claude"), 0)
+        return send.call_args.kwargs["sender_alias"]
+
+    def _stop_to_codex(self, project):
+        """Claude's Stop hook: the sender is the Claude peer."""
+        queued = []
+        payload = {"cwd": project, "transcript_path": "/tmp/transcript"}
+        with patch.object(antiphon.os.path, "exists", return_value=True), \
+             patch.object(antiphon, "last_claude_reply",
+                          return_value="@codex:ui run it"), \
+             patch.object(antiphon, "read_cursor", return_value={}), \
+             patch.object(antiphon, "write_cursor"), \
+             patch.object(antiphon, "_queue_codex",
+                          side_effect=lambda session, message:
+                              queued.append(message) or (True, "")), \
+             patch.object(antiphon.sys, "stdin",
+                          io.StringIO(json.dumps(payload))), \
+             contextlib.redirect_stderr(io.StringIO()):
+            self.assertEqual(antiphon.push("codex"), 0)
+        return queued[0]
+
+    def test_the_session_that_holds_the_alias_publishes_it(self):
+        with tempfile.TemporaryDirectory() as project:
+            self._codex_endpoint(project, self.MINE)
+            self._claude_endpoint(project, self.MINE)
+            with self._named("ui"), \
+                 patch.object(antiphon.peers, "owner_key", return_value=self.MINE):
+                self.assertEqual(self._stop_to_claude(project), "ui")
+                self.assertIn("[from=ui id=", self._stop_to_codex(project))
+
+    def test_a_session_that_lost_the_alias_does_not_publish_it(self):
+        """Both directions. The words are still delivered — only the claim to
+        be `ui` is withheld, because it is not this session's to make."""
+        with tempfile.TemporaryDirectory() as project:
+            self._codex_endpoint(project, self.THEIRS)
+            self._claude_endpoint(project, self.THEIRS)
+            with self._named("ui"), \
+                 patch.object(antiphon.peers, "owner_key", return_value=self.MINE):
+                self.assertIsNone(self._stop_to_claude(project))
+                self.assertIn("[from=<unnamed> id=", self._stop_to_codex(project))
+
+    def test_one_turn_settles_who_is_speaking_exactly_once(self):
+        """Three recipients, one sender. Deciding again per recipient would walk
+        the process tree three times for an answer already known — and would let
+        the label change mid-turn if the registry moved underneath it."""
+        with tempfile.TemporaryDirectory() as project:
+            self._claude_endpoint(project, self.MINE)
+            for alias in ("a", "b", "c"):
+                antiphon.peers.register(project, "codex", alias, f"sess-{alias}",
+                                        pid=os.getpid(), owner_key=self.MINE)
+            payload = {"cwd": project, "transcript_path": "/tmp/transcript"}
+            with self._named("ui"), \
+                 patch.object(antiphon.peers, "owner_key",
+                              return_value=self.MINE) as walk, \
+                 patch.object(antiphon.os.path, "exists", return_value=True), \
+                 patch.object(antiphon, "last_claude_reply",
+                              return_value="@codex:a one\n@codex:b two\n"
+                                           "@codex:c three"), \
+                 patch.object(antiphon, "read_cursor", return_value={}), \
+                 patch.object(antiphon, "write_cursor"), \
+                 patch.object(antiphon, "_queue_codex",
+                              return_value=(True, "")) as queued, \
+                 patch.object(antiphon.sys, "stdin",
+                              io.StringIO(json.dumps(payload))), \
+                 contextlib.redirect_stderr(io.StringIO()):
+                self.assertEqual(antiphon.push("codex"), 0)
+        self.assertEqual(queued.call_count, 3, "all three still went")
+        self.assertEqual(walk.call_count, 1, "and the sender was settled once")
+        labels = {m.split("id=")[0] for _, m in
+                  (c.args for c in queued.call_args_list)}
+        self.assertEqual(len(labels), 1, "one turn, one sender identity")
+        ids = {m.split("id=")[1].split("]")[0] for _, m in
+               (c.args for c in queued.call_args_list)}
+        self.assertEqual(len(ids), 3, "but each attempt is its own attempt")
+
+    def test_an_alias_nothing_holds_is_not_published_either(self):
+        """Nothing registered under the name at all: the environment says `ui`
+        and the registry has never heard of it."""
+        with tempfile.TemporaryDirectory() as project:
+            self._codex_endpoint(project, self.MINE)
+            antiphon.peers.unregister(project, "codex", "ui", pid=os.getpid())
+            with self._named("ui"), \
+                 patch.object(antiphon.peers, "owner_key", return_value=self.MINE):
+                self.assertIsNone(self._stop_to_claude(project))
+
+    def test_a_session_that_cannot_identify_itself_publishes_nothing(self):
+        with tempfile.TemporaryDirectory() as project:
+            self._codex_endpoint(project, self.MINE)
+            with self._named("ui"), \
+                 patch.object(antiphon.peers, "owner_key", return_value=None):
+                self.assertIsNone(self._stop_to_claude(project))
+
+    def test_a_record_written_before_owner_keys_publishes_nothing(self):
+        """It cannot show whose it is, so it is not evidence that it is ours.
+        A wrong identity is worse than no identity."""
+        with tempfile.TemporaryDirectory() as project:
+            antiphon.peers.register(project, "codex", "ui", "rollout-old",
+                                    pid=os.getpid())
+            with self._named("ui"), \
+                 patch.object(antiphon.peers, "owner_key", return_value=self.MINE):
+                self.assertIsNone(self._stop_to_claude(project))
+
+    def test_the_mcp_server_publishes_only_an_alias_it_actually_won(self):
+        """The direct tool path takes what `register_codex_peer` returned, not
+        what the environment asks for. A server refused the alias holds nothing
+        and says nothing."""
+        sent = []
+        requests = [{"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                     "params": {"name": "antiphon_send",
+                                "arguments": {"text": "hello", "to": "ui"}}}]
+        for claim, expected in (("build", "build"), (None, None)):
+            sent.clear()
+            with tempfile.TemporaryDirectory() as project, self._named("build"), \
+                 patch.object(antiphon, "project_dir", return_value=project), \
+                 patch.object(antiphon, "register_codex_peer", return_value=claim), \
+                 patch.object(antiphon.peers, "unregister"), \
+                 patch.object(antiphon, "_record_delivery"), \
+                 patch.object(antiphon, "send_to_claude",
+                              side_effect=lambda *a, **k:
+                                  sent.append(k.get("sender_alias")) or (True, "")), \
+                 patch.object(antiphon.sys, "stdin",
+                              io.StringIO("".join(json.dumps(r) + "\n"
+                                                  for r in requests))), \
+                 contextlib.redirect_stdout(io.StringIO()):
+                antiphon.mcp()
+            self.assertEqual(sent, [expected], repr(claim))
+
+    def test_the_reply_path_takes_no_alias_from_the_environment(self):
+        """`channel.mjs` publishes its name only once it holds the claim and
+        serves the socket. Falling back to the environment here would undo that
+        in the one process that cannot check.
+
+        Both wire forms: an explicit null is what a channel server that lost the
+        claim actually sends, and an absent field is what an older one sends.
+        The environment says `ui` throughout, and neither is allowed to become
+        it."""
+        for body in ({"text": "hi", "sender_alias": None}, {"text": "hi"}):
+            queued = []
+            with tempfile.TemporaryDirectory() as project:
+                self._codex_endpoint(project, self.MINE)
+                with self._named("ui"), \
+                     patch.object(antiphon, "project_dir", return_value=project), \
+                     patch.object(antiphon, "_queue_codex",
+                                  side_effect=lambda session, message:
+                                      queued.append(message) or (True, "")), \
+                     patch.object(antiphon.sys, "stdin",
+                                  io.StringIO(json.dumps(body))), \
+                     contextlib.redirect_stderr(io.StringIO()):
+                    self.assertEqual(antiphon.reply(), 0)
+            self.assertIn("[from=<unnamed> id=", queued[0], repr(body))
+
+    def test_register_peer_records_the_owner_key_it_can_see(self):
+        """The Stop hook checks the endpoint's owner against its own. Without
+        one written here, a Claude session could never publish its alias."""
+        with tempfile.TemporaryDirectory() as project, \
+             patch.object(antiphon, "project_dir", return_value=project), \
+             patch.object(antiphon.peers, "owner_key", return_value=self.MINE), \
+             patch.object(antiphon.sys, "stdin", io.StringIO(json.dumps({
+                 "kind": "claude", "name": "ui", "address": "/tmp/ui.sock",
+                 "pid": os.getpid()}))):
+            self.assertEqual(antiphon.register_peer(), 0)
+            peer = antiphon.peers.read_peers(project, "claude")[0]
+        self.assertEqual(peer["owner"], self.MINE)
+        self.assertEqual(peer["pid"], os.getpid())
 
 
 if __name__ == "__main__":

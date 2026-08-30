@@ -29,11 +29,18 @@ delete mainEnv.ANTIPHON_NAME;
 // A `codex` that records instead of queueing. Without it the reply tool can
 // only ever be tested on its failure paths, and the sentence it hands back on
 // success — the one that has to name the peer — is never exercised at all.
-const stubDir = await mkdtemp(join(tmpdir(), "antiphon-stub-"));
-const queueLog = join(stubDir, "queued.txt");
-writeFileSync(join(stubDir, "codex"),
-  `#!/bin/sh\nprintf '%s\\n' "$*" >> ${JSON.stringify(queueLog)}\nexit 0\n`,
-  { mode: 0o755 });
+async function makeCodexStub() {
+  const dir = await mkdtemp(join(tmpdir(), "antiphon-stub-"));
+  const log = join(dir, "queued.txt");
+  writeFileSync(join(dir, "codex"),
+    `#!/bin/sh\nprintf '%s\\n' "$*" >> ${JSON.stringify(log)}\nexit 0\n`,
+    { mode: 0o755 });
+  return { dir, log };
+}
+
+const stub = await makeCodexStub();
+const stubDir = stub.dir;
+const queueLog = stub.log;
 mainEnv.PATH = `${stubDir}:${process.env.PATH}`;
 
 const CODEX_SESSION = "1d5a03e0-0548-4339-87c3-45c5dbf7e9d7";
@@ -178,6 +185,82 @@ function registeredPeers(dir) {
     .map((entry) => join(root, entry, "endpoint.json"))
     .filter((path) => existsSync(path))
     .map((path) => JSON.parse(readFileSync(path, "utf8")));
+}
+
+async function onlyTheSessionThatWonTheNameSignsItsMessages() {
+  // Two sessions started as `ui`; exactly one wins the registry. The winner
+  // must sign its messages `ui` and the loser must not, because a reply
+  // addressed to `ui` reaches the winner — and a message the loser signed `ui`
+  // would send that reply to a session that never spoke.
+  //
+  // Both branches, in one real race, through two live MCP clients. With only
+  // the loser exercised, deleting the success assignment outright changed no
+  // test at all; with only the winner, the refusal branch went unwatched.
+  const dir = await mkdtemp(join(tmpdir(), "antiphon-race-"));
+  const sockets = [socketFor(dir, "ui")];
+  const stubs = [await makeCodexStub(), await makeCodexStub()];
+  const clients = [];
+  try {
+    liveCodexPeer(dir, "build", "300:build", CODEX_SESSION);
+    const start = async (stub) => {
+      const env = { ...process.env, ANTIPHON_CWD: dir, ANTIPHON_NAME: "ui" };
+      env.PATH = `${stub.dir}:${process.env.PATH}`;
+      const transport = new StdioClientTransport({
+        command: "node", args: ["lib/channel.mjs"], env, stderr: "pipe",
+      });
+      const client = new Client({ name: "antiphon-race", version: "1.0.0" });
+      await client.connect(transport);
+      let stderr = "";
+      transport.stderr?.setEncoding("utf8");
+      transport.stderr?.on("data", (chunk) => { stderr += chunk; });
+      clients.push(client);
+      return { client, stderr: () => stderr };
+    };
+
+    // `connect` returns once the MCP handshake is done, which is well before
+    // the claim has been decided. Waiting for each session to say how the race
+    // went is what makes this a test of the finished state rather than of
+    // whichever moment the call happened to land in.
+    const winner = await start(stubs[0]);
+    // Fired the instant the handshake is done, before the claim can possibly
+    // have been decided. A session that goes on to hold `ui` must still sign
+    // this message `ui`: safe-but-anonymous is still the wrong answer.
+    const earliest = winner.client.callTool({
+      name: "reply_to_codex", arguments: { text: "from the winner" },
+    });
+    assert.ok(await waitFor(() => /channel ready/.test(winner.stderr())),
+      `the first session never took the channel: ${winner.stderr()}`);
+    await earliest;
+    const loser = await start(stubs[1]);
+    assert.ok(await waitFor(() => /did not get the channel/.test(loser.stderr())),
+      `the second session never reported losing: ${loser.stderr()}`);
+
+    await loser.client.callTool({
+      name: "reply_to_codex", arguments: { text: "from the loser" },
+    });
+
+    assert.match(readFileSync(stubs[0].log, "utf8"), /\[from=ui id=/,
+      "the session that holds `ui` must sign itself `ui`");
+    const loserQueue = readFileSync(stubs[1].log, "utf8");
+    assert.match(loserQueue, /\[from=<unnamed> id=/,
+      "and the session that does not hold it must not");
+    assert.ok(!loserQueue.includes("[from=ui "),
+      `the loser signed itself with a name it does not hold: ${loserQueue}`);
+
+    await clients.pop().close();      // the loser leaves
+    const held = registeredPeers(dir).filter((peer) => peer.name === "ui");
+    assert.equal(held.length, 1, "the winner's record survives the loser's exit");
+    assert.equal(held[0].address, sockets[0]);
+    assert.ok(existsSync(sockets[0]), "and its socket still serves");
+    console.log("only the winner signs its name: ok");
+  } finally {
+    for (const client of clients) await client.close().catch(() => {});
+    for (const path of sockets) await rm(path, { force: true }).catch(() => {});
+    await rm(dir, { recursive: true, force: true }).catch(() => {});
+    for (const stub of stubs) {
+      await rm(stub.dir, { recursive: true, force: true }).catch(() => {});
+    }
+  }
 }
 
 async function onlyOneUnnamedSessionGetsTheChannel(startTogether) {
@@ -449,6 +532,7 @@ await anOversizedMessageIsRefusedWithoutKillingTheSession();
 await aRefusedClientCannotKeepStreaming();
 await aStalledClientDoesNotBlockShutdown();
 await aSocketPathItCannotClearDoesNotKillTheSession();
+await onlyTheSessionThatWonTheNameSignsItsMessages();
 await onlyOneUnnamedSessionGetsTheChannel(false);   // a second terminal, later
 await onlyOneUnnamedSessionGetsTheChannel(true);    // both started together
 console.log("per-peer sockets: ok");
