@@ -137,6 +137,24 @@ same identity on every supported host. There must be no user-settable owner-key
 override, no short-id collision, and no “newest session” fallback once more than
 one candidate is known.
 
+There is a concrete Claude-side lead, not yet a contract. On Claude Code
+2.1.251, `claude agents --json --cwd <project>` locally returned the active
+interactive session with `pid`, exact `cwd`, `sessionId` and a generated `name`,
+and the channel server's ancestor chain reached that pid. Before using it:
+
+- feature-detect the command and schema; help text calls this background-agent
+  management even though JSON currently includes interactive sessions;
+- measure the MCP startup race and use a bounded wait, never “newest” as a
+  fallback while the session has not appeared yet;
+- fail anonymous when the server is orphaned or its ancestry cannot be joined
+  to exactly one entry;
+- treat `sessionId` as the identity candidate and the generated `name` only as
+  untrusted display metadata until uniqueness and lifetime are documented;
+- prove the equivalent Codex MCP/hook join before changing the product rule —
+  a Claude-only automatic name would restore the asymmetry this release removed;
+- keep an explicit `ANTIPHON_NAME` as the deliberate override and test upgrade,
+  collision and mixed-version behaviour.
+
 ## P2 — Multi-line Stop markers
 
 Stop markers currently carry one line. Channel tools preserve multi-line text
