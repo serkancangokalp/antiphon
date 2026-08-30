@@ -30,6 +30,26 @@ def page_advance(sources=None, has_more=False, replay_reason=None):
     return antiphon.PageAdvance(sources or {}, has_more, replay_reason)
 
 
+def codex_msg(text):
+    """A `response_item` record for one Codex assistant message."""
+    return json.dumps({"type": "response_item", "payload": {
+        "type": "message", "role": "assistant",
+        "content": [{"type": "output_text", "text": text}],
+    }})
+
+
+def codex_task_started(turn_id):
+    return json.dumps({"type": "event_msg", "payload": {
+        "type": "task_started", "turn_id": turn_id,
+    }})
+
+
+def codex_task_complete(turn_id):
+    return json.dumps({"type": "event_msg", "payload": {
+        "type": "task_complete", "turn_id": turn_id,
+    }})
+
+
 def only_the_process_table(failure):
     """A `subprocess.run` that permits the registry's identity lookup and
     nothing else.
@@ -193,6 +213,153 @@ class AntiphonTest(unittest.TestCase):
         ]
         with patch.object(antiphon, "tail_lines", return_value=lines):
             self.assertEqual(antiphon.last_codex_reply("rollout"), "@claude new")
+
+    # ---- last_codex_reply: the turn the Stop hook is reporting on ----
+
+    def test_the_open_span_is_the_turn_the_stop_hook_reports_on(self):
+        """A marker written mid-turn must not be dropped just because the
+        turn has not closed yet — the Stop hook always fires before the
+        `task_complete` for the turn it is reporting on."""
+        lines = [
+            codex_task_started("T1"),
+            codex_msg("progress\n@claude do X"),
+            codex_msg("closing, no marker"),
+        ]
+        with patch.object(antiphon, "tail_lines", return_value=lines):
+            self.assertEqual(
+                antiphon.last_codex_reply("rollout", "T1"),
+                "progress\n@claude do X\nclosing, no marker")
+
+    def test_a_closed_previous_task_stays_out(self):
+        lines = [
+            codex_task_started("T1"),
+            codex_msg("@claude OLD"),
+            codex_task_complete("T1"),
+            codex_task_started("T2"),
+            codex_msg("new"),
+        ]
+        with patch.object(antiphon, "tail_lines", return_value=lines):
+            self.assertEqual(antiphon.last_codex_reply("rollout", "T2"), "new")
+
+    def test_an_orphan_complete_window_keeps_the_visible_open_span(self):
+        lines = [
+            codex_task_complete("T0"),
+            codex_msg("after clip 1"),
+            codex_msg("@claude after clip 2"),
+        ]
+        with patch.object(antiphon, "tail_lines", return_value=lines):
+            self.assertEqual(antiphon.last_codex_reply("rollout"),
+                             "after clip 1\n@claude after clip 2")
+
+    def test_a_rollout_without_task_markers_keeps_the_old_behaviour(self):
+        lines = [codex_msg("first"), codex_msg("second")]
+        with patch.object(antiphon, "tail_lines", return_value=lines):
+            self.assertEqual(antiphon.last_codex_reply("rollout"), "second")
+
+    def test_a_turn_id_match_beats_the_newest_start(self):
+        """An ancestor `task_started` matching the hook id must win even
+        though a nested, more recent `task_started` is also in view — a
+        newest-start rule would land inside the nested child instead and
+        lose the outer text written before it."""
+        lines = [
+            codex_task_started("ANCESTOR"),
+            codex_msg("outer, before the nested turn"),
+            codex_task_started("NESTED"),
+            codex_msg("nested child"),
+        ]
+        with patch.object(antiphon, "tail_lines", return_value=lines):
+            self.assertEqual(
+                antiphon.last_codex_reply("rollout", "ANCESTOR"),
+                "outer, before the nested turn\nnested child")
+
+    def test_an_unmatched_turn_id_never_binds_to_another_turn(self):
+        """The hook's id names a turn whose start already scrolled out of the
+        window. Binding to the only `task_started` actually in view — a
+        different turn — would attribute CURRENT to the wrong turn, or clip
+        it away entirely at that turn's own close."""
+        lines = [
+            codex_task_started("B"),
+            codex_msg("old"),
+            codex_task_complete("B"),
+            codex_msg("@claude CURRENT"),
+            codex_msg("closing"),
+        ]
+        with patch.object(antiphon, "tail_lines", return_value=lines):
+            self.assertEqual(antiphon.last_codex_reply("rollout", "A"),
+                             "old\n@claude CURRENT\nclosing")
+
+    def test_a_nested_turn_never_clips_the_outer_marker(self):
+        """Reviewer's counterexample: a closed nested span sits mid-window
+        with the outer turn's own marker before it. Clipping at the nested
+        span's `task_complete` — or falling through to a newest-start rule —
+        both lose the marker that came before the nested turn even started."""
+        lines = [
+            codex_msg("@claude CURRENT before child"),
+            codex_task_started("B"),
+            codex_msg("child"),
+            codex_task_complete("B"),
+            codex_msg("closing"),
+        ]
+        with patch.object(antiphon, "tail_lines", return_value=lines):
+            self.assertEqual(
+                antiphon.last_codex_reply("rollout", "A"),
+                "@claude CURRENT before child\nchild\nclosing")
+
+    def test_a_matched_span_ends_only_at_its_own_complete(self):
+        lines = [
+            codex_task_started("A"),
+            codex_msg("outer 1"),
+            codex_task_started("B"),
+            codex_msg("child"),
+            codex_task_complete("B"),
+            codex_msg("@claude outer 2"),
+        ]
+        with patch.object(antiphon, "tail_lines", return_value=lines):
+            self.assertEqual(
+                antiphon.last_codex_reply("rollout", "A"),
+                "outer 1\nchild\n@claude outer 2")
+
+    def test_without_an_id_the_newest_start_wins(self):
+        lines = [
+            codex_msg("before"),
+            codex_task_started("B"),
+            codex_msg("child"),
+            codex_task_complete("B"),
+            codex_msg("closing"),
+        ]
+        with patch.object(antiphon, "tail_lines", return_value=lines):
+            self.assertEqual(antiphon.last_codex_reply("rollout"),
+                             "child\nclosing")
+
+    def test_a_blank_turn_id_is_no_id(self):
+        lines = [
+            codex_msg("before"),
+            codex_task_started("B"),
+            codex_msg("child"),
+            codex_task_complete("B"),
+            codex_msg("closing"),
+        ]
+        with patch.object(antiphon, "tail_lines", return_value=lines):
+            for blank in ("", None):
+                self.assertEqual(antiphon.last_codex_reply("rollout", blank),
+                                 "child\nclosing", repr(blank))
+
+    def test_push_threads_the_hook_turn_id_into_last_codex_reply(self):
+        """`push` reads `turn_id` off the hook payload itself — the reader
+        cannot see it any other way — and only on the Codex→Claude side."""
+        with tempfile.TemporaryDirectory() as project:
+            input_data = {"cwd": project, "transcript_path": "/tmp/rollout",
+                         "turn_id": "T-123"}
+            with patch.object(antiphon.os.path, "exists", return_value=True), \
+                 patch.object(antiphon, "last_codex_reply",
+                              return_value="") as reader, \
+                 patch.object(antiphon, "read_cursor", return_value={}), \
+                 patch.object(antiphon, "write_cursor"), \
+                 patch.object(antiphon.sys, "stdin",
+                              io.StringIO(json.dumps(input_data))), \
+                 contextlib.redirect_stderr(io.StringIO()):
+                antiphon.push("claude")
+            reader.assert_called_once_with("/tmp/rollout", "T-123")
 
     def test_large_codex_rollout_reads_cwd_from_head(self):
         with tempfile.NamedTemporaryFile(prefix="rollout-", suffix=".jsonl") as f:

@@ -1470,21 +1470,93 @@ def last_claude_reply(transcript_path):
     return "\n".join(chunks).strip()
 
 
-def last_codex_reply(transcript_path):
-    """Returns the most recent assistant text in the Codex rollout."""
-    chunks = []
+def last_codex_reply(transcript_path, turn_id=None):
+    """Returns the assistant text(s) of the turn the Stop hook is reporting on.
+
+    `turn_id` is the hook payload's own id, threaded in from `push()`; a
+    missing key, `null`, `""`, or any non-string value all mean "no id" —
+    the hook predates the field. A matched `task_started` bounds the turn
+    exactly; anything short of a provable boundary falls open to every
+    assistant text in the window instead of guessing, because a duplicate of
+    an old turn's tail is recoverable and a lost `@claude` marker is not.
+    """
+    records = []
     for line in tail_lines(transcript_path):
         try:
-            d = json.loads(line)
+            records.append(json.loads(line))
         except json.JSONDecodeError:
             continue
+
+    def message_texts(d):
         p = d.get("payload") or {}
         if (d.get("type") != "response_item" or p.get("type") != "message"
                 or p.get("role") != "assistant"):
-            continue
+            return None
         texts = [c.get("text") or c.get("output_text") or c.get("input_text") or ""
                 for c in p.get("content") or [] if isinstance(c, dict)]
-        if any(texts):
+        return texts if any(texts) else None
+
+    def task_marker(d):
+        p = d.get("payload") or {}
+        if d.get("type") != "event_msg" or p.get("type") not in (
+                "task_started", "task_complete"):
+            return None
+        return p.get("type"), p.get("turn_id")
+
+    def all_visible_texts():
+        chunks = []
+        for d in records:
+            texts = message_texts(d)
+            if texts:
+                chunks.append("\n".join(texts))
+        return "\n".join(chunks).strip()
+
+    def span_after(start_index, ending_kind=None, ending_id=None):
+        chunks = []
+        for d in records[start_index:]:
+            marker = task_marker(d)
+            if ending_kind is not None and marker == (ending_kind, ending_id):
+                break
+            texts = message_texts(d)
+            if texts:
+                chunks.append("\n".join(texts))
+        return "\n".join(chunks).strip()
+
+    if isinstance(turn_id, str) and turn_id:
+        for i, d in enumerate(records):
+            if task_marker(d) == ("task_started", turn_id):
+                # Case 1: bounded by this turn's own close, or EOF — a
+                # nested child's complete carries a different id and does
+                # not end it.
+                return span_after(i + 1, "task_complete", turn_id)
+        # Case 2: a real id whose start already scrolled out of the window.
+        # Binding to a different task_started would attribute this reply to
+        # the wrong turn; clipping at a task_complete can cut current-turn
+        # text sitting after a closed nested span. Return everything visible.
+        return all_visible_texts()
+
+    # Case 3: no id to match against — decided on the window alone, since
+    # the reader never sees what came before or after it.
+    last_start = None
+    any_marker = False
+    for i, d in enumerate(records):
+        marker = task_marker(d)
+        if marker:
+            any_marker = True
+            if marker[0] == "task_started":
+                last_start = i
+    if last_start is not None:
+        # The current turn is still open while the hook runs, so nothing —
+        # not even its own task_complete — clips this span.
+        return span_after(last_start + 1)
+    if any_marker:
+        return all_visible_texts()          # an orphan task_complete: same fail-open
+
+    # No task marker at all in the window: today's newest-message behaviour.
+    chunks = []
+    for d in records:
+        texts = message_texts(d)
+        if texts:
             chunks = texts
     return "\n".join(chunks).strip()
 
@@ -1524,8 +1596,12 @@ def push(target="codex"):
     if not transcript or not os.path.exists(transcript):
         return 0
 
-    reply_reader = last_claude_reply if target == "codex" else last_codex_reply
-    reply_text = reply_reader(transcript)
+    if target == "codex":
+        reply_text = last_claude_reply(transcript)
+    else:
+        # Only Codex's own Stop hook carries this id; Claude's hook has
+        # nothing of the kind for `last_claude_reply` to use.
+        reply_text = last_codex_reply(transcript, input_data.get("turn_id"))
     batches = {}
     for recipient, messages in group_by_recipient(target, reply_text).items():
         # Reported per line, not per recipient: a batch holding one empty marker
