@@ -27,6 +27,7 @@ server runs on Node.js with the official MCP SDK.
 """
 
 import glob
+import errno
 import hashlib
 import json
 import os
@@ -650,39 +651,65 @@ def resolve_claude_target(cwd):
 MAX_CHANNEL_BYTES = 128 * 1024
 
 
+# A channel that is not there *yet* looks exactly like one that is not there at
+# all. Measured: Claude's MCP handshake completes 27-41ms before the socket is
+# bound, and a message sent the moment the channel looked ready was refused ten
+# times out of ten. The first thing a session says is precisely when that
+# happens, so the sender waits briefly rather than reporting a channel that is
+# about to exist as down.
+NOT_LISTENING_YET = frozenset({errno.ENOENT, errno.ECONNREFUSED})
+CONNECT_PATIENCE = 1.5            # seconds; a real outage still fails promptly
+CONNECT_RETRY_DELAY = 0.05
+
+
 def send_to_claude(cwd, text):
     """Sends a Codex message to Claude Code's MCP Channel socket."""
-    address, detail = resolve_claude_target(cwd)
-    if address is None:
-        return False, detail
     request = {
         "content": text,
         "message_id": str(uuid.uuid4()),
     }
-    size = len(json.dumps(request, ensure_ascii=False).encode())
-    if size > MAX_CHANNEL_BYTES:
-        return False, (f"message is {size} bytes; the channel accepts at most "
-                       f"{MAX_CHANNEL_BYTES}")
-    last_error = None
-    for path in (address,):
+    payload = json.dumps(request, ensure_ascii=False).encode()
+    if len(payload) > MAX_CHANNEL_BYTES:
+        return False, (f"message is {len(payload)} bytes; the channel accepts at "
+                       f"most {MAX_CHANNEL_BYTES}")
+
+    deadline = time.monotonic() + CONNECT_PATIENCE
+    while True:
+        # Re-resolved every attempt: a named peer can register in the meantime,
+        # which moves the address from the project-wide path to its own.
+        address, detail = resolve_claude_target(cwd)
+        if address is None:
+            return False, detail      # waiting cannot make two peers into one
+        sock = None
         try:
-            with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as sock:
-                sock.settimeout(5)
-                sock.connect(path)
-                sock.sendall(json.dumps(request, ensure_ascii=False).encode())
-                sock.shutdown(socket.SHUT_WR)
-                reply_bytes = b""
-                while len(reply_bytes) < 64 * 1024:
-                    chunk = sock.recv(8192)
-                    if not chunk:
-                        break
-                    reply_bytes += chunk
-            break
-        except OSError as e:
-            last_error = e
-    else:
+            sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            sock.settimeout(5)
+            sock.connect(address)
+        except OSError as error:
+            if sock is not None:
+                sock.close()
+            if error.errno in NOT_LISTENING_YET and time.monotonic() < deadline:
+                time.sleep(CONNECT_RETRY_DELAY)
+                continue
+            return False, ("Claude MCP Channel is down: "
+                           f"{error.strerror or type(error).__name__}")
+        break
+
+    # Connected. Nothing past this point is retried: the bytes may already have
+    # been accepted, and a second attempt would deliver the message twice.
+    try:
+        with sock:
+            sock.sendall(payload)
+            sock.shutdown(socket.SHUT_WR)
+            reply_bytes = b""
+            while len(reply_bytes) < 64 * 1024:
+                chunk = sock.recv(8192)
+                if not chunk:
+                    break
+                reply_bytes += chunk
+    except OSError as error:
         return False, ("Claude MCP Channel is down: "
-                       f"{last_error.strerror or type(last_error).__name__}")
+                       f"{error.strerror or type(error).__name__}")
     try:
         result = json.loads(reply_bytes.decode())
     except (UnicodeDecodeError, json.JSONDecodeError):

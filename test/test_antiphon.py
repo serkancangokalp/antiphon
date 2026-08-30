@@ -7,6 +7,7 @@ import io
 import json
 import subprocess
 import tempfile
+import time
 try:
     import tomllib          # Python 3.11+
 except ModuleNotFoundError:  # the hooks run whatever bare `python3` resolves to
@@ -230,6 +231,98 @@ class AntiphonTest(unittest.TestCase):
                 opened.assert_called()
         self.assertFalse(ok)
         self.assertNotIn(str(antiphon.MAX_CHANNEL_BYTES), detail)
+
+    class _Channel:
+        """A channel socket that is not there for the first `missing` connects."""
+
+        def __init__(self, missing=0, reply=b'{"ok": true}'):
+            self.missing = missing
+            self.reply = reply
+            self.connects = 0
+            self.sent = b""
+
+        def __call__(self, *_a, **_k):
+            return self
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_a):
+            return False
+
+        def settimeout(self, _):
+            pass
+
+        def close(self):
+            pass
+
+        def connect(self, _path):
+            self.connects += 1
+            if self.connects <= self.missing:
+                raise FileNotFoundError(2, "No such file or directory")
+
+        def sendall(self, data):
+            self.sent += data
+
+        def shutdown(self, _how):
+            pass
+
+        def recv(self, _n):
+            data, self.reply = self.reply, b""
+            return data
+
+    def test_a_message_sent_before_the_socket_exists_still_arrives(self):
+        """Measured: the MCP handshake completes 27-41ms before the channel socket
+        is bound, so a message sent the moment the channel looked ready was
+        refused 10 times out of 10. The first thing a session says is exactly when
+        this happens."""
+        chan = self._Channel(missing=2)
+        with tempfile.TemporaryDirectory() as project, \
+             patch.object(antiphon.socket, "socket", chan), \
+             patch.object(antiphon, "resolve_claude_target",
+                          side_effect=lambda cwd: ("/tmp/ui.sock", "")) as resolve:
+            ok, detail = antiphon.send_to_claude(project, "the first thing said")
+        self.assertTrue(ok, detail)
+        self.assertEqual(chan.connects, 3)
+        self.assertEqual(resolve.call_count, 3,
+                         "each attempt must re-resolve: a named peer can register "
+                         "between them and move the address")
+
+    def test_a_channel_that_never_appears_fails_within_a_bounded_time(self):
+        chan = self._Channel(missing=10_000)
+        with tempfile.TemporaryDirectory() as project, \
+             patch.object(antiphon.socket, "socket", chan), \
+             patch.object(antiphon, "resolve_claude_target",
+                          side_effect=lambda cwd: ("/tmp/ui.sock", "")):
+            started = time.monotonic()
+            ok, detail = antiphon.send_to_claude(project, "hello")
+            elapsed = time.monotonic() - started
+        self.assertFalse(ok)
+        self.assertIn("down", detail)
+        self.assertLess(elapsed, 3.0, "retrying must stay bounded")
+
+    def test_an_ambiguous_target_is_not_retried(self):
+        """Waiting cannot resolve ambiguity — more peers will not become fewer."""
+        with tempfile.TemporaryDirectory() as project, \
+             patch.object(antiphon, "resolve_claude_target",
+                          side_effect=lambda cwd: (None, "not delivered: 2 peers")
+                          ) as resolve:
+            ok, detail = antiphon.send_to_claude(project, "hello")
+        self.assertFalse(ok)
+        self.assertIn("2 peers", detail)
+        self.assertEqual(resolve.call_count, 1)
+
+    def test_a_failure_after_the_bytes_went_out_is_not_retried(self):
+        """Retrying here would deliver the message twice."""
+        chan = self._Channel(missing=0, reply=b"not json at all")
+        with tempfile.TemporaryDirectory() as project, \
+             patch.object(antiphon.socket, "socket", chan), \
+             patch.object(antiphon, "resolve_claude_target",
+                          side_effect=lambda cwd: ("/tmp/ui.sock", "")):
+            ok, detail = antiphon.send_to_claude(project, "hello")
+        self.assertFalse(ok)
+        self.assertIn("invalid response", detail)
+        self.assertEqual(chan.connects, 1, "the message must not be sent twice")
 
     def test_send_to_claude_uses_mcp_channel_socket(self):
         class FakeSocket:
