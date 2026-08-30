@@ -644,6 +644,12 @@ def resolve_claude_target(cwd):
                   "address one by name")
 
 
+# The channel server refuses anything larger. Checking here too means a sender
+# is told before transport instead of halfway through it. A contract test keeps
+# the two numbers equal.
+MAX_CHANNEL_BYTES = 128 * 1024
+
+
 def send_to_claude(cwd, text):
     """Sends a Codex message to Claude Code's MCP Channel socket."""
     address, detail = resolve_claude_target(cwd)
@@ -653,6 +659,10 @@ def send_to_claude(cwd, text):
         "content": text,
         "message_id": str(uuid.uuid4()),
     }
+    size = len(json.dumps(request, ensure_ascii=False).encode())
+    if size > MAX_CHANNEL_BYTES:
+        return False, (f"message is {size} bytes; the channel accepts at most "
+                       f"{MAX_CHANNEL_BYTES}")
     last_error = None
     for path in (address,):
         try:

@@ -135,6 +135,15 @@ class CrossBoundaryContractTest(unittest.TestCase):
                         serve_body.index("\nawait mkdir("),
                         "the bind must sit inside serveSocket, after the claim")
 
+    def test_both_sides_agree_on_the_channel_message_limit(self):
+        """The sender refuses before transport and the server refuses on arrival.
+        If the two numbers drift the sender lets through what the server then
+        rejects, and the message is lost between honest-looking components."""
+        source = read("lib", "channel.mjs")
+        node_limit = capture(r"const MAX_MESSAGE_BYTES = ([^;]+);", source)
+        self.assertEqual(eval(node_limit, {"__builtins__": {}}),
+                         antiphon.MAX_CHANNEL_BYTES)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -171,7 +171,9 @@ async function aSocketPathItCannotClearDoesNotKillTheSession() {
     assert.match(session.stderr(), /can still reply to Codex/,
       "the session must say the reply direction survives");
     assert.equal(session.child.exitCode, null, "the session must stay alive");
-    assert.deepEqual(registeredPeers(dir), [],
+    // The warning is printed before the claim is handed back, so wait for the
+    // release rather than assuming it happened by the time the message appeared.
+    assert.ok(await waitFor(() => registeredPeers(dir).length === 0),
       "a claim that could not be honoured must be given back");
   } finally {
     session.child.kill("SIGKILL");
@@ -180,6 +182,77 @@ async function aSocketPathItCannotClearDoesNotKillTheSession() {
   }
 }
 
+function sendTo(path, payload) {
+  // Resolves with whatever came back, including nothing. A server that drops the
+  // connection instead of answering gives the client an EPIPE or ECONNRESET, and
+  // rejecting on that would fail the test with a transport error rather than
+  // with the assertion that explains what actually broke.
+  return new Promise((resolve) => {
+    const socket = connect(path);
+    let reply = "";
+    socket.setEncoding("utf8");
+    socket.on("connect", () => socket.end(payload));
+    socket.on("data", (chunk) => { reply += chunk; });
+    socket.on("close", () => resolve(reply));
+    socket.on("error", () => resolve(reply));
+  });
+}
+
+async function anOversizedMessageIsRefusedWithoutKillingTheSession() {
+  // `socket.destroy(new Error(...))` emits 'error' on the client socket, and
+  // with no listener that took the whole process down: one 200 KiB message
+  // cost the registry entry, the socket and `reply_to_codex` together.
+  const dir = await mkdtemp(join(tmpdir(), "antiphon-oversize-"));
+  const session = spawnChannel(dir, "");
+  try {
+    assert.ok(await waitFor(() => existsSync(session.socketPath)), session.stderr());
+
+    const refusal = await sendTo(session.socketPath,
+      JSON.stringify({ content: "x".repeat(200 * 1024) }));
+    assert.match(refusal, /too large/, `expected a refusal, got: ${refusal}`);
+    assert.equal(session.child.exitCode, null, "the session must stay alive");
+    assert.ok(existsSync(session.socketPath), "the socket must survive");
+    assert.equal(registeredPeers(dir).length, 1, "the registry entry must survive");
+
+    // And the channel still works afterwards, which is the point of surviving.
+    const ack = await sendTo(session.socketPath,
+      JSON.stringify({ content: "after the refusal", message_id: "m-after" }));
+    assert.deepEqual(JSON.parse(ack), { ok: true, message_id: "m-after" });
+  } finally {
+    session.child.kill("SIGKILL");
+    await rm(dir, { recursive: true, force: true });
+  }
+}
+
+async function aStalledClientDoesNotBlockShutdown() {
+  // `server.close()` waits for open connections to end. A client that connects
+  // and never speaks would hold the process past its own termination, leaving
+  // its socket and its registry entry behind.
+  const dir = await mkdtemp(join(tmpdir(), "antiphon-stalled-"));
+  const session = spawnChannel(dir, "");
+  assert.ok(await waitFor(() => existsSync(session.socketPath)), session.stderr());
+  const idle = connect(session.socketPath);
+  idle.on("error", () => {});
+  try {
+    await once(idle, "connect");
+
+    session.child.kill("SIGTERM");
+    const exited = await Promise.race([
+      once(session.child, "exit").then(() => true),
+      new Promise((resolve) => setTimeout(() => resolve(false), 5_000)),
+    ]);
+    assert.ok(exited, "SIGTERM must not hang on a client that sent nothing");
+    assert.ok(!existsSync(session.socketPath), "it must remove its own socket");
+    assert.deepEqual(registeredPeers(dir), [], "it must release its own claim");
+  } finally {
+    idle.destroy();
+    session.child.kill("SIGKILL");
+    await rm(dir, { recursive: true, force: true });
+  }
+}
+
+await anOversizedMessageIsRefusedWithoutKillingTheSession();
+await aStalledClientDoesNotBlockShutdown();
 await aSocketPathItCannotClearDoesNotKillTheSession();
 await onlyOneUnnamedSessionGetsTheChannel(false);   // a second terminal, later
 await onlyOneUnnamedSessionGetsTheChannel(true);    // both started together

@@ -198,6 +198,39 @@ class AntiphonTest(unittest.TestCase):
         self.assertIn("ui", detail)
         self.assertIn("not delivered", detail.lower())
 
+    def test_an_oversized_message_never_reaches_the_socket(self):
+        """The server refuses on arrival, but a sender should not have to learn
+        that from a dropped connection. The limit is in bytes, so a multi-byte
+        message must not be measured in characters and let through at twice it."""
+        with tempfile.TemporaryDirectory() as project:
+            antiphon.peers.register(project, "claude", "ui", "/tmp/ui.sock")
+            oversized = "ç" * antiphon.MAX_CHANNEL_BYTES        # two bytes each
+            with patch.object(antiphon.socket, "socket") as opened:
+                ok, detail = antiphon.send_to_claude(project, oversized)
+                opened.assert_not_called()
+        self.assertFalse(ok)
+        self.assertIn(str(antiphon.MAX_CHANNEL_BYTES), detail)
+
+    def test_the_send_tool_reports_an_oversized_message_as_an_error(self):
+        with tempfile.TemporaryDirectory() as project:
+            antiphon.peers.register(project, "claude", "ui", "/tmp/ui.sock")
+            with patch.object(antiphon.socket, "socket") as opened:
+                result = antiphon._send_tool(project, "ç" * antiphon.MAX_CHANNEL_BYTES)
+                opened.assert_not_called()
+        self.assertIs(result.get("isError"), True)
+        self.assertIn("bytes", result["content"][0]["text"])
+
+    def test_a_message_just_under_the_limit_is_still_attempted(self):
+        """The refusal must not be a blanket one: the boundary is where it is."""
+        with tempfile.TemporaryDirectory() as project:
+            antiphon.peers.register(project, "claude", "ui", "/tmp/ui.sock")
+            with patch.object(antiphon.socket, "socket") as opened:
+                opened.side_effect = OSError("no listener")
+                ok, detail = antiphon.send_to_claude(project, "x" * 1000)
+                opened.assert_called()
+        self.assertFalse(ok)
+        self.assertNotIn(str(antiphon.MAX_CHANNEL_BYTES), detail)
+
     def test_send_to_claude_uses_mcp_channel_socket(self):
         class FakeSocket:
             def __init__(self, *_):
