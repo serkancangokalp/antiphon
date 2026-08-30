@@ -1,6 +1,6 @@
 {
   "name": "antiphon",
-  "version": "0.3.0",
+  "version": "0.3.1",
   "type": "module",
   "description": "A bridge between Claude Code and Codex CLI: each side sees the other's context and can wake it, without ever faking the sender's identity.",
   "license": "MIT",

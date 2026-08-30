@@ -2421,7 +2421,7 @@ def _mcp_serve(cwd, alias=None):
             _mcp_result(mid, {
                 "protocolVersion": "2024-11-05",
                 "capabilities": {"tools": {}},
-                "serverInfo": {"name": "antiphon", "version": "0.3.0"},
+                "serverInfo": {"name": "antiphon", "version": "0.3.1"},
             })
         elif method == "tools/list":
             _mcp_result(mid, {"tools": TOOLS})
