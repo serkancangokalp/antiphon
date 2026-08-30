@@ -583,6 +583,98 @@ class AntiphonTest(unittest.TestCase):
                          {"": antiphon.batch_fingerprint(["same"])},
                          "and the record migrates to the new form")
 
+    # ---- push, end to end: dedupe survives a real second turn ----
+    #
+    # Both tests below let `push` run its real reader and real cursor —
+    # nothing is mocked but the two send functions. A markerless second turn
+    # could not pin this: a broken reader that merges the OLD turn into the
+    # new one keeps the old fingerprint and stays green regardless of what it
+    # merged. Only a *new* marker in the new turn forces the merge to change
+    # the payload, which is why the assertion on the second send is both
+    # contains-NEW and not-contains-OLD.
+
+    def test_codex_to_claude_dedupe_survives_a_new_turn(self):
+        with tempfile.TemporaryDirectory() as project:
+            rollout = os.path.join(project, "rollout.jsonl")
+            with open(rollout, "w", encoding="utf-8") as f:
+                f.write("\n".join([
+                    codex_task_started("A"),
+                    codex_msg("note\n@claude do OLD"),
+                    codex_msg("closing, no marker"),
+                ]) + "\n")
+
+            def run(turn_id):
+                payload = {"cwd": project, "transcript_path": rollout,
+                          "turn_id": turn_id}
+                with patch.object(antiphon.sys, "stdin",
+                                  io.StringIO(json.dumps(payload))), \
+                     contextlib.redirect_stderr(io.StringIO()):
+                    return antiphon.push("claude")
+
+            with patch.object(antiphon, "send_to_claude",
+                              return_value=(True, "")) as send:
+                self.assertEqual(run("A"), 0)
+                send.assert_called_once()
+                self.assertIn("do OLD", send.call_args.args[1])
+
+                # An identical re-read of the same transcript, same turn id:
+                # the fingerprint is stable and nothing goes out again.
+                self.assertEqual(run("A"), 0)
+                send.assert_called_once()
+
+                # The turn closes and a new one opens with its own marker.
+                with open(rollout, "a", encoding="utf-8") as f:
+                    f.write("\n".join([
+                        codex_task_complete("A"),
+                        codex_task_started("B"),
+                        codex_msg("@claude do NEW"),
+                    ]) + "\n")
+                self.assertEqual(run("B"), 0)
+                self.assertEqual(send.call_count, 2)
+                second_payload = send.call_args.args[1]
+                self.assertIn("do NEW", second_payload)
+                self.assertNotIn("do OLD", second_payload)
+
+    def test_claude_to_codex_dedupe_survives_a_new_turn(self):
+        with tempfile.TemporaryDirectory() as project:
+            transcript = os.path.join(project, "transcript.jsonl")
+            with open(transcript, "w", encoding="utf-8") as f:
+                f.write("\n".join([
+                    claude_prompt("first ask"),
+                    claude_assistant("@codex do OLD"),
+                    claude_tool_result(),
+                    claude_assistant("done"),
+                ]) + "\n")
+
+            def run():
+                payload = {"cwd": project, "transcript_path": transcript}
+                with patch.object(antiphon.sys, "stdin",
+                                  io.StringIO(json.dumps(payload))), \
+                     contextlib.redirect_stderr(io.StringIO()):
+                    return antiphon.push("codex")
+
+            with patch.object(antiphon, "send_to_codex",
+                              return_value=(True, "")) as send:
+                self.assertEqual(run(), 0)
+                send.assert_called_once()
+                self.assertIn("do OLD", send.call_args.args[1])
+
+                # An identical re-read of the same transcript: not resent.
+                self.assertEqual(run(), 0)
+                send.assert_called_once()
+
+                # A new ask and a new marker, after the first turn closed.
+                with open(transcript, "a", encoding="utf-8") as f:
+                    f.write("\n".join([
+                        claude_prompt("next ask"),
+                        claude_assistant("@codex do NEW"),
+                    ]) + "\n")
+                self.assertEqual(run(), 0)
+                self.assertEqual(send.call_count, 2)
+                second_payload = send.call_args.args[1]
+                self.assertIn("do NEW", second_payload)
+                self.assertNotIn("do OLD", second_payload)
+
     def test_an_empty_marker_is_reported_even_beside_a_real_one(self):
         """A batch holding one empty marker and one real message is not empty, so
         a per-batch check let the empty line disappear without a word."""

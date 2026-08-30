@@ -110,41 +110,66 @@ This is separate from passive pull, whose old 2,600-character trim is retired
 — pull now pages complete records. Ordinary long SQL and code already fit
 under 128 KiB when sent through a channel tool.
 
-## P1 — A marker in anything but the turn's last message is dropped
+## P1 — A marker in anything but the turn's last message is dropped (fixed)
 
-`push` reads the other side's newest assistant text through `last_claude_reply`
-or `last_codex_reply`, and both keep only the most recent assistant record —
-`chunks = texts` overwrites on each one, with the Claude side even documenting
-it: "each new assistant message supersedes the last". One turn is not one
-record. An agent that writes a progress message containing `@claude do this`
-and then a closing message without markers has its instruction silently
-dropped, because only the closing message is ever examined.
+`push` used to read the other side's newest assistant text through
+`last_claude_reply` or `last_codex_reply`, and both kept only the most recent
+assistant record — `chunks = texts` overwrote on each one. One turn is not one
+record, so an agent that wrote a progress message containing `@claude do this`
+and then a closing message without markers had its instruction silently
+dropped. The obvious repair — join every assistant record in the tail window —
+was wrong on its own: it would sweep up markers from previous turns and resend
+them, since the dedupe fingerprint compares the joined text and a window that
+grows by one record each turn produces a different fingerprint every time. The
+fix needed a boundary for "this turn", not a wider join, and both readers now
+have one.
 
-Observed, not theorised: it happened in this project during development. One
-side reported sending a marker line, the other side received nothing, and later
-messages arrived normally — the marker had been in an intermediate message of a
-multi-part turn.
+### What shipped
 
-The obvious repair is wrong. Joining every assistant record in the tail window
-would sweep up markers from previous turns and resend them: the dedupe
-fingerprint compares the joined text, so a window that grows by one record each
-turn produces a different fingerprint every time and pushes again. The fix needs
-a boundary for "this turn" rather than a wider join.
+- Codex (`last_codex_reply`): the hook payload's own `turn_id` names the turn.
+  A matched id returns the span from its `task_started` to its own
+  `task_complete`, or to EOF — a live measurement (Task 1, one non-ephemeral
+  local run) confirmed the CLI writes `task_complete` only *after* the Stop
+  hook has already fired, so waiting on it would have returned the previous
+  turn forever. An id present but unmatched (its start already scrolled out
+  of the tail window) fails open to the whole visible window rather than
+  guessing at a different turn's span. With no id at all — a CLI older than
+  the `turn_id` field — the newest `task_started` alone decides, cut by
+  nothing.
+- Claude (`last_claude_reply`): a `user` record is a turn boundary unless it
+  is a tool result, an `isMeta` record carrying `sourceToolUseID` or
+  `turnCompanion` (a Skill load or turn companion), or an `isMeta` record
+  whose top-level `origin.kind` is in the measured mid-turn allowlist
+  `{"coordinator", "task-notification"}`. `origin.kind="channel"` — the
+  bridge's own injection — and any unmeasured kind stay boundaries.
+- The `promptId` field this entry originally proposed as the boundary was
+  measured and set aside: absent on all 5,067 sampled assistant records,
+  present on only 554 of 556 sampled user records — corroboration for a
+  boundary found another way, not something reliable enough to key on
+  directly.
+- Verified end to end: `push`, run against real transcript fixtures with only
+  `send_to_claude`/`send_to_codex` mocked, delivers a marker from a non-final
+  message, stays quiet on an identical re-read, and delivers again — with the
+  old turn's text absent — once a new turn carries its own marker.
 
-### What has to be decided
+### Named limitations
 
-- What delimits a turn on each side. Claude records carry a `promptId`; Codex
-  rollouts bracket turns with `task_started` / `task_complete` `event_msg`
-  records. Neither is verified as reliable for this purpose yet.
-- Whether a marker in an intermediate message should be sent when it appears or
-  held until the turn ends. Sending immediately is what the author meant; it
-  also means a turn can push several times, which the fingerprint must handle
-  per marker rather than per joined blob.
-- Whether the same boundary belongs in the pull path, which has its own reasons
-  to group records and now has an atomic-record model to group them with.
-
-Until then the workaround is the one people find by accident: put the marker in
-the last thing the turn says.
+- A turn larger than `TAIL_BYTES` still clips at the tail window; both readers
+  keep reading through `tail_lines` unchanged.
+- An ephemeral Codex run reports `transcript_path: null`, and `push` no-ops
+  before either reader runs — a marker written there never reaches the
+  bridge.
+- Codex's two fail-open paths (unmatched id; no task marker visible) can
+  duplicate an old turn's tail into a fresh send — at-least-once by design,
+  the same trade the delivery layer already makes elsewhere. An identical
+  re-read is fingerprint-stable, but a later append can shift the tail
+  window and re-expose the old text.
+- On a CLI whose hook payload predates `turn_id`, the no-id case has two
+  residual gaps: a closed nested span sitting inside the window still drops
+  text written before that nested start, and the reader cannot distinguish a
+  rollout with no markers at all (3/127 measured) from one whose markers all
+  sit beyond the tail (1/127 measured) — the two windows look identical from
+  inside.
 
 ## P2 — A refused active send does not say the message will still arrive
 
