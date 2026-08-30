@@ -957,6 +957,25 @@ class AntiphonTest(unittest.TestCase):
         text = "<recommended_plugins>which ones do you mean?</recommended_plugins>"
         self.assertEqual(self._claude_user_texts(text), [text])
 
+    def test_an_unmeasured_tag_is_in_neither_wrapper_set(self):
+        """The sets hold what was measured on that side and nothing else. Each
+        of these was dropped after review: `local-command-caveat` was seen only
+        on the Claude side, and neither `stderr` sibling was seen at all. A tag
+        a person could plausibly type costs that person's whole message."""
+        for text in ("<local-command-stderr>boom</local-command-stderr>",
+                     "<bash-stderr>command not found</bash-stderr>"):
+            self.assertFalse(
+                antiphon._is_host_record(text, antiphon.CLAUDE_WRAPPER_OPENING), text)
+            self.assertFalse(
+                antiphon._is_host_record(text, antiphon.CODEX_WRAPPER_OPENING), text)
+        self.assertFalse(antiphon._is_host_record(
+            "<local-command-caveat>Caveat: …</local-command-caveat>",
+            antiphon.CODEX_WRAPPER_OPENING))
+        # Still refused on the side it was measured on.
+        self.assertTrue(antiphon._is_host_record(
+            "<local-command-caveat>Caveat: …</local-command-caveat>",
+            antiphon.CLAUDE_WRAPPER_OPENING))
+
     def test_push_and_reply_use_the_same_labels_the_guard_matches(self):
         """The guard is derived from the constants push() and reply() send, so the
         two can never drift apart."""

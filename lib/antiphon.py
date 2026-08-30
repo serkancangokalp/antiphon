@@ -233,22 +233,28 @@ def _is_self_injected(text):
 # with `<` too, and used to vanish.
 #
 # The sets are per side because the tags are: `ide_opened_file` is Claude
-# Code's, `recommended_plugins` and `realtime_delegation` are Codex's. Shared,
-# one side's tag would silence the other side's user for typing that text.
+# Code's, `recommended_plugins` and `realtime_delegation` are Codex's, and
+# `local-command-caveat` was seen only on the Claude side. Shared, one side's
+# tag would silence the other side's user for typing that text.
 # `image` belongs in neither: it is a person's attachment.
+
+# Strictly what was measured on that side, and nothing else. A tag missing
+# here costs one stray host line in a summary — visible, and fixed by adding
+# it. A tag here that a person could type costs that person's whole message,
+# silently. Adding a plausible sibling by symmetry is how `local-command-caveat`
+# — measured only on the Claude side — first reached the Codex set.
 CLAUDE_HOST_WRAPPERS = (
     "channel", "task-notification", "ide_opened_file",
     "command-name", "command-message",
-    "local-command-caveat", "local-command-stdout", "local-command-stderr",
-    "bash-input", "bash-stdout", "bash-stderr",
+    "local-command-caveat", "local-command-stdout",
+    "bash-input", "bash-stdout",
 )
 
 CODEX_HOST_WRAPPERS = (
     "task-notification", "recommended_plugins", "realtime_delegation",
     "subagent_notification", "environment_context",
-    "command-name", "command-message",
-    "local-command-caveat", "local-command-stdout", "local-command-stderr",
-    "bash-input", "bash-stdout", "bash-stderr",
+    "command-name", "command-message", "local-command-stdout",
+    "bash-input", "bash-stdout",
 )
 
 # `promptSource` values measured carrying host records as well as people's
