@@ -3,6 +3,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "lib"))
 import antiphon
 
 import contextlib
+import errno
 import fcntl
 import io
 import json
@@ -393,6 +394,34 @@ class AntiphonTest(unittest.TestCase):
              contextlib.redirect_stdout(Broken()):
             antiphon.mcp()
         self.assertEqual(record, [])
+
+    def test_the_read_tool_reports_contention_as_an_error_not_as_context(self):
+        """`antiphon_read` returns the other side's context, so a plain content
+        string saying the read did not happen reads as something Claude said.
+        It has to arrive as a tool error, and the cursor must not move."""
+        record, out = [], io.StringIO()
+        with tempfile.TemporaryDirectory() as project:
+            path = antiphon.state_path(project, "codex") + ".lock"
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            fd = os.open(path, os.O_CREAT | os.O_RDWR, 0o600)
+            fcntl.flock(fd, fcntl.LOCK_EX)
+            self.addCleanup(os.close, fd)
+            with patch.object(antiphon, "project_dir", return_value=project), \
+                 patch.object(antiphon.sys, "stdin",
+                              io.StringIO(json.dumps(self._call("antiphon_read")) + "\n")), \
+                 patch.object(antiphon, "build_summary",
+                              return_value=("## something happened", 1000.0, 1)), \
+                 patch.object(antiphon, "read_cursor", return_value={}), \
+                 patch.object(antiphon, "write_cursor",
+                              side_effect=lambda *a, **k: record.append("advance")), \
+                 patch.object(antiphon, "CURSOR_LOCK_PATIENCE", 0.1), \
+                 contextlib.redirect_stdout(out), \
+                 contextlib.redirect_stderr(io.StringIO()):
+                antiphon.mcp()
+        responses = [json.loads(line) for line in out.getvalue().splitlines() if line.strip()]
+        self.assertEqual(len(responses), 1, "a request always gets one response")
+        self.assertIs(responses[0]["result"].get("isError"), True)
+        self.assertEqual(record, [], "and nothing was marked seen")
 
     def test_mcp_offers_codex_both_a_read_and_a_send_tool(self):
         """Reading was live from the start; sending was not. Codex could only reach
@@ -1899,6 +1928,81 @@ class CodexPeerWiringTest(unittest.TestCase):
                                       summary=("", 0.0, 0))
         self.assertEqual(record, [])
         self.assertEqual(code, 0)
+
+    def test_a_second_delivery_does_not_hand_out_the_same_page(self):
+        """The hook and `antiphon_read` are separate processes over one cursor.
+        Unserialized, both read a cursor that has not moved, select the same
+        page, and deliver it twice."""
+        record, out, err = [], io.StringIO(), io.StringIO()
+        with tempfile.TemporaryDirectory() as project:
+            with self._named(""):
+                self._hold_lock(antiphon.state_path(project, "claude"))
+            with patch.object(antiphon, "CURSOR_LOCK_PATIENCE", 0.1), \
+                 contextlib.redirect_stderr(err):
+                code = self._deliver_hook(project, out, record)
+        self.assertEqual(out.getvalue(), "", "no page while another holds it")
+        self.assertEqual(record, [], "and nothing marked seen either")
+        self.assertNotEqual(code, 0, "exit 0 would hide this from the user")
+        self.assertTrue(err.getvalue().strip(), "and it has to say why")
+
+    def test_a_filesystem_that_cannot_lock_fails_at_once_and_says_so(self):
+        """`ENOTSUP` from a mount with no lock manager is not contention. Spun on
+        for two seconds and then swallowed, a broken mount becomes a bridge that
+        quietly stopped delivering."""
+        err = io.StringIO()
+        started = time.monotonic()
+        def refuse(_fd, _op):
+            raise OSError(errno.ENOTSUP, "no locks on this filesystem")
+
+        with tempfile.TemporaryDirectory() as project, \
+             patch.object(antiphon.fcntl, "flock", refuse), \
+             patch.object(antiphon, "CURSOR_LOCK_PATIENCE", 5.0), \
+             contextlib.redirect_stderr(err):
+            with antiphon.cursor_lock(project, "claude") as locked:
+                self.assertFalse(locked)
+        self.assertLess(time.monotonic() - started, 1.0, "no retry loop for a fault")
+        self.assertIn("lock", err.getvalue().lower())
+
+    def test_the_lock_is_released_when_the_transaction_ends(self):
+        """A lock nothing releases turns the first delivery into the last."""
+        pages = []
+        with tempfile.TemporaryDirectory() as project:
+            for _ in range(2):
+                out = io.StringIO()
+                with patch.object(antiphon, "CURSOR_LOCK_PATIENCE", 0.1):
+                    self._deliver_hook(project, out)
+                pages.append(out.getvalue())
+        self.assertTrue(all(pages), "both deliveries produced a page")
+
+    def test_one_peers_delivery_does_not_block_anothers(self):
+        """Named peers own separate cursors, so they must own separate locks.
+        One lock for the project would make every peer's context page wait
+        behind every other peer's."""
+        out = io.StringIO()
+        with tempfile.TemporaryDirectory() as project:
+            with self._named("api"):
+                api_cursor = antiphon.state_path(project, "claude")
+            with self._named("ui"):
+                ui_cursor = antiphon.state_path(project, "claude")
+            self.assertNotEqual(api_cursor, ui_cursor,
+                                "two named peers must not share a cursor path")
+            self._hold_lock(api_cursor)
+            with patch.object(antiphon, "CURSOR_LOCK_PATIENCE", 0.1):
+                self._deliver_hook(project, out, name="ui")
+        self.assertTrue(out.getvalue(), "a different peer delivers regardless")
+
+    def test_a_delivery_never_takes_the_project_wide_registry_lock(self):
+        """That lock serializes every claim, refresh and prune in the project.
+        Held across a model-facing write, an unrelated session's start would
+        queue behind this peer's context page."""
+        def refuse(_cwd):
+            raise AssertionError("delivery took the registry lock")
+
+        out = io.StringIO()
+        with tempfile.TemporaryDirectory() as project, \
+             patch.object(antiphon.peers, "_registry_lock", refuse):
+            self.assertEqual(self._deliver_hook(project, out), 0)
+        self.assertTrue(out.getvalue())
 
     @staticmethod
     def _run_mcp(project, *requests, name=None, owner="300:x"):

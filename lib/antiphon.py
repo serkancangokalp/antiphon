@@ -28,7 +28,9 @@ server runs on Node.js with the official MCP SDK.
 """
 
 import glob
+import contextlib
 import errno
+import fcntl
 import hashlib
 import itertools
 import json
@@ -384,6 +386,86 @@ def state_path(cwd, kind):
     if peers.valid_kind(kind) and peers.valid_name(name):
         return os.path.join(peers.peer_dir(cwd, kind, name), "cursor.json")
     return os.path.join(cwd, ".antiphon", "cursor.json")
+
+
+CURSOR_LOCK_PATIENCE = 2.0        # seconds; a stuck holder must not hang a turn
+CURSOR_LOCK_RETRY_DELAY = 0.05
+
+
+@contextlib.contextmanager
+def cursor_lock(cwd, kind, patience=None):
+    """Serializes one peer's whole read-select-deliver-advance transaction.
+
+    Yields True when the lock was taken and False when it was not, having
+    already said on stderr why not. A caller that could not take it must
+    deliver nothing rather than proceed unserialized, and must exit non-zero:
+    on exit 0 the host sends stderr to a debug log and shows the person
+    nothing, so a leaked descriptor would deafen the bridge with no symptom.
+
+    Locking only the selection would not do. A takes the lock, picks a page and
+    releases before writing; B then reads a cursor that has not moved and picks
+    the same page. The exclusion has to cover the write and the advance too —
+    and every other writer of this file has to take the same lock, or it can
+    write back a snapshot from before the advance.
+
+    This is a lock beside the cursor, never the project-wide registry lock.
+    That one serializes every claim, refresh, prune and release in the project,
+    and holding it across a model-facing write would make an unrelated peer's
+    start, stop or refresh queue behind this peer's context page. Named peers
+    already own separate cursor files, so a lock beside each cursor gives
+    exactly the exclusion required without coupling their lifetimes.
+
+    The wait is bounded because the hook runs on a person's every prompt: a
+    holder that is stuck rather than dead would otherwise hang the turn. A
+    holder that dies has its `flock` released by the kernel, so a crash frees
+    the lock rather than wedging the project.
+
+    Not reentrant. `flock` is held per open file description, so a second
+    attempt from this same process on a fresh descriptor blocks exactly as
+    another process would. Nothing called while this is held may take it again.
+    """
+    if patience is None:
+        # Read at call time, not bound in the signature, so the constant stays
+        # the single place this is set — and a test can lower it.
+        patience = CURSOR_LOCK_PATIENCE
+    path = state_path(cwd, kind) + ".lock"
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        fd = os.open(path, os.O_CREAT | os.O_RDWR, 0o600)
+    except OSError as exc:
+        # The lock file could not even be opened — a directory that is not
+        # writable, or not a directory at all.
+        print(f"antiphon: no delivery lock at {path}: {exc}", file=sys.stderr)
+        yield False
+        return
+    held = False
+    deadline = time.monotonic() + patience
+    try:
+        while True:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                held = True
+                break
+            except BlockingIOError:
+                # The only errno that means "somebody else has it".
+                if time.monotonic() >= deadline:
+                    print("antiphon: another delivery for this peer is still "
+                          f"running after {patience:g}s; context not delivered "
+                          "this turn", file=sys.stderr)
+                    break
+                time.sleep(CURSOR_LOCK_RETRY_DELAY)
+            except OSError as exc:
+                # ENOTSUP, EIO, ENOLCK: a filesystem whose lock manager cannot
+                # answer. Retrying that for the full patience and then giving
+                # up quietly would turn a broken mount into a bridge that
+                # stopped delivering for no stated reason.
+                print(f"antiphon: cannot lock {path}: {exc}", file=sys.stderr)
+                break
+        yield held
+    finally:
+        if held:
+            fcntl.flock(fd, fcntl.LOCK_UN)
+        os.close(fd)
 
 
 def sender_side(target):
@@ -858,30 +940,47 @@ def hook(side="claude"):
         # summary nobody was shown has not been seen.
         return 0
 
-    cursor = read_cursor(cwd, side)
-    key = f"{side}_seen"
-    start = cursor_time(cursor, key)
-    text, last, _ = build_summary(cwd, side, start)
-    if not text:
-        return 0
+    with cursor_lock(cwd, side) as locked:
+        if not locked:
+            # `cursor_lock` has already said why on stderr. Non-zero so the
+            # person actually sees it: on exit 0 that line reaches a debug log
+            # and nothing else, and a bridge that stopped delivering would look
+            # exactly like a counterpart with nothing to say.
+            return 1
+        cursor = read_cursor(cwd, side)
+        key = f"{side}_seen"
+        start = cursor_time(cursor, key)
+        text, last, _ = build_summary(cwd, side, start)
+        if not text:
+            return 0
 
-    # The hook prints nothing to the terminal. The counter used to say
-    # "message" but it was counting the other side's transcript events;
-    # incoming channel messages already show up via their own notices.
-    # Context is injected silently.
-    if not _deliver(json.dumps({
-        "hookSpecificOutput": {
-            "hookEventName": "UserPromptSubmit",
-            "additionalContext": text,
-        }
-    }, ensure_ascii=False)):
-        # The page never left this process, so it has not been delivered and
-        # the cursor stays where it was. The next turn offers it again.
-        return 1
-    if last:
-        cursor[key] = last
-        write_cursor(cwd, cursor, side)
-    return 0
+        # The hook prints nothing to the terminal. The counter used to say
+        # "message" but it was counting the other side's transcript events;
+        # incoming channel messages already show up via their own notices.
+        # Context is injected silently.
+        if not _deliver(json.dumps({
+            "hookSpecificOutput": {
+                "hookEventName": "UserPromptSubmit",
+                "additionalContext": text,
+            }
+        }, ensure_ascii=False)):
+            # The page never left this process, so it has not been delivered
+            # and the cursor stays where it was. The next turn offers it again.
+            print("antiphon: could not write this turn's context", file=sys.stderr)
+            return 1
+        if last:
+            cursor[key] = last
+            if not write_cursor(cwd, cursor, side):
+                # The page WAS delivered, so the exit code stays 0: a non-zero
+                # exit suppresses plain-text stdout as context, and whether it
+                # also suppresses `additionalContext` is undocumented and
+                # unmeasured. Risking the page we just handed over to report a
+                # cursor failure would trade a visible repeat for a silent
+                # loss. The symptom of this branch is the same context
+                # arriving every turn.
+                print(f"antiphon: delivered, but could not record it in "
+                      f"{state_path(cwd, side)}", file=sys.stderr)
+        return 0
 
 
 def notice_text(side, count):
@@ -1595,18 +1694,30 @@ def _mcp_serve(cwd, alias=None):
             p = p if isinstance(p, dict) else {}
             name = p.get("name")
             if name == "antiphon_read":
-                cursor = read_cursor(cwd, "codex")
-                start = cursor_time(cursor, "codex_seen")
-                text, last, _ = build_summary(cwd, "codex", start)
-                output = text or "Nothing new on the Claude Code side since your last turn."
-                # Answer first, mark seen second — the same order as the hook,
-                # for the same reason: a result that was never written is a
-                # page the model never saw.
-                delivered = _mcp_result(mid,
-                                        {"content": [{"type": "text", "text": output}]})
-                if delivered and text and last:
-                    cursor["codex_seen"] = last
-                    write_cursor(cwd, cursor, "codex")
+                with cursor_lock(cwd, "codex") as locked:
+                    if not locked:
+                        # A JSON-RPC request must always be answered: a tool
+                        # call with no response leaves the caller waiting on a
+                        # request that never completes. It is an error result,
+                        # not content — this tool's content is the other side's
+                        # words, and a plain string here would read as some.
+                        _mcp_result(mid, _tool_error(
+                            "another read is in flight; nothing was read and "
+                            "nothing was marked seen — try again in a moment"))
+                    else:
+                        cursor = read_cursor(cwd, "codex")
+                        start = cursor_time(cursor, "codex_seen")
+                        text, last, _ = build_summary(cwd, "codex", start)
+                        output = text or ("Nothing new on the Claude Code side "
+                                          "since your last turn.")
+                        # Answer first, mark seen second — the same order as the
+                        # hook, for the same reason: a result that was never
+                        # written is a page the model never saw.
+                        delivered = _mcp_result(
+                            mid, {"content": [{"type": "text", "text": output}]})
+                        if delivered and text and last:
+                            cursor["codex_seen"] = last
+                            write_cursor(cwd, cursor, "codex")
             elif name == "antiphon_send":
                 arguments = p.get("arguments")
                 arguments = arguments if isinstance(arguments, dict) else {}
