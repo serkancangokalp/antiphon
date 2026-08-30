@@ -376,7 +376,7 @@ class AntiphonTest(unittest.TestCase):
                           return_value=("## something happened", 1000.0, 1)), \
              patch.object(antiphon, "read_cursor", return_value={}), \
              patch.object(antiphon, "write_cursor",
-                          side_effect=lambda *a, **k: record.append("advance")), \
+                          side_effect=lambda *a, **k: record.append("advance") or True), \
              contextlib.redirect_stdout(_Recording(record)):
             antiphon.mcp()
         self.assertEqual(record, ["write", "advance"])
@@ -395,7 +395,7 @@ class AntiphonTest(unittest.TestCase):
                           return_value=("## something happened", 1000.0, 1)), \
              patch.object(antiphon, "read_cursor", return_value={}), \
              patch.object(antiphon, "write_cursor",
-                          side_effect=lambda *a, **k: record.append("advance")), \
+                          side_effect=lambda *a, **k: record.append("advance") or True), \
              contextlib.redirect_stdout(Broken()):
             antiphon.mcp()
         self.assertEqual(record, [])
@@ -418,7 +418,7 @@ class AntiphonTest(unittest.TestCase):
                               return_value=("## something happened", 1000.0, 1)), \
                  patch.object(antiphon, "read_cursor", return_value={}), \
                  patch.object(antiphon, "write_cursor",
-                              side_effect=lambda *a, **k: record.append("advance")), \
+                              side_effect=lambda *a, **k: record.append("advance") or True), \
                  patch.object(antiphon, "CURSOR_LOCK_PATIENCE", 0.1), \
                  contextlib.redirect_stdout(out), \
                  contextlib.redirect_stderr(io.StringIO()):
@@ -456,7 +456,7 @@ class AntiphonTest(unittest.TestCase):
              patch.object(antiphon, "send_to_claude", return_value=(True, "")), \
              patch.object(antiphon, "read_cursor", return_value={}), \
              patch.object(antiphon, "write_cursor",
-                          side_effect=lambda cwd, data, kind: written.append(dict(data))):
+                          side_effect=lambda cwd, data, kind: written.append(dict(data)) or True):
             self._run_mcp(project, self._call("antiphon_send", text="run the tests"))
         self.assertEqual(written, [{"last_pushed_claude":
                                     {"": antiphon.batch_fingerprint(["run the tests"])}}],
@@ -494,7 +494,7 @@ class AntiphonTest(unittest.TestCase):
              patch.object(antiphon, "send_to_codex", return_value=(True, "")), \
              patch.object(antiphon, "read_cursor", return_value={}), \
              patch.object(antiphon, "write_cursor",
-                          side_effect=lambda cwd, data, kind: written.append(dict(data))), \
+                          side_effect=lambda cwd, data, kind: written.append(dict(data)) or True), \
              patch.object(antiphon.sys, "stdin", io.StringIO(json.dumps({"text": "hello"}))):
             self.assertEqual(antiphon.reply(), 0)
         self.assertEqual(written, [{"last_pushed_codex":
@@ -1875,7 +1875,7 @@ class CodexPeerWiringTest(unittest.TestCase):
              patch.object(antiphon, "build_summary", return_value=summary), \
              patch.object(antiphon, "read_cursor", return_value={}), \
              patch.object(antiphon, "write_cursor",
-                          side_effect=lambda cwd, data, kind: written.append(kind)), \
+                          side_effect=lambda cwd, data, kind: written.append(kind) or True), \
              contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
             code = antiphon.hook(side)
         return code, out.getvalue(), err.getvalue(), written
@@ -1895,7 +1895,7 @@ class CodexPeerWiringTest(unittest.TestCase):
              patch.object(antiphon, "build_summary", return_value=summary), \
              patch.object(antiphon, "read_cursor", return_value={}), \
              patch.object(antiphon, "write_cursor",
-                          side_effect=lambda *a, **k: record.append("advance")), \
+                          side_effect=lambda *a, **k: record.append("advance") or True), \
              contextlib.redirect_stdout(stdout):
             return antiphon.hook(side)
 
@@ -1955,6 +1955,17 @@ class CodexPeerWiringTest(unittest.TestCase):
             code = self._deliver_hook(project, Unflushable(), record)
         self.assertEqual(record, [])
         self.assertNotEqual(code, 0)
+
+    def test_a_genuinely_closed_stream_is_a_failed_delivery(self):
+        """`ValueError` is what a stream that is really closed raises on
+        write — the plan calls it the most ordinary form of "stdout is
+        gone". Every other test here drives a fake `OSError`; dropping
+        `ValueError` from `_deliver`'s `except` clause left the suite green
+        anyway, because nothing exercised a stream this genuinely dead."""
+        closed = io.StringIO()
+        closed.close()
+        with patch.object(antiphon.sys, "stdout", closed):
+            self.assertFalse(antiphon._deliver("line"))
 
     def test_nothing_is_marked_seen_when_there_was_nothing_to_send(self):
         """An empty summary is not a delivery, and must not move the cursor."""
