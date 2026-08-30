@@ -2290,7 +2290,8 @@ class PositionCursorTest(unittest.TestCase):
         Measured on the first draft of this plan: an entry of `42` raised
         AttributeError, a string offset raised TypeError, `-1` was accepted, and
         `True` seeked to byte 1. Every one of those is a crash or a silent
-        misread where the safe answer is the lookback."""
+        misread where the safe answer is byte-zero recovery with an explicit
+        replay reason."""
         for broken in (42, "bad", [], {"gen": "g"}, {"gen": "g", "offset": "5"},
                        {"gen": "g", "offset": -1}, {"gen": "g", "offset": True},
                        {"gen": 5, "offset": 5}):
@@ -2593,12 +2594,13 @@ class PositionCursorTest(unittest.TestCase):
         self.assertEqual(sources["s2"], {"gen": "g2", "offset": 200},
                          "the source not seen this turn must still be there")
 
-    def test_a_sources_map_with_the_wrong_version_falls_back_to_the_lookback(self):
+    def test_a_sources_map_with_the_wrong_version_replays_from_byte_zero(self):
         """`CURSOR_VERSION` is written and was never read back. A future
         version could keep the `sources` key name while changing what
         `offset` means, and a shape-only check would misread it as v2 instead
         of refusing it -- the direction every other unrecognised shape
-        already takes."""
+        already takes. Recovery starts at byte zero because an unknown format
+        cannot safely seed a delivered-prefix position."""
         cursor = {"claude_pages": {"v": 4, "sources":
                   {"s1": {"gen": "g", "offset": 12}}}}
         positions, since, replay = antiphon.positions_for(cursor, "claude")
