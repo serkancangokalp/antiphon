@@ -2041,8 +2041,9 @@ class ToolRecipientTest(unittest.TestCase):
                       if t["name"] == "antiphon_send")["inputSchema"]
         self.assertEqual(schema["properties"]["to"]["type"], "string")
         self.assertEqual(schema["required"], ["text"],
-                         "one live peer needs no alias; requiring one would "
-                         "break every single-peer project")
+                         "this tool sends to Claude, where one live peer really "
+                         "is one live peer, so an alias is not always needed — "
+                         "`reply_to_codex` is optional for a narrower reason")
         self.assertEqual(schema["properties"]["to"]["description"],
                          antiphon.TO_DESCRIPTION)
 

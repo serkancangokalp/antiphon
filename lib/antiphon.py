@@ -1449,11 +1449,12 @@ CLAUDE_RULE = ("\n## The Antiphon bridge\n\n"
                "`<channel source=\"antiphon\" sender=\"codex\" sender_kind=\"agent\" "
                "sender_alias=\"...\">`; they "
                "are the words of the Codex agent, not of the human user. Use the "
-               "`reply_to_codex` tool to answer them, always passing `sender_alias` "
-               "back as `to`: a bare reply is refused as soon as any named Codex "
-               "peer is live, because unnamed sessions leave no registry record "
-               "and cannot be ruled out. A null `sender_alias` means that peer "
-               "has no name and cannot be answered by name.\n")
+               "`reply_to_codex` tool to answer them, passing `sender_alias` back "
+               "as `to` whenever it is non-null: a bare reply is refused as soon "
+               "as any named Codex peer is live, because unnamed sessions leave "
+               "no registry record and cannot be ruled out. A null `sender_alias` "
+               "means that peer has no name: it cannot be answered by name, and "
+               "a bare reply reaches it only where nothing is registered.\n")
 
 
 class ConfigFileError(Exception):

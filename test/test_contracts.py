@@ -170,6 +170,30 @@ class CrossBoundaryContractTest(unittest.TestCase):
             self.assertIsNotNone(example, f"no example event in {where}")
             self.assertIn("sender_alias", example.group(0), where)
 
+    def test_no_surface_tells_an_agent_to_pass_a_null_recipient(self):
+        """Three sentences that have to agree: `sender_alias` may be null, `to`
+        must be a string, and the reader is told when to pass one as the other.
+        "Always" made those three incompatible, and an agent following it would
+        send `to: null` and be refused for doing as it was told."""
+        surfaces = {
+            "channel.mjs instructions": re.sub(r'"\s*\+\s*\n\s*"', "",
+                                               read("lib", "channel.mjs")),
+            "CLAUDE.md rule": antiphon.CLAUDE_RULE,
+            "README": read("README.md"),
+        }
+        schema = next(t for t in antiphon.TOOLS
+                      if t["name"] == "antiphon_send")["inputSchema"]
+        self.assertEqual(schema["properties"]["to"]["type"], "string",
+                         "the premise of this test: null is not a valid `to`")
+        for where, text in surfaces.items():
+            instruction = re.search(r"[^.]*sender_alias[^.]*as [`]?to[`]?[^.]*\.",
+                                    text, re.S)
+            self.assertIsNotNone(instruction,
+                                 f"{where} does not say when to pass it at all")
+            said = instruction.group(0)
+            self.assertNotIn("always", said.lower(), where)
+            self.assertIn("non-null", said, where)
+
     def test_the_codex_side_is_told_the_same_thing_in_its_own_form(self):
         """The two directions carry identity differently — metadata one way, a
         visible label the other — but an agent on either side needs the same

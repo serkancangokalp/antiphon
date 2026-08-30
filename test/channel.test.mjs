@@ -558,7 +558,8 @@ try {
   const schema = tools.tools[0].inputSchema;
   assert.equal(schema.properties.to.type, "string");
   assert.deepEqual(schema.required, ["text"],
-    "one live peer needs no alias; requiring one would break every single-peer project");
+    "`to` is optional here only to preserve the project with no registered " +
+    "Codex peer at all; requiring it would break every unnamed single pair");
 
   // `to` has to survive the hop into the Python process. Only the resolver
   // there can produce this sentence, so seeing the alias in the error proves

@@ -47,7 +47,7 @@ A Codex → Claude message never pastes text into the terminal and never imperso
 <channel source="antiphon" sender="codex" sender_kind="agent" sender_alias="build" message_id="...">
 ```
 
-Claude Code's interface shows this as an incoming channel event, and Claude treats the message as the words of the Codex agent, not of the human user. It sends its reply back with the `reply_to_codex` MCP tool, always passing `sender_alias` as `to`. A bare reply is refused as soon as any named Codex peer is registered: an unnamed Codex session leaves no registry record, so one visible peer cannot be shown to be the only one running. `sender_alias` is `null` for a peer with no name.
+Claude Code's interface shows this as an incoming channel event, and Claude treats the message as the words of the Codex agent, not of the human user. It sends its reply back with the `reply_to_codex` MCP tool, passing `sender_alias` as `to` whenever it is non-null. A bare reply is refused as soon as any named Codex peer is registered: an unnamed Codex session leaves no registry record, so one visible peer cannot be shown to be the only one running. A `null` `sender_alias` is a peer with no name — it cannot be addressed by name, and a bare reply reaches it only in a project where nothing is registered.
 
 ## Install
 
