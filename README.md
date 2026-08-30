@@ -198,25 +198,54 @@ Without this entry the pull hook still delivers Claude's context at the start of
 - Matching is done on the same project's absolute directory.
 - Unix sockets only — there is no Windows support.
 
-### Passive pull loses content, permanently
+### Passive pull pages, and what it still cannot promise
 
-The pull path is lossy today, and the loss is silent: the cursor advances past
-what was dropped, so nothing re-delivers it and nothing reports it. Against one
-turn it cuts in this order:
+The pull path delivers the other side's transcript as pages of completed
+records, oldest first. An ordinary full page targets 8,000 UTF-8 bytes and at
+most 40 completed source records — the byte number is measured against the
+installed hosts' injection limits, not a permanent host guarantee. Non-tool
+records are no longer cut or flattened: line structure, indentation, code and
+SQL formatting travel intact, and a record is never split across pages.
 
-- discovery reads only the newest 3 transcript files per side;
-- selection keeps only the newest 40 events from what discovery found;
-- rendering collapses each non-tool event's whitespace to single spaces — code
-  and SQL line breaks with it — and cuts that event to 420 characters;
-- the whole rendered summary is cut to 2,600 characters, keeping its newest
-  lines.
+A page that leaves work behind says so with a visible `has_more: true` line;
+calling `antiphon_read` again (or simply letting later turns run) drains the
+rest. Either `has_more` value describes only the transcripts discovery can
+currently see — discovery still reads only the newest 3 transcript files per
+side, so `has_more: false` is not an inventory of all project history.
 
-A message longer than any of those does not arrive truncated with a warning; the
-remainder is marked seen and is gone. Lossless oldest-first paging, with a
-per-peer cursor that only advances over records actually delivered, is the P0
-item in [BACKLOG.md](BACKLOG.md) — it is designed, not yet built. Until then, do
-not use the pull path to move anything you cannot afford to lose; send it
-directly instead.
+One record larger than an ordinary page is handled asymmetrically, from
+measurement rather than preference. Both hosts' automatic prompt hooks save an
+oversized injection to a host-managed file and show the model a preview and the
+path, so the hook hands such a record over whole — which means host-written
+spill files may contain verbatim transcript text, under the host's own
+lifecycle. Codex's MCP tool-result surface showed no such verified path, so
+`antiphon_read` refuses that one record instead: nothing is read or marked
+seen, and the next automatic prompt hook delivers it.
+
+Page positions live under an isolated v3 cursor key, `<side>_pages`
+(`claude_pages`, `codex_pages`). The old `<side>_seen` value is
+preserved untouched beside it for still-running pre-upgrade processes and
+rollback — it is never trusted or overwritten by paging code, and it is
+scheduled for
+retirement once pre-v3 processes no longer need it, not a template for
+accumulating keys. Any present legacy value, and equally a malformed or
+unreadable existing cursor file, starts a conservative replay of the currently
+discovered sources from byte zero; only a genuinely missing cursor means a new
+side and keeps the normal six-hour lookback. The old promise that a timestamp
+cursor migrates at its exact boundary is gone: that boundary cannot be trusted
+while an old process may still move it. The replay is bounded but it is not
+small — on the reviewed snapshots it took 69 Claude-source pages and 53
+Codex-source pages, up to that many automatic prompt turns — and every replay
+page carries one of exactly two fixed explanation lines, one for the legacy
+upgrade and one for cursor recovery, until the final successfully persisted
+page clears it, so duplicated history is visible as recovery rather than
+mistaken for a malfunction. A failed delivery leaves the cursor bytes exactly
+as they were.
+
+What still loses, by name: tool calls remain compressed one-line summaries
+with no stable-id retrieval yet, discovery has no catalog (the newest-3 window
+above), and there is no backward paging into history an older version already
+marked seen. Those are tracked in [BACKLOG.md](BACKLOG.md).
 
 ### The Codex-to-Claude channel refuses rather than truncates
 

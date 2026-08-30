@@ -315,35 +315,165 @@ class ShippedContractTest(unittest.TestCase):
                          "the README must name the Python floor it was tested "
                          "at, not a bare `Python 3`")
 
-    def test_the_limits_section_quotes_the_numbers_the_pull_path_uses(self):
-        """Every cut the passive pull makes is permanent — the cursor advances
-        past what was dropped. A reader can only weigh that risk against real
-        numbers, so each one is read back off the constant that enforces it."""
+    def test_paged_context_limits_match_code(self):
+        """Every number the README states about the pull path is read back off
+        the constant that enforces it, and the retired cuts are gone from both
+        sides of the boundary: no 2,600-character trim, no 420-character
+        per-event cut, in code or in prose."""
+        self.assertEqual(antiphon.PAGE_BUDGET, 8_000)
+        self.assertEqual(antiphon.EVENT_LIMIT, 40)
+        self.assertEqual(antiphon.RECENT_FILES, 3)
+        self.assertEqual(antiphon.PAGE_CURSOR_VERSION, 3)
+        for side in ("claude", "codex"):
+            self.assertEqual(antiphon.page_cursor_key(side), side + "_pages")
+        self.assertEqual(set(antiphon.REPLAY_NOTICES), {"legacy_upgrade",
+                                                        "cursor_recovery"})
+        self.assertFalse(hasattr(antiphon, "SUMMARY_BUDGET"),
+                         "the summary budget must not survive as an unused "
+                         "constant a later reader mistakes for a live setting")
+        self.assertFalse(hasattr(antiphon, "EVENT_BUDGET"),
+                         "the per-event cut must not survive as an unused "
+                         "constant a later reader mistakes for a live setting")
         limits = section(read("README.md"), "Limits")
         self.assertIsNotNone(limits, "the README has no Limits section")
         # `\s+` rather than a literal space: prose gets rewrapped, and a number
-        # that moved to the next line is still stated next to its noun. What is
-        # being pinned is the pairing, not the line breaks around it.
+        # that moved to the next line is still stated next to its noun.
         for what, words in (
-                ("the summary budget", (f"{antiphon.SUMMARY_BUDGET:,}", "characters")),
-                ("the per-event cut", (str(antiphon.EVENT_BUDGET), "characters")),
-                ("the event limit", (str(antiphon.EVENT_LIMIT), "events")),
+                ("the page target", ("8,000", "UTF-8", "bytes")),
+                ("the page record limit", ("40", "completed", "source", "records")),
                 ("the transcript window",
                  (str(antiphon.RECENT_FILES), "transcript", "files")),
                 ("the direct-channel cap",
                  (str(antiphon.MAX_CHANNEL_BYTES // 1024), "KiB"))):
             self.assertRegex(limits, r"\s+".join(map(re.escape, words)), what)
+        self.assertRegex(
+            limits, r"(?i)8,000 UTF-8 bytes[^.]*measured[^.]*not a\s+permanent",
+            "the 8,000-byte target's own sentence must call it a measured "
+            "host observation and not a permanent guarantee — the word "
+            "'measured' appearing somewhere else in the section is not that")
+        self.assertNotIn("2,600", limits, "the retired summary budget")
+        self.assertNotRegex(limits, r"\b420\b", "the retired per-event cut")
 
-    def test_the_limits_section_does_not_promise_the_pull_path_is_already_fixed(self):
-        """The paging work is designed, not written. A Limits section that reads
-        as though it were done is worse than one that never mentioned it: it
-        retires the reader's suspicion about the one path that still loses
-        content silently."""
+    def test_paged_context_surfaces_teach_has_more(self):
+        """An agent that has not been told a page is one of several will treat
+        the first page as the whole answer. Both the tool description and the
+        agent instructions teach the loop, and both scope `has_more: false` to
+        the sources discovery can currently see — it is not an inventory of
+        project history."""
+        tool = next(t for t in antiphon.TOOLS if t["name"] == "antiphon_read")
+        for name, text in (("the antiphon_read description", tool["description"]),
+                           ("AGENTS_RULE", antiphon.AGENTS_RULE)):
+            self.assertIn("has_more", text, name)
+            self.assertRegex(text, r"(?i)one page|a single page", name)
+            self.assertRegex(text, r"(?i)discover", name)
+            # Operational, not decorative: the surface must tell the agent what
+            # to DO while has_more is true — call again, or let later turns
+            # drain it. Naming the field without the loop teaches nothing.
+            self.assertRegex(text, r"(?i)again", name)
+            self.assertRegex(text, r"(?i)drain", name)
+        # The replay lifecycle lives on the agent surface too: an agent that
+        # sees dozens of duplicate-history pages with no framing will treat
+        # recovery as malfunction. Deleting this guidance left every test
+        # green once; now it cannot.
+        rule = antiphon.AGENTS_RULE
+        self.assertRegex(rule, r"(?i)upgrade", "AGENTS_RULE")
+        self.assertRegex(rule, r"(?i)cursor\s+recovery", "AGENTS_RULE")
+        self.assertRegex(rule, r"(?i)duplicate", "AGENTS_RULE")
+        self.assertRegex(rule, r"(?i)disappear|clear", "AGENTS_RULE")
+
+    def test_paged_context_surfaces_explain_oversized_mcp(self):
+        """Measured on the installed hosts: both hooks spill an oversized record
+        and expose a path, but Codex's MCP tool result does not — the model saw
+        neither content nor a path. So `antiphon_read` refuses that one record
+        without advancing, and the surfaces have to say the safe route is the
+        next automatic prompt hook, or the refusal reads as data loss."""
+        tool = next(t for t in antiphon.TOOLS if t["name"] == "antiphon_read")
+        for name, text in (("the antiphon_read description", tool["description"]),
+                           ("AGENTS_RULE", antiphon.AGENTS_RULE)):
+            self.assertRegex(text, r"(?i)nothing (is|was) (read or )?marked seen",
+                             name)
+            self.assertRegex(text, r"(?i)next (automatic )?prompt", name)
+            # Review proved these decorative once: swapping both surfaces'
+            # safe-refusal story for explicit truncation left everything
+            # green. The refusal, the no-truncation promise and the whole
+            # delivery are each load-bearing words.
+            self.assertRegex(text, r"(?i)refus", name)
+            self.assertRegex(text, r"(?i)truncat", name)
+            self.assertRegex(text, r"(?i)whole", name)
+
+    def test_paged_context_docs_name_the_remaining_losses(self):
+        """A Limits section that reads as though the work were finished retires
+        the reader's suspicion about exactly the paths that still lose content.
+        The remaining gaps are named, the upgrade replay is quantified rather
+        than waved off as one-time, and host spill files are named as holding
+        verbatim transcript text."""
         limits = section(read("README.md"), "Limits")
+        self.assertIsNotNone(limits, "the README has no Limits section")
+        for gap, pattern in (
+                ("compressed tool detail", r"(?i)tool (call|detail)s? (are|remain|stay)[a-z ]*compressed"),
+                ("backward paging", r"(?i)backward"),
+                ("catalog completeness", r"(?i)newest 3|newest three"),
+                ("host spill contents", r"(?i)verbatim"),
+                ("the replay size", r"69"),
+                ("the replay size, codex side", r"53")):
+            self.assertRegex(limits, pattern, gap)
+        self.assertNotRegex(limits, r"(?i)one[- ]time",
+                            "the measured replay is 69/53 pages, not a "
+                            "hand-wave")
+        self.assertRegex(limits, r"(?i)line structure[^.]*intact|"
+                                 r"line structure[^.]*preserved",
+                         "whitespace preservation is stated, not implied")
+        self.assertRegex(limits, r"(?i)never\s+split\s+across\s+pages",
+                         "record atomicity is stated")
+        self.assertIn("_pages", limits, "the semantic key is named")
+        self.assertIn("_seen", limits, "the preserved legacy key is named")
+        self.assertRegex(limits, r"(?i)exactly\s+two\s+fixed\s+explanation",
+                         "the replay reasons are a closed set, and the README "
+                         "says so rather than leaving the set open")
+        self.assertRegex(limits, r"(?i)legacy\s+upgrade", "reason one, named")
+        self.assertRegex(limits, r"(?i)cursor\s+recovery", "reason two, named")
+        self.assertRegex(limits, r"(?i)(malformed|unreadable)[^.]*byte\s+zero",
+                         "a malformed existing cursor replays; it is not a "
+                         "fresh install")
+        self.assertRegex(limits, r"(?i)missing\s+cursor[^.]*new\s+side",
+                         "only a genuinely missing cursor means a new side")
+        self.assertRegex(limits, r"(?i)timestamp\s+cursor[^.]*boundary[^.]*gone",
+                         "the retired boundary-migration promise is named as "
+                         "retired")
+        self.assertNotRegex(antiphon.offset_at_or_after.__doc__,
+                            r"(?i)migrat",
+                            "the helper's docstring described the rejected "
+                            "boundary-migration model once already")
+        self.assertRegex(limits, r"(?i)host.s own\s+lifecycle",
+                         "spill files follow the host lifecycle, and the "
+                         "README says whose files they are")
+        backlog = read("BACKLOG.md")
+        for gap, pattern in (
+                ("stable event id", r"(?i)stable\s+event\s+id"),
+                ("source catalog", r"(?i)source\s+catalog"),
+                ("degraded-discovery marker", r"(?i)degraded-discovery"),
+                ("backward paging", r"(?i)backward\s+paging"),
+                ("last-record anchor", r"(?i)anchor"),
+                ("descriptor-safe reading", r"(?i)descriptor-safe"),
+                ("direct-channel spill", r"(?i)direct-channel\s+spill"),
+                ("v2 retirement", r"(?i)retirement")):
+            self.assertRegex(backlog, pattern,
+                             f"BACKLOG's ledger must keep naming {gap}")
         self.assertNotRegex(limits, r"(?i)\blossless\b(?![^.]*\bBACKLOG)",
-                            "Limits calls the current path lossless")
+                            "Limits calls the pull path lossless while tool "
+                            "detail, discovery and backward paging still lose")
         self.assertIn("BACKLOG.md", limits,
                       "Limits must send the reader to the tracked work")
+        # The retired cuts must not survive elsewhere in the same package as a
+        # present-tense bug. This exact contradiction shipped once: P0 declared
+        # the 2,600/420 cuts gone while a P1 paragraph three sections later
+        # still called one "the 2,600-character pull bug".
+        for doc in ("README.md", "BACKLOG.md"):
+            text = read(doc)
+            self.assertNotRegex(text, r"(?i)pull bug", doc)
+            self.assertNotRegex(
+                text, r"(?i)(2,600|420)[^.\n]*\b(keeps|cuts|is cut|loses)\b",
+                f"{doc} still describes a retired cut in the present tense")
 
     def test_an_npm_reader_can_open_the_backlog_the_readme_points_at(self):
         """`files` is an allowlist. A pointer into a file that never entered the
