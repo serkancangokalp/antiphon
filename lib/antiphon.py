@@ -1453,20 +1453,53 @@ def notice_text(side, count):
 # ---------- push (both directions) ----------
 
 def last_claude_reply(transcript_path):
-    """Returns the most recent assistant text in the Claude transcript."""
-    chunks = []
+    """Returns every assistant text of the last Claude turn, joined in order.
+
+    A turn can span several assistant records — one per model response
+    before and after each tool call in between — so the newest assistant
+    record alone is not the whole reply. The last turn is everything after
+    the last `user` record that is a real turn boundary; see `is_boundary`
+    for what disqualifies one. Claude's hook payload carries no turn id, so
+    unlike `last_codex_reply` this has only the window to decide with.
+    """
+    records = []
     for line in tail_lines(transcript_path):
         try:
-            d = json.loads(line)
+            records.append(json.loads(line))
         except json.JSONDecodeError:
             continue
+
+    def is_boundary(d):
+        if d.get("type") != "user":
+            return False
+        if d.get("isMeta"):
+            # A mid-turn Skill-load or companion record shares isMeta with a
+            # `<channel>` injection, but carries one of these two fields —
+            # the injection carries neither and still starts a turn.
+            return not (d.get("sourceToolUseID") or d.get("turnCompanion"))
+        content = (d.get("message") or {}).get("content")
+        return not (isinstance(content, list) and content
+                    and all(isinstance(c, dict) and c.get("type") == "tool_result"
+                            for c in content))
+
+    def assistant_texts(d):
         if d.get("type") != "assistant" or d.get("isMeta"):
-            continue
+            return None
         content = (d.get("message") or {}).get("content")
         texts = [c.get("text", "") for c in content or []
                 if isinstance(c, dict) and c.get("type") == "text"]
+        return texts if texts else None
+
+    last_boundary = -1
+    for i, d in enumerate(records):
+        if is_boundary(d):
+            last_boundary = i
+
+    chunks = []
+    for d in records[last_boundary + 1:]:
+        texts = assistant_texts(d)
         if texts:
-            chunks = texts            # each new assistant message supersedes the last
+            chunks.extend(texts)
     return "\n".join(chunks).strip()
 
 

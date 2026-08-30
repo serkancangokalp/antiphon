@@ -50,6 +50,36 @@ def codex_task_complete(turn_id):
     }})
 
 
+def claude_prompt(text):
+    """A `user` record for one plain prompt — real content is a bare string
+    when there is nothing but typed text, not a content-block list."""
+    return json.dumps({"type": "user", "message": {"content": text}})
+
+
+def claude_assistant(text):
+    """An `assistant` record for one plain text reply."""
+    return json.dumps({"type": "assistant", "message": {
+        "content": [{"type": "text", "text": text}]}})
+
+
+def claude_tool_result():
+    """A `user` record carrying a tool result rather than typed text — the
+    same content shape `claude_events` already treats as invisible to a
+    person reading the transcript."""
+    return json.dumps({"type": "user", "message": {"content": [
+        {"type": "tool_result", "tool_use_id": "toolu_1",
+         "content": [{"type": "text", "text": "ok"}]}]}})
+
+
+def claude_meta_user(text, **extra):
+    """A `user` record marked `isMeta` — the host's own bookkeeping shares
+    this record type with a real turn boundary. `extra` carries whichever
+    of `sourceToolUseID` / `turnCompanion` sets a mid-turn record apart, or
+    neither for a `<channel>` injection."""
+    return json.dumps(dict({"type": "user", "isMeta": True,
+                            "message": {"content": text}}, **extra))
+
+
 def only_the_process_table(failure):
     """A `subprocess.run` that permits the registry's identity lookup and
     nothing else.
@@ -369,6 +399,79 @@ class AntiphonTest(unittest.TestCase):
                  contextlib.redirect_stderr(io.StringIO()):
                 antiphon.push("claude")
             reader.assert_called_once_with("/tmp/rollout", "T-123")
+
+    # ---- last_claude_reply: every record of the last Claude turn ----
+
+    def test_a_marker_between_tool_calls_reaches_codex(self):
+        """99.6% of measured Claude turns hold more than one assistant
+        record — a marker written before a tool call must not be dropped
+        just because the model kept talking after the tool result came
+        back."""
+        lines = [
+            claude_prompt("do the thing"),
+            claude_assistant("@codex run the suite"),
+            claude_tool_result(),
+            claude_assistant("all done"),
+        ]
+        with patch.object(antiphon, "tail_lines", return_value=lines):
+            self.assertEqual(antiphon.last_claude_reply("transcript"),
+                             "@codex run the suite\nall done")
+
+    def test_the_previous_claude_turn_stays_out(self):
+        lines = [
+            claude_prompt("first ask"),
+            claude_assistant("@codex OLD line"),
+            claude_prompt("second ask"),
+            claude_assistant("fresh reply"),
+        ]
+        with patch.object(antiphon, "tail_lines", return_value=lines):
+            self.assertEqual(antiphon.last_claude_reply("transcript"),
+                             "fresh reply")
+
+    def test_a_marker_before_a_skill_load_survives(self):
+        """A Skill's contents land mid-turn as their own `user` record —
+        `isMeta` with `sourceToolUseID` — and must not read as a new turn."""
+        lines = [
+            claude_prompt("do the thing"),
+            claude_assistant("@codex before skill"),
+            claude_tool_result(),
+            claude_meta_user("<skill-instructions>…</skill-instructions>",
+                             sourceToolUseID="toolu_skill1"),
+            claude_assistant("done"),
+        ]
+        with patch.object(antiphon, "tail_lines", return_value=lines):
+            self.assertEqual(antiphon.last_claude_reply("transcript"),
+                             "@codex before skill\ndone")
+
+    def test_a_turn_companion_record_is_a_continuation(self):
+        """The production rule is an OR: `turnCompanion` alone, with no
+        `sourceToolUseID`, must also read as a continuation."""
+        lines = [
+            claude_prompt("do the thing"),
+            claude_assistant("@codex before skill"),
+            claude_tool_result(),
+            claude_meta_user("companion turn contents",
+                             turnCompanion="toolu_companion1"),
+            claude_assistant("done"),
+        ]
+        with patch.object(antiphon, "tail_lines", return_value=lines):
+            self.assertEqual(antiphon.last_claude_reply("transcript"),
+                             "@codex before skill\ndone")
+
+    def test_a_channel_injection_still_starts_a_turn(self):
+        """A `<channel>` injection is `isMeta` too, but carries neither
+        `sourceToolUseID` nor `turnCompanion` — host bookkeeping of a
+        different kind, and it remains a boundary."""
+        lines = [
+            claude_prompt("do the thing"),
+            claude_assistant("@codex OLD"),
+            claude_meta_user('<channel source="antiphon" sender="codex" '
+                             'sender_kind="agent">ping</channel>'),
+            claude_assistant("reply to channel"),
+        ]
+        with patch.object(antiphon, "tail_lines", return_value=lines):
+            self.assertEqual(antiphon.last_claude_reply("transcript"),
+                             "reply to channel")
 
     def test_large_codex_rollout_reads_cwd_from_head(self):
         with tempfile.NamedTemporaryFile(prefix="rollout-", suffix=".jsonl") as f:
