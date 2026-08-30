@@ -600,8 +600,11 @@ async function aRefusedClientCannotKeepStreaming() {
   const session = spawnChannel(dir, "");
   const client = new Socket({ allowHalfOpen: true });
   let written = 0;
+  let reply = "";
   try {
     assert.ok(await waitFor(() => existsSync(session.socketPath)), session.stderr());
+    client.setEncoding("utf8");
+    client.on("data", (chunk) => { reply += chunk; });
     client.on("error", () => {});
     client.connect(session.socketPath);
     await once(client, "connect");
@@ -619,6 +622,11 @@ async function aRefusedClientCannotKeepStreaming() {
     }, 8_000);
     assert.ok(closed,
       `the server must close a refused connection; wrote ${written} bytes after the refusal`);
+    const refusal = JSON.parse(reply);
+    assert.equal(refusal.ok, false,
+      `the half-open client must receive the refusal before close: ${reply}`);
+    assert.match(refusal.error, /message too large: over 131072 bytes/,
+      "the refusal must arrive as one complete JSON response, not a truncated write");
 
     // And the channel still serves everyone else.
     const ack = await sendTo(session.socketPath,
