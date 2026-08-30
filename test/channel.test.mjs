@@ -3,7 +3,7 @@ import { createHash } from "node:crypto";
 import { spawn } from "node:child_process";
 import { existsSync, mkdirSync, readdirSync, readFileSync } from "node:fs";
 import { mkdtemp, rm } from "node:fs/promises";
-import { connect } from "node:net";
+import { Socket, connect } from "node:net";
 import { once } from "node:events";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -190,11 +190,15 @@ function sendTo(path, payload) {
   return new Promise((resolve) => {
     const socket = connect(path);
     let reply = "";
+    // Bounded, so a server that answers nothing fails the assertion instead of
+    // hanging the whole suite.
+    const giveUp = setTimeout(() => { socket.destroy(); resolve(reply); }, 5_000);
+    const settle = () => { clearTimeout(giveUp); resolve(reply); };
     socket.setEncoding("utf8");
     socket.on("connect", () => socket.end(payload));
     socket.on("data", (chunk) => { reply += chunk; });
-    socket.on("close", () => resolve(reply));
-    socket.on("error", () => resolve(reply));
+    socket.on("close", settle);
+    socket.on("error", settle);
   });
 }
 
@@ -251,7 +255,49 @@ async function aStalledClientDoesNotBlockShutdown() {
   }
 }
 
+async function aRefusedClientCannotKeepStreaming() {
+  // Ending the response closes only the server's write half. With
+  // `allowHalfOpen` the read half stays open, so a client that opts into
+  // half-open can go on writing after it has been refused — measured at 2 MiB,
+  // with every write pushing the idle timeout back. The byte cap has to bound
+  // what a connection can cost, not only what gets parsed.
+  const dir = await mkdtemp(join(tmpdir(), "antiphon-stream-"));
+  const session = spawnChannel(dir, "");
+  const client = new Socket({ allowHalfOpen: true });
+  let written = 0;
+  try {
+    assert.ok(await waitFor(() => existsSync(session.socketPath)), session.stderr());
+    client.on("error", () => {});
+    client.connect(session.socketPath);
+    await once(client, "connect");
+    client.write(JSON.stringify({ content: "x".repeat(200 * 1024) }));
+
+    // Never calls end(): the server has to be the one that closes.
+    const blob = Buffer.alloc(64 * 1024, 0x61);
+    const closed = await waitFor(() => {
+      if (client.destroyed) return true;
+      if (written < 32 * blob.length) {
+        client.write(blob);
+        written += blob.length;
+      }
+      return false;
+    }, 8_000);
+    assert.ok(closed,
+      `the server must close a refused connection; wrote ${written} bytes after the refusal`);
+
+    // And the channel still serves everyone else.
+    const ack = await sendTo(session.socketPath,
+      JSON.stringify({ content: "still here", message_id: "m-stream" }));
+    assert.deepEqual(JSON.parse(ack), { ok: true, message_id: "m-stream" });
+  } finally {
+    client.destroy();
+    session.child.kill("SIGKILL");
+    await rm(dir, { recursive: true, force: true });
+  }
+}
+
 await anOversizedMessageIsRefusedWithoutKillingTheSession();
+await aRefusedClientCannotKeepStreaming();
 await aStalledClientDoesNotBlockShutdown();
 await aSocketPathItCannotClearDoesNotKillTheSession();
 await onlyOneUnnamedSessionGetsTheChannel(false);   // a second terminal, later
