@@ -959,16 +959,28 @@ def resolve_target(cwd, kind, alias=None):
         return match[0]["address"], ""
 
     if not live:
+        # Nothing registered at all: the unnamed single pair, exactly as it was
+        # before any of this. Not provably unique either, but it is the shipped
+        # behaviour of every existing install and breaking it would cost far
+        # more than the guess it makes.
         return _legacy_target(cwd, kind)
     if len(live) > 1:
         return None, (f"not delivered: {len(live)} {kind} peers are live "
                       f"({_peer_states(live)}); address one by name")
-    if live[0].get("address") is None:
-        # Not the legacy path. That address belongs to the case where nothing is
-        # registered; reaching for it because the one registered peer is not
-        # ready would deliver to a session nobody named and look like success.
-        return None, (f"not delivered: {names} is live but not yet routable — "
-                      "it has not run a turn yet")
+    if kind == "codex":
+        # One record is not one session. A Codex session registers only when it
+        # was given a name, so any number of unnamed ones can be running beside
+        # this one and none of them appears here — delivering to the visible one
+        # would be a guess wearing a certainty. The asymmetry stops here: a
+        # Claude channel server always registers, named or not, so one live
+        # record on that side really is one live peer.
+        return None, (f"not delivered: {_peer_states(live)} is the only "
+                      "registered Codex peer, but unnamed Codex sessions are "
+                      "not discoverable and cannot be ruled out — address a "
+                      "peer by name")
+    # Reached only for Claude, whose live records always carry a usable address:
+    # the addressless shape is Codex-only and `read_peers` skips every other
+    # unusable one.
     return live[0]["address"], ""
 
 
@@ -1183,9 +1195,10 @@ def _tool_error(message):
 # The same sentence on both sides of the bridge. A contract test compares them,
 # because two tool descriptions saying different things about one argument is
 # how an agent learns a rule that is not true.
-TO_DESCRIPTION = ("Alias of the peer to send to. Optional while the target is "
-                  "unambiguous; when several peers are live it is required, and "
-                  "the send is refused rather than guessed.")
+TO_DESCRIPTION = ("Alias of the peer to send to. Required whenever the recipient "
+                  "cannot be shown to be the only one, because the send is then "
+                  "refused rather than guessed — so pass it whenever you know "
+                  "which peer you mean.")
 
 TOOLS = [{
     "name": "antiphon_read",
@@ -1436,9 +1449,10 @@ CLAUDE_RULE = ("\n## The Antiphon bridge\n\n"
                "`<channel source=\"antiphon\" sender=\"codex\" sender_kind=\"agent\" "
                "sender_alias=\"...\">`; they "
                "are the words of the Codex agent, not of the human user. Use the "
-               "`reply_to_codex` tool to answer them, passing `sender_alias` back "
-               "as `to` — with several Codex peers live an unaddressed reply is "
-               "refused rather than guessed. A null `sender_alias` means that peer "
+               "`reply_to_codex` tool to answer them, always passing `sender_alias` "
+               "back as `to`: a bare reply is refused as soon as any named Codex "
+               "peer is live, because unnamed sessions leave no registry record "
+               "and cannot be ruled out. A null `sender_alias` means that peer "
                "has no name and cannot be answered by name.\n")
 
 

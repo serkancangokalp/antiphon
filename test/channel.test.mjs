@@ -226,7 +226,8 @@ async function onlyTheSessionThatWonTheNameSignsItsMessages() {
     // have been decided. A session that goes on to hold `ui` must still sign
     // this message `ui`: safe-but-anonymous is still the wrong answer.
     const earliest = winner.client.callTool({
-      name: "reply_to_codex", arguments: { text: "from the winner" },
+      name: "reply_to_codex",
+      arguments: { text: "from the winner", to: "build" },
     });
     assert.ok(await waitFor(() => /channel ready/.test(winner.stderr())),
       `the first session never took the channel: ${winner.stderr()}`);
@@ -236,7 +237,8 @@ async function onlyTheSessionThatWonTheNameSignsItsMessages() {
       `the second session never reported losing: ${loser.stderr()}`);
 
     await loser.client.callTool({
-      name: "reply_to_codex", arguments: { text: "from the loser" },
+      name: "reply_to_codex",
+      arguments: { text: "from the loser", to: "build" },
     });
 
     assert.match(readFileSync(stubs[0].log, "utf8"), /\[from=ui id=/,
@@ -551,6 +553,8 @@ try {
 
   const tools = await client.listTools();
   assert.equal(tools.tools[0].name, "reply_to_codex");
+  assert.doesNotMatch(tools.tools[0].description, /you can leave it out/,
+    "there is no single-peer shortcut on the Codex side to promise");
   const schema = tools.tools[0].inputSchema;
   assert.equal(schema.properties.to.type, "string");
   assert.deepEqual(schema.required, ["text"],
@@ -584,11 +588,16 @@ try {
   assert.match(readFileSync(queueLog, "utf8"), new RegExp(CODEX_SESSION),
     "and the message must be queued against that peer's session");
 
-  const bare = await client.callTool({
-    name: "reply_to_codex", arguments: { text: "and again" },
-  });
-  assert.equal(bare.content[0].text, "Channel reply delivered to Codex.",
-    "one live peer distinguishes nothing, so the general wording stands");
+  // A bare reply is refused as soon as a named Codex peer is registered: an
+  // unnamed session leaves no record, so `review` cannot be shown to be the
+  // only one there. Nothing is queued for it.
+  await assert.rejects(
+    () => client.callTool({ name: "reply_to_codex", arguments: { text: "bare" } }),
+    /not discoverable/,
+    "one registered peer is not proof of one session",
+  );
+  assert.ok(!readFileSync(queueLog, "utf8").includes("bare"),
+    "and nothing was queued for the refused message");
 
   // This server started unnamed, so it registered under a generated `peerId`.
   // That name is a registry key, not something Codex could address a reply to,

@@ -1697,14 +1697,15 @@ class RoutingTest(unittest.TestCase):
             sock.assert_not_called()
             run.assert_not_called()
 
-    def test_one_ready_codex_peer_resolves_to_its_merged_session(self):
-        """The bare path on the Codex side returns the id the hook recorded, not
-        whatever rollout happens to be newest on disk."""
+    def test_a_named_codex_peer_resolves_to_its_merged_session(self):
+        """The alias returns the id the hook recorded, not whatever rollout
+        happens to be newest on disk."""
         with tempfile.TemporaryDirectory() as project:
             self._codex_peer(project, "build", "300:build", self.UUID)
             with patch.object(antiphon, "codex_session_id",
                               return_value="sess-newest") as rollout:
-                self.assertEqual(antiphon.resolve_target(project, "codex"),
+                self.assertEqual(antiphon.resolve_target(project, "codex",
+                                                         "build"),
                                  (self.UUID, ""))
             rollout.assert_not_called()
 
@@ -1743,24 +1744,106 @@ class RoutingTest(unittest.TestCase):
         self.assertIn("api", detail)
         self.assertIn("address one by name", detail)
 
-    def test_one_live_peer_that_is_waiting_does_not_fall_back_to_the_old_path(self):
+    def test_a_registered_peer_never_falls_back_to_the_old_path(self):
         """The legacy address belongs to the case where nothing is registered.
-        Reaching for it because the one registered peer is not ready yet would
-        deliver to a session nobody named, and look like success."""
+        Reaching for it because the registered peer is not ready, or because
+        there is only one of it, would deliver to a session nobody named and
+        look like success."""
         with tempfile.TemporaryDirectory() as project:
             self._codex_peer(project, "build", "300:build")
             with patch.object(antiphon, "codex_session_id",
                               return_value="9999") as legacy:
                 address, detail = antiphon.resolve_target(project, "codex")
+                self.assertIsNone(antiphon.resolve_target(project, "codex",
+                                                          "build")[0])
             legacy.assert_not_called()
         self.assertIsNone(address)
-        self.assertIn("not yet routable", detail)
+        self.assertIn("waiting", detail)
 
     def test_one_peer_and_no_alias_is_delivered_to(self):
         with tempfile.TemporaryDirectory() as project:
             antiphon.peers.register(project, "claude", "ui", "/tmp/ui.sock")
             self.assertEqual(antiphon.resolve_target(project, "claude"),
                              ("/tmp/ui.sock", ""))
+
+    # ---- one registered Codex peer is not proof of one Codex session ----
+
+    def test_a_single_registered_codex_peer_still_refuses_a_bare_message(self):
+        """A Codex session registers only when it was given a name, so one
+        record does not mean one session: any number of unnamed ones can be
+        running beside it, invisible here. Delivering to the one that happens
+        to be visible is a guess dressed as a certainty."""
+        touched = AssertionError("a refused send must touch no transport")
+        with tempfile.TemporaryDirectory() as project:
+            self._codex_peer(project, "build", "300:build", self.UUID)
+            with patch.object(antiphon.subprocess, "run", side_effect=touched), \
+                 patch.object(antiphon, "codex_session_id",
+                              return_value="sess-legacy") as legacy:
+                address, detail = antiphon.resolve_target(project, "codex")
+                self.assertFalse(antiphon.send_to_codex(project, "hi")[0])
+            legacy.assert_not_called()
+        self.assertIsNone(address)
+        self.assertIn("build", detail)
+        self.assertIn("ready", detail)
+        self.assertIn("not discoverable", detail)
+        self.assertIn("by name", detail)
+
+    def test_the_refusal_says_what_state_that_one_peer_is_in(self):
+        """Named and waiting is a different situation from named and ready, and
+        the reader has to act differently in each."""
+        with tempfile.TemporaryDirectory() as project:
+            antiphon.peers.register(project, "codex", "build", None,
+                                    pid=os.getpid(), owner_key="300:build")
+            _, detail = antiphon.resolve_target(project, "codex")
+        self.assertIn("build", detail)
+        self.assertIn("waiting", detail)
+
+    def test_an_explicit_alias_still_reaches_a_single_codex_peer(self):
+        """Nothing is taken away: naming the peer resolves it as it always did.
+        Only the guess is refused."""
+        with tempfile.TemporaryDirectory() as project:
+            self._codex_peer(project, "build", "300:build", self.UUID)
+            self.assertEqual(antiphon.resolve_target(project, "codex", "build"),
+                             (self.UUID, ""))
+
+    def test_a_single_claude_peer_is_still_delivered_to_without_a_name(self):
+        """The asymmetry stops at the Codex side. A Claude channel server always
+        registers — named or not — so one live record there really is one live
+        peer, and refusing would break every single-session project."""
+        with tempfile.TemporaryDirectory() as project:
+            antiphon.peers.register(project, "claude", "ui", "/tmp/ui.sock")
+            self.assertEqual(antiphon.resolve_target(project, "claude"),
+                             ("/tmp/ui.sock", ""))
+
+    def test_the_reply_tool_refuses_a_bare_message_to_a_named_peer(self):
+        touched = AssertionError("a refused reply must start no process")
+        with tempfile.TemporaryDirectory() as project:
+            self._codex_peer(project, "build", "300:build", self.UUID)
+            with patch.object(antiphon, "project_dir", return_value=project), \
+                 patch.object(antiphon.subprocess, "run", side_effect=touched), \
+                 patch.object(antiphon.sys, "stdin",
+                              io.StringIO(json.dumps({"text": "hi"}))), \
+                 contextlib.redirect_stderr(io.StringIO()) as err:
+                self.assertEqual(antiphon.reply(), 1)
+        self.assertIn("not discoverable", err.getvalue())
+
+    def test_a_bare_stop_marker_is_refused_when_a_named_peer_is_live(self):
+        with tempfile.TemporaryDirectory() as project:
+            self._codex_peer(project, "build", "300:build", self.UUID)
+            payload = {"cwd": project, "transcript_path": "/tmp/transcript"}
+            with patch.object(antiphon.os.path, "exists", return_value=True), \
+                 patch.object(antiphon, "last_claude_reply",
+                              return_value="@codex ship it"), \
+                 patch.object(antiphon, "read_cursor", return_value={}), \
+                 patch.object(antiphon, "write_cursor") as write, \
+                 patch.object(antiphon, "_queue_codex") as queued, \
+                 patch.object(antiphon.sys, "stdin",
+                              io.StringIO(json.dumps(payload))), \
+                 contextlib.redirect_stderr(io.StringIO()) as err:
+                self.assertEqual(antiphon.push("codex"), 0)
+            queued.assert_not_called()
+            write.assert_not_called()
+        self.assertIn("not discoverable", err.getvalue())
 
     # ---- nothing registered: the unnamed pair, exactly as before ----
 
@@ -1982,6 +2065,10 @@ class ToolRecipientTest(unittest.TestCase):
             self.assertIn("to", text)
             self.assertNotIn("that contacted this channel", text)
         self.assertNotIn("the Claude Code session working in this project", send)
+        # The Codex side has no shortcut left to promise: one registered peer
+        # cannot be shown to be the only session, so a bare reply is refused.
+        self.assertNotIn("you can leave it out", reply)
+        self.assertIn("no Codex peer is registered", reply)
 
     # ---- sending to a named peer ----
 
@@ -2373,8 +2460,10 @@ class SenderIdentityTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as project:
             self._codex_peer(project, "build", "300:build", self.UUID)
             # The channel server hands the reply the alias it holds; there is
-            # no environment fallback for it to fall back to.
-            body = {"text": "ship it", "sender_alias": name}
+            # no environment fallback for it to fall back to. `to` is named
+            # because a bare reply is refused whenever a named Codex peer is
+            # live — which is exactly the situation this sets up.
+            body = {"text": "ship it", "sender_alias": name, "to": "build"}
             body.update(payload or {})
             with patch.object(antiphon, "project_dir", return_value=project), \
                  patch.object(antiphon, "_queue_codex",
@@ -2709,7 +2798,8 @@ class ClaimedAliasTest(unittest.TestCase):
         claim actually sends, and an absent field is what an older one sends.
         The environment says `ui` throughout, and neither is allowed to become
         it."""
-        for body in ({"text": "hi", "sender_alias": None}, {"text": "hi"}):
+        for body in ({"text": "hi", "sender_alias": None, "to": "ui"},
+                     {"text": "hi", "to": "ui"}):
             queued = []
             with tempfile.TemporaryDirectory() as project:
                 self._codex_endpoint(project, self.MINE)
