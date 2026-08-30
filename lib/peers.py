@@ -272,6 +272,20 @@ def _pid_of(record):
     return pid if pid > 0 else None
 
 
+def _birth_of(record):
+    """The start time of the process the record was written for, or None.
+
+    None is two different histories with one correct reading. The record may
+    predate this field, or `ps` may have had nothing to say when the claim was
+    made. Neither is evidence that the pid has been recycled, so both fall back
+    to the liveness the registry has always used.
+    """
+    birth = record.get("birth") if hasattr(record, "get") else None
+    if not isinstance(birth, str) or not birth.strip():
+        return None
+    return birth
+
+
 def alive(pid):
     """True if the process still exists. Signal 0 checks without delivering.
 
@@ -279,12 +293,48 @@ def alive(pid):
     answers this, so a peer can read as live for the window before its parent
     reaps it. The cost is a delivery attempt that fails loudly against a socket
     nobody serves, never a silent misroute.
+
+    This answers "somebody holds that number", which is weaker than what any
+    caller here wants to know. `_record_alive` is what they ask; this is one
+    half of its answer.
     """
     try:
         os.kill(int(pid), 0)
     except (OSError, TypeError, ValueError):
         return False
     return True
+
+
+def _record_alive(record):
+    """Whether the process this record was written for is the one still running.
+
+    Every liveness decision in the registry goes through here, because they are
+    all the same decision and one of them getting it wrong is enough. A pid is a
+    number the kernel hands out again; `owner_key` has always said so by pairing
+    a pid with a start time, and liveness used to contradict it by asking only
+    whether the number was in use. An endpoint that crashed without releasing
+    its claim therefore came back to life the moment its number was reassigned
+    to an unrelated process — holding an alias, holding an address, and standing
+    between a Codex session and the address it was entitled to.
+
+    Three readings, and only the last one is a corpse:
+
+    - no fingerprint in the record: it predates the field or its owner could not
+      be fingerprinted at registration. The pid alone, exactly as before.
+    - a fingerprint, and none readable now: `ps` failed, which is evidence of
+      nothing. Releasing a peer that may well be live over a lookup that could
+      not be made would trade a rare bug for a common one.
+    - a fingerprint, and a different one: the process this record names is gone
+      and its number belongs to somebody else. Dead, and prunable.
+    """
+    pid = _pid_of(record)
+    if pid is None or not alive(pid):
+        return False
+    recorded = _birth_of(record)
+    if recorded is None:
+        return True
+    observed = _process_birth(pid)
+    return observed is None or observed == recorded
 
 
 def _prune(cwd, kind, name, dead_pid):
@@ -302,7 +352,7 @@ def _prune(cwd, kind, name, dead_pid):
         held_pid = _pid_of(held) if held else None
         if held_pid is None or held_pid != dead_pid:
             return
-        if alive(held_pid):
+        if _record_alive(held):
             return
         path = _peer_file(cwd, kind, name)
         try:
@@ -347,6 +397,9 @@ def _scan(cwd):
 def read_peers(cwd, kind=None):
     """Live peers, newest first. Records left by dead processes are removed.
 
+    Live is `_record_alive`, not a signal to a pid: a record whose process is
+    gone is still removed when its number has been handed to somebody else.
+
     Live is not the same as reachable. A Codex peer that has not been given its
     address yet is listed with `address` set to `None`, because a peer nobody
     can name is a peer an ambiguity refusal cannot mention. This is the single
@@ -368,7 +421,7 @@ def read_peers(cwd, kind=None):
             continue                  # identifies nobody; not a peer, not prunable
         if _address_of(peer) is None and not _addressless(peer):
             continue                  # reaches nobody, and is not on its way
-        if not alive(peer_pid):
+        if not _record_alive(peer):
             _prune(cwd, peer.get("kind"), peer.get("name"), peer_pid)
             continue
         if kind is None or peer.get("kind") == kind:
@@ -431,10 +484,16 @@ def register(cwd, kind, name, address, pid=None, owner_key=None):
     owner_pid = _pid_of({"pid": pid}) if pid is not None else os.getpid()
     if owner_pid is None:
         return False, f"invalid owner pid {pid!r}: expected a positive integer"
+    # Observed here and taken from nowhere else. There is no parameter for it
+    # and no field of the payload reaches it: a fingerprint a caller could hand
+    # in is a stale record vouching for itself, which is the one claim the
+    # comparison exists to disbelieve. Read before the lock — `ps` is a
+    # subprocess, and nothing about it needs the registry held still.
+    birth = _process_birth(owner_pid)
     with _registry_lock(cwd):
         for other in _scan(cwd):
             other_pid = _pid_of(other)
-            if other_pid is None or not alive(other_pid):
+            if other_pid is None or not _record_alive(other):
                 continue
             if other.get("kind") != kind:
                 continue                  # a rollout id and a socket path never collide
@@ -474,6 +533,11 @@ def register(cwd, kind, name, address, pid=None, owner_key=None):
                   "address": address, "started_at": time.time()}
         if owner_key:
             record["owner"] = owner_key
+        if birth:
+            # Kept apart from `started_at`, which is when the claim was made and
+            # is what the listing sorts on. This is when the process was born,
+            # and it is the half of its identity the number does not carry.
+            record["birth"] = birth
         tmp = f"{path}.{os.getpid()}.tmp"
         with open(tmp, "w", encoding="utf-8") as f:
             json.dump(record, f, ensure_ascii=False)
@@ -536,7 +600,7 @@ def write_session(cwd, kind, name, session_id, transcript, owner):
                        "start time that tells it from a recycled one")
     with _registry_lock(cwd):
         endpoint = _read_record(_peer_file(cwd, kind, name))
-        if endpoint and _owner_of(endpoint) != owner and alive(_pid_of(endpoint)):
+        if endpoint and _owner_of(endpoint) != owner and _record_alive(endpoint):
             return False, (f"alias {name!r} is held by another live {kind} session "
                            f"(pid {_pid_of(endpoint)}); its record was not touched")
         record = {"kind": kind, "name": name, "owner": owner,
@@ -579,6 +643,19 @@ def _process_info(pid):
     except ValueError:
         return None
     return ppid, rest[:24].strip(), rest[24:].strip()
+
+
+def _process_birth(pid):
+    """The start time `ps` reports for `pid` itself, or None when it has none.
+
+    The same reading `owner_key` builds its key from, asked about one process
+    instead of a walk: two processes that hold one number in turn were born at
+    different moments, and that difference is all the registry needs to tell
+    them apart. Seconds of resolution is the resolution `owner_key` already
+    trusts for the same purpose.
+    """
+    info = _process_info(pid)
+    return (info[1] or None) if info else None
 
 
 def owner_key(pid=None):

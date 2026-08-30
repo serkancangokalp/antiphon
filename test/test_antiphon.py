@@ -24,6 +24,27 @@ from unittest.mock import Mock, patch
 os.environ.pop("ANTIPHON_NAME", None)
 
 
+def only_the_process_table(failure):
+    """A `subprocess.run` that permits the registry's identity lookup and
+    nothing else.
+
+    The tests below mean one thing by "starts no process": no `codex` was
+    spawned to carry a message that was refused. Since liveness became
+    record-aware, reading the registry also runs `ps` to check that a live pid
+    is still the process the record was written for — a lookup, not a delivery,
+    and one a refusal has to make before it can know it is a refusal. Letting
+    exactly that through keeps each assertion about what it was always about
+    rather than about how many processes the answer took to reach.
+    """
+    real = subprocess.run
+
+    def run(args, *rest, **kwargs):
+        if isinstance(args, (list, tuple)) and args and args[0] == "ps":
+            return real(args, *rest, **kwargs)
+        raise failure
+    return run
+
+
 def read_source(*parts):
     with open(os.path.join(os.path.dirname(__file__), "..", *parts),
               encoding="utf-8") as f:
@@ -1873,7 +1894,8 @@ class RoutingTest(unittest.TestCase):
              patch.object(antiphon, "codex_session_id",
                           return_value="sess-legacy") as rollout, \
              patch.object(antiphon.socket, "socket", side_effect=touched) as sock, \
-             patch.object(antiphon.subprocess, "run", side_effect=touched) as run:
+             patch.object(antiphon.subprocess, "run",
+                          side_effect=only_the_process_table(touched)) as run:
             for kind in ("claude", "codex"):
                 address, detail = antiphon.resolve_target(project, kind, "ghost")
                 self.assertIsNone(address, kind)
@@ -2008,7 +2030,8 @@ class RoutingTest(unittest.TestCase):
         touched = AssertionError("a refused send must touch no transport")
         with tempfile.TemporaryDirectory() as project:
             self._codex_peer(project, "build", "300:build", self.UUID)
-            with patch.object(antiphon.subprocess, "run", side_effect=touched), \
+            with patch.object(antiphon.subprocess, "run",
+                              side_effect=only_the_process_table(touched)), \
                  patch.object(antiphon, "codex_session_id",
                               return_value="sess-legacy") as legacy:
                 address, detail = antiphon.resolve_target(project, "codex")
@@ -2052,7 +2075,8 @@ class RoutingTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as project:
             self._codex_peer(project, "build", "300:build", self.UUID)
             with patch.object(antiphon, "project_dir", return_value=project), \
-                 patch.object(antiphon.subprocess, "run", side_effect=touched), \
+                 patch.object(antiphon.subprocess, "run",
+                              side_effect=only_the_process_table(touched)), \
                  patch.object(antiphon.sys, "stdin",
                               io.StringIO(json.dumps({"text": "hi"}))), \
                  contextlib.redirect_stderr(io.StringIO()) as err:
@@ -2120,11 +2144,16 @@ class RoutingTest(unittest.TestCase):
             self._codex_peer(project, "review", "301:review", self.OTHER)
             touched = AssertionError("a refused message must touch no transport")
             with patch.object(antiphon.socket, "socket", side_effect=touched) as sock, \
-                 patch.object(antiphon.subprocess, "run", side_effect=touched) as run:
+                 patch.object(antiphon.subprocess, "run",
+                              side_effect=only_the_process_table(touched)) as run:
                 claude_ok, claude_detail = antiphon.send_to_claude(project, "hi")
                 codex_ok, codex_detail = antiphon.send_to_codex(project, "hi")
                 sock.assert_not_called()
-                run.assert_not_called()
+                self.assertEqual(
+                    [c for c in run.call_args_list if c.args[0][0] != "ps"], [],
+                    "reading the process table to see whether a pid has been "
+                    "recycled is how the refusal knows it is one; spawning "
+                    "anything else is the side effect this refuses")
         self.assertFalse(claude_ok)
         self.assertFalse(codex_ok)
         self.assertIn("address one by name", claude_detail)
@@ -2379,7 +2408,8 @@ class ToolRecipientTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as project:
             self._codex_peer(project, "build", "300:build", self.UUID)
             self._codex_peer(project, "review", "301:review", self.OTHER)
-            with patch.object(antiphon.subprocess, "run", side_effect=touched):
+            with patch.object(antiphon.subprocess, "run",
+                              side_effect=only_the_process_table(touched)):
                 for payload, expected in (({"text": "x", "to": "ghost"}, "ghost"),
                                           ({"text": "x"}, "address one by name"),
                                           ({"text": "x", "to": 42}, "to")):
@@ -2394,7 +2424,8 @@ class ToolRecipientTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as project:
             antiphon.peers.register(project, "codex", "review", None,
                                     pid=os.getpid(), owner_key="301:review")
-            with patch.object(antiphon.subprocess, "run", side_effect=touched):
+            with patch.object(antiphon.subprocess, "run",
+                              side_effect=only_the_process_table(touched)):
                 code, err = self._reply(project, {"text": "x", "to": "review"})
         self.assertEqual(code, 1)
         self.assertIn("not yet routable", err)
@@ -3060,6 +3091,28 @@ class ClaimedAliasTest(unittest.TestCase):
             peer = antiphon.peers.read_peers(project, "claude")[0]
         self.assertEqual(peer["owner"], self.MINE)
         self.assertEqual(peer["pid"], os.getpid())
+
+    def test_register_peer_fingerprints_the_owner_itself(self):
+        """The record's proof that its pid has not been recycled is taken from
+        the process table here, never from the payload. A caller that could
+        supply one could keep a dead peer's claim alive forever by naming a
+        start time that will always match."""
+        with tempfile.TemporaryDirectory() as project, \
+             patch.object(antiphon, "project_dir", return_value=project), \
+             patch.object(antiphon.peers, "owner_key", return_value=self.MINE), \
+             patch.object(antiphon.sys, "stdin", io.StringIO(json.dumps({
+                 "kind": "claude", "name": "ui", "address": "/tmp/ui.sock",
+                 "pid": os.getpid(), "birth": "Thu Jan  1 00:00:00 1970"}))):
+            self.assertEqual(antiphon.register_peer(), 0)
+            path = os.path.join(antiphon.peers.peer_dir(project, "claude", "ui"),
+                                "endpoint.json")
+            with open(path, encoding="utf-8") as f:
+                record = json.load(f)
+            observed = antiphon.peers._process_info(os.getpid())
+            self.assertEqual(record.get("birth"),
+                             observed[1] if observed else None)
+            self.assertEqual([p["name"] for p in
+                              antiphon.peers.read_peers(project, "claude")], ["ui"])
 
 
 class StatusTest(unittest.TestCase):

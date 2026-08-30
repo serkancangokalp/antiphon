@@ -465,6 +465,206 @@ class OwnerKeyTest(unittest.TestCase):
         self.assertTrue(start.strip())
 
 
+class RecycledPidTest(unittest.TestCase):
+    """A pid is a number the kernel hands out again, and the registry knew it.
+
+    `owner_key` has always paired a pid with the start time that tells it from
+    a recycled one, because a bare number identifies nobody. Liveness did not:
+    it asked `os.kill(pid, 0)`, which answers "somebody is using that number",
+    not "the process this record was written for is still running". So an
+    endpoint that crashed without releasing its claim came back to life the
+    moment its number was reassigned to an unrelated process — holding an
+    alias, holding an address, and, on the Codex side, standing in the way of
+    the session that legitimately wanted them.
+
+    The fix is the same one the owner key already made: record what the process
+    was, not only what it was called. Each endpoint record carries the start
+    time `ps` reports for its own pid, and a live pid whose start time differs
+    from the record's is the recycled number, not the peer.
+    """
+
+    LIVE = "Sat Aug 30 01:00:00 2026"
+    RECYCLED = "Sun Aug 30 09:41:12 2026"
+    KEY = "300:first"
+    OTHER_KEY = "301:second"
+    UUID = "1d5a03e0-0548-4339-87c3-45c5dbf7e9d7"
+
+    @staticmethod
+    def _ps(start):
+        """`ps` fixed at one answer, so a test can say when a process was born."""
+        return patch.object(peers, "_process_info",
+                            return_value=("1", start, "node server.js"))
+
+    @staticmethod
+    def _endpoint(project, kind="claude", name="ui"):
+        return os.path.join(peers.peer_dir(project, kind, name), "endpoint.json")
+
+    def _read(self, project, kind="claude", name="ui"):
+        with open(self._endpoint(project, kind, name), encoding="utf-8") as f:
+            return json.load(f)
+
+    def _register(self, project, born, kind="claude", name="ui",
+                  address="/tmp/ui.sock", pid=None, owner_key=None):
+        with self._ps(born):
+            ok, detail = peers.register(project, kind, name, address,
+                                        pid=os.getpid() if pid is None else pid,
+                                        owner_key=owner_key)
+        self.assertTrue(ok, detail)
+
+    # ---- what a record now carries ----
+
+    def test_a_record_carries_the_fingerprint_of_the_process_it_names(self):
+        with tempfile.TemporaryDirectory() as project:
+            self._register(project, self.LIVE)
+            record = self._read(project)
+        self.assertEqual(record["birth"], self.LIVE)
+        self.assertIsInstance(record["started_at"], float,
+                              "when the claim was made is a different fact from "
+                              "when the process was born, and stays its own field")
+
+    def test_the_fingerprint_is_observed_here_and_never_supplied(self):
+        """A fingerprint a caller could hand in would let a stale record assert
+        its own liveness, which is the claim being checked."""
+        with tempfile.TemporaryDirectory() as project:
+            with self.assertRaises(TypeError):
+                peers.register(project, "claude", "ui", "/tmp/ui.sock",
+                               pid=os.getpid(), birth=self.RECYCLED)
+
+    def test_an_owner_that_cannot_be_fingerprinted_registers_without_one(self):
+        """`ps` is not guaranteed to answer. Refusing the claim would cost a
+        working session its alias over a lookup, so the field is simply
+        omitted and the record behaves exactly as records did before it."""
+        with tempfile.TemporaryDirectory() as project:
+            with patch.object(peers, "_process_info", return_value=None):
+                ok, detail = peers.register(project, "claude", "ui",
+                                            "/tmp/ui.sock", pid=os.getpid())
+            self.assertTrue(ok, detail)
+            self.assertNotIn("birth", self._read(project))
+            self.assertEqual([p["name"] for p in peers.read_peers(project)], ["ui"])
+
+    # ---- the decision every caller now shares ----
+
+    def test_a_matching_fingerprint_leaves_the_peer_live(self):
+        with tempfile.TemporaryDirectory() as project:
+            self._register(project, self.LIVE)
+            with self._ps(self.LIVE):
+                self.assertEqual([p["name"] for p in peers.read_peers(project)],
+                                 ["ui"])
+            self.assertTrue(os.path.exists(self._endpoint(project)))
+
+    def test_a_recycled_pid_reads_as_dead_and_its_record_is_pruned(self):
+        """The pid answers `os.kill`, and it is still not the peer."""
+        with tempfile.TemporaryDirectory() as project:
+            self._register(project, self.LIVE)
+            with patch.object(peers, "alive", return_value=True), \
+                 self._ps(self.RECYCLED):
+                self.assertEqual(peers.read_peers(project), [])
+            self.assertFalse(os.path.exists(self._endpoint(project)),
+                             "a corpse holding a live number is still a corpse")
+
+    def test_a_recycled_pid_no_longer_holds_the_name(self):
+        with tempfile.TemporaryDirectory() as project:
+            self._register(project, self.LIVE, pid=os.getppid())
+            with patch.object(peers, "alive", return_value=True), \
+                 self._ps(self.RECYCLED):
+                ok, detail = peers.register(project, "claude", "ui",
+                                            "/tmp/mine.sock", pid=os.getpid())
+                self.assertTrue(ok, detail)
+                self.assertEqual([p["address"] for p in peers.read_peers(project)],
+                                 ["/tmp/mine.sock"],
+                                 "and the new holder is the one listed")
+
+    def test_a_recycled_pid_no_longer_holds_the_address(self):
+        """The name check and the address check are two different refusals, and
+        a stale record must lose both."""
+        with tempfile.TemporaryDirectory() as project:
+            self._register(project, self.LIVE, name="ui", pid=os.getppid())
+            with patch.object(peers, "alive", return_value=True), \
+                 self._ps(self.RECYCLED):
+                ok, detail = peers.register(project, "claude", "api",
+                                            "/tmp/ui.sock", pid=os.getpid())
+            self.assertTrue(ok, detail)
+
+    def test_a_recycled_pid_no_longer_blocks_the_session_that_wants_the_alias(self):
+        """The Codex failure in full: a crashed server holds `build`, its number
+        is reassigned, and the hook of the session actually running under that
+        alias is refused its own address."""
+        with tempfile.TemporaryDirectory() as project:
+            self._register(project, self.LIVE, kind="codex", name="build",
+                           address=None, pid=os.getppid(), owner_key=self.KEY)
+            with patch.object(peers, "alive", return_value=True), \
+                 self._ps(self.RECYCLED):
+                ok, detail = peers.write_session(project, "codex", "build",
+                                                 self.UUID, "/t/r.jsonl",
+                                                 self.OTHER_KEY)
+            self.assertTrue(ok, detail)
+            self.assertEqual(peers.read_session(project, "codex", "build")["owner"],
+                             self.OTHER_KEY)
+
+    # ---- what must not change ----
+
+    def test_a_record_without_a_fingerprint_keeps_pid_only_liveness(self):
+        """Upgrading must not make the peers that are running right now vanish.
+        Their records were written before this field existed, and the only
+        honest reading of a missing fingerprint is the old one."""
+        with tempfile.TemporaryDirectory() as project:
+            directory = peers.peer_dir(project, "claude", "ui")
+            os.makedirs(directory)
+            with open(os.path.join(directory, "endpoint.json"), "w",
+                      encoding="utf-8") as f:
+                json.dump({"kind": "claude", "name": "ui", "pid": os.getpid(),
+                           "address": "/tmp/ui.sock", "started_at": 1.0}, f)
+            with self._ps(self.RECYCLED):
+                self.assertEqual([p["name"] for p in peers.read_peers(project)],
+                                 ["ui"], "no fingerprint is not a mismatch")
+                ok, _ = peers.register(project, "claude", "ui", "/tmp/other.sock",
+                                       pid=os.getppid())
+            self.assertFalse(ok, "and it still holds its name")
+            self.assertTrue(os.path.exists(self._endpoint(project)))
+
+    def test_a_fingerprint_that_cannot_be_read_now_does_not_release_a_peer(self):
+        """`ps` failing is not evidence of anything. Pruning on it would drop a
+        live peer for a lookup that could not be made; only a fingerprint that
+        is readable *and* different says the process is gone."""
+        with tempfile.TemporaryDirectory() as project:
+            self._register(project, self.LIVE)
+            with patch.object(peers, "alive", return_value=True), \
+                 patch.object(peers, "_process_info", return_value=None):
+                self.assertEqual([p["name"] for p in peers.read_peers(project)],
+                                 ["ui"])
+            self.assertTrue(os.path.exists(self._endpoint(project)))
+
+    # ---- against a real process, with nothing mocked ----
+
+    def test_a_real_process_matches_the_fingerprint_taken_from_it(self):
+        if peers._process_info(os.getpid()) is None:
+            self.skipTest("no readable process table")
+        with tempfile.TemporaryDirectory() as project:
+            ok, detail = peers.register(project, "claude", "ui", "/tmp/ui.sock",
+                                        pid=os.getpid())
+            self.assertTrue(ok, detail)
+            self.assertEqual(self._read(project)["birth"],
+                             peers._process_info(os.getpid())[1])
+            self.assertEqual([p["name"] for p in peers.read_peers(project)], ["ui"])
+
+    def test_a_real_live_pid_with_a_foreign_fingerprint_is_not_the_peer(self):
+        """This process is genuinely running, so `os.kill` says live and always
+        will. Only the recorded start time can say the record belongs to
+        somebody else who once held the number."""
+        if peers._process_info(os.getpid()) is None:
+            self.skipTest("no readable process table")
+        with tempfile.TemporaryDirectory() as project:
+            peers.register(project, "claude", "ui", "/tmp/ui.sock",
+                           pid=os.getpid())
+            record = self._read(project)
+            record["birth"] = "Thu Jan  1 00:00:00 1970"
+            with open(self._endpoint(project), "w", encoding="utf-8") as f:
+                json.dump(record, f)
+            self.assertTrue(peers.alive(os.getpid()))
+            self.assertEqual(peers.read_peers(project), [])
+            self.assertFalse(os.path.exists(self._endpoint(project)))
+
+
 class AddresslessEndpointTest(unittest.TestCase):
     """A Codex peer is knowable before it is reachable.
 
