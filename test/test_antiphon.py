@@ -1706,6 +1706,231 @@ class AntiphonTest(unittest.TestCase):
                 }, "the next write persists the translation")
 
 
+class PagedSummaryModelTest(unittest.TestCase):
+    """The page model delivers whole completed source records in source order."""
+
+    def event(self, text, source="source", generation="generation", offset=0,
+              end=100, when=10.0, kind="codex"):
+        return antiphon.Event(when, kind, text, source, generation, offset, end)
+
+    def scanned(self, *sources):
+        return {source: {"gen": generation, "offset": offset}
+                for source, generation, offset in sources}
+
+    def page(self, events, scanned=None, side="claude", replay_reason=None):
+        return antiphon._build_page(events, scanned or {}, side, replay_reason)
+
+    def test_events_from_one_source_record_are_one_atomic_record(self):
+        events = [
+            self.event("first block", offset=0, end=100),
+            self.event("second block", offset=0, end=100, when=11),
+            self.event("later record", offset=100, end=200, when=12),
+        ]
+        with patch.object(antiphon, "EVENT_LIMIT", 1):
+            text, advance, count = self.page(events, self.scanned(("source", "generation", 200)))
+        self.assertIn("first block", text)
+        self.assertIn("second block", text)
+        self.assertNotIn("later record", text)
+        self.assertEqual(count, 1)
+        self.assertTrue(advance.has_more)
+        self.assertEqual(advance.sources["source"]["offset"], 100)
+
+    def test_the_oldest_completed_records_fill_the_page_first(self):
+        events = [
+            self.event("second", source="b", offset=0, end=100, when=20),
+            self.event("first", source="a", offset=0, end=100, when=10),
+            self.event("third", source="a", offset=100, end=200, when=30),
+        ]
+        with patch.object(antiphon, "EVENT_LIMIT", 2):
+            text, advance, count = self.page(events)
+        self.assertLess(text.index("first"), text.index("second"))
+        self.assertNotIn("third", text)
+        self.assertEqual(count, 2)
+        self.assertTrue(advance.has_more)
+
+    def test_event_limit_counts_completed_records_not_blocks(self):
+        events = [
+            self.event("one", offset=0, end=100),
+            self.event("two", offset=0, end=100, when=11),
+            self.event("three", offset=100, end=200, when=12),
+        ]
+        with patch.object(antiphon, "EVENT_LIMIT", 1):
+            text, _advance, count = self.page(events)
+        self.assertIn("one", text)
+        self.assertIn("two", text)
+        self.assertNotIn("three", text)
+        self.assertEqual(count, 1)
+
+    def test_a_timestamp_regression_cannot_jump_over_an_earlier_offset(self):
+        events = [
+            self.event("offset zero", source="stream", offset=0, end=100, when=20),
+            self.event("offset one hundred", source="stream", offset=100, end=200, when=10),
+            self.event("other source", source="other", offset=0, end=100, when=15),
+        ]
+        ordered = antiphon._ordered_records(events)
+        self.assertLess(ordered.index(next(r for r in ordered if r.events[0].text == "offset zero")),
+                        ordered.index(next(r for r in ordered if r.events[0].text == "offset one hundred")))
+
+    def test_equal_timestamps_use_source_generation_and_offset_not_path(self):
+        events = [
+            self.event("source b", source="b", generation="z", offset=0, end=100, when=10),
+            self.event("source a later", source="a", generation="z", offset=100, end=200, when=10),
+            self.event("source a first", source="a", generation="z", offset=0, end=100, when=10),
+            self.event("source a old generation", source="a", generation="a", offset=0, end=100, when=10),
+        ]
+        self.assertEqual([record.events[0].text for record in antiphon._ordered_records(events)], [
+            "source a old generation", "source a first", "source a later", "source b",
+        ])
+
+    def test_the_complete_ordinary_envelope_stays_within_page_budget(self):
+        events = [self.event("é" * 3_800, offset=0, end=100)]
+        text, advance, count = self.page(
+            events, self.scanned(("source", "generation", 200)))
+        self.assertLessEqual(len(text.encode("utf-8")), antiphon.PAGE_BUDGET)
+        self.assertFalse(advance.has_more)
+        self.assertEqual(count, 1)
+
+    def test_a_first_oversized_record_is_returned_whole(self):
+        oversized = "X" * (antiphon.PAGE_BUDGET + 100)
+        text, advance, count = self.page([self.event(oversized, offset=0, end=100)])
+        self.assertIn(oversized, text)
+        self.assertGreater(len(text.encode("utf-8")), antiphon.PAGE_BUDGET)
+        self.assertFalse(advance.has_more)
+        self.assertEqual(count, 1)
+
+    def test_an_oversized_record_after_content_waits_whole_for_the_next_page(self):
+        events = [
+            self.event("small", offset=0, end=100),
+            self.event("X" * (antiphon.PAGE_BUDGET + 100), offset=100, end=200, when=11),
+        ]
+        text, advance, count = self.page(
+            events, self.scanned(("source", "generation", 200)))
+        self.assertIn("small", text)
+        self.assertNotIn("X" * 100, text)
+        self.assertTrue(advance.has_more)
+        self.assertEqual(count, 1)
+        self.assertEqual(advance.sources["source"]["offset"], 100)
+
+    def test_has_more_describes_undelivered_visible_records_only(self):
+        events = [self.event("visible", offset=0, end=100)]
+        text, advance, count = self.page(events, self.scanned(("source", "generation", 300)))
+        self.assertIn("has_more: false", text)
+        self.assertFalse(advance.has_more)
+        self.assertEqual(count, 1)
+
+    def test_each_frontier_stops_at_its_first_undelivered_visible_record(self):
+        events = [
+            self.event("selected", source="a", generation="ga", offset=0, end=100),
+            self.event("unselected", source="a", generation="ga", offset=200, end=300, when=20),
+            self.event("all selected", source="b", generation="gb", offset=0, end=100, when=11),
+        ]
+        scanned = self.scanned(("a", "ga", 400), ("b", "gb", 500))
+        with patch.object(antiphon, "EVENT_LIMIT", 2):
+            _text, advance, _count = self.page(events, scanned)
+        self.assertEqual(advance.sources["a"], {"gen": "ga", "offset": 200})
+        self.assertEqual(advance.sources["b"], {"gen": "gb", "offset": 500})
+
+    def test_a_filtered_only_source_advances_to_its_scanned_position(self):
+        scanned = self.scanned(("filtered", "g", 700))
+        text, advance, count = self.page([], scanned)
+        self.assertEqual(text, "")
+        self.assertEqual(advance.sources, scanned)
+        self.assertFalse(advance.has_more)
+        self.assertEqual(count, 0)
+
+    def test_tool_summaries_are_record_local_and_stay_compressed(self):
+        events = [
+            self.event("shell one " + "x" * 100, offset=0, end=100, kind="tool"),
+            self.event("shell two " + "y" * 100, offset=0, end=100, when=11, kind="tool"),
+            self.event("shell three " + "z" * 100, offset=100, end=200, when=12, kind="tool"),
+            self.event("message", offset=100, end=200, when=13),
+        ]
+        text, _advance, count = self.page(events)
+        self.assertIn("2 tool calls:", text)
+        self.assertIn("1 tool calls:", text)
+        self.assertIn("message", text)
+        self.assertNotIn("x" * 80, text)
+        self.assertNotIn("y" * 80, text)
+        self.assertNotIn("z" * 80, text)
+        self.assertEqual(count, 1)
+
+    def test_an_oversized_first_record_leaves_the_following_record_for_page_two(self):
+        events = [
+            self.event("X" * (antiphon.PAGE_BUDGET + 100), offset=0, end=100),
+            self.event("page two", offset=100, end=200, when=11),
+        ]
+        scanned = self.scanned(("source", "generation", 200))
+        first, advance, count = self.page(events, scanned)
+        self.assertIn("X" * 100, first)
+        self.assertNotIn("page two", first)
+        self.assertTrue(advance.has_more)
+        self.assertEqual(advance.sources["source"]["offset"], 100)
+        self.assertEqual(count, 1)
+        second, second_advance, second_count = self.page([events[1]], scanned)
+        self.assertIn("page two", second)
+        self.assertFalse(second_advance.has_more)
+        self.assertEqual(second_count, 1)
+
+    def test_a_rendered_page_preserves_raw_whitespace_after_its_label(self):
+        when = antiphon.datetime(2026, 8, 30, 10, 0).timestamp()
+        events = [
+            self.event("  first\n\nsecond\n", offset=0, end=100, when=when),
+            self.event("   ", offset=0, end=100, when=when + 1),
+            self.event("tail\n", offset=0, end=100, when=when + 2),
+        ]
+        text, _advance, _count = self.page(events)
+        self.assertEqual(text, "## What happened on the Codex side (since your last turn)\n"
+                         "has_more: false\n"
+                         "has_more_scope: currently discovered sources\n"
+                         "[10:00] Codex:\n"
+                         "  first\n\nsecond\n\n\n   \n\ntail\n"
+                         "This record belongs to the Antiphon bridge — this is what actually happened "
+                         "there. Do not assume anything that is not in it.")
+
+    def test_the_final_prefix_is_checked_after_the_has_more_footer_disappears(self):
+        a = self.event("A" * 7_693, offset=0, end=100)
+        b = self.event("B", offset=100, end=200, when=11)
+        with patch.object(antiphon, "EVENT_LIMIT", 1):
+            only_a, only_a_advance, _count = self.page([a, b])
+        text, advance, count = self.page([a, b])
+        self.assertEqual(len(only_a.encode("utf-8")), 8_001)
+        self.assertTrue(only_a_advance.has_more)
+        self.assertLessEqual(len(text.encode("utf-8")), antiphon.PAGE_BUDGET)
+        self.assertFalse(advance.has_more)
+        self.assertIn("A" * 100, text)
+        self.assertIn("B", text)
+        self.assertEqual(count, 2)
+
+    def test_replay_and_discovery_scope_are_part_of_the_byte_budget(self):
+        events = [
+            self.event("A" * 7_500, offset=0, end=100),
+            self.event("deferred " + "D" * 200, offset=100, end=200, when=11),
+        ]
+        text, advance, count = self.page(
+            events, self.scanned(("source", "generation", 200)),
+            replay_reason="legacy_upgrade")
+        self.assertLessEqual(len(text.encode("utf-8")), antiphon.PAGE_BUDGET)
+        self.assertIn(antiphon.REPLAY_NOTICES["legacy_upgrade"], text)
+        self.assertNotIn("deferred", text)
+        self.assertTrue(advance.has_more)
+        self.assertEqual(advance.sources["source"]["offset"], 100)
+        self.assertEqual(count, 1)
+
+    def test_a_filtered_only_replay_gets_one_visible_notice_page(self):
+        scanned = self.scanned(("filtered", "g", 700))
+        text, advance, count = self.page([], scanned, replay_reason="cursor_recovery")
+        self.assertIn(antiphon.REPLAY_NOTICES["cursor_recovery"], text)
+        self.assertIn("has_more: false", text)
+        self.assertEqual(count, 0)
+        self.assertEqual(advance.sources, scanned)
+        self.assertEqual(advance.replay_reason, "cursor_recovery")
+        empty, no_advance, empty_count = self.page([], {}, replay_reason="cursor_recovery")
+        self.assertEqual(empty, "")
+        self.assertEqual(no_advance.sources, {})
+        self.assertIsNone(no_advance.replay_reason)
+        self.assertEqual(empty_count, 0)
+
+
 class OffsetReadingTest(unittest.TestCase):
     """`read_records` reads a transcript forward from a byte offset instead of
     seeking a fixed window from its end, and `source_generation` says when the

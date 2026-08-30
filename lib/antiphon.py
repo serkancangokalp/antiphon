@@ -33,6 +33,7 @@ import contextlib
 import errno
 import fcntl
 import hashlib
+import heapq
 import itertools
 import json
 import math
@@ -54,7 +55,8 @@ CODEX_SESSIONS = os.path.join(HOME, ".codex", "sessions")
 TAIL_BYTES = 300_000      # amount to read from the tail of each transcript file
 SUMMARY_BUDGET = 2600     # character budget for the injected summary
 EVENT_BUDGET = 420        # character budget for a single non-tool event
-EVENT_LIMIT = 40          # max events that go into the summary
+EVENT_LIMIT = 40          # completed source records per page
+PAGE_BUDGET = 8_000       # UTF-8 bytes in an ordinary complete page envelope
 RECENT_FILES = 3          # transcript files per side the summary reads at all
 LOOKBACK = 6 * 3600       # anything older than this doesn't count as part of "this session"
 
@@ -796,6 +798,19 @@ def iso_epoch(s):
 
 
 Event = collections.namedtuple("Event", "time kind text source generation offset end")
+Record = collections.namedtuple(
+    "Record", "time source generation offset end events")
+PageAdvance = collections.namedtuple(
+    "PageAdvance", "sources has_more replay_reason")
+REPLAY_NOTICES = {
+    "legacy_upgrade": (
+        "replay: replaying discovered history after an upgrade; duplicates "
+        "are expected until this backlog drains"),
+    "cursor_recovery": (
+        "replay: replaying discovered history because the previous cursor "
+        "could not be trusted; duplicates are expected until this backlog "
+        "drains"),
+}
 
 
 def offset_at_or_after(path, timestamp):
@@ -1175,6 +1190,161 @@ OTHER_SIDE = {
     "claude": ("codex", "Codex", "from Codex"),
     "codex": ("claude", "Claude Code", "from Claude Code"),
 }
+
+
+def _ordered_records(events):
+    """Return completed source records in a source-prefix-preserving merge."""
+    grouped = {}
+    for event in events:
+        key = (event.source, event.generation, event.offset, event.end)
+        grouped.setdefault(key, []).append(event)
+
+    streams = {}
+    for (source, generation, offset, end), record_events in grouped.items():
+        record = Record(record_events[0].time, source, generation, offset, end,
+                        tuple(record_events))
+        streams.setdefault((source, generation), []).append(record)
+
+    ordered_streams = []
+    for stream_key in sorted(streams, key=lambda key: (key[0], key[1] or "")):
+        stream = streams[stream_key]
+        stream.sort(key=lambda record: (record.offset, record.end))
+        ordered_streams.append(stream)
+
+    heap = []
+    for stream_number, stream in enumerate(ordered_streams):
+        record = stream[0]
+        heapq.heappush(heap, (record.time, record.source, record.generation or "",
+                            record.offset, stream_number, 0, record))
+
+    records = []
+    while heap:
+        _time, _source, _generation, _offset, stream_number, index, record = heapq.heappop(heap)
+        records.append(record)
+        next_index = index + 1
+        stream = ordered_streams[stream_number]
+        if next_index < len(stream):
+            next_record = stream[next_index]
+            heapq.heappush(
+                heap,
+                (next_record.time, next_record.source, next_record.generation or "",
+                 next_record.offset, stream_number, next_index, next_record))
+    return records
+
+
+def _render_record(record):
+    """Render one completed source record without cutting its non-tool text."""
+    pieces = []
+    tools = []
+    run_kind = None
+    run_time = None
+    run_texts = []
+
+    def flush_tools():
+        if tools:
+            pieces.append("  · {} tool calls: {}".format(
+                len(tools), truncate(" | ".join(tools[-3:]), 130)))
+            del tools[:]
+
+    def flush_run():
+        nonlocal run_kind, run_time, run_texts
+        if run_kind is not None:
+            clock = datetime.fromtimestamp(run_time).strftime("%H:%M")
+            pieces.append("[{}] {}:\n{}".format(
+                clock, LABEL.get(run_kind, run_kind), "\n\n".join(run_texts)))
+            run_kind = None
+            run_time = None
+            run_texts = []
+
+    for event in record.events:
+        if event.kind == "tool":
+            flush_run()
+            tools.append(truncate(event.text, 70))
+            continue
+        flush_tools()
+        if run_kind != event.kind:
+            flush_run()
+            run_kind = event.kind
+            run_time = event.time
+        run_texts.append(event.text)
+    flush_run()
+    flush_tools()
+    return "\n".join(pieces), int(any(event.kind != "tool" for event in record.events))
+
+
+def _append_page_section(text, section):
+    """Separate envelope sections without changing a record's trailing bytes."""
+    if not text:
+        return section
+    if text.endswith("\n"):
+        return text + section
+    return text + "\n" + section
+
+
+def _render_page(side, records, has_more, replay_reason):
+    """Render the exact visible envelope whose UTF-8 size is page-bounded."""
+    other = OTHER_SIDE[side][1]
+    text = "## What happened on the {} side (since your last turn)".format(other)
+    text = _append_page_section(text, "has_more: {}".format(str(has_more).lower()))
+    text = _append_page_section(text, "has_more_scope: currently discovered sources")
+    if replay_reason is not None:
+        text = _append_page_section(text, REPLAY_NOTICES[replay_reason])
+    for record in records:
+        rendered, _count = _render_record(record)
+        text = _append_page_section(text, rendered)
+    if has_more:
+        if side == "codex":
+            text = _append_page_section(
+                text, "More remains; call antiphon_read again or continue on a later turn.")
+        else:
+            text = _append_page_section(text, "More remains; it will continue on a later turn.")
+    return _append_page_section(
+        text, "This record belongs to the Antiphon bridge — this is what actually happened "
+        "there. Do not assume anything that is not in it.")
+
+
+def _page_frontier(records, selected, scanned):
+    """Return offsets that stop at each source's first undelivered record."""
+    first_remaining = {}
+    for record in records[selected:]:
+        first_remaining.setdefault(record.source, record.offset)
+    frontier = {}
+    for source, position in scanned.items():
+        offset = first_remaining.get(source, position["offset"])
+        frontier[source] = dict(position, offset=offset)
+    return frontier
+
+
+def _build_page(events, scanned, side, replay_reason=None):
+    """Build one bounded, whole-record page and its safe source frontier."""
+    if replay_reason not in (None, "legacy_upgrade", "cursor_recovery"):
+        raise ValueError("unknown replay reason")
+    records = _ordered_records(events)
+    if not records:
+        if not scanned or replay_reason is None:
+            return "", PageAdvance(dict(scanned), False, None), 0
+        text = _render_page(side, [], False, replay_reason)
+        return text, PageAdvance(dict(scanned), False, replay_reason), 0
+
+    maximum = min(EVENT_LIMIT, len(records))
+    selected = 0
+    text = ""
+    for length in range(1, maximum + 1):
+        has_more = length < len(records)
+        candidate = _render_page(side, records[:length], has_more, replay_reason)
+        if len(candidate.encode("utf-8")) <= PAGE_BUDGET:
+            selected = length
+            text = candidate
+
+    if selected == 0:
+        selected = 1
+        text = _render_page(side, records[:selected], len(records) > selected,
+                            replay_reason)
+
+    has_more = selected < len(records)
+    frontier = _page_frontier(records, selected, scanned)
+    count = sum(_render_record(record)[1] for record in records[:selected])
+    return text, PageAdvance(frontier, has_more, replay_reason), count
 
 
 def build_summary(cwd, side, positions=None, since=None):
