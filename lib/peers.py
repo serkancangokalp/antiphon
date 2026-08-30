@@ -111,6 +111,24 @@ def _read_record(path):
     return record if isinstance(record, dict) else None
 
 
+def _address_of(record):
+    """A usable address, or None. An empty address is not a peer: stored, it made
+    the single-peer resolver fall back to the legacy socket without saying so."""
+    address = record.get("address") if hasattr(record, "get") else None
+    if not isinstance(address, str) or not address.strip():
+        return None
+    return address
+
+
+def _started_at(record):
+    """The record's timestamp as a float, or 0. Sorting a float against a string
+    raises, and it would raise inside every read of the registry."""
+    try:
+        return float(record.get("started_at"))
+    except (AttributeError, TypeError, ValueError):
+        return 0.0
+
+
 def _pid_of(record):
     """A usable owner pid, or None when the record identifies nobody.
 
@@ -188,12 +206,14 @@ def read_peers(cwd, kind=None):
         peer_pid = _pid_of(peer)
         if peer_pid is None:
             continue                  # identifies nobody; not a peer, not prunable
+        if _address_of(peer) is None:
+            continue                  # reaches nobody; must never be routed to
         if not alive(peer_pid):
             _prune(cwd, peer.get("kind"), peer.get("name"), peer_pid)
             continue
         if kind is None or peer.get("kind") == kind:
             found.append(peer)
-    found.sort(key=lambda p: p.get("started_at") or 0, reverse=True)
+    found.sort(key=_started_at, reverse=True)
     return found
 
 
@@ -221,6 +241,8 @@ def register(cwd, kind, name, address, pid=None):
     if not valid_name(name):
         return False, (f"invalid peer name {name!r}: "
                        "expected [a-z0-9][a-z0-9_-]{0,31}")
+    if _address_of({"address": address}) is None:
+        return False, f"invalid peer address {address!r}: expected a non-empty string"
     owner = _pid_of({"pid": pid}) if pid is not None else os.getpid()
     if owner is None:
         return False, f"invalid owner pid {pid!r}: expected a positive integer"
@@ -233,7 +255,7 @@ def register(cwd, kind, name, address, pid=None):
                 continue                  # a rollout id and a socket path never collide
             if other.get("name") == name:
                 return False, f"peer name {name!r} is already held by pid {other_pid}"
-            if other.get("address") == address:
+            if _address_of(other) == address:
                 # The contended resource is the address, not the name. Two
                 # sessions that both found a socket path free would bind it in
                 # turn and register under different automatic names carrying the

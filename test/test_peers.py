@@ -3,6 +3,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "lib"))
 import peers
 
 import hashlib
+import json
 import multiprocessing
 import subprocess
 import tempfile
@@ -66,6 +67,19 @@ class PeerNameTest(unittest.TestCase):
         much of it, so the key is hashed rather than appended."""
         cwd = "/Users/me/dev/project"
         self.assertEqual(len(peers.socket_key(cwd, "x" * 32)), 20)
+
+
+def _claim_address(project, barrier, results):
+    """Two processes, different names, one address — the shape of the real race.
+
+    Both hold at the barrier, claim together, and hold again so neither can look
+    dead to the other while the second is still deciding.
+    """
+    barrier.wait()
+    ok, _ = peers.register(project, "claude", f"peer-{os.getpid()}", "/tmp/shared.sock",
+                           pid=os.getpid())
+    results.append(ok)
+    barrier.wait()
 
 
 def _claim(project, barrier, results):
@@ -268,6 +282,66 @@ class PeerRegistryTest(unittest.TestCase):
             peers.register(project, "claude", "ui", "shared-string")
             ok, detail = peers.register(project, "codex", "build", "shared-string")
             self.assertTrue(ok, detail)
+
+    def test_an_address_must_be_a_non_empty_string(self):
+        """An empty address is not a peer. Stored, it made the single-peer
+        resolver fall back to the legacy socket without saying so — a misroute
+        dressed as a default."""
+        with tempfile.TemporaryDirectory() as project:
+            for address in ("", "   ", None, 0, ["/tmp/x.sock"]):
+                ok, detail = peers.register(project, "claude", "ui", address)
+                self.assertFalse(ok, repr(address))
+                self.assertIn("address", detail)
+            self.assertEqual(peers.read_peers(project), [])
+
+    def test_a_record_without_a_usable_address_is_not_routed_to(self):
+        with tempfile.TemporaryDirectory() as project:
+            hand_written = peers.peer_dir(project, "claude", "ui")
+            os.makedirs(hand_written)
+            with open(os.path.join(hand_written, "endpoint.json"), "w",
+                      encoding="utf-8") as f:
+                json.dump({"kind": "claude", "name": "ui", "pid": os.getpid(),
+                           "address": ""}, f)
+            self.assertEqual(peers.read_peers(project), [])
+
+    def test_records_with_mixed_started_at_types_do_not_crash_the_sort(self):
+        """Sorting a float against a string raises, and it would raise inside
+        every read of the registry."""
+        with tempfile.TemporaryDirectory() as project:
+            for name, started in (("ui", 100.0), ("api", "not-a-time"), ("docs", None)):
+                directory = peers.peer_dir(project, "claude", name)
+                os.makedirs(directory)
+                with open(os.path.join(directory, "endpoint.json"), "w",
+                          encoding="utf-8") as f:
+                    json.dump({"kind": "claude", "name": name, "pid": os.getpid(),
+                               "address": f"/tmp/{name}.sock", "started_at": started}, f)
+            live = peers.read_peers(project, "claude")
+        self.assertEqual(sorted(p["name"] for p in live), ["api", "docs", "ui"])
+        self.assertEqual(live[0]["name"], "ui", "a usable timestamp still sorts first")
+
+    def test_two_simultaneous_claims_on_one_address_produce_one_winner(self):
+        """The name race and the address race are different races. This is the one
+        that actually mattered: two sessions with different automatic names both
+        binding the same socket path."""
+        with tempfile.TemporaryDirectory() as project:
+            barrier = multiprocessing.Barrier(2, timeout=10)
+            results = multiprocessing.Manager().list()
+            workers = [multiprocessing.Process(target=_claim_address,
+                                               args=(project, barrier, results))
+                       for _ in range(2)]
+            for worker in workers:
+                worker.start()
+            for worker in workers:
+                worker.join(20)
+            self.assertEqual(sorted(results), [False, True],
+                             f"exactly one claimant must win, got {list(results)}")
+            # Both workers have been reaped by now, so `read_peers` correctly sees
+            # no live peer. Count the records on disk instead: exactly one claim
+            # was ever written.
+            written = [name for name in os.listdir(peers.peers_dir(project))
+                       if os.path.exists(os.path.join(peers.peers_dir(project), name,
+                                                      "endpoint.json"))]
+            self.assertEqual(len(written), 1, written)
 
     def test_unregister_releases_only_your_own_name(self):
         with tempfile.TemporaryDirectory() as project:

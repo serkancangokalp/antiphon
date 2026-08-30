@@ -636,7 +636,9 @@ def resolve_claude_target(cwd):
         # project-wide path, and it is a working peer.
         return claude_socket_path(cwd), ""
     if len(live) == 1:
-        return live[0].get("address") or claude_socket_path(cwd), ""
+        # `read_peers` drops records without a usable address, so a live peer
+        # always has one; no silent fallback can hide behind a missing field.
+        return live[0]["address"], ""
     names = ", ".join(sorted(p.get("name") or "?" for p in live))
     return None, (f"not delivered: {len(live)} Claude peers are live ({names}); "
                   "address one by name")

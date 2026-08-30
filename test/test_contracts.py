@@ -115,6 +115,26 @@ class CrossBoundaryContractTest(unittest.TestCase):
             capture_output=True, text=True, check=True)
         self.assertEqual(probe.stdout.strip(), peers.socket_key("/tmp/project", "ui"))
 
+    def test_the_channel_server_claims_the_address_before_it_binds(self):
+        """Ordering is the whole fix. Probe, unlink and listen are three steps, so
+        two servers can each find the path free; only an atomic claim taken first
+        keeps one of them from binding over the other. A later edit that moves the
+        claim down would restore the race without failing any behavioural test."""
+        source = read("lib", "channel.mjs")
+        # Source position would only measure where things are written, and
+        # `serveSocket` is defined above the branch that calls it. What matters is
+        # evaluation order in the chain, plus binding living in exactly one place
+        # so there is no second path to it.
+        self.assertLess(source.index("await claimPeer()"),
+                        source.index("await serveSocket()"),
+                        "the address must be claimed before anything binds")
+        self.assertEqual(source.count("socketServer.listen("), 1,
+                         "binding must happen in exactly one place")
+        serve_body = source[source.index("async function serveSocket()"):]
+        self.assertLess(serve_body.index("socketServer.listen("),
+                        serve_body.index("\nawait mkdir("),
+                        "the bind must sit inside serveSocket, after the claim")
+
 
 if __name__ == "__main__":
     unittest.main()

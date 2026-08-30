@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
 import { spawn } from "node:child_process";
-import { existsSync, readdirSync, readFileSync } from "node:fs";
+import { existsSync, mkdirSync, readdirSync, readFileSync } from "node:fs";
 import { mkdtemp, rm } from "node:fs/promises";
 import { connect } from "node:net";
 import { once } from "node:events";
@@ -156,6 +156,31 @@ async function onlyOneUnnamedSessionGetsTheChannel(startTogether) {
 }
 
 await twoNamedPeersKeepSeparateSockets();
+async function aSocketPathItCannotClearDoesNotKillTheSession() {
+  // A directory sitting on the socket path makes `unlink` fail with EPERM. That
+  // rejection used to reach the top level of the module, where an uncaught error
+  // exits the process — taking `reply_to_codex` down with it over a socket that
+  // was only ever the other half of the bridge, and leaving the claim behind.
+  const dir = await mkdtemp(join(tmpdir(), "antiphon-blocked-"));
+  const blocked = socketFor(dir, "");
+  mkdirSync(blocked, { recursive: true });
+  const session = spawnChannel(dir, "");
+  try {
+    assert.ok(await waitFor(() => /could not clear|could not serve/.test(session.stderr())),
+      `expected a refusal, got: ${session.stderr()}`);
+    assert.match(session.stderr(), /can still reply to Codex/,
+      "the session must say the reply direction survives");
+    assert.equal(session.child.exitCode, null, "the session must stay alive");
+    assert.deepEqual(registeredPeers(dir), [],
+      "a claim that could not be honoured must be given back");
+  } finally {
+    session.child.kill("SIGKILL");
+    await rm(blocked, { recursive: true, force: true });
+    await rm(dir, { recursive: true, force: true });
+  }
+}
+
+await aSocketPathItCannotClearDoesNotKillTheSession();
 await onlyOneUnnamedSessionGetsTheChannel(false);   // a second terminal, later
 await onlyOneUnnamedSessionGetsTheChannel(true);    // both started together
 console.log("per-peer sockets: ok");
