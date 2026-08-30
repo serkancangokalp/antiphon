@@ -30,6 +30,61 @@ def page_advance(sources=None, has_more=False, replay_reason=None):
     return antiphon.PageAdvance(sources or {}, has_more, replay_reason)
 
 
+def codex_msg(text):
+    """A `response_item` record for one Codex assistant message."""
+    return json.dumps({"type": "response_item", "payload": {
+        "type": "message", "role": "assistant",
+        "content": [{"type": "output_text", "text": text}],
+    }})
+
+
+def codex_task_started(turn_id):
+    return json.dumps({"type": "event_msg", "payload": {
+        "type": "task_started", "turn_id": turn_id,
+    }})
+
+
+def codex_task_complete(turn_id):
+    return json.dumps({"type": "event_msg", "payload": {
+        "type": "task_complete", "turn_id": turn_id,
+    }})
+
+
+def claude_prompt(text, uuid=None):
+    """A `user` record for one plain prompt — real content is a bare string
+    when there is nothing but typed text, not a content-block list. `uuid`
+    is the record's own top-level id, present on real transcripts and needed
+    by any fixture that exercises push's turn-scoped dedupe key."""
+    record = {"type": "user", "message": {"content": text}}
+    if uuid is not None:
+        record["uuid"] = uuid
+    return json.dumps(record)
+
+
+def claude_assistant(text):
+    """An `assistant` record for one plain text reply."""
+    return json.dumps({"type": "assistant", "message": {
+        "content": [{"type": "text", "text": text}]}})
+
+
+def claude_tool_result():
+    """A `user` record carrying a tool result rather than typed text — the
+    same content shape `claude_events` already treats as invisible to a
+    person reading the transcript."""
+    return json.dumps({"type": "user", "message": {"content": [
+        {"type": "tool_result", "tool_use_id": "toolu_1",
+         "content": [{"type": "text", "text": "ok"}]}]}})
+
+
+def claude_meta_user(text, **extra):
+    """A `user` record marked `isMeta` — the host's own bookkeeping shares
+    this record type with a real turn boundary. `extra` carries whichever of
+    `sourceToolUseID` / `turnCompanion` / a top-level `origin` dict sets a
+    mid-turn record apart, or none of them for a `<channel>` injection."""
+    return json.dumps(dict({"type": "user", "isMeta": True,
+                            "message": {"content": text}}, **extra))
+
+
 def only_the_process_table(failure):
     """A `subprocess.run` that permits the registry's identity lookup and
     nothing else.
@@ -194,6 +249,315 @@ class AntiphonTest(unittest.TestCase):
         with patch.object(antiphon, "tail_lines", return_value=lines):
             self.assertEqual(antiphon.last_codex_reply("rollout"), "@claude new")
 
+    # ---- last_codex_reply: the turn the Stop hook is reporting on ----
+
+    def test_the_open_span_is_the_turn_the_stop_hook_reports_on(self):
+        """A marker written mid-turn must not be dropped just because the
+        turn has not closed yet — the Stop hook always fires before the
+        `task_complete` for the turn it is reporting on."""
+        lines = [
+            codex_task_started("T1"),
+            codex_msg("progress\n@claude do X"),
+            codex_msg("closing, no marker"),
+        ]
+        with patch.object(antiphon, "tail_lines", return_value=lines):
+            self.assertEqual(
+                antiphon.last_codex_reply("rollout", "T1"),
+                "progress\n@claude do X\nclosing, no marker")
+
+    def test_a_closed_previous_task_stays_out(self):
+        lines = [
+            codex_task_started("T1"),
+            codex_msg("@claude OLD"),
+            codex_task_complete("T1"),
+            codex_task_started("T2"),
+            codex_msg("new"),
+        ]
+        with patch.object(antiphon, "tail_lines", return_value=lines):
+            self.assertEqual(antiphon.last_codex_reply("rollout", "T2"), "new")
+
+    def test_an_orphan_complete_window_keeps_the_visible_open_span(self):
+        lines = [
+            codex_task_complete("T0"),
+            codex_msg("after clip 1"),
+            codex_msg("@claude after clip 2"),
+        ]
+        with patch.object(antiphon, "tail_lines", return_value=lines):
+            self.assertEqual(antiphon.last_codex_reply("rollout"),
+                             "after clip 1\n@claude after clip 2")
+
+    def test_a_rollout_without_task_markers_keeps_the_old_behaviour(self):
+        lines = [codex_msg("first"), codex_msg("second")]
+        with patch.object(antiphon, "tail_lines", return_value=lines):
+            self.assertEqual(antiphon.last_codex_reply("rollout"), "second")
+
+    def test_a_turn_id_match_beats_the_newest_start(self):
+        """An ancestor `task_started` matching the hook id must win even
+        though a nested, more recent `task_started` is also in view — a
+        newest-start rule would land inside the nested child instead and
+        lose the outer text written before it."""
+        lines = [
+            codex_task_started("ANCESTOR"),
+            codex_msg("outer, before the nested turn"),
+            codex_task_started("NESTED"),
+            codex_msg("nested child"),
+        ]
+        with patch.object(antiphon, "tail_lines", return_value=lines):
+            self.assertEqual(
+                antiphon.last_codex_reply("rollout", "ANCESTOR"),
+                "outer, before the nested turn\nnested child")
+
+    def test_an_unmatched_turn_id_never_binds_to_another_turn(self):
+        """The hook's id names a turn whose start already scrolled out of the
+        window. Binding to the only `task_started` actually in view — a
+        different turn — would attribute CURRENT to the wrong turn, or clip
+        it away entirely at that turn's own close."""
+        lines = [
+            codex_task_started("B"),
+            codex_msg("old"),
+            codex_task_complete("B"),
+            codex_msg("@claude CURRENT"),
+            codex_msg("closing"),
+        ]
+        with patch.object(antiphon, "tail_lines", return_value=lines):
+            self.assertEqual(antiphon.last_codex_reply("rollout", "A"),
+                             "old\n@claude CURRENT\nclosing")
+
+    def test_a_nested_turn_never_clips_the_outer_marker(self):
+        """Reviewer's counterexample: a closed nested span sits mid-window
+        with the outer turn's own marker before it. Clipping at the nested
+        span's `task_complete` — or falling through to a newest-start rule —
+        both lose the marker that came before the nested turn even started."""
+        lines = [
+            codex_msg("@claude CURRENT before child"),
+            codex_task_started("B"),
+            codex_msg("child"),
+            codex_task_complete("B"),
+            codex_msg("closing"),
+        ]
+        with patch.object(antiphon, "tail_lines", return_value=lines):
+            self.assertEqual(
+                antiphon.last_codex_reply("rollout", "A"),
+                "@claude CURRENT before child\nchild\nclosing")
+
+    def test_a_matched_span_ends_only_at_its_own_complete(self):
+        """A foreign complete does not end the span (complete(B)); its own
+        complete(A) does — nothing after it, including a later turn's own
+        marker, belongs to this reply."""
+        lines = [
+            codex_task_started("A"),
+            codex_msg("outer 1"),
+            codex_task_started("B"),
+            codex_msg("child"),
+            codex_task_complete("B"),
+            codex_msg("@claude outer 2"),
+            codex_task_complete("A"),
+            codex_task_started("C"),
+            codex_msg("@claude AFTER"),
+        ]
+        with patch.object(antiphon, "tail_lines", return_value=lines):
+            result = antiphon.last_codex_reply("rollout", "A")
+        self.assertEqual(result, "outer 1\nchild\n@claude outer 2")
+        self.assertNotIn("AFTER", result)
+
+    def test_without_an_id_the_newest_start_wins(self):
+        lines = [
+            codex_msg("before"),
+            codex_task_started("B"),
+            codex_msg("child"),
+            codex_task_complete("B"),
+            codex_msg("closing"),
+        ]
+        with patch.object(antiphon, "tail_lines", return_value=lines):
+            self.assertEqual(antiphon.last_codex_reply("rollout"),
+                             "child\nclosing")
+
+    def test_a_blank_turn_id_is_no_id(self):
+        """Anything short of a non-empty string never reaches the matching
+        branch — including JSON types a hand-edited or malformed payload
+        could carry (a number, a bool, a list, a dict)."""
+        lines = [
+            codex_msg("before"),
+            codex_task_started("B"),
+            codex_msg("child"),
+            codex_task_complete("B"),
+            codex_msg("closing"),
+        ]
+        with patch.object(antiphon, "tail_lines", return_value=lines):
+            for blank in ("", None, 42, True, ["A"], {"id": "A"}):
+                self.assertEqual(antiphon.last_codex_reply("rollout", blank),
+                                 "child\nclosing", repr(blank))
+
+    def test_a_fresh_codex_turn_with_no_reply_pushes_nothing(self):
+        """A turn just opened and has not said anything yet — the previous
+        turn's text must not leak in as a stand-in reply, with or without a
+        hook id naming the fresh turn."""
+        lines = [
+            codex_msg("@claude OLD"),
+            codex_task_complete("A"),
+            codex_task_started("B"),
+        ]
+        with patch.object(antiphon, "tail_lines", return_value=lines):
+            self.assertEqual(antiphon.last_codex_reply("rollout"), "")
+            self.assertEqual(antiphon.last_codex_reply("rollout", "B"), "")
+
+    def test_push_threads_the_hook_turn_id_into_the_codex_reader(self):
+        """`push` reads `turn_id` off the hook payload itself — the reader
+        cannot see it any other way — and only on the Codex→Claude side. One
+        call, as on the Claude side: the text and the key it is scoped under
+        must come from the same read of the same window."""
+        with tempfile.TemporaryDirectory() as project:
+            input_data = {"cwd": project, "transcript_path": "/tmp/rollout",
+                         "turn_id": "T-123"}
+            with patch.object(antiphon.os.path, "exists", return_value=True), \
+                 patch.object(antiphon, "_codex_turn",
+                              return_value=("", "")) as reader, \
+                 patch.object(antiphon, "read_cursor", return_value={}), \
+                 patch.object(antiphon, "write_cursor"), \
+                 patch.object(antiphon.sys, "stdin",
+                              io.StringIO(json.dumps(input_data))), \
+                 contextlib.redirect_stderr(io.StringIO()):
+                antiphon.push("claude")
+            reader.assert_called_once_with("/tmp/rollout", "T-123")
+
+    # ---- last_claude_reply: every record of the last Claude turn ----
+
+    def test_a_marker_between_tool_calls_reaches_codex(self):
+        """99.6% of measured Claude turns hold more than one assistant
+        record — a marker written before a tool call must not be dropped
+        just because the model kept talking after the tool result came
+        back."""
+        lines = [
+            claude_prompt("do the thing"),
+            claude_assistant("@codex run the suite"),
+            claude_tool_result(),
+            claude_assistant("all done"),
+        ]
+        with patch.object(antiphon, "tail_lines", return_value=lines):
+            self.assertEqual(antiphon.last_claude_reply("transcript"),
+                             "@codex run the suite\nall done")
+
+    def test_the_previous_claude_turn_stays_out(self):
+        lines = [
+            claude_prompt("first ask"),
+            claude_assistant("@codex OLD line"),
+            claude_prompt("second ask"),
+            claude_assistant("fresh reply"),
+        ]
+        with patch.object(antiphon, "tail_lines", return_value=lines):
+            self.assertEqual(antiphon.last_claude_reply("transcript"),
+                             "fresh reply")
+
+    def test_a_marker_before_a_skill_load_survives(self):
+        """A Skill's contents land mid-turn as their own `user` record —
+        `isMeta` with `sourceToolUseID` — and must not read as a new turn."""
+        lines = [
+            claude_prompt("do the thing"),
+            claude_assistant("@codex before skill"),
+            claude_tool_result(),
+            claude_meta_user("<skill-instructions>…</skill-instructions>",
+                             sourceToolUseID="toolu_skill1"),
+            claude_assistant("done"),
+        ]
+        with patch.object(antiphon, "tail_lines", return_value=lines):
+            self.assertEqual(antiphon.last_claude_reply("transcript"),
+                             "@codex before skill\ndone")
+
+    def test_a_turn_companion_record_is_a_continuation(self):
+        """The production rule is an OR: `turnCompanion` alone, with no
+        `sourceToolUseID`, must also read as a continuation."""
+        lines = [
+            claude_prompt("do the thing"),
+            claude_assistant("@codex before skill"),
+            claude_tool_result(),
+            claude_meta_user("companion turn contents",
+                             turnCompanion="toolu_companion1"),
+            claude_assistant("done"),
+        ]
+        with patch.object(antiphon, "tail_lines", return_value=lines):
+            self.assertEqual(antiphon.last_claude_reply("transcript"),
+                             "@codex before skill\ndone")
+
+    def test_a_channel_injection_still_starts_a_turn(self):
+        """A `<channel>` injection is `isMeta` too, but carries neither
+        `sourceToolUseID` nor `turnCompanion`, nor an `origin.kind` on the
+        continuation allowlist — host bookkeeping of a different kind, and
+        it remains a boundary. Checked in both shapes actually seen: older
+        records carry no `origin` key at all; the current CLI stamps
+        `origin: {"kind": "channel", ...}` on the same record."""
+        injections = [
+            claude_meta_user('<channel source="antiphon" sender="codex" '
+                             'sender_kind="agent">ping</channel>'),
+            claude_meta_user('<channel source="antiphon" sender="codex" '
+                             'sender_kind="agent">ping</channel>',
+                             origin={"kind": "channel", "server": "antiphon"}),
+        ]
+        for injection in injections:
+            lines = [
+                claude_prompt("do the thing"),
+                claude_assistant("@codex OLD"),
+                injection,
+                claude_assistant("reply to channel"),
+            ]
+            with patch.object(antiphon, "tail_lines", return_value=lines):
+                self.assertEqual(antiphon.last_claude_reply("transcript"),
+                                 "reply to channel", injection)
+
+    def test_a_marker_before_a_coordinator_event_survives(self):
+        """Measured on real transcripts: a top-level `origin.kind` of
+        `"coordinator"` is a mid-turn event (63 across 484 transcripts, 56
+        of them landing directly between two assistant records) with
+        neither `sourceToolUseID` nor `turnCompanion` set."""
+        lines = [
+            claude_prompt("do the thing"),
+            claude_assistant("@codex BEFORE"),
+            claude_meta_user("coordinator event contents",
+                             origin={"kind": "coordinator"}),
+            claude_assistant("AFTER"),
+        ]
+        with patch.object(antiphon, "tail_lines", return_value=lines):
+            self.assertEqual(antiphon.last_claude_reply("transcript"),
+                             "@codex BEFORE\nAFTER")
+
+    def test_a_marker_before_a_task_notification_survives(self):
+        """Same allowlist, the other measured `origin.kind`: `"task-
+        notification"` (2 across 484 transcripts, 1 landing mid-turn)."""
+        lines = [
+            claude_prompt("do the thing"),
+            claude_assistant("@codex BEFORE"),
+            claude_meta_user("task notification contents",
+                             origin={"kind": "task-notification"}),
+            claude_assistant("AFTER"),
+        ]
+        with patch.object(antiphon, "tail_lines", return_value=lines):
+            self.assertEqual(antiphon.last_claude_reply("transcript"),
+                             "@codex BEFORE\nAFTER")
+
+    def test_a_fresh_claude_turn_with_no_reply_pushes_nothing(self):
+        """A new prompt just landed and nothing has been said in reply to it
+        yet — the previous turn's assistant text must not leak through as a
+        stand-in."""
+        lines = [
+            claude_prompt("ask"),
+            claude_assistant("@codex OLD"),
+            claude_prompt("new ask"),
+        ]
+        with patch.object(antiphon, "tail_lines", return_value=lines):
+            self.assertEqual(antiphon.last_claude_reply("transcript"), "")
+
+    def test_a_peer_record_is_a_boundary(self):
+        """`origin.kind="peer"` is not on the measured mid-turn allowlist —
+        an unmeasured kind stays a boundary, same as any other unknown one."""
+        lines = [
+            claude_prompt("ask"),
+            claude_assistant("@codex OLD"),
+            claude_meta_user("peer record contents", origin={"kind": "peer"}),
+            claude_assistant("reply to peer"),
+        ]
+        with patch.object(antiphon, "tail_lines", return_value=lines):
+            self.assertEqual(antiphon.last_claude_reply("transcript"),
+                             "reply to peer")
+
     def test_large_codex_rollout_reads_cwd_from_head(self):
         with tempfile.NamedTemporaryFile(prefix="rollout-", suffix=".jsonl") as f:
             f.write(b'{"cwd":"/tmp/project"}\n')
@@ -210,7 +574,7 @@ class AntiphonTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as project:
             input_data = {"cwd": project, "transcript_path": "/tmp/rollout"}
             with patch.object(antiphon.os.path, "exists", return_value=True), \
-                 patch.object(antiphon, "last_codex_reply", return_value="@claude test"), \
+                 patch.object(antiphon, "_codex_turn", return_value=("@claude test", "")), \
                  patch.object(antiphon, "read_cursor", return_value={}), \
                  patch.object(antiphon, "write_cursor",
                               side_effect=lambda cwd, data, kind: written.append(dict(data)) or True), \
@@ -232,7 +596,7 @@ class AntiphonTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as project:
             input_data = {"cwd": project, "transcript_path": "/tmp/rollout"}
             with patch.object(antiphon.os.path, "exists", return_value=True), \
-                 patch.object(antiphon, "last_codex_reply", return_value="@claude same"), \
+                 patch.object(antiphon, "_codex_turn", return_value=("@claude same", "")), \
                  patch.object(antiphon, "read_cursor",
                               return_value={"last_pushed_claude": {"": antiphon.batch_fingerprint(["same"])},
                                             "last_pushed_codex": {"": "other"}}), \
@@ -250,7 +614,7 @@ class AntiphonTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as project:
             input_data = {"cwd": project, "transcript_path": "/tmp/rollout"}
             with patch.object(antiphon.os.path, "exists", return_value=True), \
-                 patch.object(antiphon, "last_codex_reply", return_value="@claude same"), \
+                 patch.object(antiphon, "_codex_turn", return_value=("@claude same", "")), \
                  patch.object(antiphon, "read_cursor",
                               return_value={"last_pushed_claude": "same"}), \
                  patch.object(antiphon, "write_cursor",
@@ -264,6 +628,347 @@ class AntiphonTest(unittest.TestCase):
                          {"": antiphon.batch_fingerprint(["same"])},
                          "and the record migrates to the new form")
 
+    # ---- push, end to end: dedupe survives a real second turn ----
+    #
+    # Both tests below let `push` run its real reader and real cursor —
+    # nothing is mocked but the two send functions. A markerless second turn
+    # could not pin this: a broken reader that merges the OLD turn into the
+    # new one keeps the old fingerprint and stays green regardless of what it
+    # merged. Only a *new* marker in the new turn forces the merge to change
+    # the payload, which is why the assertion on the second send is both
+    # contains-NEW and not-contains-OLD.
+
+    def test_codex_to_claude_dedupe_survives_a_new_turn(self):
+        with tempfile.TemporaryDirectory() as project:
+            rollout = os.path.join(project, "rollout.jsonl")
+            with open(rollout, "w", encoding="utf-8") as f:
+                f.write("\n".join([
+                    codex_task_started("A"),
+                    codex_msg("note\n@claude do OLD"),
+                    codex_msg("closing, no marker"),
+                ]) + "\n")
+
+            def run(turn_id):
+                payload = {"cwd": project, "transcript_path": rollout,
+                          "turn_id": turn_id}
+                with patch.object(antiphon.sys, "stdin",
+                                  io.StringIO(json.dumps(payload))), \
+                     contextlib.redirect_stderr(io.StringIO()):
+                    return antiphon.push("claude")
+
+            with patch.object(antiphon, "send_to_claude",
+                              return_value=(True, "")) as send:
+                self.assertEqual(run("A"), 0)
+                send.assert_called_once()
+                self.assertIn("do OLD", send.call_args.args[1])
+
+                # An identical re-read of the same transcript, same turn id:
+                # the fingerprint is stable and nothing goes out again.
+                self.assertEqual(run("A"), 0)
+                send.assert_called_once()
+
+                # The turn closes and a new one opens with its own marker.
+                with open(rollout, "a", encoding="utf-8") as f:
+                    f.write("\n".join([
+                        codex_task_complete("A"),
+                        codex_task_started("B"),
+                        codex_msg("@claude do NEW"),
+                    ]) + "\n")
+                self.assertEqual(run("B"), 0)
+                self.assertEqual(send.call_count, 2)
+                second_payload = send.call_args.args[1]
+                self.assertIn("do NEW", second_payload)
+                self.assertNotIn("do OLD", second_payload)
+
+    def test_claude_to_codex_dedupe_survives_a_new_turn(self):
+        with tempfile.TemporaryDirectory() as project:
+            transcript = os.path.join(project, "transcript.jsonl")
+            with open(transcript, "w", encoding="utf-8") as f:
+                f.write("\n".join([
+                    # Both boundary prompts carry a `uuid`, as real records
+                    # do, so this runs on the scoped fingerprint rather than
+                    # falling back to the content-only shape.
+                    claude_prompt("first ask", uuid="U1"),
+                    claude_assistant("@codex do OLD"),
+                    claude_tool_result(),
+                    claude_assistant("done"),
+                ]) + "\n")
+
+            def run():
+                payload = {"cwd": project, "transcript_path": transcript}
+                with patch.object(antiphon.sys, "stdin",
+                                  io.StringIO(json.dumps(payload))), \
+                     contextlib.redirect_stderr(io.StringIO()):
+                    return antiphon.push("codex")
+
+            with patch.object(antiphon, "send_to_codex",
+                              return_value=(True, "")) as send:
+                self.assertEqual(run(), 0)
+                send.assert_called_once()
+                self.assertIn("do OLD", send.call_args.args[1])
+
+                # An identical re-read of the same transcript: not resent.
+                self.assertEqual(run(), 0)
+                send.assert_called_once()
+
+                # A new ask and a new marker, after the first turn closed.
+                with open(transcript, "a", encoding="utf-8") as f:
+                    f.write("\n".join([
+                        claude_prompt("next ask", uuid="U2"),
+                        claude_assistant("@codex do NEW"),
+                    ]) + "\n")
+                self.assertEqual(run(), 0)
+                self.assertEqual(send.call_count, 2)
+                second_payload = send.call_args.args[1]
+                self.assertIn("do NEW", second_payload)
+                self.assertNotIn("do OLD", second_payload)
+
+    # ---- push, end to end: the SAME marker in a NEW turn is not deduped away ----
+    #
+    # Content-only dedupe cannot tell "the same instruction, still pending
+    # from the turn that said it" from "the same instruction, said again in a
+    # later turn" — both hash identically. The fingerprint must fold in which
+    # turn produced the batch, not just what it says.
+
+    def test_the_same_marker_in_a_new_codex_turn_sends_again(self):
+        with tempfile.TemporaryDirectory() as project:
+            rollout = os.path.join(project, "rollout.jsonl")
+            with open(rollout, "w", encoding="utf-8") as f:
+                f.write("\n".join([
+                    codex_task_started("A"),
+                    codex_msg("@claude do SAME"),
+                ]) + "\n")
+
+            def run(turn_id):
+                payload = {"cwd": project, "transcript_path": rollout,
+                          "turn_id": turn_id}
+                with patch.object(antiphon.sys, "stdin",
+                                  io.StringIO(json.dumps(payload))), \
+                     contextlib.redirect_stderr(io.StringIO()):
+                    return antiphon.push("claude")
+
+            with patch.object(antiphon, "send_to_claude",
+                              return_value=(True, "")) as send:
+                self.assertEqual(run("A"), 0)
+                send.assert_called_once()
+
+                # Identical re-read, same turn: still deduped.
+                self.assertEqual(run("A"), 0)
+                send.assert_called_once()
+
+                # The turn closes and a new one repeats the exact same words.
+                with open(rollout, "a", encoding="utf-8") as f:
+                    f.write("\n".join([
+                        codex_task_complete("A"),
+                        codex_task_started("B"),
+                        codex_msg("@claude do SAME"),
+                    ]) + "\n")
+                self.assertEqual(run("B"), 0)
+                self.assertEqual(send.call_count, 2,
+                                 "the identical instruction, said again in a "
+                                 "new turn, must go out again")
+
+    def test_a_fail_open_window_does_not_resend_per_turn(self):
+        """The window opens with an orphan `task_complete`: this turn's own
+        `task_started` scrolled out of the tail, so the reader cannot bind
+        the turn and returns everything visible. Scoping that batch to the
+        hook's id anyway made the fingerprint change every turn while the
+        marker text did not — measured, one instruction delivered four times
+        over four turns. An unbound window carries no turn key, so content
+        alone decides."""
+        with tempfile.TemporaryDirectory() as project:
+            rollout = os.path.join(project, "rollout.jsonl")
+            with open(rollout, "w", encoding="utf-8") as f:
+                f.write("\n".join([
+                    codex_task_complete("OLD"),
+                    codex_msg("@claude do X"),
+                ]) + "\n")
+
+            def run(turn_id):
+                payload = {"cwd": project, "transcript_path": rollout,
+                          "turn_id": turn_id}
+                with patch.object(antiphon.sys, "stdin",
+                                  io.StringIO(json.dumps(payload))), \
+                     contextlib.redirect_stderr(io.StringIO()):
+                    return antiphon.push("claude")
+
+            with patch.object(antiphon, "send_to_claude",
+                              return_value=(True, "")) as send:
+                self.assertEqual(run("A"), 0)
+                send.assert_called_once()
+
+                # Three more turns, each writing an unmarked line and
+                # reporting its own fresh hook id. The marker they all still
+                # see is the one already delivered.
+                for turn_id in ("B", "C", "D"):
+                    with open(rollout, "a", encoding="utf-8") as f:
+                        f.write(codex_msg(f"turn {turn_id} says nothing marked")
+                                + "\n")
+                    self.assertEqual(run(turn_id), 0)
+                self.assertEqual(send.call_count, 1,
+                                 "a marker the reader could not bind to a "
+                                 "turn must not go out once per turn")
+
+    def test_the_same_marker_in_a_new_claude_turn_sends_again(self):
+        with tempfile.TemporaryDirectory() as project:
+            transcript = os.path.join(project, "transcript.jsonl")
+            with open(transcript, "w", encoding="utf-8") as f:
+                f.write("\n".join([
+                    claude_prompt("ask", uuid="U1"),
+                    claude_assistant("@codex do SAME"),
+                ]) + "\n")
+
+            def run():
+                payload = {"cwd": project, "transcript_path": transcript}
+                with patch.object(antiphon.sys, "stdin",
+                                  io.StringIO(json.dumps(payload))), \
+                     contextlib.redirect_stderr(io.StringIO()):
+                    return antiphon.push("codex")
+
+            with patch.object(antiphon, "send_to_codex",
+                              return_value=(True, "")) as send:
+                self.assertEqual(run(), 0)
+                send.assert_called_once()
+
+                # Identical re-read, same turn: still deduped.
+                self.assertEqual(run(), 0)
+                send.assert_called_once()
+
+                # A new turn repeats the exact same words.
+                with open(transcript, "a", encoding="utf-8") as f:
+                    f.write("\n".join([
+                        claude_prompt("ask again", uuid="U2"),
+                        claude_assistant("@codex do SAME"),
+                    ]) + "\n")
+                self.assertEqual(run(), 0)
+                self.assertEqual(send.call_count, 2,
+                                 "the identical instruction, said again in a "
+                                 "new turn, must go out again")
+
+    def test_one_read_decides_both_the_reply_and_its_turn(self):
+        """`_claude_turn` must be the single source of both the reply text and
+        the turn key it is scoped under. Two independent reads are not
+        duplicate-safe: reviewer's repro grows the transcript between them, so
+        a second, later read can see a new boundary the first read never saw
+        — the text from turn A gets recorded under turn B's key, and a real
+        later send from turn B then hashes identically to that poisoned
+        record and is silently suppressed. A single call cannot disagree with
+        itself."""
+        with tempfile.TemporaryDirectory() as project:
+            payload = {"cwd": project, "transcript_path": "/tmp/transcript"}
+
+            def run():
+                with patch.object(antiphon.os.path, "exists", return_value=True), \
+                     patch.object(antiphon.sys, "stdin",
+                                  io.StringIO(json.dumps(payload))), \
+                     contextlib.redirect_stderr(io.StringIO()):
+                    return antiphon.push("codex")
+
+            with patch.object(antiphon, "_claude_turn",
+                              side_effect=[("@codex do SAME", "uuid-A"),
+                                           ("@codex do SAME", "uuid-B")]) as turn, \
+                 patch.object(antiphon, "send_to_codex",
+                              return_value=(True, "")) as send:
+                self.assertEqual(run(), 0)
+                self.assertEqual(turn.call_count, 1,
+                                 "exactly one read must decide both the "
+                                 "reply and the turn key it is scoped under")
+                send.assert_called_once()
+
+                # A second push, a different turn key from the same one read
+                # — never a second, independent read of the first.
+                self.assertEqual(run(), 0)
+                self.assertEqual(turn.call_count, 2)
+                self.assertEqual(send.call_count, 2,
+                                 "the same words under a different turn key "
+                                 "must still send")
+
+    # ---- push: a flat, pre-scoping fingerprint upgrades without resending ----
+    #
+    # A cursor slot can hold the flat, content-only digest a batch already
+    # carried before turn scoping shipped, or from an earlier push that
+    # resolved no turn key for this exact content. Comparing that flat value
+    # to the new scoped digest calls it new and resends a message that
+    # already went out once.
+
+    def test_a_flat_fingerprint_upgrades_without_resending(self):
+        with tempfile.TemporaryDirectory() as project:
+            transcript = os.path.join(project, "transcript.jsonl")
+            with open(transcript, "w", encoding="utf-8") as f:
+                f.write("\n".join([
+                    claude_prompt("ask", uuid="U1"),
+                    claude_assistant("@codex do SAME"),
+                ]) + "\n")
+            antiphon.write_cursor(
+                project,
+                {"last_pushed_codex": {"": antiphon.batch_fingerprint(["do SAME"])}},
+                "claude")
+
+            payload = {"cwd": project, "transcript_path": transcript}
+            with patch.object(antiphon, "send_to_codex",
+                              return_value=(True, "")) as send, \
+                 patch.object(antiphon.sys, "stdin",
+                              io.StringIO(json.dumps(payload))), \
+                 contextlib.redirect_stderr(io.StringIO()):
+                self.assertEqual(antiphon.push("codex"), 0)
+            send.assert_not_called()
+            record = antiphon.read_cursor(project, "claude")["last_pushed_codex"]
+            self.assertEqual(record[""],
+                             antiphon.batch_fingerprint(["U1", ["do SAME"]]),
+                             "the slot upgrades to the scoped digest in place")
+
+    def test_a_flat_fingerprint_upgrades_without_resending_a_named_recipient(self):
+        """Same upgrade, for a named `@alias` slot rather than the bare one."""
+        with tempfile.TemporaryDirectory() as project:
+            transcript = os.path.join(project, "transcript.jsonl")
+            with open(transcript, "w", encoding="utf-8") as f:
+                f.write("\n".join([
+                    claude_prompt("ask", uuid="U1"),
+                    claude_assistant("@codex:review do SAME"),
+                ]) + "\n")
+            antiphon.write_cursor(
+                project,
+                {"last_pushed_codex": {"@review": antiphon.batch_fingerprint(["do SAME"])}},
+                "claude")
+
+            payload = {"cwd": project, "transcript_path": transcript}
+            with patch.object(antiphon, "send_to_codex",
+                              return_value=(True, "")) as send, \
+                 patch.object(antiphon.sys, "stdin",
+                              io.StringIO(json.dumps(payload))), \
+                 contextlib.redirect_stderr(io.StringIO()):
+                self.assertEqual(antiphon.push("codex"), 0)
+            send.assert_not_called()
+            record = antiphon.read_cursor(project, "claude")["last_pushed_codex"]
+            self.assertEqual(record["@review"],
+                             antiphon.batch_fingerprint(["U1", ["do SAME"]]),
+                             "the named slot upgrades to the scoped digest too")
+
+    def test_a_non_matching_flat_fingerprint_still_sends(self):
+        """The upgrade path must not over-suppress: a stored flat digest for
+        different content is not this batch's own prior delivery, and must
+        not stand in the way of a genuinely new send."""
+        with tempfile.TemporaryDirectory() as project:
+            transcript = os.path.join(project, "transcript.jsonl")
+            with open(transcript, "w", encoding="utf-8") as f:
+                f.write("\n".join([
+                    claude_prompt("ask", uuid="U1"),
+                    claude_assistant("@codex do SAME"),
+                ]) + "\n")
+            antiphon.write_cursor(
+                project,
+                {"last_pushed_codex": {"": antiphon.batch_fingerprint(["something else"])}},
+                "claude")
+
+            payload = {"cwd": project, "transcript_path": transcript}
+            with patch.object(antiphon, "send_to_codex",
+                              return_value=(True, "")) as send, \
+                 patch.object(antiphon.sys, "stdin",
+                              io.StringIO(json.dumps(payload))), \
+                 contextlib.redirect_stderr(io.StringIO()):
+                self.assertEqual(antiphon.push("codex"), 0)
+            send.assert_called_once()
+
     def test_an_empty_marker_is_reported_even_beside_a_real_one(self):
         """A batch holding one empty marker and one real message is not empty, so
         a per-batch check let the empty line disappear without a word."""
@@ -272,8 +977,8 @@ class AntiphonTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as project:
             input_data = {"cwd": project, "transcript_path": "/tmp/rollout"}
             with patch.object(antiphon.os.path, "exists", return_value=True), \
-                 patch.object(antiphon, "last_codex_reply",
-                              return_value="@claude\n@claude run it"), \
+                 patch.object(antiphon, "_codex_turn",
+                              return_value=("@claude\n@claude run it", "")), \
                  patch.object(antiphon, "read_cursor", return_value={}), \
                  patch.object(antiphon, "write_cursor"), \
                  patch.object(antiphon, "send_to_claude",
@@ -291,8 +996,8 @@ class AntiphonTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as project:
             input_data = {"cwd": project, "transcript_path": "/tmp/rollout"}
             with patch.object(antiphon.os.path, "exists", return_value=True), \
-                 patch.object(antiphon, "last_codex_reply",
-                              return_value="@claude:api\n@claude:api run"), \
+                 patch.object(antiphon, "_codex_turn",
+                              return_value=("@claude:api\n@claude:api run", "")), \
                  patch.object(antiphon, "read_cursor", return_value={}), \
                  patch.object(antiphon, "write_cursor"), \
                  patch.object(antiphon.sys, "stdin", io.StringIO(json.dumps(input_data))), \
@@ -314,8 +1019,8 @@ class AntiphonTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as project:
             input_data = {"cwd": project, "transcript_path": "/tmp/rollout"}
             with patch.object(antiphon.os.path, "exists", return_value=True), \
-                 patch.object(antiphon, "last_codex_reply",
-                              return_value="@claude:api run"), \
+                 patch.object(antiphon, "_codex_turn",
+                              return_value=("@claude:api run", "")), \
                  patch.object(antiphon, "read_cursor", return_value={}), \
                  patch.object(antiphon, "write_cursor") as write, \
                  patch.object(antiphon.socket, "socket",
@@ -336,8 +1041,8 @@ class AntiphonTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as project:
             input_data = {"cwd": project, "transcript_path": "/tmp/rollout"}
             with patch.object(antiphon.os.path, "exists", return_value=True), \
-                 patch.object(antiphon, "last_codex_reply",
-                              return_value="@claude:api named\n@claude bare"), \
+                 patch.object(antiphon, "_codex_turn",
+                              return_value=("@claude:api named\n@claude bare", "")), \
                  patch.object(antiphon, "read_cursor", return_value={}), \
                  patch.object(antiphon, "write_cursor"), \
                  patch.object(antiphon, "send_to_claude",
@@ -4162,8 +4867,8 @@ class CodexPeerWiringTest(unittest.TestCase):
             self._hold_lock(antiphon.state_path(project, "codex"))
             input_data = {"cwd": project, "transcript_path": "/tmp/rollout"}
             with patch.object(antiphon.os.path, "exists", return_value=True), \
-                 patch.object(antiphon, "last_codex_reply",
-                              return_value="@claude go"), \
+                 patch.object(antiphon, "_codex_turn",
+                              return_value=("@claude go", "")), \
                  patch.object(antiphon, "send_to_claude",
                               side_effect=lambda cwd, msg, alias=None, **_:
                                   sent.append(msg) or (True, "")), \
@@ -4649,8 +5354,8 @@ class RoutingTest(unittest.TestCase):
             self._codex_peer(project, "review", "301:review", self.OTHER)
             payload = {"cwd": project, "transcript_path": "/tmp/transcript"}
             with patch.object(antiphon.os.path, "exists", return_value=True), \
-                 patch.object(antiphon, "last_claude_reply",
-                              return_value="@codex:review ship it"), \
+                 patch.object(antiphon, "_claude_turn",
+                              return_value=("@codex:review ship it", None)), \
                  patch.object(antiphon, "read_cursor", return_value={}), \
                  patch.object(antiphon, "write_cursor"), \
                  patch.object(antiphon, "_queue_codex",
@@ -4869,8 +5574,8 @@ class RoutingTest(unittest.TestCase):
             self._codex_peer(project, "build", "300:build", self.UUID)
             payload = {"cwd": project, "transcript_path": "/tmp/transcript"}
             with patch.object(antiphon.os.path, "exists", return_value=True), \
-                 patch.object(antiphon, "last_claude_reply",
-                              return_value="@codex ship it"), \
+                 patch.object(antiphon, "_claude_turn",
+                              return_value=("@codex ship it", None)), \
                  patch.object(antiphon, "read_cursor", return_value={}), \
                  patch.object(antiphon, "write_cursor") as write, \
                  patch.object(antiphon, "_queue_codex") as queued, \
@@ -4959,8 +5664,8 @@ class RoutingTest(unittest.TestCase):
             antiphon.peers.register(project, "claude", "api", "/tmp/api.sock")
             payload = {"cwd": project, "transcript_path": "/tmp/rollout"}
             with patch.object(antiphon.os.path, "exists", return_value=True), \
-                 patch.object(antiphon, "last_codex_reply",
-                              return_value="@claude:api run the tests"), \
+                 patch.object(antiphon, "_codex_turn",
+                              return_value=("@claude:api run the tests", "")), \
                  patch.object(antiphon, "read_cursor", return_value={}), \
                  patch.object(antiphon, "write_cursor"), \
                  patch.object(antiphon, "send_to_claude",
@@ -5009,8 +5714,8 @@ class RoutingTest(unittest.TestCase):
             antiphon.peers.register(project, "claude", "ui", "/tmp/ui.sock")
             payload = {"cwd": project, "transcript_path": "/tmp/rollout"}
             with patch.object(antiphon.os.path, "exists", return_value=True), \
-                 patch.object(antiphon, "last_codex_reply",
-                              return_value="@claude:ui landed\n@claude:gone lost"), \
+                 patch.object(antiphon, "_codex_turn",
+                              return_value=("@claude:ui landed\n@claude:gone lost", "")), \
                  patch.object(antiphon, "read_cursor", return_value={}), \
                  patch.object(antiphon, "write_cursor",
                               side_effect=lambda cwd, data, kind:
@@ -5251,13 +5956,17 @@ class ToolRecipientTest(unittest.TestCase):
                     project, {"text": "tool to Codex", "to": "build"})
                 self.assertEqual(code, 0, err)
 
+            # The reader named here is the one `push` actually calls — the
+            # internal (text, turn key) pair, not its public wrapper. Naming
+            # the wrapper leaves the real reader running against the fixture
+            # path and the push silently does nothing.
             for target, reader, transport, marker in (
-                    ("claude", "last_codex_reply", "send_to_claude",
+                    ("claude", "_codex_turn", "send_to_claude",
                      "@claude:api Stop to Claude"),
-                    ("codex", "last_claude_reply", "send_to_codex",
+                    ("codex", "_claude_turn", "send_to_codex",
                      "@codex:build Stop to Codex")):
                 with patch.object(antiphon.os.path, "exists", return_value=True), \
-                     patch.object(antiphon, reader, return_value=marker), \
+                     patch.object(antiphon, reader, return_value=(marker, "")), \
                      patch.object(antiphon, transport, return_value=(True, "")), \
                      patch.object(antiphon, "claimed_alias", return_value=None), \
                      patch.object(antiphon.sys, "stdin",
@@ -5282,8 +5991,8 @@ class ToolRecipientTest(unittest.TestCase):
                 antiphon._send_tool(project, "run the tests", "api")
             payload = {"cwd": project, "transcript_path": "/tmp/rollout"}
             with patch.object(antiphon.os.path, "exists", return_value=True), \
-                 patch.object(antiphon, "last_codex_reply",
-                              return_value="@claude:api run the tests"), \
+                 patch.object(antiphon, "_codex_turn",
+                              return_value=("@claude:api run the tests", "")), \
                  patch.object(antiphon, "send_to_claude") as send, \
                  patch.object(antiphon.sys, "stdin",
                               io.StringIO(json.dumps(payload))), \
@@ -5307,8 +6016,8 @@ class ToolRecipientTest(unittest.TestCase):
 
                 payload = {"cwd": project, "transcript_path": "/tmp/transcript"}
                 with patch.object(antiphon.os.path, "exists", return_value=True), \
-                     patch.object(antiphon, "last_claude_reply",
-                                  return_value="@codex:review ship"), \
+                     patch.object(antiphon, "_claude_turn",
+                                  return_value=("@codex:review ship", None)), \
                      patch.object(antiphon.sys, "stdin",
                                   io.StringIO(json.dumps(payload))), \
                      contextlib.redirect_stderr(io.StringIO()):
@@ -5353,8 +6062,8 @@ class ToolRecipientTest(unittest.TestCase):
                 antiphon._send_tool(project, "first", "api")
             payload = {"cwd": project, "transcript_path": "/tmp/rollout"}
             with patch.object(antiphon.os.path, "exists", return_value=True), \
-                 patch.object(antiphon, "last_codex_reply",
-                              return_value="@claude:api second"), \
+                 patch.object(antiphon, "_codex_turn",
+                              return_value=("@claude:api second", "")), \
                  patch.object(antiphon, "send_to_claude",
                               return_value=(True, "")), \
                  patch.object(antiphon.sys, "stdin",
@@ -5419,7 +6128,7 @@ class ToolRecipientTest(unittest.TestCase):
 
             def stop(reply, send):
                 with patch.object(antiphon.os.path, "exists", return_value=True), \
-                     patch.object(antiphon, "last_codex_reply", return_value=reply), \
+                     patch.object(antiphon, "_codex_turn", return_value=(reply, "")), \
                      patch.object(antiphon, "send_to_claude", send), \
                      patch.object(antiphon.sys, "stdin",
                                   io.StringIO(json.dumps(payload))), \
@@ -5533,7 +6242,7 @@ class SenderIdentityTest(unittest.TestCase):
             antiphon.peers.register(project, "claude", "ui", "/tmp/ui.sock")
             payload = {"cwd": project, "transcript_path": "/tmp/rollout"}
             with patch.object(antiphon.os.path, "exists", return_value=True), \
-                 patch.object(antiphon, "last_codex_reply", return_value=line), \
+                 patch.object(antiphon, "_codex_turn", return_value=(line, "")), \
                  patch.object(antiphon, "read_cursor", return_value={}), \
                  patch.object(antiphon, "write_cursor"), \
                  patch.object(antiphon, "send_to_claude",
@@ -5571,8 +6280,8 @@ class SenderIdentityTest(unittest.TestCase):
             self._codex_peer(project, "build", "300:build", self.UUID)
             payload = {"cwd": project, "transcript_path": "/tmp/transcript"}
             with patch.object(antiphon.os.path, "exists", return_value=True), \
-                 patch.object(antiphon, "last_claude_reply",
-                              return_value="@codex:build ship it"), \
+                 patch.object(antiphon, "_claude_turn",
+                              return_value=("@codex:build ship it", None)), \
                  patch.object(antiphon, "read_cursor", return_value={}), \
                  patch.object(antiphon, "write_cursor"), \
                  patch.object(antiphon, "_queue_codex",
@@ -5743,8 +6452,8 @@ class ClaimedAliasTest(unittest.TestCase):
         """Codex's Stop hook: the sender is the Codex peer."""
         payload = {"cwd": project, "transcript_path": "/tmp/rollout"}
         with patch.object(antiphon.os.path, "exists", return_value=True), \
-             patch.object(antiphon, "last_codex_reply",
-                          return_value="@claude:ui run it"), \
+             patch.object(antiphon, "_codex_turn",
+                          return_value=("@claude:ui run it", "")), \
              patch.object(antiphon, "read_cursor", return_value={}), \
              patch.object(antiphon, "write_cursor"), \
              patch.object(antiphon, "send_to_claude",
@@ -5760,8 +6469,8 @@ class ClaimedAliasTest(unittest.TestCase):
         queued = []
         payload = {"cwd": project, "transcript_path": "/tmp/transcript"}
         with patch.object(antiphon.os.path, "exists", return_value=True), \
-             patch.object(antiphon, "last_claude_reply",
-                          return_value="@codex:ui run it"), \
+             patch.object(antiphon, "_claude_turn",
+                          return_value=("@codex:ui run it", None)), \
              patch.object(antiphon, "read_cursor", return_value={}), \
              patch.object(antiphon, "write_cursor"), \
              patch.object(antiphon, "_queue_codex",
@@ -5807,9 +6516,9 @@ class ClaimedAliasTest(unittest.TestCase):
                  patch.object(antiphon.peers, "owner_key",
                               return_value=self.MINE) as walk, \
                  patch.object(antiphon.os.path, "exists", return_value=True), \
-                 patch.object(antiphon, "last_claude_reply",
-                              return_value="@codex:a one\n@codex:b two\n"
-                                           "@codex:c three"), \
+                 patch.object(antiphon, "_claude_turn",
+                              return_value=("@codex:a one\n@codex:b two\n"
+                                           "@codex:c three", None)), \
                  patch.object(antiphon, "read_cursor", return_value={}), \
                  patch.object(antiphon, "write_cursor"), \
                  patch.object(antiphon, "_queue_codex",

@@ -185,18 +185,58 @@ def forget_superseded(record):
     return record
 
 
-def deliver_batches(batches, sent, deliver):
+def push_fingerprint(turn_key, messages):
+    """The dedupe fingerprint for one batch, scoped to the turn that said it.
+
+    Content alone is not identity: `@claude do SAME` in one turn and the exact
+    same line in a later turn hash identically under `batch_fingerprint`, so a
+    genuinely new instruction that happens to repeat old wording was silently
+    swallowed — measured, `send_to_claude` called once where two turns each
+    said it once. A non-empty `turn_key` (the matched Codex `turn_id`, or the
+    `uuid` of the Claude boundary record that opened the turn) folds the
+    turn's own identity into the fingerprint as a structured `[key, messages]`
+    pair, which cannot collide with the flat legacy shape below. An empty key
+    — no `turn_id` on a pre-`turn_id` Codex hook, or a Claude boundary that
+    scrolled out of the tail window or carries no `uuid` — has no turn to
+    scope to, and falls back to the original content-only digest unchanged:
+    both for continuity with every cursor already on disk, and because a
+    repeat with no nameable turn is exactly the case content-only dedupe was
+    always meant for.
+    """
+    if turn_key:
+        return batch_fingerprint([turn_key, messages])
+    return batch_fingerprint(messages)
+
+
+def deliver_batches(batches, sent, deliver, turn_key=""):
     """Calls `deliver(recipient, messages)` for each batch that has not gone yet.
 
     A recipient's fingerprint advances only if its own delivery succeeded, so one
     failure does not suppress its retry while another recipient's success is
     kept. The key is `""` for unaddressed and `"@alias"` otherwise, so a peer
     named the empty string cannot collide with the unaddressed slot.
+
+    `turn_key` scopes every fingerprint computed here to the turn `push`
+    resolved it from; see `push_fingerprint`. The default keeps every other
+    caller's content-only behaviour exactly as it was.
+
+    A slot can also hold the flat, content-only digest this exact batch
+    already carried before turn scoping shipped — written by an older
+    binary, or by an earlier push that resolved no turn key for this same
+    content. Once `turn_key` is non-empty that flat value can no longer equal
+    the scoped fingerprint, so comparing only against the new shape would
+    call already-delivered content new and resend it — measured: one
+    resend, then the slot converts. Recognised here the same way the
+    string-cursor migration is: matched against its own old shape, then
+    upgraded in place to the scoped digest without sending again.
     """
     for recipient, messages in batches.items():
         key = "" if recipient is None else f"@{recipient}"
-        fingerprint = batch_fingerprint(messages)
+        fingerprint = push_fingerprint(turn_key, messages)
         if sent.get(key) == fingerprint:
+            continue
+        if turn_key and sent.get(key) == batch_fingerprint(messages):
+            sent[key] = fingerprint
             continue
         if deliver(recipient, messages):
             sent[key] = fingerprint
@@ -1452,41 +1492,199 @@ def notice_text(side, count):
 
 # ---------- push (both directions) ----------
 
-def last_claude_reply(transcript_path):
-    """Returns the most recent assistant text in the Claude transcript."""
-    chunks = []
+def _claude_turn(transcript_path):
+    """(text, boundary_uuid) for the last Claude turn in the window.
+
+    `text` is every assistant text of that turn, joined in order — a turn can
+    span several assistant records, one per model response before and after
+    each tool call in between, so the newest assistant record alone is not
+    the whole reply. The last turn is everything after the last `user` record
+    that is a real turn boundary; see `is_boundary` for what disqualifies one.
+    Claude's hook payload carries no turn id, so unlike `last_codex_reply`
+    this has only the window to decide with.
+
+    `boundary_uuid` is that boundary record's own top-level `uuid` — measured
+    present on 1,220 of 1,220 sampled boundary records — or `None` when the
+    window holds no boundary at all, or the boundary record itself carries
+    none. `push` uses it to scope the Claude-turn side of the dedupe
+    fingerprint to the turn that produced the text, so an identical
+    instruction repeated in a later turn is not silently deduped against the
+    one an earlier turn already sent.
+    """
+    records = []
     for line in tail_lines(transcript_path):
         try:
-            d = json.loads(line)
+            records.append(json.loads(line))
         except json.JSONDecodeError:
             continue
+
+    # Measured `origin.kind` values for a mid-turn `isMeta` record that
+    # carries neither `sourceToolUseID` nor `turnCompanion`. This is an
+    # allowlist, not a denylist: an unmeasured kind, a missing `origin`, and
+    # `"channel"` itself (the bridge's own injection) all stay boundaries.
+    MID_TURN_ORIGIN_KINDS = {"coordinator", "task-notification"}
+
+    def is_boundary(d):
+        if d.get("type") != "user":
+            return False
+        if d.get("isMeta"):
+            if d.get("sourceToolUseID") or d.get("turnCompanion"):
+                return False
+            origin = d.get("origin")
+            kind = origin.get("kind") if isinstance(origin, dict) else None
+            return kind not in MID_TURN_ORIGIN_KINDS
+        content = (d.get("message") or {}).get("content")
+        return not (isinstance(content, list) and content
+                    and all(isinstance(c, dict) and c.get("type") == "tool_result"
+                            for c in content))
+
+    def assistant_texts(d):
         if d.get("type") != "assistant" or d.get("isMeta"):
-            continue
+            return None
         content = (d.get("message") or {}).get("content")
         texts = [c.get("text", "") for c in content or []
                 if isinstance(c, dict) and c.get("type") == "text"]
-        if texts:
-            chunks = texts            # each new assistant message supersedes the last
-    return "\n".join(chunks).strip()
+        return texts if texts else None
 
+    last_boundary = -1
+    for i, d in enumerate(records):
+        if is_boundary(d):
+            last_boundary = i
 
-def last_codex_reply(transcript_path):
-    """Returns the most recent assistant text in the Codex rollout."""
     chunks = []
+    for d in records[last_boundary + 1:]:
+        texts = assistant_texts(d)
+        if texts:
+            chunks.extend(texts)
+
+    boundary_uuid = None
+    if last_boundary != -1:
+        candidate = records[last_boundary].get("uuid")
+        if isinstance(candidate, str) and candidate:
+            boundary_uuid = candidate
+
+    return "\n".join(chunks).strip(), boundary_uuid
+
+
+def last_claude_reply(transcript_path):
+    """Returns every assistant text of the last Claude turn, joined in order.
+
+    A thin wrapper over `_claude_turn`, which also names the turn's boundary
+    record for `push`'s dedupe scoping; see its docstring for the rule. This
+    is the stable public name; `push` reads through the pair.
+    """
+    return _claude_turn(transcript_path)[0]
+
+
+def _codex_turn(transcript_path, turn_id=None):
+    """(text, bound_key) for the turn the Codex Stop hook is reporting on.
+
+    `turn_id` is the hook payload's own id, threaded in from `push()`; a
+    missing key, `null`, `""`, or any non-string value all mean "no id" —
+    the hook predates the field. A matched `task_started` bounds the turn
+    exactly; anything short of a provable boundary falls open to every
+    assistant text in the window instead of guessing, because a duplicate of
+    an old turn's tail is recoverable and a lost `@claude` marker is not.
+
+    `bound_key` is that matched id, and only that: `""` wherever this reader
+    fails open or has no id to match, because there the returned text is not
+    a turn's text but a window's. `push` scopes its dedupe fingerprint to it,
+    and a key naming a turn the text was never cut to is worse than no key —
+    measured, a clipped window whose marker never changes re-delivered it
+    once per turn (four sends over four turns) purely because the hook
+    reported a new id each time.
+    """
+    records = []
     for line in tail_lines(transcript_path):
         try:
-            d = json.loads(line)
+            records.append(json.loads(line))
         except json.JSONDecodeError:
             continue
+
+    def message_texts(d):
         p = d.get("payload") or {}
         if (d.get("type") != "response_item" or p.get("type") != "message"
                 or p.get("role") != "assistant"):
-            continue
+            return None
         texts = [c.get("text") or c.get("output_text") or c.get("input_text") or ""
                 for c in p.get("content") or [] if isinstance(c, dict)]
-        if any(texts):
+        return texts if any(texts) else None
+
+    def task_marker(d):
+        p = d.get("payload") or {}
+        if d.get("type") != "event_msg" or p.get("type") not in (
+                "task_started", "task_complete"):
+            return None
+        return p.get("type"), p.get("turn_id")
+
+    def all_visible_texts():
+        chunks = []
+        for d in records:
+            texts = message_texts(d)
+            if texts:
+                chunks.append("\n".join(texts))
+        return "\n".join(chunks).strip()
+
+    def span_after(start_index, ending_kind=None, ending_id=None):
+        chunks = []
+        for d in records[start_index:]:
+            marker = task_marker(d)
+            if ending_kind is not None and marker == (ending_kind, ending_id):
+                break
+            texts = message_texts(d)
+            if texts:
+                chunks.append("\n".join(texts))
+        return "\n".join(chunks).strip()
+
+    if isinstance(turn_id, str) and turn_id:
+        for i, d in enumerate(records):
+            if task_marker(d) == ("task_started", turn_id):
+                # Case 1: bounded by this turn's own close, or EOF — a
+                # nested child's complete carries a different id and does
+                # not end it. The only branch that names the turn it read.
+                return span_after(i + 1, "task_complete", turn_id), turn_id
+        # Case 2: a real id whose start already scrolled out of the window.
+        # Binding to a different task_started would attribute this reply to
+        # the wrong turn; clipping at a task_complete can cut current-turn
+        # text sitting after a closed nested span. Return everything visible.
+        return all_visible_texts(), ""
+
+    # Case 3: no id to match against — decided on the window alone, since
+    # the reader never sees what came before or after it.
+    last_start = None
+    any_marker = False
+    for i, d in enumerate(records):
+        marker = task_marker(d)
+        if marker:
+            any_marker = True
+            if marker[0] == "task_started":
+                last_start = i
+    if last_start is not None:
+        # The current turn is still open while the hook runs, so nothing —
+        # not even its own task_complete — clips this span. The start's own
+        # id is not the key: nothing proves it is the turn the hook is
+        # reporting on, which is the whole reason case 1 needs the payload.
+        return span_after(last_start + 1), ""
+    if any_marker:
+        return all_visible_texts(), ""      # an orphan task_complete: same fail-open
+
+    # No task marker at all in the window: today's newest-message behaviour.
+    chunks = []
+    for d in records:
+        texts = message_texts(d)
+        if texts:
             chunks = texts
-    return "\n".join(chunks).strip()
+    return "\n".join(chunks).strip(), ""
+
+
+def last_codex_reply(transcript_path, turn_id=None):
+    """Returns the assistant text(s) of the turn the Stop hook is reporting on.
+
+    A thin wrapper over `_codex_turn`, which also names the turn it bound the
+    text to for `push`'s dedupe scoping; see its docstring for the rule. This
+    is the stable public name; `push` reads through the pair.
+    """
+    return _codex_turn(transcript_path, turn_id)[0]
 
 
 def codex_session_id(cwd):
@@ -1524,8 +1722,25 @@ def push(target="codex"):
     if not transcript or not os.path.exists(transcript):
         return 0
 
-    reply_reader = last_claude_reply if target == "codex" else last_codex_reply
-    reply_text = reply_reader(transcript)
+    if target == "codex":
+        # One read decides both. A second, independent call to re-derive
+        # `boundary_uuid` looked cheap but was not safe: the transcript can
+        # grow between two reads, so the boundary the second read sees can
+        # differ from the one that actually produced `reply_text` — measured,
+        # a send from turn A gets recorded under turn B's key, and a later
+        # turn B that genuinely repeats the same words is then silently
+        # suppressed as an apparent duplicate. A single call guarantees the
+        # text and the key it is scoped under always name the same turn.
+        reply_text, boundary_uuid = _claude_turn(transcript)
+        turn_key = boundary_uuid or ""
+    else:
+        # Only Codex's own Stop hook carries this id; Claude's hook has
+        # nothing of the kind for `_claude_turn` to use. One read again, and
+        # the key is the reader's, not the payload's: the hook id names a
+        # turn, the reader says whether the text it returned was actually cut
+        # to that turn. Where it was not, there is no key.
+        reply_text, turn_key = _codex_turn(transcript,
+                                           input_data.get("turn_id"))
     batches = {}
     for recipient, messages in group_by_recipient(target, reply_text).items():
         # Reported per line, not per recipient: a batch holding one empty marker
@@ -1596,9 +1811,11 @@ def push(target="codex"):
     if already:
         # The exact bare message already went out under the old string
         # format; nothing left to send for it, but the migration to the new
-        # shape still needs recording.
-        raw_sent[""] = batch_fingerprint(batches[None])
-    updated = forget_superseded(deliver_batches(batches, raw_sent, deliver))
+        # shape still needs recording — through the same scoped helper every
+        # other fingerprint in this function goes through, so the shapes
+        # cannot drift apart.
+        raw_sent[""] = push_fingerprint(turn_key, batches[None])
+    updated = forget_superseded(deliver_batches(batches, raw_sent, deliver, turn_key))
     # The delta: only the slots this call actually resolved — never the whole
     # map computed from the read above. Writing that map back, whole, would
     # reintroduce exactly the lost update the cursor lock exists to prevent:
