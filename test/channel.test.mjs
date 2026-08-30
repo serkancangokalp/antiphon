@@ -75,6 +75,26 @@ function spawnChannel(dir, name) {
   return { child, socketPath: socketFor(dir, name), stderr: () => stderr };
 }
 
+// Every test removes exactly the socket it created and nothing else. Killing
+// the child and deleting only the project directory leaves the socket in the
+// shared temp directory: 163 of them had piled up before this was noticed.
+async function cleanUp(session, dir) {
+  session.child.kill("SIGTERM");
+  await Promise.race([
+    once(session.child, "exit"),
+    new Promise((resolve) => setTimeout(resolve, 2_000)),
+  ]);
+  if (session.child.exitCode === null) {
+    session.child.kill("SIGKILL");
+    await Promise.race([
+      once(session.child, "exit"),
+      new Promise((resolve) => setTimeout(resolve, 2_000)),
+    ]);
+  }
+  await rm(session.socketPath, { force: true });
+  await rm(dir, { recursive: true, force: true });
+}
+
 async function waitFor(predicate, timeoutMs = 5_000) {
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
@@ -98,9 +118,8 @@ async function twoNamedPeersKeepSeparateSockets() {
     assert.ok(existsSync(api.socketPath),
       "closing one peer must not remove another peer's socket");
   } finally {
-    ui.child.kill("SIGKILL");
-    api.child.kill("SIGKILL");
-    await rm(dir, { recursive: true, force: true });
+    await cleanUp(ui, dir);
+    await cleanUp(api, dir);
   }
 }
 
@@ -149,9 +168,8 @@ async function onlyOneUnnamedSessionGetsTheChannel(startTogether) {
     assert.equal(registeredPeers(dir).length, 1,
       "the refused session must not have left a claim behind");
   } finally {
-    first.child.kill("SIGKILL");
-    second.child.kill("SIGKILL");
-    await rm(dir, { recursive: true, force: true });
+    await cleanUp(first, dir);
+    await cleanUp(second, dir);
   }
 }
 
@@ -176,9 +194,8 @@ async function aSocketPathItCannotClearDoesNotKillTheSession() {
     assert.ok(await waitFor(() => registeredPeers(dir).length === 0),
       "a claim that could not be honoured must be given back");
   } finally {
-    session.child.kill("SIGKILL");
     await rm(blocked, { recursive: true, force: true });
-    await rm(dir, { recursive: true, force: true });
+    await cleanUp(session, dir);
   }
 }
 
@@ -223,8 +240,7 @@ async function anOversizedMessageIsRefusedWithoutKillingTheSession() {
       JSON.stringify({ content: "after the refusal", message_id: "m-after" }));
     assert.deepEqual(JSON.parse(ack), { ok: true, message_id: "m-after" });
   } finally {
-    session.child.kill("SIGKILL");
-    await rm(dir, { recursive: true, force: true });
+    await cleanUp(session, dir);
   }
 }
 
@@ -250,8 +266,7 @@ async function aStalledClientDoesNotBlockShutdown() {
     assert.deepEqual(registeredPeers(dir), [], "it must release its own claim");
   } finally {
     idle.destroy();
-    session.child.kill("SIGKILL");
-    await rm(dir, { recursive: true, force: true });
+    await cleanUp(session, dir);
   }
 }
 
@@ -291,11 +306,68 @@ async function aRefusedClientCannotKeepStreaming() {
     assert.deepEqual(JSON.parse(ack), { ok: true, message_id: "m-stream" });
   } finally {
     client.destroy();
-    session.child.kill("SIGKILL");
+    await cleanUp(session, dir);
+  }
+}
+
+async function losingTheStdioClientEndsTheSession() {
+  // The Unix server keeps the event loop alive, so a stdio client going away is
+  // not enough on its own to end the process. Observed in the wild: a channel
+  // server from a session that ended hours earlier, orphaned under PPID 1, still
+  // holding its socket, with its stdio descriptors pointing at nothing. Only a
+  // signal cleared it — and nothing sends one when a session merely closes.
+  const dir = await mkdtemp(join(tmpdir(), "antiphon-eof-"));
+  const session = spawnChannel(dir, "");
+  try {
+    assert.ok(await waitFor(() => existsSync(session.socketPath)), session.stderr());
+
+    session.child.stdin.end();                    // EOF, no signal
+    const exited = await Promise.race([
+      once(session.child, "exit").then(() => true),
+      new Promise((resolve) => setTimeout(() => resolve(false), 5_000)),
+    ]);
+    assert.ok(exited, "the session must exit when its stdio client goes away");
+    assert.equal(session.child.exitCode, 0, "and exit cleanly");
+    assert.ok(!existsSync(session.socketPath), "it must remove its own socket");
+    assert.deepEqual(registeredPeers(dir), [], "it must release its own claim");
+  } finally {
+    await cleanUp(session, dir);
+  }
+}
+
+async function theWrapperTakesItsChannelDownWithIt() {
+  // The installed command is `antiphon channel`, a wrapper that spawns
+  // channel.mjs. It used to exit under a signal without passing it on, leaving
+  // the server orphaned under PPID 1 — which is how the real leak happened,
+  // not by anyone running lib/channel.mjs directly.
+  const dir = await mkdtemp(join(tmpdir(), "antiphon-wrapper-"));
+  const env = { ...process.env, ANTIPHON_CWD: dir };
+  delete env.ANTIPHON_NAME;
+  const wrapper = spawn("node", ["bin/antiphon.mjs", "channel"],
+    { env, stdio: ["pipe", "pipe", "pipe"] });
+  const socketPath = socketFor(dir, "");
+  try {
+    assert.ok(await waitFor(() => existsSync(socketPath)), "wrapper never served");
+
+    wrapper.kill("SIGTERM");
+    const exited = await Promise.race([
+      once(wrapper, "exit").then(() => true),
+      new Promise((resolve) => setTimeout(() => resolve(false), 5_000)),
+    ]);
+    assert.ok(exited, "the wrapper must exit on a signal");
+    assert.ok(await waitFor(() => !existsSync(socketPath), 3_000),
+      "the channel it started must clean up its socket, not outlive it");
+    assert.deepEqual(registeredPeers(dir), [],
+      "and release its registry claim");
+  } finally {
+    wrapper.kill("SIGKILL");
+    await rm(socketPath, { force: true });
     await rm(dir, { recursive: true, force: true });
   }
 }
 
+await losingTheStdioClientEndsTheSession();
+await theWrapperTakesItsChannelDownWithIt();
 await anOversizedMessageIsRefusedWithoutKillingTheSession();
 await aRefusedClientCannotKeepStreaming();
 await aStalledClientDoesNotBlockShutdown();
