@@ -1216,12 +1216,22 @@ def _codex_config_block(cwd):
 
     Note `args = ["mcp"]`, not `["channel"]`: the channel server is Claude's side
     and hands out `reply_to_codex`. Pointing Codex at it would let Codex publish
-    messages labelled as Claude's — the one thing this bridge exists to prevent."""
+    messages labelled as Claude's — the one thing this bridge exists to prevent.
+
+    `env_vars` names a variable to forward from the parent rather than a value to
+    set. Codex does not pass the parent environment through: measured on live
+    processes, the Claude MCP child carried 46 variables and the Codex child 10 —
+    a curated set plus whatever `env` declares. Without this line `ANTIPHON_NAME`
+    never reaches `antiphon mcp` however the terminal was started, so the server
+    and the hook could not agree on which peer they belong to."""
     return (f'[{CODEX_MCP_TABLE}]\n'
             'command = "antiphon"\n'
             'args = ["mcp"]\n'
             '# read-only local bridge; no need to ask on every turn\n'
             'default_tools_approval_mode = "approve"\n'
+            '# forwarded, not set: the peer name comes from the terminal that\n'
+            "# started this session, and Codex does not pass it down otherwise\n"
+            'env_vars = ["ANTIPHON_NAME"]\n'
             f'\n[{CODEX_MCP_TABLE}.env]\n'
             f'ANTIPHON_CWD = "{cwd}"\n')
 

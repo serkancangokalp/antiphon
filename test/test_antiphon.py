@@ -660,6 +660,60 @@ class AntiphonTest(unittest.TestCase):
         self.assertIn('args = ["mcp"]', config)
         self.assertIn(f'ANTIPHON_CWD = "{project}"', config)
 
+    def test_setup_forwards_the_alias_to_the_codex_server(self):
+        """Codex does not pass the parent environment to an MCP server: measured
+        on live processes, the Claude child carried 46 variables and the Codex
+        child 10 — a curated set plus whatever `env` declares. So `ANTIPHON_NAME`
+        never reaches `antiphon mcp` however the terminal was started, and an
+        alias only the hook can read joins nothing. `env_vars` names a variable
+        to forward rather than a value to set."""
+        with tempfile.TemporaryDirectory() as project, \
+             patch.object(antiphon, "project_dir", return_value=project), \
+             contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(antiphon.setup(), 0)
+            with open(os.path.join(project, ".codex", "config.toml"),
+                      encoding="utf-8") as f:
+                config = f.read()
+        self.assertIn('env_vars = ["ANTIPHON_NAME"]', config)
+
+    def test_setup_adds_the_forward_to_a_config_that_predates_it(self):
+        """An existing install gets it on the next `setup`, exactly once."""
+        with tempfile.TemporaryDirectory() as project:
+            os.makedirs(os.path.join(project, ".codex"))
+            with open(os.path.join(project, ".codex", "config.toml"), "w",
+                      encoding="utf-8") as f:
+                f.write('[mcp_servers.unrelated]\ncommand = "keep-me"\n\n'
+                        '[mcp_servers.antiphon]\ncommand = "antiphon"\n'
+                        'args = ["mcp"]\n\n'
+                        '[mcp_servers.antiphon.env]\n'
+                        f'ANTIPHON_CWD = "{project}"\n')
+            with patch.object(antiphon, "project_dir", return_value=project), \
+                 contextlib.redirect_stdout(io.StringIO()):
+                antiphon.setup()
+                antiphon.setup()
+            with open(os.path.join(project, ".codex", "config.toml"),
+                      encoding="utf-8") as f:
+                config = f.read()
+        self.assertEqual(config.count("env_vars"), 1)
+        self.assertEqual(config.count("[mcp_servers.antiphon]"), 1)
+        self.assertIn('command = "keep-me"', config,
+                      "an unrelated table still survives the rewrite")
+
+    @unittest.skipUnless(tomllib, "tomllib needs Python 3.11+")
+    def test_the_forwarded_variable_parses_as_a_list_of_strings(self):
+        """The text assertions above run on every Python 3; where the stdlib can
+        parse TOML, prove the shape Codex will actually read."""
+        with tempfile.TemporaryDirectory() as project, \
+             patch.object(antiphon, "project_dir", return_value=project), \
+             contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(antiphon.setup(), 0)
+            with open(os.path.join(project, ".codex", "config.toml"), "rb") as f:
+                config = tomllib.load(f)
+        server = config["mcp_servers"]["antiphon"]
+        self.assertEqual(server["env_vars"], ["ANTIPHON_NAME"])
+        self.assertEqual(server["env"]["ANTIPHON_CWD"], project,
+                         "the forward is additive: the directory is still set")
+
     def test_setup_repairs_a_codex_config_aimed_at_the_wrong_server(self):
         """The bug this file was written for: a hand-written entry naming the
         `channel` server (Claude's, not Codex's) and a project directory left over
