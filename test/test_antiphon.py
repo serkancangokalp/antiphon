@@ -1391,6 +1391,77 @@ class AntiphonTest(unittest.TestCase):
                             ]},
             }), [value])
 
+    def test_standalone_whitespace_user_block_is_content_on_both_sides(self):
+        records = {
+            "claude": {
+                "type": "user",
+                "timestamp": "2026-08-30T10:00:00.000Z",
+                "message": {"content": [
+                    {"type": "text", "text": "   "},
+                ]},
+            },
+            "codex": {
+                "type": "response_item",
+                "timestamp": "2026-08-30T10:00:00.000Z",
+                "payload": {"type": "message", "role": "user",
+                            "content": [
+                                {"type": "input_text", "text": "   "},
+                            ]},
+            },
+        }
+        for side, record in records.items():
+            with self.subTest(side=side):
+                self.assertEqual(self._events_from_real_jsonl(side, record),
+                                 ["   "])
+
+    def test_leading_whitespace_before_a_host_wrapper_is_filtered_on_both_sides(self):
+        records = {
+            "claude": {
+                "type": "user",
+                "timestamp": "2026-08-30T10:00:00.000Z",
+                "message": {"content": [
+                    {"type": "text", "text": "  <channel source>host text"},
+                ]},
+            },
+            "codex": {
+                "type": "response_item",
+                "timestamp": "2026-08-30T10:00:00.000Z",
+                "payload": {"type": "message", "role": "user",
+                            "content": [
+                                {"type": "input_text",
+                                 "text": "  <recommended_plugins source>host text"},
+                            ]},
+            },
+        }
+        for side, record in records.items():
+            with self.subTest(side=side):
+                self.assertEqual(self._events_from_real_jsonl(side, record), [])
+
+    def test_leading_whitespace_before_an_antiphon_label_is_filtered_on_both_sides(self):
+        records = {
+            "claude": {
+                "type": "user",
+                "promptSource": "typed",
+                "timestamp": "2026-08-30T10:00:00.000Z",
+                "message": {"content": [
+                    {"type": "text",
+                     "text": "  [Antiphon bridge] Claude: already delivered"},
+                ]},
+            },
+            "codex": {
+                "type": "response_item",
+                "timestamp": "2026-08-30T10:00:00.000Z",
+                "payload": {"type": "message", "role": "user",
+                            "content": [
+                                {"type": "input_text",
+                                 "text": "  [Antiphon bridge] Claude: already delivered"},
+                            ]},
+            },
+        }
+        for side, record in records.items():
+            with self.subTest(side=side):
+                self.assertEqual(self._events_from_real_jsonl(side, record), [])
+
     # ---- Important 2: upgrading a legacy hook must not leave a duplicate ----
 
     @staticmethod
