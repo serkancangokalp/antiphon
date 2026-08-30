@@ -685,7 +685,10 @@ class AntiphonTest(unittest.TestCase):
             transcript = os.path.join(project, "transcript.jsonl")
             with open(transcript, "w", encoding="utf-8") as f:
                 f.write("\n".join([
-                    claude_prompt("first ask"),
+                    # Both boundary prompts carry a `uuid`, as real records
+                    # do, so this runs on the scoped fingerprint rather than
+                    # falling back to the content-only shape.
+                    claude_prompt("first ask", uuid="U1"),
                     claude_assistant("@codex do OLD"),
                     claude_tool_result(),
                     claude_assistant("done"),
@@ -711,7 +714,7 @@ class AntiphonTest(unittest.TestCase):
                 # A new ask and a new marker, after the first turn closed.
                 with open(transcript, "a", encoding="utf-8") as f:
                     f.write("\n".join([
-                        claude_prompt("next ask"),
+                        claude_prompt("next ask", uuid="U2"),
                         claude_assistant("@codex do NEW"),
                     ]) + "\n")
                 self.assertEqual(run(), 0)

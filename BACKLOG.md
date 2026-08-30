@@ -135,7 +135,9 @@ have one.
   of the tail window) fails open to the whole visible window rather than
   guessing at a different turn's span. With no id at all — a CLI older than
   the `turn_id` field — the newest `task_started` alone decides, cut by
-  nothing.
+  nothing. The reader also reports *whether* it bound the turn: the matched
+  id where a span was actually cut to it, nothing in either fail-open branch
+  or in any no-id branch.
 - Claude (`last_claude_reply`): a `user` record is a turn boundary unless it
   is a tool result, an `isMeta` record carrying `sourceToolUseID` or
   `turnCompanion` (a Skill load or turn companion), or an `isMeta` record
@@ -158,7 +160,28 @@ have one.
   content-only shape; an empty key falls back to that original shape
   unchanged, both for continuity with cursors already on disk and because
   a repeat with no nameable turn is exactly what content-only dedupe was
-  always meant for.
+  always meant for. The key is always the *reader's* — never the hook
+  payload's on its own. Keying an unbound window on the id the hook happened
+  to report changed the fingerprint every turn while the window's marker text
+  did not: measured, four sends of one instruction across four turns where
+  content-only dedupe sends it once.
+- One read decides both halves, each direction. `push` calls the internal
+  `(text, turn key)` reader once — `_claude_turn` or `_codex_turn` — rather
+  than parsing the transcript a second time to re-derive the key.
+  `last_claude_reply` / `last_codex_reply` remain the public single-value
+  names over those pairs. Two reads were not equivalent: the transcript can
+  grow between them, so the second can name a turn the first never saw, and
+  the send from turn A is then recorded under turn B's key — which silently
+  suppresses turn B's own later identical marker. Measured: one send where
+  two were expected.
+- A cursor slot still holding the flat, pre-scoping digest of the batch about
+  to be pushed migrates in place, without sending. Comparing it against the
+  new scoped shape alone would call already-delivered content new and resend
+  it once per slot; recognised in its own old form instead and rewritten to
+  the scoped digest, the same way the pre-digest string cursor migrates.
+  Every fingerprint `push` writes goes through the one scoped helper — the
+  migration write included — so the two shapes cannot drift apart. This
+  migration is not free of consequence; see the follow-up entry below.
 - Verified end to end: `push`, run against real transcript fixtures with only
   `send_to_claude`/`send_to_codex` mocked, delivers a marker from a non-final
   message, stays quiet on an identical re-read, delivers again — with the
@@ -179,8 +202,15 @@ have one.
   send: at-least-once by design, the same trade the delivery layer already
   makes elsewhere. (The third no-id sub-branch, no task marker visible at
   all, does not fail open; it falls back to today's newest-message
-  behaviour instead.) An identical re-read is fingerprint-stable, but a
-  later append can shift the tail window and re-expose the old text.
+  behaviour instead.) Neither carries a turn key — the reader cannot name a
+  turn it just failed to bind — so these windows dedupe on content alone: an
+  unchanged window stays fingerprint-stable turn after turn, however many
+  turns run over it. What still duplicates is a window whose *marker set*
+  changes, because the whole window is one batch: measured, a fail-open
+  window holding `do X` (already delivered) that gains a second marker
+  delivers `do X\ndo Y` — the new instruction and the old one again.
+  At-least-once, once per new marker written into the same unbound window,
+  not once per turn.
 - Where no turn key exists at all — a pre-`turn_id` Codex hook, or a Claude
   window whose boundary record has scrolled out of the tail or carries no
   `uuid` — the dedupe fingerprint stays content-only, so an identical
@@ -192,6 +222,44 @@ have one.
   rollout with no markers at all (3/127 measured) from one whose markers all
   sit beyond the tail (1/127 measured) — the two windows look identical from
   inside.
+
+## P1 — A mid-turn tool reply's digest swallows a later turn's identical marker
+
+Left open by the turn-scoped-markers work above, and named here because the
+entry above would otherwise read as if the whole class were closed.
+
+`_record_delivery` — the mid-turn `reply_to_codex` / `_send_tool` path —
+writes `batch_fingerprint([text])`, the **flat**, content-only shape, into
+exactly the slot `push`'s dedupe reads. It has to: without that record the
+same text arrives twice, once from the tool and once from the Stop hook that
+ends the turn. But `deliver_batches`'s flat→scoped migration branch reads a
+flat value in that slot as "this batch already went out", and that premise is
+false when the flat digest came from a *different, earlier* turn. So the
+migration is a live path, not a one-time upgrade path, and it consumes one
+genuine send per flat-digest state.
+
+Measured here (real transcript, real cursor, only `send_to_codex` mocked):
+
+- turn A: Claude answers Codex through the reply tool with `run the suite`;
+  its visible reply carries no marker, so the Stop hook finds no batch and
+  the slot keeps the flat digest `8a2e661d…`;
+- turn B: Claude writes `@codex run the suite` — a genuinely new instruction
+  that happens to repeat the earlier wording. **0 sends where 1 is expected**,
+  silently; the slot upgrades to the scoped digest `c573f74c…`;
+- turn C: the same words again → 1 send, as expected.
+
+Bounded to one loss per flat-digest state, and strictly better than the
+pre-branch behaviour, where content-only dedupe dropped that instruction
+*permanently* rather than once. Still a loss, and the bridge's contract
+everywhere else is at-least-once.
+
+Suggested direction: park the flat digest where it can be consumed exactly
+once, the way `LEGACY_SLOT` already parks the pre-digest string cursor, so a
+later turn's identical marker is never matched against another turn's
+delivery record; or give the reply path a turn identity of its own so its
+record is scoped like every other. Either way the mid-turn duplicate the flat
+record exists to prevent must stay prevented — a fix that reintroduces it
+trades a rare loss for a common duplicate.
 
 ## P2 — A refused active send does not say the message will still arrive
 
