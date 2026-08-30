@@ -595,7 +595,8 @@ def positions_for(cursor, side):
     delivery, under the lock, like every other cursor write.
     """
     value = cursor.get("%s_seen" % side) if isinstance(cursor, dict) else None
-    if isinstance(value, dict) and isinstance(value.get("sources"), dict):
+    if (isinstance(value, dict) and value.get("v") == CURSOR_VERSION
+            and isinstance(value.get("sources"), dict)):
         sources = {sid: entry for sid, entry in value["sources"].items()
                    if _valid_position(entry)}
         if len(sources) == len(value["sources"]):
@@ -613,9 +614,9 @@ def _advance_cursor(cwd, kind, cursor, key, positions, reached):
     Every record a parser read moves its source's mark forward, whether or
     not that record produced anything visible: a turn with nothing to show
     still has to leave the read position behind it, or the same bytes are
-    read again next turn. A no-op, reporting success, when there is nothing
-    to record. Returns whether the state that needed writing was written;
-    the caller decides what, if anything, to say about a failure.
+    read again next turn. It is a no-op, reporting success, when there is
+    nothing to record. Returns whether the state that needed writing was
+    written; the caller decides what, if anything, to say about a failure.
     """
     if not reached:
         return True
@@ -810,32 +811,46 @@ def offset_at_or_after(path, timestamp):
 
 
 def _source_size(path):
+    """The file's size, or None when it could not be measured at all.
+
+    `None` is not zero: a file `stat` cannot reach -- vanished, permissions
+    changed underneath the bridge -- has no size to compare a recorded offset
+    against, and treating that as "zero bytes long" would tell `_start_offset`
+    the file had shrunk, which is a different fact and points at the wrong
+    cause.
+    """
     try:
         return os.path.getsize(path)
     except OSError:
-        return 0
+        return None
 
 
 def _start_offset(path, sid, generation, positions, since):
-    """Where to start reading one source.
+    """Where to start reading one source: its recorded offset, when the file
+    is still the one that offset was measured against and has not shrunk
+    underneath it; otherwise the lookback, or byte zero when there is none.
 
-    Every reason to distrust a recorded offset resolves the same way — read the
-    source again from the window's start — because repeating records is the
-    error this bridge accepts and skipping them is the one it does not. Task 3
-    adds the part where somebody is told which reason applied.
+    Every reason to distrust a recorded offset resolves the same way —
+    because repeating records is the error this bridge accepts and skipping
+    them is the one it does not.
     """
     recorded = (positions or {}).get(sid)
     if recorded:
         if recorded.get("gen") != generation:
             print("antiphon: %s was replaced since it was last read (was %s, "
-                  "now %s); reading it again from the start of the window"
+                  "now %s); reading it again"
                   % (sid, recorded.get("gen"), generation), file=sys.stderr)
-        elif recorded["offset"] > _source_size(path):
-            print("antiphon: %s is shorter than the %d bytes already read from "
-                  "it; reading it again" % (sid, recorded["offset"]),
-                  file=sys.stderr)
         else:
-            return recorded["offset"]
+            size = _source_size(path)
+            if size is None:
+                print("antiphon: %s could not be measured; reading it again"
+                      % sid, file=sys.stderr)
+            elif recorded["offset"] > size:
+                print("antiphon: %s is shorter than the %d bytes already read "
+                      "from it; reading it again" % (sid, recorded["offset"]),
+                      file=sys.stderr)
+            else:
+                return recorded["offset"]
     return offset_at_or_after(path, since) if since is not None else 0
 
 
@@ -2675,8 +2690,9 @@ def _cursor_entry(key, value):
         offsets = [entry.get("offset") for entry in sources.values()
                    if isinstance(entry, dict) and isinstance(entry.get("offset"), int)]
         if offsets and len(offsets) == len(sources):
-            return truncate("%d sources, at %s"
-                            % (len(sources),
+            noun = "source" if len(sources) == 1 else "sources"
+            return truncate("%d %s, at %s"
+                            % (len(sources), noun,
                                ", ".join(str(o) for o in sorted(offsets, reverse=True))), 80)
         # `sources` held something that is not a position, or was empty: fall
         # through below, shown literally rather than raising or claiming a

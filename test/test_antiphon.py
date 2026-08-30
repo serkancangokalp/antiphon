@@ -2107,6 +2107,43 @@ class PositionCursorTest(unittest.TestCase):
                          "must not appear just because it had no recorded "
                          "position of its own")
 
+    def test_a_source_not_rediscovered_this_turn_is_not_dropped_from_the_cursor(self):
+        """`_advance_cursor` merges `reached` onto a copy of `positions`, not
+        the other way around, so a source that is in the cursor but was not
+        among this turn's newest-three transcripts keeps its recorded
+        position instead of vanishing from the map -- and being read whole,
+        from byte zero, the turn it rotates back in."""
+        with tempfile.TemporaryDirectory() as project:
+            positions = {"s1": {"gen": "g1", "offset": 100},
+                         "s2": {"gen": "g2", "offset": 200}}
+            reached = {"s1": {"gen": "g1", "offset": 150}}
+            cursor = {}
+            self.assertTrue(antiphon._advance_cursor(
+                project, "codex", cursor, "codex_seen", positions, reached))
+            written = antiphon.read_cursor(project, "codex")
+        sources = written["codex_seen"]["sources"]
+        self.assertEqual(sources["s1"], {"gen": "g1", "offset": 150},
+                         "the rediscovered source's position moved forward")
+        self.assertEqual(sources["s2"], {"gen": "g2", "offset": 200},
+                         "the source not seen this turn must still be there")
+
+    def test_a_sources_map_with_the_wrong_version_falls_back_to_the_lookback(self):
+        """`CURSOR_VERSION` is written and was never read back. A future
+        version could keep the `sources` key name while changing what
+        `offset` means, and a shape-only check would misread it as v2 instead
+        of refusing it -- the direction every other unrecognised shape
+        already takes."""
+        cursor = {"claude_seen": {"v": 3, "sources":
+                  {"s1": {"gen": "g", "offset": 12}}}}
+        positions, since = antiphon.positions_for(cursor, "claude")
+        self.assertEqual(positions, {})
+        self.assertIsNotNone(since)
+
+        cursor = {"claude_seen": {"sources": {"s1": {"gen": "g", "offset": 12}}}}
+        positions, since = antiphon.positions_for(cursor, "claude")
+        self.assertEqual(positions, {})
+        self.assertIsNotNone(since)
+
 
 class MalformedStateTest(unittest.TestCase):
     """State that parses as JSON and still isn't what the reader expects.
@@ -4553,8 +4590,8 @@ class StatusTest(unittest.TestCase):
             self.assertNotIn(secret, text, secret)
         self.assertIn("1 file", text, "the counts are still there")
         self.assertNotIn("1 files", text, "and one of something is not plural")
-        self.assertIn("1 sources, at 42", text,
-                      "the cursor's own progress is still shown")
+        self.assertIn("1 source, at 42", text,
+                      "the cursor's own progress is still shown, and singular")
 
     def test_the_counts_are_written_the_way_a_person_writes_them(self):
         with tempfile.TemporaryDirectory() as project:
