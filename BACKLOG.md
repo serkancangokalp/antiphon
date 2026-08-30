@@ -124,6 +124,42 @@ oversized message has a recoverable path:
 This is separate from the 2,600-character pull bug. Ordinary long SQL and code
 already fit under 128 KiB when sent through a channel tool.
 
+## P1 — A marker in anything but the turn's last message is dropped
+
+`push` reads the other side's newest assistant text through `last_claude_reply`
+or `last_codex_reply`, and both keep only the most recent assistant record —
+`chunks = texts` overwrites on each one, with the Claude side even documenting
+it: "each new assistant message supersedes the last". One turn is not one
+record. An agent that writes a progress message containing `@claude do this`
+and then a closing message without markers has its instruction silently
+dropped, because only the closing message is ever examined.
+
+Observed, not theorised: it happened in this project during development. One
+side reported sending a marker line, the other side received nothing, and later
+messages arrived normally — the marker had been in an intermediate message of a
+multi-part turn.
+
+The obvious repair is wrong. Joining every assistant record in the tail window
+would sweep up markers from previous turns and resend them: the dedupe
+fingerprint compares the joined text, so a window that grows by one record each
+turn produces a different fingerprint every time and pushes again. The fix needs
+a boundary for "this turn" rather than a wider join.
+
+### What has to be decided
+
+- What delimits a turn on each side. Claude records carry a `promptId`; Codex
+  rollouts bracket turns with `task_started` / `task_complete` `event_msg`
+  records. Neither is verified as reliable for this purpose yet.
+- Whether a marker in an intermediate message should be sent when it appears or
+  held until the turn ends. Sending immediately is what the author meant; it
+  also means a turn can push several times, which the fingerprint must handle
+  per marker rather than per joined blob.
+- Whether the same boundary belongs in the pull path, which has its own reasons
+  to group records and now has an atomic-record model to group them with.
+
+Until then the workaround is the one people find by accident: put the marker in
+the last thing the turn says.
+
 ## P1 — `antiphon doctor`
 
 Add one read-only command that explains the common “bridge is quiet” cases:
