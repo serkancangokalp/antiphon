@@ -1894,11 +1894,13 @@ class PositionCursorTest(unittest.TestCase):
 
     def test_a_v2_cursor_is_read_as_positions(self):
         """`since` still comes back as the lookback, even for a valid v2 map:
-        a source *with* a recorded entry resumes from it and never consults
-        `since`, so this changes nothing for it, but a v2 map can meet a
-        source it has no entry for -- an old session resumed, or a fourth
-        transcript rotating into the newest three -- and that source needs
-        the same floor a brand-new source gets rather than none at all."""
+        a source *with* a recorded entry never consults `since` at all -- it
+        resumes from that entry when trusted, or restarts from byte zero,
+        not the lookback, when it is not -- so this changes nothing for it
+        either way. A v2 map can still meet a source it has no entry for --
+        an old session resumed, or a fourth transcript rotating into the
+        newest three -- and that source needs the same floor a brand-new
+        source gets rather than none at all."""
         cursor = {"claude_seen": {"v": 2, "sources": {"s1": {"gen": "g", "offset": 12}}}}
         positions, since = antiphon.positions_for(cursor, "claude")
         self.assertEqual(positions, {"s1": {"gen": "g", "offset": 12}})
@@ -2079,7 +2081,8 @@ class PositionCursorTest(unittest.TestCase):
         plus an eight-day-old 200-record source produced 39 of 40 kept slots
         from the stale one. `positions_for` must still hand back the lookback
         as a floor even for an otherwise-valid v2 map; a source *with* an
-        entry never consults it, so steady state is unchanged."""
+        entry never consults it, whether that entry is trusted or not, so
+        steady state is unchanged."""
         known_sid = "4eecac24-1c21-47ad-ab11-a650708f3098"
         new_sid = "01a04f6b-4485-7290-afbd-9eae74405ec8"
         old_ts = "2020-01-01T00:00:00.000Z"
@@ -2106,6 +2109,76 @@ class PositionCursorTest(unittest.TestCase):
                          "the never-before-seen source's pre-lookback record "
                          "must not appear just because it had no recorded "
                          "position of its own")
+
+    def test_a_replaced_source_still_delivers_its_pre_lookback_record(self):
+        """`_start_offset` used to share one fallback line between two
+        different questions. A source with NO recorded entry gets the
+        lookback as a floor (the fix above, and correct). A source WITH a
+        recorded entry that is distrusted -- here, a generation mismatch --
+        fell through to that same line and inherited the lookback bound with
+        it: reproduced end to end through `positions_for`, a source recorded
+        under a stale generation and holding one record from 2020 delivered
+        zero events and had its position advanced to the end of the file,
+        silently and permanently losing a record no repeat would recover. An
+        offset that cannot be trusted says nothing about what this peer has
+        already seen, so the whole source must be offered again -- not
+        bounded by anything newer than its actual content."""
+        sid = "4eecac24-1c21-47ad-ab11-a650708f3098"
+        old_ts = "2020-01-01T00:00:00.000Z"
+        with tempfile.TemporaryDirectory() as project:
+            path = os.path.join(project, sid + ".jsonl")
+            with open(path, "w", encoding="utf-8") as f:
+                f.write(json.dumps({"type": "assistant", "timestamp": old_ts,
+                                    "message": {"content": [{"type": "text",
+                                                             "text": "from 2020"}]}}) + "\n")
+            cursor_path = os.path.join(project, ".antiphon", "cursor.json")
+            os.makedirs(os.path.dirname(cursor_path))
+            with open(cursor_path, "w", encoding="utf-8") as f:
+                json.dump({"claude_seen": {"v": 2, "sources":
+                           {sid: {"gen": "a-generation-from-before",
+                                  "offset": 0}}}}, f)
+
+            cursor = antiphon.read_cursor(project, "claude")
+            positions, since = antiphon.positions_for(cursor, "claude")
+            err = io.StringIO()
+            with patch.object(antiphon, "claude_transcripts",
+                              return_value=[path]), \
+                 contextlib.redirect_stderr(err):
+                events, _reached = antiphon.claude_events(project, positions, since)
+        self.assertEqual([e[2] for e in events], ["from 2020"],
+                         "a distrusted entry's whole source is offered again, "
+                         "not bounded by the lookback")
+        self.assertIn("replaced", err.getvalue())
+
+    def test_a_shrunk_source_still_delivers_its_pre_lookback_record(self):
+        """Same mechanism, the other distrust branch: a recorded offset past
+        the end of the file must not be bounded by the lookback either."""
+        sid = "4eecac24-1c21-47ad-ab11-a650708f3098"
+        old_ts = "2020-01-01T00:00:00.000Z"
+        with tempfile.TemporaryDirectory() as project:
+            path = os.path.join(project, sid + ".jsonl")
+            with open(path, "w", encoding="utf-8") as f:
+                f.write(json.dumps({"type": "assistant", "timestamp": old_ts,
+                                    "message": {"content": [{"type": "text",
+                                                             "text": "from 2020, shrunk"}]}}) + "\n")
+            gen = antiphon.source_generation(path)
+            cursor_path = os.path.join(project, ".antiphon", "cursor.json")
+            os.makedirs(os.path.dirname(cursor_path))
+            with open(cursor_path, "w", encoding="utf-8") as f:
+                json.dump({"claude_seen": {"v": 2, "sources":
+                           {sid: {"gen": gen, "offset": 999_999}}}}, f)
+
+            cursor = antiphon.read_cursor(project, "claude")
+            positions, since = antiphon.positions_for(cursor, "claude")
+            err = io.StringIO()
+            with patch.object(antiphon, "claude_transcripts",
+                              return_value=[path]), \
+                 contextlib.redirect_stderr(err):
+                events, _reached = antiphon.claude_events(project, positions, since)
+        self.assertEqual([e[2] for e in events], ["from 2020, shrunk"],
+                         "a shrunk entry's whole source is offered again, "
+                         "not bounded by the lookback")
+        self.assertIn("shorter", err.getvalue())
 
     def test_a_source_not_rediscovered_this_turn_is_not_dropped_from_the_cursor(self):
         """`_advance_cursor` merges `reached` onto a copy of `positions`, not

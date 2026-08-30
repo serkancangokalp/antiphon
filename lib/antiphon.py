@@ -586,13 +586,15 @@ def positions_for(cursor, side):
     A float under `<side>_seen` is the timestamp cursor every installed bridge
     holds today: no offsets yet, so it comes back as a `since` and each source
     is placed once. A dict is already offsets, but `since` still comes back as
-    the lookback rather than `None`: a source with a recorded entry resumes
-    from it and never looks at `since`, but a v2 map can still meet a source
-    it has no entry for -- an old session resumed, or a fourth transcript
-    rotating into the newest three -- and that source needs the same floor a
-    brand-new one gets, not the whole file with nothing holding it back.
-    Nothing here writes — the migration is finished by the first successful
-    delivery, under the lock, like every other cursor write.
+    the lookback rather than `None`: a source with a recorded entry never
+    consults `since` at all -- it resumes from that entry when it is still
+    trusted, or restarts from byte zero, not the lookback, when it is not --
+    but a v2 map can still meet a source it has no entry for -- an old session
+    resumed, or a fourth transcript rotating into the newest three -- and that
+    source needs the same floor a brand-new one gets, not the whole file with
+    nothing holding it back. Nothing here writes — the migration is finished
+    by the first successful delivery, under the lock, like every other cursor
+    write.
     """
     value = cursor.get("%s_seen" % side) if isinstance(cursor, dict) else None
     if (isinstance(value, dict) and value.get("v") == CURSOR_VERSION
@@ -828,7 +830,9 @@ def _source_size(path):
 def _start_offset(path, sid, generation, positions, since):
     """Where to start reading one source: its recorded offset, when the file
     is still the one that offset was measured against and has not shrunk
-    underneath it; otherwise the lookback, or byte zero when there is none.
+    underneath it; from byte zero, when the recorded offset cannot be
+    trusted; from the lookback, or byte zero, only when there is no
+    recorded entry to distrust in the first place.
 
     Every reason to distrust a recorded offset resolves the same way —
     because repeating records is the error this bridge accepts and skipping
@@ -836,21 +840,29 @@ def _start_offset(path, sid, generation, positions, since):
     """
     recorded = (positions or {}).get(sid)
     if recorded:
+        # Both branches below return 0, not the shared fallback at the end of
+        # this function. An offset that cannot be trusted says nothing about
+        # what this peer has already seen, so the whole source is offered
+        # again; bounding that by the lookback (the shared fallback) would
+        # skip everything older than it -- a gap, where a repeat is the error
+        # this bridge accepts everywhere else. That fallback answers a
+        # different question: a source with no recorded entry at all.
         if recorded.get("gen") != generation:
             print("antiphon: %s was replaced since it was last read (was %s, "
                   "now %s); reading it again"
                   % (sid, recorded.get("gen"), generation), file=sys.stderr)
-        else:
-            size = _source_size(path)
-            if size is None:
-                print("antiphon: %s could not be measured; reading it again"
-                      % sid, file=sys.stderr)
-            elif recorded["offset"] > size:
-                print("antiphon: %s is shorter than the %d bytes already read "
-                      "from it; reading it again" % (sid, recorded["offset"]),
-                      file=sys.stderr)
-            else:
-                return recorded["offset"]
+            return 0
+        size = _source_size(path)
+        if size is None:
+            print("antiphon: %s could not be measured; reading it again"
+                  % sid, file=sys.stderr)
+            return 0
+        if recorded["offset"] > size:
+            print("antiphon: %s is shorter than the %d bytes already read "
+                  "from it; reading it again" % (sid, recorded["offset"]),
+                  file=sys.stderr)
+            return 0
+        return recorded["offset"]
     return offset_at_or_after(path, since) if since is not None else 0
 
 
