@@ -581,11 +581,20 @@ def update_cursor(cwd, kind, mutate):
     `mutate` is called with the freshly read cursor and returns the object to
     write. Returns whether the write succeeded, or False if the lock could not
     be taken — in which case nothing was read, changed or written.
+
+    A `mutate` that changes nothing writes nothing. Two reads under one hold
+    cost less than a rewrite of the whole file on every turn end, and leaving
+    the bytes alone keeps `write_cursor`'s failure paths out of the ordinary
+    case where there was nothing to record.
     """
     with cursor_lock(cwd, kind) as locked:
         if not locked:
             return False
-        return write_cursor(cwd, mutate(read_cursor(cwd, kind)), kind)
+        before = read_cursor(cwd, kind)
+        updated = mutate(read_cursor(cwd, kind))
+        if updated == before:
+            return True
+        return write_cursor(cwd, updated, kind)
 
 
 def truncate(s, n):
@@ -1147,6 +1156,17 @@ def push(target="codex"):
             cursor[key] = updated
         return cursor
 
+    # The actual send happens inside `mutate`, which runs while `update_cursor`
+    # holds this peer's cursor lock — on purpose. The dedupe decision (what has
+    # already gone out) and the record of it cannot be separated: releasing the
+    # lock between them would let two pushes both pass the dedupe check and
+    # send the same message twice, which is exactly the failure dedupe exists
+    # to prevent. The cost is real — a slow or hung send holds the lock for up
+    # to its own timeout, and a concurrent `hook` or `antiphon_read` for this
+    # same peer waits behind it, up to `CURSOR_LOCK_PATIENCE`, before giving up
+    # on delivering context that turn. Splitting the delivery cursor from the
+    # push fingerprints into separate files with separate locks would remove
+    # this coupling; deferred to the plan that next migrates this file's shape.
     update_cursor(cwd, side, mutate)
     return 0
 
