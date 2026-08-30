@@ -85,8 +85,22 @@ def project_dir():
     return os.path.abspath(os.environ.get("ANTIPHON_CWD") or os.getcwd())
 
 
-def state_path(cwd):
+def state_path(cwd, kind):
+    """Where this peer's cursor lives. `kind` is the side the caller runs on.
+
+    A named peer owns its own file. An unnamed one keeps the project-wide path:
+    without a name there is one peer per side by definition, so there is nothing
+    to race with, and moving the path would strand every existing install.
+    """
+    name = peers.explicit_name()
+    if peers.valid_kind(kind) and peers.valid_name(name):
+        return os.path.join(peers.peer_dir(cwd, kind, name), "cursor.json")
     return os.path.join(cwd, ".antiphon", "cursor.json")
+
+
+def sender_side(target):
+    """The side a message addressed to `target` is being sent from."""
+    return "codex" if target == "claude" else "claude"
 
 
 LEGACY_KEYS = {
@@ -102,8 +116,8 @@ def _translate_cursor_keys(data):
     return {LEGACY_KEYS.get(k, k): v for k, v in data.items()}
 
 
-def read_cursor(cwd):
-    new_path = state_path(cwd)
+def read_cursor(cwd, kind):
+    new_path = state_path(cwd, kind)
     try:
         with open(new_path, encoding="utf-8") as f:
             data = json.load(f)
@@ -112,12 +126,12 @@ def read_cursor(cwd):
 
     translated = _translate_cursor_keys(data)
     if translated != data:
-        write_cursor(cwd, translated)
+        write_cursor(cwd, translated, kind)
     return translated
 
 
-def write_cursor(cwd, data):
-    path = state_path(cwd)
+def write_cursor(cwd, data, kind):
+    path = state_path(cwd, kind)
     os.makedirs(os.path.dirname(path), exist_ok=True)
     tmp = f"{path}.{os.getpid()}.tmp"
     try:
@@ -452,13 +466,13 @@ def hook(side="claude"):
         input_data = {}
     cwd = os.path.abspath(input_data.get("cwd") or project_dir())
 
-    cursor = read_cursor(cwd)
+    cursor = read_cursor(cwd, side)
     key = f"{side}_seen"
     start = float(cursor.get(key) or (time.time() - LOOKBACK))
     text, last, _ = build_summary(cwd, side, start)
     if text and last:
         cursor[key] = last
-        write_cursor(cwd, cursor)
+        write_cursor(cwd, cursor, side)
 
     if not text:
         return 0
@@ -559,7 +573,7 @@ def push(target="codex"):
         return 0
 
     outgoing = "\n".join(messages)
-    cursor = read_cursor(cwd)
+    cursor = read_cursor(cwd, sender_side(target))
     key = f"last_pushed_{target}"
     previous = cursor.get(key)
     if previous == outgoing:
@@ -576,7 +590,7 @@ def push(target="codex"):
 
     if ok:
         cursor[key] = outgoing
-        write_cursor(cwd, cursor)
+        write_cursor(cwd, cursor, sender_side(target))
         print(f"antiphon: delivered to {target.title()} ({len(outgoing)} characters)",
               file=sys.stderr)
     else:
@@ -696,9 +710,10 @@ def _record_delivery(cwd, target, text):
     Without it a message sent mid-turn through a channel tool arrives twice:
     once from the tool, once more when the same text ends the turn as an
     `@claude` / `@codex` line."""
-    cursor = read_cursor(cwd)
+    side = sender_side(target)
+    cursor = read_cursor(cwd, side)
     cursor[f"last_pushed_{target}"] = text
-    write_cursor(cwd, cursor)
+    write_cursor(cwd, cursor, side)
 
 
 def register_peer(*_):
@@ -797,12 +812,12 @@ def mcp():
             p = request.get("params") or {}
             name = p.get("name")
             if name == "antiphon_read":
-                cursor = read_cursor(cwd)
+                cursor = read_cursor(cwd, "codex")
                 start = float(cursor.get("codex_seen") or (time.time() - LOOKBACK))
                 text, last, _ = build_summary(cwd, "codex", start)
                 if text and last:
                     cursor["codex_seen"] = last
-                    write_cursor(cwd, cursor)
+                    write_cursor(cwd, cursor, "codex")
                 output = text or "Nothing new on the Claude Code side since your last turn."
                 _mcp_result(mid, {"content": [{"type": "text", "text": output}]})
             elif name == "antiphon_send":
@@ -1218,7 +1233,7 @@ def status():
     print(f"Codex rollouts:     {len(x)} files" + (f" (newest: {os.path.basename(x[0])})" if x else " — none"))
     socket_path = claude_socket_path(cwd)
     print(f"Claude channel:     {'live' if os.path.exists(socket_path) else 'down'} ({socket_path})")
-    cursor = read_cursor(cwd)
+    cursor = read_cursor(cwd, "claude")
     for k, v in (cursor or {}).items():
         if k.endswith("_seen") and isinstance(v, (int, float)):
             shown = datetime.fromtimestamp(v).strftime('%H:%M:%S') if v else '—'

@@ -53,7 +53,7 @@ class AntiphonTest(unittest.TestCase):
              patch.object(antiphon, "last_codex_reply", return_value="@claude test"), \
              patch.object(antiphon, "read_cursor", return_value={}), \
              patch.object(antiphon, "write_cursor",
-                          side_effect=lambda cwd, data: written.append(dict(data))), \
+                          side_effect=lambda cwd, data, kind: written.append(dict(data))), \
              patch.object(antiphon, "send_to_claude",
                           side_effect=lambda cwd, msg: (sent.append((cwd, msg)) or (True, ""))), \
              patch.object(antiphon.sys, "stdin", io.StringIO(json.dumps(input_data))), \
@@ -118,7 +118,7 @@ class AntiphonTest(unittest.TestCase):
              patch.object(antiphon, "send_to_claude", return_value=(True, "")), \
              patch.object(antiphon, "read_cursor", return_value={}), \
              patch.object(antiphon, "write_cursor",
-                          side_effect=lambda cwd, data: written.append(dict(data))):
+                          side_effect=lambda cwd, data, kind: written.append(dict(data))):
             self._run_mcp(project, self._call("antiphon_send", text="run the tests"))
         self.assertEqual(written, [{"last_pushed_claude": "run the tests"}])
 
@@ -149,7 +149,7 @@ class AntiphonTest(unittest.TestCase):
              patch.object(antiphon, "send_to_codex", return_value=(True, "")), \
              patch.object(antiphon, "read_cursor", return_value={}), \
              patch.object(antiphon, "write_cursor",
-                          side_effect=lambda cwd, data: written.append(dict(data))), \
+                          side_effect=lambda cwd, data, kind: written.append(dict(data))), \
              patch.object(antiphon.sys, "stdin", io.StringIO(json.dumps({"text": "hello"}))):
             self.assertEqual(antiphon.reply(), 0)
         self.assertEqual(written, [{"last_pushed_codex": "hello"}])
@@ -701,6 +701,47 @@ class AntiphonTest(unittest.TestCase):
                 os.path.join(project, ".codex", "hooks.json")))
             self.assertTrue(os.path.exists(os.path.join(project, ".mcp.json")))
 
+    # ---- one cursor per named peer ----
+
+    def test_an_unnamed_peer_keeps_the_project_wide_cursor(self):
+        """The compatibility contract: with no name there is one peer per side,
+        nothing to race with, and the path must not move."""
+        with patch.dict(os.environ, {}, clear=True):
+            self.assertEqual(antiphon.state_path("/tmp/project", "claude"),
+                             os.path.join("/tmp/project", ".antiphon", "cursor.json"))
+
+    def test_a_named_peer_gets_its_own_cursor_file(self):
+        with patch.dict(os.environ, {"ANTIPHON_NAME": "ui"}):
+            self.assertEqual(
+                antiphon.state_path("/tmp/project", "claude"),
+                os.path.join(antiphon.peers.peer_dir("/tmp/project", "claude", "ui"),
+                             "cursor.json"))
+
+    def test_the_two_sides_do_not_share_a_cursor_under_one_name(self):
+        """A user may well set the same ANTIPHON_NAME in both terminals."""
+        with patch.dict(os.environ, {"ANTIPHON_NAME": "ui"}):
+            self.assertNotEqual(antiphon.state_path("/tmp/project", "claude"),
+                                antiphon.state_path("/tmp/project", "codex"))
+
+    def test_two_named_peers_do_not_consume_each_others_events(self):
+        """One shared cursor meant the first reader advanced it for everyone and
+        the others never saw the event at all."""
+        with tempfile.TemporaryDirectory() as project:
+            with patch.dict(os.environ, {"ANTIPHON_NAME": "ui"}):
+                antiphon.write_cursor(project, {"codex_seen": 100.0}, "claude")
+            with patch.dict(os.environ, {"ANTIPHON_NAME": "api"}):
+                self.assertEqual(antiphon.read_cursor(project, "claude"), {})
+                antiphon.write_cursor(project, {"codex_seen": 200.0}, "claude")
+            with patch.dict(os.environ, {"ANTIPHON_NAME": "ui"}):
+                self.assertEqual(antiphon.read_cursor(project, "claude"),
+                                 {"codex_seen": 100.0})
+
+    def test_an_invalid_name_falls_back_to_the_project_cursor(self):
+        """A malformed name must not put a cursor somewhere unreachable."""
+        with patch.dict(os.environ, {"ANTIPHON_NAME": "Not Valid"}):
+            self.assertEqual(antiphon.state_path("/tmp/project", "codex"),
+                             os.path.join("/tmp/project", ".antiphon", "cursor.json"))
+
     def test_cursor_keys_from_the_turkish_era_are_translated_in_place(self):
         """A cursor written before the English rename carries Turkish keys; reading
         it must translate them and persist the translation."""
@@ -710,7 +751,7 @@ class AntiphonTest(unittest.TestCase):
             with open(path, "w", encoding="utf-8") as f:
                 json.dump({"codex_gordu": 12.0, "son_itilen_claude": "hello"}, f)
 
-            self.assertEqual(antiphon.read_cursor(project), {
+            self.assertEqual(antiphon.read_cursor(project, "claude"), {
                 "codex_seen": 12.0,
                 "last_pushed_claude": "hello",
             })
