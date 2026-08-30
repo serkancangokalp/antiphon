@@ -92,6 +92,13 @@ class AntiphonTest(unittest.TestCase):
         self.assertEqual(antiphon.batch_fingerprint(["a", "b"]),
                          antiphon.batch_fingerprint(["a", "b"]))
 
+    def test_a_cursor_field_of_the_wrong_shape_starts_over_instead_of_raising(self):
+        """`dict()` on a list is a TypeError and would surface as a traceback out
+        of the Stop hook — the last place a hand-edited file should reach."""
+        for broken in ([1, 2, 3], ["bad"], 42, 0.5, True):
+            self.assertEqual(antiphon.migrate_pushed(broken, ["m"]), ({}, False),
+                             repr(broken))
+
     def test_the_old_string_record_migrates_without_resending(self):
         """The old format stored the joined text, not a digest. Compared against
         a digest it is always unequal and would resend once on upgrade."""
@@ -112,24 +119,24 @@ class AntiphonTest(unittest.TestCase):
         the second differs from the newly stored first."""
         calls = []
         batches = antiphon.group_by_recipient("claude", "@claude:ui a\n@claude:ui b")
-        sent = antiphon.deliver_batches("claude", batches, {},
+        sent = antiphon.deliver_batches(batches, {},
                                         lambda r, m: calls.append((r, m)) or True)
-        antiphon.deliver_batches("claude", batches, sent,
+        antiphon.deliver_batches(batches, sent,
                                  lambda r, m: calls.append((r, m)) or True)
         self.assertEqual(calls, [("ui", ["a", "b"])])
 
     def test_only_the_recipient_that_succeeded_stops_being_retried(self):
         batches = antiphon.group_by_recipient("claude", "@claude:ui a\n@claude:api b")
-        sent = antiphon.deliver_batches("claude", batches, {},
+        sent = antiphon.deliver_batches(batches, {},
                                         lambda r, m: r == "ui")
         retried = []
-        antiphon.deliver_batches("claude", batches, sent,
+        antiphon.deliver_batches(batches, sent,
                                  lambda r, m: retried.append(r) or True)
         self.assertEqual(retried, ["api"])
 
     def test_the_unaddressed_slot_cannot_collide_with_a_peer_named_empty(self):
         batches = antiphon.group_by_recipient("claude", "@claude a\n@claude:: b")
-        sent = antiphon.deliver_batches("claude", batches, {}, lambda r, m: True)
+        sent = antiphon.deliver_batches(batches, {}, lambda r, m: True)
         self.assertEqual(sorted(sent), ["", "@"])
 
     def test_last_codex_reply(self):
@@ -211,6 +218,39 @@ class AntiphonTest(unittest.TestCase):
         self.assertEqual(written[0]["last_pushed_claude"],
                          {"": antiphon.batch_fingerprint(["same"])},
                          "and the record migrates to the new form")
+
+    def test_an_empty_marker_is_reported_even_beside_a_real_one(self):
+        """A batch holding one empty marker and one real message is not empty, so
+        a per-batch check let the empty line disappear without a word."""
+        sent = []
+        input_data = {"cwd": "/tmp/project", "transcript_path": "/tmp/rollout"}
+        err = io.StringIO()
+        with patch.object(antiphon.os.path, "exists", return_value=True), \
+             patch.object(antiphon, "last_codex_reply",
+                          return_value="@claude\n@claude run it"), \
+             patch.object(antiphon, "read_cursor", return_value={}), \
+             patch.object(antiphon, "write_cursor"), \
+             patch.object(antiphon, "send_to_claude",
+                          side_effect=lambda cwd, msg: (sent.append(msg) or (True, ""))), \
+             patch.object(antiphon.sys, "stdin", io.StringIO(json.dumps(input_data))), \
+             contextlib.redirect_stderr(err):
+            self.assertEqual(antiphon.push("claude"), 0)
+        self.assertEqual(sent, ["run it"], "the real message still goes")
+        self.assertEqual(err.getvalue().count("carried no message"), 1,
+                         "and the empty line is reported, not swallowed")
+
+    def test_an_empty_named_marker_names_the_recipient_it_meant(self):
+        input_data = {"cwd": "/tmp/project", "transcript_path": "/tmp/rollout"}
+        err = io.StringIO()
+        with patch.object(antiphon.os.path, "exists", return_value=True), \
+             patch.object(antiphon, "last_codex_reply",
+                          return_value="@claude:api\n@claude:api run"), \
+             patch.object(antiphon, "read_cursor", return_value={}), \
+             patch.object(antiphon, "write_cursor"), \
+             patch.object(antiphon.sys, "stdin", io.StringIO(json.dumps(input_data))), \
+             contextlib.redirect_stderr(err):
+            self.assertEqual(antiphon.push("claude"), 0)
+        self.assertIn("@claude:api line carried no message", err.getvalue())
 
     def test_a_named_marker_is_refused_until_routing_exists(self):
         """Resolving a name is a later task. Refusing out loud is honest;

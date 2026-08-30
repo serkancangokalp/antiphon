@@ -126,13 +126,20 @@ def migrate_pushed(sent, unaddressed):
     The old format stored the joined text rather than a digest, so comparing it
     against a digest is always unequal and would resend the last message once on
     upgrade. It is compared in its own form instead.
+
+    Any other shape — a list, a number, a hand-edited mistake — starts over as
+    an empty record rather than raising. `dict()` on a list is a TypeError, and
+    it would surface as a traceback out of the Stop hook, which is the last
+    place a malformed file should be able to reach.
     """
-    if not isinstance(sent, str):
-        return dict(sent or {}), False
-    return {}, bool(unaddressed) and sent == "\n".join(unaddressed)
+    if isinstance(sent, str):
+        return {}, bool(unaddressed) and sent == "\n".join(unaddressed)
+    if isinstance(sent, dict):
+        return dict(sent), False
+    return {}, False
 
 
-def deliver_batches(target, batches, sent, deliver):
+def deliver_batches(batches, sent, deliver):
     """Calls `deliver(recipient, messages)` for each batch that has not gone yet.
 
     A recipient's fingerprint advances only if its own delivery succeeded, so one
@@ -662,12 +669,16 @@ def push(target="codex"):
     reply_text = reply_reader(transcript)
     batches = {}
     for recipient, messages in group_by_recipient(target, reply_text).items():
+        # Reported per line, not per recipient: a batch holding one empty marker
+        # and one real message is not empty, so a per-batch check would let the
+        # empty line disappear without a word.
+        for blank in (m for m in messages if not m.strip()):
+            named = f":{recipient}" if recipient is not None else ""
+            print(f"antiphon: a @{target}{named} line carried no message, "
+                  "nothing sent for it", file=sys.stderr)
         said = [m for m in messages if m.strip()]
         if said:
             batches[recipient] = said
-        else:
-            print(f"antiphon: a @{target} line carried no message, nothing sent",
-                  file=sys.stderr)
     if not batches:
         return 0
 
@@ -704,7 +715,7 @@ def push(target="codex"):
             print(f"antiphon: delivery failed — {detail}", file=sys.stderr)
         return ok
 
-    updated = deliver_batches(target, batches, sent, deliver)
+    updated = deliver_batches(batches, sent, deliver)
     # Written only when something actually moved: a delivery landed, or the old
     # string format was recognised and needs recording in the new one. A turn
     # that delivered nothing leaves the cursor file alone.
