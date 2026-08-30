@@ -344,9 +344,10 @@ class ShippedContractTest(unittest.TestCase):
                  (str(antiphon.MAX_CHANNEL_BYTES // 1024), "KiB"))):
             self.assertRegex(limits, r"\s+".join(map(re.escape, words)), what)
         self.assertRegex(
-            limits, r"(?i)measured|not a permanent",
-            "the byte target is a measured host observation, and the README "
-            "must say so rather than promise it as a platform guarantee")
+            limits, r"(?i)8,000 UTF-8 bytes[^.]*measured[^.]*not a\s+permanent",
+            "the 8,000-byte target's own sentence must call it a measured "
+            "host observation and not a permanent guarantee — the word "
+            "'measured' appearing somewhere else in the section is not that")
         self.assertNotIn("2,600", limits, "the retired summary budget")
         self.assertNotRegex(limits, r"\b420\b", "the retired per-event cut")
 
@@ -362,6 +363,11 @@ class ShippedContractTest(unittest.TestCase):
             self.assertIn("has_more", text, name)
             self.assertRegex(text, r"(?i)one page|a single page", name)
             self.assertRegex(text, r"(?i)discover", name)
+            # Operational, not decorative: the surface must tell the agent what
+            # to DO while has_more is true — call again, or let later turns
+            # drain it. Naming the field without the loop teaches nothing.
+            self.assertRegex(text, r"(?i)again", name)
+            self.assertRegex(text, r"(?i)drain", name)
 
     def test_paged_context_surfaces_explain_oversized_mcp(self):
         """Measured on the installed hosts: both hooks spill an oversized record
@@ -375,6 +381,38 @@ class ShippedContractTest(unittest.TestCase):
             self.assertRegex(text, r"(?i)nothing (is|was) (read or )?marked seen",
                              name)
             self.assertRegex(text, r"(?i)next (automatic )?prompt", name)
+
+    def test_paged_context_cursor_keys_and_replay_reasons(self):
+        """The cursor contract is public product surface: both sides' page keys
+        are named in the README beside the preserved legacy key, the replay
+        reasons are a closed two-member set, a malformed cursor is documented
+        as replay rather than mistaken for a new side, and the rejected
+        timestamp-boundary migration model cannot quietly return — in prose or
+        in a docstring."""
+        for side in ("claude", "codex"):
+            self.assertEqual(antiphon.page_cursor_key(side), side + "_pages")
+        self.assertEqual(set(antiphon.REPLAY_NOTICES), {"legacy_upgrade",
+                                                        "cursor_recovery"})
+        limits = section(read("README.md"), "Limits")
+        self.assertIn("_pages", limits, "the semantic key is named")
+        self.assertIn("_seen", limits, "the preserved legacy key is named")
+        self.assertRegex(limits, r"(?i)exactly\s+two\s+fixed\s+explanation",
+                         "the replay reasons are a closed set, and the README "
+                         "says so rather than leaving the set open")
+        self.assertRegex(limits, r"(?i)legacy\s+upgrade", "reason one, named")
+        self.assertRegex(limits, r"(?i)cursor\s+recovery", "reason two, named")
+        self.assertRegex(limits, r"(?i)(malformed|unreadable)[^.]*byte\s+zero",
+                         "a malformed existing cursor replays; it is not a "
+                         "fresh install")
+        self.assertRegex(limits, r"(?i)missing\s+cursor[^.]*new\s+side",
+                         "only a genuinely missing cursor means a new side")
+        self.assertRegex(limits, r"(?i)timestamp\s+cursor[^.]*boundary[^.]*gone",
+                         "the retired boundary-migration promise is named as "
+                         "retired")
+        self.assertNotRegex(antiphon.offset_at_or_after.__doc__,
+                            r"(?i)migrat",
+                            "the helper's docstring described the rejected "
+                            "boundary-migration model once already")
 
     def test_paged_context_docs_name_the_remaining_losses(self):
         """A Limits section that reads as though the work were finished retires
@@ -395,6 +433,26 @@ class ShippedContractTest(unittest.TestCase):
         self.assertNotRegex(limits, r"(?i)one[- ]time",
                             "the measured replay is 69/53 pages, not a "
                             "hand-wave")
+        self.assertRegex(limits, r"(?i)line structure[^.]*intact|"
+                                 r"line structure[^.]*preserved",
+                         "whitespace preservation is stated, not implied")
+        self.assertRegex(limits, r"(?i)never\s+split\s+across\s+pages",
+                         "record atomicity is stated")
+        self.assertRegex(limits, r"(?i)host.s own\s+lifecycle",
+                         "spill files follow the host lifecycle, and the "
+                         "README says whose files they are")
+        backlog = read("BACKLOG.md")
+        for gap, pattern in (
+                ("stable event id", r"(?i)stable\s+event\s+id"),
+                ("source catalog", r"(?i)source\s+catalog"),
+                ("degraded-discovery marker", r"(?i)degraded-discovery"),
+                ("backward paging", r"(?i)backward\s+paging"),
+                ("last-record anchor", r"(?i)anchor"),
+                ("descriptor-safe reading", r"(?i)descriptor-safe"),
+                ("direct-channel spill", r"(?i)direct-channel\s+spill"),
+                ("v2 retirement", r"(?i)retirement")):
+            self.assertRegex(backlog, pattern,
+                             f"BACKLOG's ledger must keep naming {gap}")
         self.assertNotRegex(limits, r"(?i)\blossless\b(?![^.]*\bBACKLOG)",
                             "Limits calls the pull path lossless while tool "
                             "detail, discovery and backward paging still lose")

@@ -828,11 +828,13 @@ REPLAY_NOTICES = {
 def offset_at_or_after(path, timestamp):
     """The offset of the first record at or after `timestamp`, or the file's end.
 
-    Run once for a source a peer has never read, and once to migrate a cursor
-    that held a timestamp. Both are the same question, so they get one answer
-    rather than two that can disagree. `>=` rather than `>` repeats the record
-    at the boundary: deliberate, because records sharing that timestamp may
-    include ones an earlier selection dropped while the cursor moved past them.
+    Run only for a source a peer has genuinely never read, to place the normal
+    lookback window. It is deliberately NOT how legacy cursors arrive here: a
+    present v2/`_seen` value, like a malformed or unreadable cursor file, takes
+    the conservative byte-zero replay instead, because an old process may still
+    be moving that value and its boundary cannot be trusted. `>=` rather than
+    `>` repeats a record sharing the boundary timestamp — a duplicate, which
+    this bridge accepts where it never accepts a gap.
     """
     end = 0
     for start, end, line in read_records(path):

@@ -222,9 +222,11 @@ lifecycle. Codex's MCP tool-result surface showed no such verified path, so
 `antiphon_read` refuses that one record instead: nothing is read or marked
 seen, and the next automatic prompt hook delivers it.
 
-Page positions live under an isolated v3 cursor key. The old `_seen` value is
-preserved untouched for still-running pre-upgrade processes and rollback — it
-is never trusted or overwritten by paging code, and it is scheduled for
+Page positions live under an isolated v3 cursor key, `<side>_pages`
+(`claude_pages`, `codex_pages`). The old `<side>_seen` value is
+preserved untouched beside it for still-running pre-upgrade processes and
+rollback — it is never trusted or overwritten by paging code, and it is
+scheduled for
 retirement once pre-v3 processes no longer need it, not a template for
 accumulating keys. Any present legacy value, and equally a malformed or
 unreadable existing cursor file, starts a conservative replay of the currently
@@ -234,7 +236,8 @@ cursor migrates at its exact boundary is gone: that boundary cannot be trusted
 while an old process may still move it. The replay is bounded but it is not
 small — on the reviewed snapshots it took 69 Claude-source pages and 53
 Codex-source pages, up to that many automatic prompt turns — and every replay
-page carries a fixed explanation line until the final successfully persisted
+page carries one of exactly two fixed explanation lines, one for the legacy
+upgrade and one for cursor recovery, until the final successfully persisted
 page clears it, so duplicated history is visible as recovery rather than
 mistaken for a malfunction. A failed delivery leaves the cursor bytes exactly
 as they were.
