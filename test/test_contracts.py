@@ -315,6 +315,14 @@ class ShippedContractTest(unittest.TestCase):
                          "the README must name the Python floor it was tested "
                          "at, not a bare `Python 3`")
 
+    def test_the_mcp_server_reports_the_package_version(self):
+        """The MCP handshake names a version, and it sat at 0.1.0 through two
+        releases because nothing tied it to package.json. One number, one
+        fact: the string in the handshake is the version npm installs."""
+        version = json.loads(read("package.json"))["version"]
+        self.assertIn(f'"version": "{version}"', read("lib", "antiphon.py"),
+                      "serverInfo must carry the package version")
+
     def test_paged_context_limits_match_code(self):
         """Every number the README states about the pull path is read back off
         the constant that enforces it, and the retired cuts are gone from both
