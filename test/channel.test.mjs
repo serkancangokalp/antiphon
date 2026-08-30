@@ -363,6 +363,42 @@ async function theWrapperTakesItsChannelDownWithIt(signal) {
   }
 }
 
+async function aSignalTheInstantTheSocketAppearsIsStillClean() {
+  // The socket becomes externally visible partway through startup. Registering
+  // the lifecycle handlers after that — at the end of the module, once the claim
+  // and the bind had finished — left a window where a signal met the default
+  // disposition instead: measured at 30 runs out of 30, each exiting under
+  // SIGTERM with its socket and its registry claim left behind. A session closed
+  // at the wrong moment hit exactly this.
+  //
+  // Signalled the instant the socket exists, repeatedly, because a window this
+  // wide only stays shut if something keeps checking.
+  for (let attempt = 0; attempt < 5; attempt++) {
+    const dir = await mkdtemp(join(tmpdir(), "antiphon-startrace-"));
+    const session = spawnChannel(dir, "");
+    try {
+      const deadline = Date.now() + 8_000;
+      while (!existsSync(session.socketPath) && Date.now() < deadline
+             && session.child.exitCode === null) {
+        await new Promise((resolve) => setImmediate(resolve));
+      }
+      assert.ok(existsSync(session.socketPath), `never served: ${session.stderr()}`);
+
+      session.child.kill("SIGTERM");
+      assert.ok(await waitForExit(session.child, 5_000), `attempt ${attempt}: no exit`);
+      assert.equal(session.child.exitCode, 0,
+        `attempt ${attempt}: signalled during startup must still exit cleanly`);
+      assert.ok(!existsSync(session.socketPath),
+        `attempt ${attempt}: socket left behind`);
+      assert.deepEqual(registeredPeers(dir), [],
+        `attempt ${attempt}: registry claim left behind`);
+    } finally {
+      await cleanUp(session, dir);
+    }
+  }
+}
+
+await aSignalTheInstantTheSocketAppearsIsStillClean();
 await losingTheStdioClientEndsTheSession();
 for (const signal of ["SIGTERM", "SIGINT", "SIGHUP"]) {
   await theWrapperTakesItsChannelDownWithIt(signal);
