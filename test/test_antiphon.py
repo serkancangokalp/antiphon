@@ -373,7 +373,8 @@ class AntiphonTest(unittest.TestCase):
              patch.object(antiphon.sys, "stdin",
                           io.StringIO(json.dumps(self._call("antiphon_read")) + "\n")), \
              patch.object(antiphon, "build_summary",
-                          return_value=("## something happened", 1000.0, 1)), \
+                          return_value=("## something happened",
+                                       {"s1": {"gen": "g", "offset": 1000}}, 1)), \
              patch.object(antiphon, "read_cursor", return_value={}), \
              patch.object(antiphon, "write_cursor",
                           side_effect=lambda *a, **k: record.append("advance") or True), \
@@ -392,7 +393,8 @@ class AntiphonTest(unittest.TestCase):
              patch.object(antiphon.sys, "stdin",
                           io.StringIO(json.dumps(self._call("antiphon_read")) + "\n")), \
              patch.object(antiphon, "build_summary",
-                          return_value=("## something happened", 1000.0, 1)), \
+                          return_value=("## something happened",
+                                       {"s1": {"gen": "g", "offset": 1000}}, 1)), \
              patch.object(antiphon, "read_cursor", return_value={}), \
              patch.object(antiphon, "write_cursor",
                           side_effect=lambda *a, **k: record.append("advance") or True), \
@@ -415,7 +417,8 @@ class AntiphonTest(unittest.TestCase):
                  patch.object(antiphon.sys, "stdin",
                               io.StringIO(json.dumps(self._call("antiphon_read")) + "\n")), \
                  patch.object(antiphon, "build_summary",
-                              return_value=("## something happened", 1000.0, 1)), \
+                              return_value=("## something happened",
+                                           {"s1": {"gen": "g", "offset": 1000}}, 1)), \
                  patch.object(antiphon, "read_cursor", return_value={}), \
                  patch.object(antiphon, "write_cursor",
                               side_effect=lambda *a, **k: record.append("advance") or True), \
@@ -707,7 +710,9 @@ class AntiphonTest(unittest.TestCase):
              patch.object(antiphon, "project_dir", return_value=project), \
              patch.object(antiphon, "read_cursor", return_value={}), \
              patch.object(antiphon, "write_cursor"), \
-             patch.object(antiphon, "build_summary", return_value=("summary", 123.0, 2)), \
+             patch.object(antiphon, "build_summary",
+                          return_value=("summary",
+                                        {"s1": {"gen": "g", "offset": 123}}, 2)), \
              patch.object(antiphon.sys, "stdin",
                           io.StringIO(json.dumps({"cwd": project}))), \
              contextlib.redirect_stdout(out):
@@ -946,8 +951,9 @@ class AntiphonTest(unittest.TestCase):
                                 "timestamp": "2026-08-30T10:00:00.000Z",
                                 "message": {"content": text}}, **record))
         with patch.object(antiphon, "claude_transcripts", return_value=["t.jsonl"]), \
-             patch.object(antiphon, "tail_lines", return_value=[line]):
-            return [e[2] for e in antiphon.claude_events("/tmp/project")]
+             patch.object(antiphon, "read_records", side_effect=_as_records([line])):
+            events, _ = antiphon.claude_events("/tmp/project")
+            return [e[2] for e in events]
 
     @staticmethod
     def _codex_user_texts(text):
@@ -955,8 +961,9 @@ class AntiphonTest(unittest.TestCase):
                            "payload": {"type": "message", "role": "user",
                                        "content": [{"type": "input_text", "text": text}]}})
         with patch.object(antiphon, "codex_rollout_files", return_value=["r.jsonl"]), \
-             patch.object(antiphon, "tail_lines", return_value=[line]):
-            return [e[2] for e in antiphon.codex_events("/tmp/project")]
+             patch.object(antiphon, "read_records", side_effect=_as_records([line])):
+            events, _ = antiphon.codex_events("/tmp/project")
+            return [e[2] for e in events]
 
     def test_a_user_message_naming_the_tool_is_not_swallowed(self):
         """A bare substring test over the first 40 characters silently dropped a
@@ -1170,8 +1177,9 @@ class AntiphonTest(unittest.TestCase):
             "message": {"content": [{"type": "text", "text": "SELECT\n  id"},
                                     {"type": "text", "text": "FROM users;"}]}})
         with patch.object(antiphon, "claude_transcripts", return_value=["t.jsonl"]), \
-             patch.object(antiphon, "tail_lines", return_value=[line]):
-            texts = [e[2] for e in antiphon.claude_events("/tmp/project")]
+             patch.object(antiphon, "read_records", side_effect=_as_records([line])):
+            events, _ = antiphon.claude_events("/tmp/project")
+            texts = [e[2] for e in events]
         self.assertEqual(texts, ["SELECT\n  id", "FROM users;"])
 
     def test_two_records_sharing_a_timestamp_keep_their_position_in_the_file(self):
@@ -1181,8 +1189,9 @@ class AntiphonTest(unittest.TestCase):
                              "message": {"content": [{"type": "text", "text": t}]}})
                  for t in ("zebra first", "apple second")]
         with patch.object(antiphon, "claude_transcripts", return_value=["t.jsonl"]), \
-             patch.object(antiphon, "tail_lines", return_value=lines):
-            texts = [e[2] for e in antiphon.claude_events("/tmp/project")]
+             patch.object(antiphon, "read_records", side_effect=_as_records(lines)):
+            events, _ = antiphon.claude_events("/tmp/project")
+            texts = [e[2] for e in events]
         self.assertEqual(texts, ["zebra first", "apple second"])
 
     def test_the_codex_parser_orders_by_position_too(self):
@@ -1193,8 +1202,9 @@ class AntiphonTest(unittest.TestCase):
                                          "content": [{"type": "text", "text": t}]}})
                  for t in ("zebra first", "apple second")]
         with patch.object(antiphon, "codex_rollout_files", return_value=["r.jsonl"]), \
-             patch.object(antiphon, "tail_lines", side_effect=lambda _p: lines):
-            texts = [e[2] for e in antiphon.codex_events("/tmp/project")]
+             patch.object(antiphon, "read_records", side_effect=_as_records(lines)):
+            events, _ = antiphon.codex_events("/tmp/project")
+            texts = [e[2] for e in events]
         self.assertEqual(texts, ["zebra first", "apple second"])
 
     def test_cross_file_order_follows_the_path_not_the_text(self):
@@ -1211,15 +1221,18 @@ class AntiphonTest(unittest.TestCase):
         contents = {"a.jsonl": "zebra, in the first file",
                     "b.jsonl": "apple, in the second"}
 
-        def per_file(path):
-            return [json.dumps({"type": "assistant",
-                                "timestamp": "2026-08-30T10:00:00.000Z",
-                                "message": {"content": [{"type": "text",
-                                                         "text": contents[path]}]}})]
+        def per_file(path, offset=0):
+            line = json.dumps({"type": "assistant",
+                               "timestamp": "2026-08-30T10:00:00.000Z",
+                               "message": {"content": [{"type": "text",
+                                                        "text": contents[path]}]}})
+            return _as_records([line])(path, offset)
+
         for discovery in (["b.jsonl", "a.jsonl"], ["a.jsonl", "b.jsonl"]):
             with patch.object(antiphon, "claude_transcripts", return_value=discovery), \
-                 patch.object(antiphon, "tail_lines", side_effect=per_file):
-                texts = [e[2] for e in antiphon.claude_events("/tmp/project")]
+                 patch.object(antiphon, "read_records", side_effect=per_file):
+                events, _ = antiphon.claude_events("/tmp/project")
+                texts = [e[2] for e in events]
             self.assertEqual(texts, ["zebra, in the first file",
                                      "apple, in the second"], discovery)
 
@@ -1233,8 +1246,9 @@ class AntiphonTest(unittest.TestCase):
                                {"type": "text", "text": "here is the query"},
                                {"type": "text", "text": "SELECT 1;"}]}})
         with patch.object(antiphon, "claude_transcripts", return_value=["t.jsonl"]), \
-             patch.object(antiphon, "tail_lines", return_value=[line]):
-            texts = [e[2] for e in antiphon.claude_events("/tmp/project")]
+             patch.object(antiphon, "read_records", side_effect=_as_records([line])):
+            events, _ = antiphon.claude_events("/tmp/project")
+            texts = [e[2] for e in events]
         self.assertEqual(texts, ["here is the query\n\nSELECT 1;"])
 
     def test_the_join_does_not_become_a_per_block_strip(self):
@@ -1247,8 +1261,9 @@ class AntiphonTest(unittest.TestCase):
                                {"type": "text", "text": "def f():\n    return 1\n"},
                                {"type": "text", "text": "  indented note"}]}})
         with patch.object(antiphon, "claude_transcripts", return_value=["t.jsonl"]), \
-             patch.object(antiphon, "tail_lines", return_value=[line]):
-            texts = [e[2] for e in antiphon.claude_events("/tmp/project")]
+             patch.object(antiphon, "read_records", side_effect=_as_records([line])):
+            events, _ = antiphon.claude_events("/tmp/project")
+            texts = [e[2] for e in events]
         self.assertEqual(texts, ["def f():\n    return 1\n\n\n  indented note"])
 
     def test_an_empty_block_adds_no_boundary(self):
@@ -1260,9 +1275,9 @@ class AntiphonTest(unittest.TestCase):
                                {"type": "text", "text": "   "},
                                {"type": "text", "text": "two"}]}})
         with patch.object(antiphon, "claude_transcripts", return_value=["t.jsonl"]), \
-             patch.object(antiphon, "tail_lines", return_value=[line]):
-            self.assertEqual([e[2] for e in antiphon.claude_events("/tmp/project")],
-                             ["one\n\ntwo"])
+             patch.object(antiphon, "read_records", side_effect=_as_records([line])):
+            events, _ = antiphon.claude_events("/tmp/project")
+            self.assertEqual([e[2] for e in events], ["one\n\ntwo"])
 
     def test_the_codex_parser_keeps_its_block_boundaries(self):
         line = json.dumps({"type": "response_item",
@@ -1274,8 +1289,9 @@ class AntiphonTest(unittest.TestCase):
                                            {"type": "input_text",
                                             "text": "SELECT 1;"}]}})
         with patch.object(antiphon, "codex_rollout_files", return_value=["r.jsonl"]), \
-             patch.object(antiphon, "tail_lines", return_value=[line]):
-            self.assertEqual([e[2] for e in antiphon.codex_events("/tmp/project")],
+             patch.object(antiphon, "read_records", side_effect=_as_records([line])):
+            events, _ = antiphon.codex_events("/tmp/project")
+            self.assertEqual([e[2] for e in events],
                              ["here is the query\n\nSELECT 1;"])
 
     def test_the_codex_join_does_not_become_a_per_block_strip(self):
@@ -1292,8 +1308,9 @@ class AntiphonTest(unittest.TestCase):
                                            {"type": "input_text",
                                             "text": "  indented note"}]}})
         with patch.object(antiphon, "codex_rollout_files", return_value=["r.jsonl"]), \
-             patch.object(antiphon, "tail_lines", return_value=[line]):
-            texts = [e[2] for e in antiphon.codex_events("/tmp/project")]
+             patch.object(antiphon, "read_records", side_effect=_as_records([line])):
+            events, _ = antiphon.codex_events("/tmp/project")
+            texts = [e[2] for e in events]
         self.assertEqual(texts, ["def f():\n    return 1\n\n\n  indented note"])
 
     def test_an_empty_codex_block_adds_no_boundary(self):
@@ -1307,9 +1324,9 @@ class AntiphonTest(unittest.TestCase):
                                            {"type": "input_text", "text": "   "},
                                            {"type": "input_text", "text": "two"}]}})
         with patch.object(antiphon, "codex_rollout_files", return_value=["r.jsonl"]), \
-             patch.object(antiphon, "tail_lines", return_value=[line]):
-            self.assertEqual([e[2] for e in antiphon.codex_events("/tmp/project")],
-                             ["one\n\ntwo"])
+             patch.object(antiphon, "read_records", side_effect=_as_records([line])):
+            events, _ = antiphon.codex_events("/tmp/project")
+            self.assertEqual([e[2] for e in events], ["one\n\ntwo"])
 
     # ---- Important 2: upgrading a legacy hook must not leave a duplicate ----
 
@@ -1710,6 +1727,149 @@ class OffsetReadingTest(unittest.TestCase):
             self.assertEqual(list(antiphon.read_records(os.path.join(d, "gone.jsonl"))), [])
 
 
+class PositionCursorTest(unittest.TestCase):
+    """The parsers read from a per-source position instead of a fixed tail
+    window, and the cursor records one instead of a timestamp.
+
+    `reached` is the parser's own high-water mark: the end of the last
+    complete record read from each source, not of the last record that
+    produced an event. `positions_for` reads whichever cursor version is on
+    disk — a float `since` for the pre-existing timestamp cursor, or a v2
+    positions map — and the cursor still advances past everything read, not
+    only what a summary kept, because selection stays newest-first until the
+    next plan pages oldest-first.
+    """
+
+    def test_an_event_carries_the_source_and_offset_it_came_from(self):
+        """A timestamp cannot resume inside a group of records written in the
+        same second. An offset can, which is what this field is for."""
+        lines = [json.dumps({"type": "assistant",
+                             "timestamp": "2026-08-30T10:00:00.000Z",
+                             "message": {"content": [{"type": "text", "text": t}]}})
+                 for t in ("first", "second")]
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "4eecac24-1c21-47ad-ab11-a650708f3098.jsonl")
+            with open(path, "w", encoding="utf-8") as f:
+                f.write("\n".join(lines) + "\n")
+            with patch.object(antiphon, "claude_transcripts", return_value=[path]):
+                events, reached = antiphon.claude_events("/tmp/project")
+        self.assertEqual([e[2] for e in events], ["first", "second"],
+                         "the text is still the third field")
+        sid = "4eecac24-1c21-47ad-ab11-a650708f3098"
+        self.assertEqual([e.source for e in events], [sid, sid])
+        self.assertEqual(events[0].end, events[1].offset,
+                         "one record ends where the next begins")
+        self.assertEqual(reached[sid]["offset"], events[1].end)
+
+    def test_a_source_resumes_from_its_recorded_offset(self):
+        lines = [json.dumps({"type": "assistant",
+                             "timestamp": "2026-08-30T10:00:00.000Z",
+                             "message": {"content": [{"type": "text", "text": t}]}})
+                 for t in ("first", "second")]
+        sid = "4eecac24-1c21-47ad-ab11-a650708f3098"
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, sid + ".jsonl")
+            with open(path, "w", encoding="utf-8") as f:
+                f.write("\n".join(lines) + "\n")
+            with patch.object(antiphon, "claude_transcripts", return_value=[path]):
+                first, _ = antiphon.claude_events("/tmp/project")
+                gen = antiphon.source_generation(path)
+                resumed, _ = antiphon.claude_events(
+                    "/tmp/project", {sid: {"gen": gen, "offset": first[0].end}})
+        self.assertEqual([e[2] for e in resumed], ["second"])
+
+    def test_reached_passes_the_records_that_produced_no_event(self):
+        """Host records and system entries produce no event. A high-water mark
+        taken from the events would stop before them and re-read them every
+        turn — measured at 227,170 bytes on one real source."""
+        content = json.dumps({"type": "assistant",
+                              "timestamp": "2026-08-30T10:00:00.000Z",
+                              "message": {"content": [{"type": "text",
+                                                       "text": "shown"}]}})
+        filtered = json.dumps({"type": "user", "promptSource": "system",
+                               "timestamp": "2026-08-30T10:00:01.000Z",
+                               "message": {"content": "<task-notification>x"}})
+        sid = "4eecac24-1c21-47ad-ab11-a650708f3098"
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, sid + ".jsonl")
+            with open(path, "w", encoding="utf-8") as f:
+                f.write(content + "\n" + filtered + "\n")
+            size = os.path.getsize(path)
+            with patch.object(antiphon, "claude_transcripts", return_value=[path]):
+                events, reached = antiphon.claude_events("/tmp/project")
+        self.assertEqual([e[2] for e in events], ["shown"])
+        self.assertEqual(reached[sid]["offset"], size,
+                         "the position passes the filtered record too")
+
+    def test_a_peer_with_no_position_starts_at_the_lookback(self):
+        old = json.dumps({"type": "assistant", "timestamp": "2020-01-01T00:00:00.000Z",
+                          "message": {"content": [{"type": "text", "text": "ancient"}]}})
+        recent = json.dumps({"type": "assistant",
+                             "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S.000Z",
+                                                        time.gmtime()),
+                             "message": {"content": [{"type": "text", "text": "recent"}]}})
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "4eecac24-1c21-47ad-ab11-a650708f3098.jsonl")
+            with open(path, "w", encoding="utf-8") as f:
+                f.write(old + "\n" + recent + "\n")
+            with patch.object(antiphon, "claude_transcripts", return_value=[path]):
+                events, _ = antiphon.claude_events(
+                    "/tmp/project", since=time.time() - antiphon.LOOKBACK)
+        self.assertEqual([e[2] for e in events], ["recent"])
+
+    def test_a_timestamp_cursor_becomes_a_lookback_and_repeats_its_boundary(self):
+        """Measured against real cursors: no gap in either direction, and
+        exactly one record repeated at the boundary. The repeat is deliberate —
+        records sharing that timestamp may include ones the old EVENT_LIMIT
+        slice dropped while the cursor jumped past them anyway."""
+        positions, since = antiphon.positions_for({"claude_seen": 1000.0}, "claude")
+        self.assertEqual(positions, {})
+        self.assertEqual(since, 1000.0)
+
+    def test_a_v2_cursor_is_read_as_positions(self):
+        cursor = {"claude_seen": {"v": 2, "sources": {"s1": {"gen": "g", "offset": 12}}}}
+        positions, since = antiphon.positions_for(cursor, "claude")
+        self.assertEqual(positions, {"s1": {"gen": "g", "offset": 12}})
+        self.assertIsNone(since)
+
+    def test_a_cursor_entry_that_is_not_a_position_is_refused(self):
+        """`cursor.json` gets hand-edited, restored from the wrong place, and
+        written by other versions — this file has a whole test class about it.
+        Measured on the first draft of this plan: an entry of `42` raised
+        AttributeError, a string offset raised TypeError, `-1` was accepted, and
+        `True` seeked to byte 1. Every one of those is a crash or a silent
+        misread where the safe answer is the lookback."""
+        for broken in (42, "bad", [], {"gen": "g"}, {"gen": "g", "offset": "5"},
+                       {"gen": "g", "offset": -1}, {"gen": "g", "offset": True},
+                       {"gen": 5, "offset": 5}):
+            cursor = {"claude_seen": {"v": 2, "sources": {"s1": broken}}}
+            positions, since = antiphon.positions_for(cursor, "claude")
+            self.assertEqual(positions, {}, repr(broken))
+            self.assertIsNotNone(since, repr(broken))
+
+    def test_the_advance_covers_every_record_read_not_only_those_shown(self):
+        """Selection is still newest-first. Advancing only over what was shown
+        would either skip the records in between for good, or move nothing at
+        all and re-read the same backlog every turn."""
+        many = [json.dumps({"type": "assistant",
+                            "timestamp": "2026-08-30T10:00:00.000Z",
+                            "message": {"content": [{"type": "text",
+                                                     "text": "line %d" % i}]}})
+                for i in range(antiphon.EVENT_LIMIT + 5)]
+        sid = "4eecac24-1c21-47ad-ab11-a650708f3098"
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, sid + ".jsonl")
+            with open(path, "w", encoding="utf-8") as f:
+                f.write("\n".join(many) + "\n")
+            size = os.path.getsize(path)
+            with patch.object(antiphon, "codex_rollout_files", return_value=[]), \
+                 patch.object(antiphon, "claude_transcripts", return_value=[path]):
+                text, reached, _count = antiphon.build_summary("/tmp/project", "codex")
+        self.assertTrue(text)
+        self.assertEqual(reached[sid]["offset"], size,
+                         "past the last record read, not the last shown")
+
+
 class MalformedStateTest(unittest.TestCase):
     """State that parses as JSON and still isn't what the reader expects.
 
@@ -1795,7 +1955,7 @@ class MalformedStateTest(unittest.TestCase):
                           return_value=("", None, 0)) as summary, \
              contextlib.redirect_stdout(out):
             code = antiphon.hook(side)
-        return code, summary.call_args.args[2]
+        return code, summary.call_args.args[3]
 
     def test_the_hook_starts_from_the_lookback_when_the_cursor_holds_no_time(self):
         for contents in ('{"claude_seen": NaN}', '{"claude_seen": Infinity}',
@@ -1821,7 +1981,7 @@ class MalformedStateTest(unittest.TestCase):
                                   return_value=("", None, 0)) as summary, \
                      contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
                     antiphon.mcp()
-                start = summary.call_args.args[2]
+                start = summary.call_args.args[3]
             self.assertTrue(out.getvalue().strip(), contents)
             self.assertAlmostEqual(start, time.time() - antiphon.LOOKBACK,
                                    delta=5, msg=contents)
@@ -1914,6 +2074,26 @@ class _Recording(io.StringIO):
         return super().write(chunk)
 
 
+def _as_records(lines):
+    """Turns transcript lines into what `read_records` yields.
+
+    Offsets are counted in **bytes**, as the real reader does. Measured on this
+    project's transcripts, 26% of lines differ in length between characters and
+    UTF-8 bytes — 384 KB in total, up to 15 KB on a single line — so a helper
+    that counted characters would hand the tests synthetic offsets that agree
+    with nothing, and a resume test could stay green while the offsets were
+    wrong.
+    """
+    def records(_path, offset=0):
+        position = 0
+        for line in lines:
+            start = position
+            position += len(line.encode("utf-8")) + 1
+            if start >= offset:
+                yield start, position, line
+    return records
+
+
 class CodexPeerWiringTest(unittest.TestCase):
     """The two Codex writers, wired to the processes that actually run them.
 
@@ -1964,7 +2144,9 @@ class CodexPeerWiringTest(unittest.TestCase):
         return code, out.getvalue(), err.getvalue(), written
 
     def _deliver_hook(self, project, stdout, record=None, name="",
-                      summary=("## something happened", 1000.0, 1), side="claude"):
+                      summary=("## something happened",
+                               {"s1": {"gen": "g", "offset": 1000}}, 1),
+                      side="claude"):
         """One prompt through the hook, against a real project directory, with a
         stdout of the test's choosing.
 
@@ -2446,7 +2628,7 @@ class CodexPeerWiringTest(unittest.TestCase):
             with tempfile.TemporaryDirectory() as project:
                 code, out, _, _ = self._hook(project, event=event,
                                              session_id=self.UUID,
-                                             summary=("news", 5.0, 1))
+                                             summary=("news", {"s1": {"gen": "g", "offset": 5}}, 1))
                 self.assertEqual(code, 0, event)
                 self.assertEqual(out, "", event)
 
@@ -2474,11 +2656,11 @@ class CodexPeerWiringTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as project:
             _, _, _, written = self._hook(project, event="SessionStart",
                                           session_id=self.UUID,
-                                          summary=("news", 5.0, 1))
+                                          summary=("news", {"s1": {"gen": "g", "offset": 5}}, 1))
             self.assertEqual(written, [], "nothing was read, so nothing is seen")
             _, out, _, written = self._hook(project, event="UserPromptSubmit",
                                             session_id=self.UUID,
-                                            summary=("news", 5.0, 1))
+                                            summary=("news", {"s1": {"gen": "g", "offset": 5}}, 1))
         self.assertEqual(written, ["codex"])
         self.assertIn("news", out)
 
@@ -2487,7 +2669,7 @@ class CodexPeerWiringTest(unittest.TestCase):
         the prompt one. Guessing silence there would cost every injection."""
         with tempfile.TemporaryDirectory() as project:
             _, out, _, _ = self._hook(project, event=None, session_id=self.UUID,
-                                      summary=("news", 5.0, 1))
+                                      summary=("news", {"s1": {"gen": "g", "offset": 5}}, 1))
         self.assertIn("news", out)
 
     def test_the_claude_hook_touches_no_part_of_the_codex_registry(self):
@@ -2519,7 +2701,7 @@ class CodexPeerWiringTest(unittest.TestCase):
                           side_effect=OSError("disk gone")):
             _, out, err, _ = self._hook(project, event="UserPromptSubmit",
                                         session_id=self.UUID,
-                                        summary=("news", 5.0, 1))
+                                        summary=("news", {"s1": {"gen": "g", "offset": 5}}, 1))
         self.assertIn("news", out)
         self.assertIn("disk gone", err)
 
@@ -2527,7 +2709,7 @@ class CodexPeerWiringTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as project:
             self._register(project)
             _, out, _, _ = self._hook(project, event="UserPromptSubmit",
-                                      session_id=None, summary=("news", 5.0, 1))
+                                      session_id=None, summary=("news", {"s1": {"gen": "g", "offset": 5}}, 1))
             self.assertIsNone(antiphon.peers.read_peers(project, "codex")[0]["address"])
         self.assertIn("news", out)
 

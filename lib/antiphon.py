@@ -28,6 +28,7 @@ server runs on Node.js with the official MCP SDK.
 """
 
 import glob
+import collections
 import contextlib
 import errno
 import fcntl
@@ -561,6 +562,46 @@ def cursor_time(cursor, key, default=None):
     return value
 
 
+CURSOR_VERSION = 2
+
+
+def _valid_position(entry):
+    """A cursor entry is trusted only when every part of it is what it claims.
+
+    This file is hand-edited, restored from the wrong place, and written by
+    other versions — the suite has a class about exactly that. An entry that is
+    not a position must send the caller to the lookback, which repeats, rather
+    than into a seek to byte 1 or an exception out of a hook.
+    """
+    return (isinstance(entry, dict)
+            and isinstance(entry.get("gen"), str)
+            and isinstance(entry.get("offset"), int)
+            and not isinstance(entry.get("offset"), bool)
+            and entry["offset"] >= 0)
+
+
+def positions_for(cursor, side):
+    """`(positions, since)` for one side, whichever cursor version is on disk.
+
+    A float under `<side>_seen` is the timestamp cursor every installed bridge
+    holds today: no offsets yet, so it comes back as a `since` and each source
+    is placed once. A dict is already offsets. Nothing here writes — the
+    migration is finished by the first successful delivery, under the lock,
+    like every other cursor write.
+    """
+    value = cursor.get("%s_seen" % side) if isinstance(cursor, dict) else None
+    if isinstance(value, dict) and isinstance(value.get("sources"), dict):
+        sources = {sid: entry for sid, entry in value["sources"].items()
+                   if _valid_position(entry)}
+        if len(sources) == len(value["sources"]):
+            return sources, None
+        # Something in there is not a position. Rather than trust the rest of a
+        # file that has clearly been through something, fall back whole.
+        print("antiphon: %s_seen holds an entry that is not a position; "
+              "reading from the lookback instead" % side, file=sys.stderr)
+    return {}, cursor_time(cursor, "%s_seen" % side)
+
+
 def write_cursor(cwd, data, kind):
     path = state_path(cwd, kind)
     os.makedirs(os.path.dirname(path), exist_ok=True)
@@ -722,6 +763,51 @@ def iso_epoch(s):
         return 0.0
 
 
+Event = collections.namedtuple("Event", "time kind text source generation offset end")
+
+
+def offset_at_or_after(path, timestamp):
+    """The offset of the first record at or after `timestamp`, or the file's end.
+
+    Run once for a source a peer has never read, and once to migrate a cursor
+    that held a timestamp. Both are the same question, so they get one answer
+    rather than two that can disagree. `>=` rather than `>` repeats the record
+    at the boundary: deliberate, because records sharing that timestamp may
+    include ones an earlier selection dropped while the cursor moved past them.
+    """
+    end = 0
+    for start, end, line in read_records(path):
+        try:
+            when = iso_epoch(json.loads(line).get("timestamp"))
+        except (json.JSONDecodeError, AttributeError):
+            continue
+        if when >= timestamp:
+            return start
+    return end
+
+
+def _source_size(path):
+    try:
+        return os.path.getsize(path)
+    except OSError:
+        return 0
+
+
+def _start_offset(path, sid, generation, positions, since):
+    """Where to start reading one source.
+
+    Every reason to distrust a recorded offset resolves the same way — read the
+    source again from the window's start — because repeating records is the
+    error this bridge accepts and skipping them is the one it does not. Task 3
+    adds the part where somebody is told which reason applied.
+    """
+    recorded = (positions or {}).get(sid)
+    if (recorded and recorded.get("gen") == generation
+            and recorded["offset"] <= _source_size(path)):
+        return recorded["offset"]
+    return offset_at_or_after(path, since) if since is not None else 0
+
+
 # ---------- Claude side ----------
 
 def _claude_slug(cwd):
@@ -798,19 +884,28 @@ def claude_transcripts(cwd):
     return files
 
 
-def claude_events(cwd, start=0.0):
-    """(time, type, text) — type: you | claude | tool
+def claude_events(cwd, positions=None, since=None):
+    """`([Event], reached)` — `Event.kind` is one of: you | claude | tool
 
     Ordered by when each record was written, never by its text. Several blocks
     of one message share a timestamp, and a sort that breaks that tie on the
     text delivers the message scrambled with nothing to show for it. Across
     files the path breaks the tie: it is stable between reads, which mtime is
     not, and cross-file write order is not knowable here anyway.
+
+    `reached` is the end of the last complete record read from each source,
+    whether or not it produced an event — a host record or a system entry
+    still has to be passed, or the next read pays for it again.
     """
     events = []
+    reached = {}
     position = itertools.count()
     for path in claude_transcripts(cwd)[:RECENT_FILES]:
-        for line in tail_lines(path):
+        sid = source_id(path)
+        gen = source_generation(path)
+        offset = _start_offset(path, sid, gen, positions, since)
+        for start, end, line in read_records(path, offset):
+            reached[sid] = {"gen": gen, "offset": end}
             try:
                 d = json.loads(line)
             except json.JSONDecodeError:
@@ -818,8 +913,6 @@ def claude_events(cwd, start=0.0):
             if d.get("isMeta"):
                 continue
             ts = iso_epoch(d.get("timestamp"))
-            if ts <= start:
-                continue
             kind = d.get("type")
             msg = d.get("message") or {}
             content = msg.get("content")
@@ -843,18 +936,23 @@ def claude_events(cwd, start=0.0):
                         and not _is_host_record(text, CLAUDE_WRAPPER_OPENING,
                                                 d.get("promptSource"))
                         and not _is_self_injected(text)):
-                    events.append((ts, path, next(position), "you", text))
+                    events.append((ts, path, next(position),
+                                  Event(ts, "you", text, sid, gen, start, end)))
             elif kind == "assistant":
                 for c in content if isinstance(content, list) else []:
                     if c.get("type") == "text" and c.get("text", "").strip():
-                        events.append((ts, path, next(position), "claude", c["text"].strip()))
+                        events.append((ts, path, next(position),
+                                      Event(ts, "claude", c["text"].strip(),
+                                            sid, gen, start, end)))
                     elif c.get("type") == "tool_use":
                         i = c.get("input") or {}
                         detail = i.get("file_path") or i.get("command") or i.get("pattern") or ""
-                        events.append((ts, path, next(position), "tool",
-                                      f"{c.get('name', '?')} {detail}".strip()))
+                        events.append((ts, path, next(position),
+                                      Event(ts, "tool",
+                                            f"{c.get('name', '?')} {detail}".strip(),
+                                            sid, gen, start, end)))
     events.sort(key=lambda e: (e[0], e[1], e[2]))
-    return [(ts, kind, text) for ts, _path, _pos, kind, text in events]
+    return [e[3] for e in events], reached
 
 
 # ---------- Codex side ----------
@@ -910,26 +1008,33 @@ def codex_rollout_files(cwd, days=3):
     return matched
 
 
-def codex_events(cwd, start=0.0):
-    """(time, type, text) — type: you | codex | tool
+def codex_events(cwd, positions=None, since=None):
+    """`([Event], reached)` — `Event.kind` is one of: you | codex | tool
 
     Ordered by when each record was written, never by its text. Several blocks
     of one message share a timestamp, and a sort that breaks that tie on the
     text delivers the message scrambled with nothing to show for it. Across
     files the path breaks the tie: it is stable between reads, which mtime is
     not, and cross-file write order is not knowable here anyway.
+
+    `reached` is the end of the last complete record read from each source,
+    whether or not it produced an event — a host record or a system entry
+    still has to be passed, or the next read pays for it again.
     """
     events = []
+    reached = {}
     position = itertools.count()
     for path in codex_rollout_files(cwd)[:RECENT_FILES]:
-        for line in tail_lines(path):
+        sid = source_id(path)
+        gen = source_generation(path)
+        offset = _start_offset(path, sid, gen, positions, since)
+        for start, end, line in read_records(path, offset):
+            reached[sid] = {"gen": gen, "offset": end}
             try:
                 d = json.loads(line)
             except json.JSONDecodeError:
                 continue
             ts = iso_epoch(d.get("timestamp"))
-            if ts <= start:
-                continue
             kind, p = d.get("type"), d.get("payload") or {}
             if kind == "response_item" and p.get("type") == "message":
                 role = p.get("role")
@@ -947,17 +1052,21 @@ def codex_events(cwd, start=0.0):
                     if (_is_host_record(text, CODEX_WRAPPER_OPENING)
                             or _is_self_injected(text)):
                         continue
-                    events.append((ts, path, next(position), "you", text))
+                    events.append((ts, path, next(position),
+                                  Event(ts, "you", text, sid, gen, start, end)))
                 elif role == "assistant":
-                    events.append((ts, path, next(position), "codex", text))
+                    events.append((ts, path, next(position),
+                                  Event(ts, "codex", text, sid, gen, start, end)))
             elif kind == "event_msg" and p.get("type") == "exec_command_begin":
                 cmd = p.get("command")
                 if isinstance(cmd, list):
                     cmd = " ".join(cmd)
                 if cmd:
-                    events.append((ts, path, next(position), "tool", f"shell {cmd}"))
+                    events.append((ts, path, next(position),
+                                  Event(ts, "tool", f"shell {cmd}",
+                                        sid, gen, start, end)))
     events.sort(key=lambda e: (e[0], e[1], e[2]))
-    return [(ts, kind, text) for ts, _path, _pos, kind, text in events]
+    return [e[3] for e in events], reached
 
 
 # ---------- summary ----------
@@ -972,37 +1081,40 @@ OTHER_SIDE = {
 }
 
 
-def build_summary(cwd, side, start=0.0):
+def build_summary(cwd, side, positions=None, since=None):
     """`side` is the side that will READ the summary ('claude' | 'codex').
     Turns what happened on the other side, and what the user said, into
     compact text.
 
-    Returns: (text, last_event_time, message_count). `message_count` doesn't
-    count tool calls — the notice shown in the terminal uses it."""
+    Returns: (text, reached, message_count). `message_count` doesn't count
+    tool calls — the notice shown in the terminal uses it. `reached` is the
+    parser's own high-water mark, covering every record it read — not only
+    the ones kept below, since selection is newest-first and the cursor still
+    has to advance past everything read, or the same backlog is read and
+    dropped again next turn."""
     if side == "claude":
-        events = codex_events(cwd, start)
+        events, reached = codex_events(cwd, positions, since)
     else:
-        events = claude_events(cwd, start)
+        events, reached = claude_events(cwd, positions, since)
     other = OTHER_SIDE[side][1]
 
     if not events:
-        return "", 0.0, 0
+        return "", {}, 0
 
-    events = events[-EVENT_LIMIT:]
-    last_time = events[-1][0]
-    count = sum(1 for _, kind, _ in events if kind != "tool")
+    shown = events[-EVENT_LIMIT:]
+    count = sum(1 for e in shown if e.kind != "tool")
 
     lines = []
     tools = []
-    for ts, kind, text in events:
-        if kind == "tool":
-            tools.append(truncate(text, 70))
+    for e in shown:
+        if e.kind == "tool":
+            tools.append(truncate(e.text, 70))
             continue
         if tools:
             lines.append(f"  · {len(tools)} tool calls: " + truncate(" | ".join(tools[-3:]), 130))
             tools = []
-        clock = datetime.fromtimestamp(ts).strftime("%H:%M")
-        lines.append(f"[{clock}] {LABEL.get(kind, kind)}: {truncate(text, EVENT_BUDGET)}")
+        clock = datetime.fromtimestamp(e.time).strftime("%H:%M")
+        lines.append(f"[{clock}] {LABEL.get(e.kind, e.kind)}: {truncate(e.text, EVENT_BUDGET)}")
     if tools:
         lines.append(f"  · {len(tools)} tool calls: " + truncate(" | ".join(tools[-3:]), 130))
 
@@ -1020,7 +1132,7 @@ def build_summary(cwd, side, start=0.0):
             "there. Do not assume anything that is not in it.")
     if truncated:
         foot = "\n(older lines were cut for budget)" + foot
-    return f"{head}\n{body}{foot}", last_time, count
+    return f"{head}\n{body}{foot}", reached, count
 
 
 # ---------- hook (both sides share the same contract) ----------
@@ -1073,8 +1185,8 @@ def hook(side="claude"):
             return 1
         cursor = read_cursor(cwd, side)
         key = f"{side}_seen"
-        start = cursor_time(cursor, key)
-        text, last, _ = build_summary(cwd, side, start)
+        positions, since = positions_for(cursor, side)
+        text, reached, _ = build_summary(cwd, side, positions, since)
         if not text:
             return 0
 
@@ -1092,8 +1204,10 @@ def hook(side="claude"):
             # and the cursor stays where it was. The next turn offers it again.
             print("antiphon: could not write this turn's context", file=sys.stderr)
             return 1
-        if last:
-            cursor[key] = last
+        if reached:
+            merged = dict(positions)
+            merged.update(reached)
+            cursor[key] = {"v": CURSOR_VERSION, "sources": merged}
             if not write_cursor(cwd, cursor, side):
                 # The page WAS delivered, so the exit code stays 0: a non-zero
                 # exit suppresses plain-text stdout as context, and whether it
@@ -1884,8 +1998,8 @@ def _mcp_serve(cwd, alias=None):
                             "nothing was marked seen — try again in a moment"))
                     else:
                         cursor = read_cursor(cwd, "codex")
-                        start = cursor_time(cursor, "codex_seen")
-                        text, last, _ = build_summary(cwd, "codex", start)
+                        positions, since = positions_for(cursor, "codex")
+                        text, reached, _ = build_summary(cwd, "codex", positions, since)
                         output = text or ("Nothing new on the Claude Code side "
                                           "since your last turn.")
                         # Answer first, mark seen second — the same order as the
@@ -1893,8 +2007,10 @@ def _mcp_serve(cwd, alias=None):
                         # written is a page the model never saw.
                         delivered = _mcp_result(
                             mid, {"content": [{"type": "text", "text": output}]})
-                        if delivered and text and last:
-                            cursor["codex_seen"] = last
+                        if delivered and text and reached:
+                            merged = dict(positions)
+                            merged.update(reached)
+                            cursor["codex_seen"] = {"v": CURSOR_VERSION, "sources": merged}
                             if not write_cursor(cwd, cursor, "codex"):
                                 # Symmetric with the hook: the page was
                                 # delivered, so the tool result already went
@@ -2488,8 +2604,7 @@ def status():
     for k, v in (cursor or {}).items():
         print(f"cursor {k}: {_cursor_entry(k, v)}")
     for side in ("claude", "codex"):
-        start = cursor_time(cursor, f"{side}_seen")
-        text, _, count = build_summary(cwd, side, start)
+        text, _, count = build_summary(cwd, side, since=time.time() - LOOKBACK)
         print(f"\n=== what {side} would see ===")
         if count:
             print(notice_text(side, count))
@@ -2499,7 +2614,7 @@ def status():
 
 def print_summary(side="claude"):
     cwd = project_dir()
-    text, _, _ = build_summary(cwd, side, time.time() - LOOKBACK)
+    text, _, _ = build_summary(cwd, side, since=time.time() - LOOKBACK)
     print(text or "(nothing new)")
     return 0
 
