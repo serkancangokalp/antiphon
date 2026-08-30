@@ -30,6 +30,7 @@ server runs on Node.js with the official MCP SDK.
 import glob
 import errno
 import hashlib
+import itertools
 import json
 import math
 import os
@@ -593,8 +594,16 @@ def claude_transcripts(cwd):
 
 
 def claude_events(cwd, start=0.0):
-    """(time, type, text) — type: you | claude | tool"""
+    """(time, type, text) — type: you | claude | tool
+
+    Ordered by when each record was written, never by its text. Several blocks
+    of one message share a timestamp, and a sort that breaks that tie on the
+    text delivers the message scrambled with nothing to show for it. Across
+    files the path breaks the tie: it is stable between reads, which mtime is
+    not, and cross-file write order is not knowable here anyway.
+    """
     events = []
+    position = itertools.count()
     for path in claude_transcripts(cwd)[:RECENT_FILES]:
         for line in tail_lines(path):
             try:
@@ -622,16 +631,18 @@ def claude_events(cwd, start=0.0):
                         and not _is_host_record(text, CLAUDE_WRAPPER_OPENING,
                                                 d.get("promptSource"))
                         and not _is_self_injected(text)):
-                    events.append((ts, "you", text))
+                    events.append((ts, path, next(position), "you", text))
             elif kind == "assistant":
                 for c in content if isinstance(content, list) else []:
                     if c.get("type") == "text" and c.get("text", "").strip():
-                        events.append((ts, "claude", c["text"].strip()))
+                        events.append((ts, path, next(position), "claude", c["text"].strip()))
                     elif c.get("type") == "tool_use":
                         i = c.get("input") or {}
                         detail = i.get("file_path") or i.get("command") or i.get("pattern") or ""
-                        events.append((ts, "tool", f"{c.get('name', '?')} {detail}".strip()))
-    return sorted(events)
+                        events.append((ts, path, next(position), "tool",
+                                      f"{c.get('name', '?')} {detail}".strip()))
+    events.sort(key=lambda e: (e[0], e[1], e[2]))
+    return [(ts, kind, text) for ts, _path, _pos, kind, text in events]
 
 
 # ---------- Codex side ----------
@@ -688,8 +699,16 @@ def codex_rollout_files(cwd, days=3):
 
 
 def codex_events(cwd, start=0.0):
-    """(time, type, text) — type: you | codex | tool"""
+    """(time, type, text) — type: you | codex | tool
+
+    Ordered by when each record was written, never by its text. Several blocks
+    of one message share a timestamp, and a sort that breaks that tie on the
+    text delivers the message scrambled with nothing to show for it. Across
+    files the path breaks the tie: it is stable between reads, which mtime is
+    not, and cross-file write order is not knowable here anyway.
+    """
     events = []
+    position = itertools.count()
     for path in codex_rollout_files(cwd)[:RECENT_FILES]:
         for line in tail_lines(path):
             try:
@@ -715,16 +734,17 @@ def codex_events(cwd, start=0.0):
                     if (_is_host_record(text, CODEX_WRAPPER_OPENING)
                             or _is_self_injected(text)):
                         continue
-                    events.append((ts, "you", text))
+                    events.append((ts, path, next(position), "you", text))
                 elif role == "assistant":
-                    events.append((ts, "codex", text))
+                    events.append((ts, path, next(position), "codex", text))
             elif kind == "event_msg" and p.get("type") == "exec_command_begin":
                 cmd = p.get("command")
                 if isinstance(cmd, list):
                     cmd = " ".join(cmd)
                 if cmd:
-                    events.append((ts, "tool", f"shell {cmd}"))
-    return sorted(events)
+                    events.append((ts, path, next(position), "tool", f"shell {cmd}"))
+    events.sort(key=lambda e: (e[0], e[1], e[2]))
+    return [(ts, kind, text) for ts, _path, _pos, kind, text in events]
 
 
 # ---------- summary ----------

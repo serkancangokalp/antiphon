@@ -1018,6 +1018,70 @@ class AntiphonTest(unittest.TestCase):
         text = "<ide_opened_file>what does this one mean?</ide_opened_file>"
         self.assertEqual(self._codex_user_texts(text), [text])
 
+    # ---- Important 3: events arrive in the order they were written ----
+
+    def test_content_blocks_keep_the_order_they_were_written_in(self):
+        """A message of several text blocks became several events sharing one
+        timestamp, and the sort broke that tie by comparing the text. The other
+        agent read a scrambled message and could not tell."""
+        line = json.dumps({
+            "type": "assistant", "timestamp": "2026-08-30T10:00:00.000Z",
+            "message": {"content": [{"type": "text", "text": "SELECT\n  id"},
+                                    {"type": "text", "text": "FROM users;"}]}})
+        with patch.object(antiphon, "claude_transcripts", return_value=["t.jsonl"]), \
+             patch.object(antiphon, "tail_lines", return_value=[line]):
+            texts = [e[2] for e in antiphon.claude_events("/tmp/project")]
+        self.assertEqual(texts, ["SELECT\n  id", "FROM users;"])
+
+    def test_two_records_sharing_a_timestamp_keep_their_position_in_the_file(self):
+        """The tie-break is position, not text."""
+        lines = [json.dumps({"type": "assistant",
+                             "timestamp": "2026-08-30T10:00:00.000Z",
+                             "message": {"content": [{"type": "text", "text": t}]}})
+                 for t in ("zebra first", "apple second")]
+        with patch.object(antiphon, "claude_transcripts", return_value=["t.jsonl"]), \
+             patch.object(antiphon, "tail_lines", return_value=lines):
+            texts = [e[2] for e in antiphon.claude_events("/tmp/project")]
+        self.assertEqual(texts, ["zebra first", "apple second"])
+
+    def test_the_codex_parser_orders_by_position_too(self):
+        """Same sort, same tie, same silent scramble."""
+        lines = [json.dumps({"type": "response_item",
+                             "timestamp": "2026-08-30T10:00:00.000Z",
+                             "payload": {"type": "message", "role": "assistant",
+                                         "content": [{"type": "text", "text": t}]}})
+                 for t in ("zebra first", "apple second")]
+        with patch.object(antiphon, "codex_rollout_files", return_value=["r.jsonl"]), \
+             patch.object(antiphon, "tail_lines", side_effect=lambda _p: lines):
+            texts = [e[2] for e in antiphon.codex_events("/tmp/project")]
+        self.assertEqual(texts, ["zebra first", "apple second"])
+
+    def test_cross_file_order_follows_the_path_not_the_text(self):
+        """Across files the order is arbitrary until the paging plan gives each
+        source a real id — but it must be the same on every read, and it must
+        not be the text. The contents here are deliberately in the opposite
+        alphabetical order to the filenames, so today's text sort and the
+        path tie-break cannot agree by accident.
+
+        Ordering by the file's mtime is rejected for the same reason it is not
+        tested here: a copy or a restore rewrites it, and the delivered history
+        would silently rearrange itself. The discovery order is varied instead,
+        because that is what a mtime sort would change."""
+        contents = {"a.jsonl": "zebra, in the first file",
+                    "b.jsonl": "apple, in the second"}
+
+        def per_file(path):
+            return [json.dumps({"type": "assistant",
+                                "timestamp": "2026-08-30T10:00:00.000Z",
+                                "message": {"content": [{"type": "text",
+                                                         "text": contents[path]}]}})]
+        for discovery in (["b.jsonl", "a.jsonl"], ["a.jsonl", "b.jsonl"]):
+            with patch.object(antiphon, "claude_transcripts", return_value=discovery), \
+                 patch.object(antiphon, "tail_lines", side_effect=per_file):
+                texts = [e[2] for e in antiphon.claude_events("/tmp/project")]
+            self.assertEqual(texts, ["zebra, in the first file",
+                                     "apple, in the second"], discovery)
+
     # ---- Important 2: upgrading a legacy hook must not leave a duplicate ----
 
     @staticmethod
