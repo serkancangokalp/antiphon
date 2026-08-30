@@ -3005,11 +3005,12 @@ class _PagingIntegrationCase(unittest.TestCase):
         })
 
     @classmethod
-    def _codex_record(cls, text, index=0, old=False):
+    def _codex_record(cls, text, index=0, old=False, blocks=None):
         return json.dumps({
             "type": "response_item", "timestamp": cls._timestamp(index, old),
             "payload": {"type": "message", "role": "assistant",
-                        "content": [{"type": "output_text", "text": text}]},
+                        "content": blocks if blocks is not None else [
+                            {"type": "output_text", "text": text}]},
         })
 
     @staticmethod
@@ -3142,26 +3143,39 @@ class PagedDeliveryTest(_PagingIntegrationCase):
         self.assertGreater(sources[self.SID_B]["offset"], 0)
 
     def test_production_page_caps_each_parser_at_page_plus_one_records(self):
-        records_a = [self._claude_record("A %d" % i, i) for i in range(50)]
-        records_b = [self._claude_record("B %d" % i, i,
-                     blocks=[{"type": "text", "text": "B block one"},
-                             {"type": "text", "text": "B block two"}]
-                     if i == antiphon.EVENT_LIMIT else None) for i in range(50)]
-        with tempfile.TemporaryDirectory() as project:
-            paths = [self._write_source(project, self.SID_A, records_a),
-                     self._write_source(project, self.SID_B, records_b)]
-            real_read = antiphon.read_records
-            counts = {path: 0 for path in paths}
+        cases = (
+            ("codex", "claude_transcripts", self._claude_record, "text", False),
+            ("claude", "codex_rollout_files", self._codex_record,
+             "output_text", True),
+        )
+        for side, discover, make_record, block_type, codex in cases:
+            with self.subTest(side=side), tempfile.TemporaryDirectory() as project:
+                records_a = [make_record("A %d" % i, i) for i in range(50)]
+                records_b = [make_record(
+                    "B %d" % i, i,
+                    blocks=[{"type": block_type, "text": "B block one"},
+                            {"type": block_type, "text": "B block two"}]
+                    if i == antiphon.EVENT_LIMIT else None)
+                    for i in range(50)]
+                paths = [self._write_source(project, self.SID_A, records_a,
+                                            codex=codex),
+                         self._write_source(project, self.SID_B, records_b,
+                                            codex=codex)]
+                real_read = antiphon.read_records
+                counts = {path: 0 for path in paths}
 
-            def tracked(path, offset=0):
-                for record in real_read(path, offset):
-                    counts[path] += 1
-                    yield record
+                def tracked(path, offset=0):
+                    for record in real_read(path, offset):
+                        counts[path] += 1
+                        yield record
 
-            with patch.object(antiphon, "claude_transcripts", return_value=paths), \
-                 patch.object(antiphon, "read_records", side_effect=tracked):
-                antiphon.build_summary(project, "codex")
-        self.assertEqual(counts, {path: antiphon.EVENT_LIMIT + 1 for path in paths})
+                with patch.object(antiphon, discover, return_value=paths), \
+                     patch.object(antiphon, "read_records", side_effect=tracked):
+                    antiphon.build_summary(project, side)
+            self.assertEqual(
+                counts,
+                {path: antiphon.EVENT_LIMIT + 1 for path in paths},
+                side)
 
     def test_filtered_only_hook_persists_v3_and_preserves_legacy_bytes(self):
         seeded = {"v": 2, "sources": {"legacy": {"gen": "old", "offset": 17}}}
@@ -3247,7 +3261,9 @@ class PagedDeliveryTest(_PagingIntegrationCase):
                          size)
 
     def test_oversized_mcp_refuses_without_advancing_or_spilling(self):
-        oversized = "mcp-oversized-start\n" + "Y" * (antiphon.PAGE_BUDGET + 500)
+        oversized = "界" * (antiphon.PAGE_BUDGET // 3 + 100)
+        self.assertLess(len(oversized), antiphon.PAGE_BUDGET)
+        self.assertGreater(len(oversized.encode("utf-8")), antiphon.PAGE_BUDGET)
         original = {"keep": "same"}
         with tempfile.TemporaryDirectory() as project:
             path = self._write_source(project, self.SID_A,
@@ -3270,6 +3286,10 @@ class PagedDeliveryTest(_PagingIntegrationCase):
 
     def test_status_clips_each_private_peer_preview_from_its_own_snapshot(self):
         secret = "4f412a2c-6b47-48cf-a476-f0a6f8f39c40"
+        secret_generation = "generation-private-" + secret
+        secret_path = "/private/transcripts/" + secret + "/rollout.jsonl"
+        malformed_v3 = {"v": 3, "sources": {secret: {
+            "gen": secret_generation, "offset": secret_path}}}
         huge = "é" * (antiphon.PAGE_BUDGET // 2 + 500)
         with tempfile.TemporaryDirectory() as project, \
              patch.dict(os.environ, {"ANTIPHON_NAME": "ui"}):
@@ -3280,10 +3300,11 @@ class PagedDeliveryTest(_PagingIntegrationCase):
             antiphon.write_cursor(project, {
                 "claude_pages": {"v": 3, "sources": {
                     self.SID_B: {"gen": "replaced-" + secret, "offset": 1}}},
-                "leaky_pages": {"v": 999, "sources": {secret: secret}},
+                "leaky_pages": malformed_v3,
             }, "claude")
             antiphon.write_cursor(project, {
-                "codex_pages": {"v": 999, "sources": {secret: secret}},
+                "codex_pages": {"v": 999, "sources": {secret: {
+                    "gen": secret_generation, "offset": secret_path}}},
             }, "codex")
             out, err = io.StringIO(), io.StringIO()
             with patch.object(antiphon, "project_dir", return_value=project), \
@@ -3297,6 +3318,13 @@ class PagedDeliveryTest(_PagingIntegrationCase):
         self.assertIn("CLAUDE-NEXT", shown)
         self.assertIn("CODEX-NEXT", shown)
         self.assertIn("status preview ends here", shown)
+        self.assertIn("cursor claude leaky_pages: invalid cursor state", shown)
+        recovery_notice = antiphon.REPLAY_NOTICES["cursor_recovery"]
+        claude_preview, codex_preview = shown.split(
+            "=== what claude would see ===", 1)[1].split(
+                "=== what codex would see ===", 1)
+        self.assertNotIn(recovery_notice, claude_preview)
+        self.assertIn(recovery_notice, codex_preview)
         previews = shown.split("=== what ")[1:]
         self.assertTrue(all(len(preview.encode("utf-8")) <= antiphon.PAGE_BUDGET + 200
                             for preview in previews))
@@ -3305,10 +3333,10 @@ class PagedDeliveryTest(_PagingIntegrationCase):
                              antiphon.PAGE_BUDGET)
         self.assertIn("status preview ends here", direct_preview)
         for stream in (shown, err.getvalue()):
-            self.assertNotIn(secret, stream)
-            self.assertNotIn(secret[:8], stream)
-            self.assertNotIn(claude_path, stream)
-            self.assertNotIn(codex_path, stream)
+            for private in (secret, secret[:8], secret_generation,
+                            secret_generation[:18], secret_path,
+                            secret_path[:20], claude_path, codex_path):
+                self.assertNotIn(private, stream)
 
     def test_explicit_summary_prints_full_oversized_page_without_advancing(self):
         oversized = "summary-start\n" + "Z" * (antiphon.PAGE_BUDGET + 500) + "\nsummary-end"
@@ -3468,6 +3496,21 @@ class RollingUpgradePagingTest(_PagingIntegrationCase):
                    self._claude_record("recent included", 1)]
         with tempfile.TemporaryDirectory() as project:
             path = self._write_source(project, self.SID_A, records)
+            page = self._hook(project, [path])[1]
+        self.assertIn("recent included", page)
+        self.assertNotIn("ancient excluded", page)
+        self.assertNotIn("replay:", page)
+
+    def test_valid_v3_map_bounds_a_newly_discovered_source_by_lookback(self):
+        records = [self._claude_record("ancient excluded", 0, old=True),
+                   self._claude_record("recent included", 1)]
+        with tempfile.TemporaryDirectory() as project:
+            path = self._write_source(project, self.SID_A, records)
+            antiphon.write_cursor(project, {"codex_pages": {
+                "v": 3,
+                "sources": {self.SID_B: {
+                    "gen": "known-generation", "offset": 17}},
+            }}, "codex")
             page = self._hook(project, [path])[1]
         self.assertIn("recent included", page)
         self.assertNotIn("ancient excluded", page)
