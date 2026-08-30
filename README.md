@@ -204,8 +204,7 @@ The pull path is lossy today, and the loss is silent: the cursor advances past
 what was dropped, so nothing re-delivers it and nothing reports it. Against one
 turn it cuts in this order:
 
-- discovery reads only the newest 3 transcript files per side and only the last
-  300,000 bytes of each;
+- discovery reads only the newest 3 transcript files per side;
 - selection keeps only the newest 40 events from what discovery found;
 - rendering collapses each non-tool event's whitespace to single spaces — code
   and SQL line breaks with it — and cuts that event to 420 characters;

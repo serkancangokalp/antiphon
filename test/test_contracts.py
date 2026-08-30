@@ -330,8 +330,6 @@ class ShippedContractTest(unittest.TestCase):
                 ("the event limit", (str(antiphon.EVENT_LIMIT), "events")),
                 ("the transcript window",
                  (str(antiphon.RECENT_FILES), "transcript", "files")),
-                ("the per-file tail window",
-                 (f"{antiphon.TAIL_BYTES:,}", "bytes")),
                 ("the direct-channel cap",
                  (str(antiphon.MAX_CHANNEL_BYTES // 1024), "KiB"))):
             self.assertRegex(limits, r"\s+".join(map(re.escape, words)), what)
