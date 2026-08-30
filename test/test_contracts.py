@@ -324,7 +324,10 @@ class ShippedContractTest(unittest.TestCase):
         self.assertEqual(antiphon.EVENT_LIMIT, 40)
         self.assertEqual(antiphon.RECENT_FILES, 3)
         self.assertEqual(antiphon.PAGE_CURSOR_VERSION, 3)
-        self.assertEqual(antiphon.page_cursor_key("claude"), "claude_pages")
+        for side in ("claude", "codex"):
+            self.assertEqual(antiphon.page_cursor_key(side), side + "_pages")
+        self.assertEqual(set(antiphon.REPLAY_NOTICES), {"legacy_upgrade",
+                                                        "cursor_recovery"})
         self.assertFalse(hasattr(antiphon, "SUMMARY_BUDGET"),
                          "the summary budget must not survive as an unused "
                          "constant a later reader mistakes for a live setting")
@@ -368,6 +371,15 @@ class ShippedContractTest(unittest.TestCase):
             # drain it. Naming the field without the loop teaches nothing.
             self.assertRegex(text, r"(?i)again", name)
             self.assertRegex(text, r"(?i)drain", name)
+        # The replay lifecycle lives on the agent surface too: an agent that
+        # sees dozens of duplicate-history pages with no framing will treat
+        # recovery as malfunction. Deleting this guidance left every test
+        # green once; now it cannot.
+        rule = antiphon.AGENTS_RULE
+        self.assertRegex(rule, r"(?i)upgrade", "AGENTS_RULE")
+        self.assertRegex(rule, r"(?i)cursor\s+recovery", "AGENTS_RULE")
+        self.assertRegex(rule, r"(?i)duplicate", "AGENTS_RULE")
+        self.assertRegex(rule, r"(?i)disappear|clear", "AGENTS_RULE")
 
     def test_paged_context_surfaces_explain_oversized_mcp(self):
         """Measured on the installed hosts: both hooks spill an oversized record
@@ -381,38 +393,13 @@ class ShippedContractTest(unittest.TestCase):
             self.assertRegex(text, r"(?i)nothing (is|was) (read or )?marked seen",
                              name)
             self.assertRegex(text, r"(?i)next (automatic )?prompt", name)
-
-    def test_paged_context_cursor_keys_and_replay_reasons(self):
-        """The cursor contract is public product surface: both sides' page keys
-        are named in the README beside the preserved legacy key, the replay
-        reasons are a closed two-member set, a malformed cursor is documented
-        as replay rather than mistaken for a new side, and the rejected
-        timestamp-boundary migration model cannot quietly return — in prose or
-        in a docstring."""
-        for side in ("claude", "codex"):
-            self.assertEqual(antiphon.page_cursor_key(side), side + "_pages")
-        self.assertEqual(set(antiphon.REPLAY_NOTICES), {"legacy_upgrade",
-                                                        "cursor_recovery"})
-        limits = section(read("README.md"), "Limits")
-        self.assertIn("_pages", limits, "the semantic key is named")
-        self.assertIn("_seen", limits, "the preserved legacy key is named")
-        self.assertRegex(limits, r"(?i)exactly\s+two\s+fixed\s+explanation",
-                         "the replay reasons are a closed set, and the README "
-                         "says so rather than leaving the set open")
-        self.assertRegex(limits, r"(?i)legacy\s+upgrade", "reason one, named")
-        self.assertRegex(limits, r"(?i)cursor\s+recovery", "reason two, named")
-        self.assertRegex(limits, r"(?i)(malformed|unreadable)[^.]*byte\s+zero",
-                         "a malformed existing cursor replays; it is not a "
-                         "fresh install")
-        self.assertRegex(limits, r"(?i)missing\s+cursor[^.]*new\s+side",
-                         "only a genuinely missing cursor means a new side")
-        self.assertRegex(limits, r"(?i)timestamp\s+cursor[^.]*boundary[^.]*gone",
-                         "the retired boundary-migration promise is named as "
-                         "retired")
-        self.assertNotRegex(antiphon.offset_at_or_after.__doc__,
-                            r"(?i)migrat",
-                            "the helper's docstring described the rejected "
-                            "boundary-migration model once already")
+            # Review proved these decorative once: swapping both surfaces'
+            # safe-refusal story for explicit truncation left everything
+            # green. The refusal, the no-truncation promise and the whole
+            # delivery are each load-bearing words.
+            self.assertRegex(text, r"(?i)refus", name)
+            self.assertRegex(text, r"(?i)truncat", name)
+            self.assertRegex(text, r"(?i)whole", name)
 
     def test_paged_context_docs_name_the_remaining_losses(self):
         """A Limits section that reads as though the work were finished retires
@@ -438,6 +425,25 @@ class ShippedContractTest(unittest.TestCase):
                          "whitespace preservation is stated, not implied")
         self.assertRegex(limits, r"(?i)never\s+split\s+across\s+pages",
                          "record atomicity is stated")
+        self.assertIn("_pages", limits, "the semantic key is named")
+        self.assertIn("_seen", limits, "the preserved legacy key is named")
+        self.assertRegex(limits, r"(?i)exactly\s+two\s+fixed\s+explanation",
+                         "the replay reasons are a closed set, and the README "
+                         "says so rather than leaving the set open")
+        self.assertRegex(limits, r"(?i)legacy\s+upgrade", "reason one, named")
+        self.assertRegex(limits, r"(?i)cursor\s+recovery", "reason two, named")
+        self.assertRegex(limits, r"(?i)(malformed|unreadable)[^.]*byte\s+zero",
+                         "a malformed existing cursor replays; it is not a "
+                         "fresh install")
+        self.assertRegex(limits, r"(?i)missing\s+cursor[^.]*new\s+side",
+                         "only a genuinely missing cursor means a new side")
+        self.assertRegex(limits, r"(?i)timestamp\s+cursor[^.]*boundary[^.]*gone",
+                         "the retired boundary-migration promise is named as "
+                         "retired")
+        self.assertNotRegex(antiphon.offset_at_or_after.__doc__,
+                            r"(?i)migrat",
+                            "the helper's docstring described the rejected "
+                            "boundary-migration model once already")
         self.assertRegex(limits, r"(?i)host.s own\s+lifecycle",
                          "spill files follow the host lifecycle, and the "
                          "README says whose files they are")
