@@ -987,6 +987,37 @@ class AntiphonTest(unittest.TestCase):
         self.assertTrue(sent.startswith(antiphon.CHANNEL_LABEL))
         self.assertEqual(self._codex_user_texts(sent), [])
 
+    def test_the_codex_parser_delivers_a_user_message_in_angle_brackets(self):
+        """The same one-character guess, in the other parser. Codex rollouts
+        carry no provenance field, so the closed wrapper set is the whole
+        answer here — and it must not swallow a person's markup."""
+        for text in ("<html><body>merhaba</body></html>",
+                     "<Component prop={1} />",
+                     "<commanders> are not host records"):
+            self.assertEqual(self._codex_user_texts(text), [text], text)
+
+    def test_the_codex_parser_still_refuses_a_host_record(self):
+        """What the `<` test was protecting, kept by name rather than by shape."""
+        for text in ("<task-notification>\n<task-id>abc</task-id>\n</task-notification>",
+                     "<environment_context>\n  <cwd>/tmp</cwd>\n</environment_context>",
+                     "<recommended_plugins>vercel</recommended_plugins>",
+                     "<realtime_delegation>on</realtime_delegation>",
+                     "<subagent_notification>done</subagent_notification>",
+                     "<command-name>/agents</command-name>"):
+            self.assertEqual(self._codex_user_texts(text), [], text)
+
+    def test_an_attachment_is_not_a_host_record(self):
+        """`<image>` was measured on real Codex rollouts and is a person's
+        attachment, not the host's bookkeeping. It belongs in neither set."""
+        text = "<image>screenshot.png</image>"
+        self.assertEqual(self._codex_user_texts(text), [text])
+
+    def test_a_claude_only_wrapper_does_not_silence_a_codex_user(self):
+        """The mirror of the Claude-side test: `ide_opened_file` is Claude
+        Code's record, and a Codex user typing it is still a Codex user."""
+        text = "<ide_opened_file>what does this one mean?</ide_opened_file>"
+        self.assertEqual(self._codex_user_texts(text), [text])
+
     # ---- Important 2: upgrading a legacy hook must not leave a duplicate ----
 
     @staticmethod

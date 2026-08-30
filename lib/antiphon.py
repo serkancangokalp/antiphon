@@ -709,7 +709,11 @@ def codex_events(cwd, start=0.0):
                 if not text or role == "developer":
                     continue
                 if role == "user":
-                    if text.startswith("<") or _is_self_injected(text):
+                    # No `promptSource` on this side: a Codex rollout records no
+                    # provenance field, so a known wrapper tag is the only
+                    # evidence available. Anything else is a person's words.
+                    if (_is_host_record(text, CODEX_WRAPPER_OPENING)
+                            or _is_self_injected(text)):
                         continue
                     events.append((ts, "you", text))
                 elif role == "assistant":
