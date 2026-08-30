@@ -277,10 +277,13 @@ def _join_text_blocks(blocks):
 # never by a leading `<`. A user pasting HTML, JSX or a stack trace starts
 # with `<` too, and used to vanish.
 #
-# The sets are per side because the tags are: `ide_opened_file` is Claude
-# Code's, `recommended_plugins` and `realtime_delegation` are Codex's, and
-# `local-command-caveat` was seen only on the Claude side. Shared, one side's
-# tag would silence the other side's user for typing that text.
+# The sets are per side because the tags are: `recommended_plugins` and
+# `realtime_delegation` are Codex's, `channel` and `local-command-caveat`
+# were seen only on the Claude side, and `ide_opened_file` — Claude's in the
+# first census — was measured on the Codex side too on 2026-08-31 (4 records,
+# the host's own "The user opened the file … in the IDE" bookkeeping).
+# Shared, one side's tag would silence the other side's user for typing that
+# text.
 # `image` belongs in neither: it is a person's attachment.
 
 # Strictly what was measured on that side, and nothing else. A tag missing
@@ -288,8 +291,10 @@ def _join_text_blocks(blocks):
 # it. A tag here that a person could type costs that person's whole message,
 # silently. Adding a plausible sibling by symmetry is how `local-command-caveat`
 # — measured only on the Claude side — first reached the Codex set.
-# Measured on 2026-08-30 over 1,575 Claude and 445 Codex `role: user` records;
-# see BACKLOG.md for when this census has to be re-run.
+# Measured on 2026-08-30 over 1,575 Claude and 445 Codex `role: user`
+# records; re-measured on 2026-08-31 over 4,309 and 872 (one change:
+# `ide_opened_file` joined the Codex set on direct evidence). See BACKLOG.md
+# for when this census has to be re-run.
 CLAUDE_HOST_WRAPPERS = (
     "channel", "task-notification", "ide_opened_file",
     "command-name", "command-message",
@@ -299,7 +304,7 @@ CLAUDE_HOST_WRAPPERS = (
 
 CODEX_HOST_WRAPPERS = (
     "task-notification", "recommended_plugins", "realtime_delegation",
-    "subagent_notification", "environment_context",
+    "subagent_notification", "environment_context", "ide_opened_file",
     "command-name", "command-message", "local-command-stdout",
     "bash-input", "bash-stdout",
 )

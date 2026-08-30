@@ -424,7 +424,9 @@ from arbitrary following prose.
 ## P1 — Re-run the host wrapper census before release
 
 `CLAUDE_HOST_WRAPPERS` and `CODEX_HOST_WRAPPERS` in `lib/antiphon.py` hold
-exactly what a census measured (2026-08-30), and nothing else. They will go
+exactly what a census measured (2026-08-30; re-run 2026-08-31 before 0.3.1,
+which moved `ide_opened_file` into the Codex set on 4 directly inspected
+records), and nothing else. They will go
 stale as each host adds, renames or drops its own wrapper tags, and the
 obligation to re-measure must not live only in a planning document that ships
 nowhere. Re-run it before every release:

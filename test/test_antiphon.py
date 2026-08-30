@@ -1854,9 +1854,10 @@ class AntiphonTest(unittest.TestCase):
         # equality check catches either side drifting from the other.
         every_codex_wrapper = ("task-notification", "recommended_plugins",
                                "realtime_delegation", "subagent_notification",
-                               "environment_context", "command-name",
-                               "command-message", "local-command-stdout",
-                               "bash-input", "bash-stdout")
+                               "environment_context", "ide_opened_file",
+                               "command-name", "command-message",
+                               "local-command-stdout", "bash-input",
+                               "bash-stdout")
         self.assertEqual(sorted(every_codex_wrapper),
                          sorted(antiphon.CODEX_HOST_WRAPPERS),
                          "CODEX_HOST_WRAPPERS changed without this test being updated")
@@ -1871,9 +1872,11 @@ class AntiphonTest(unittest.TestCase):
         self.assertEqual(self._codex_user_texts(text), [text])
 
     def test_a_claude_only_wrapper_does_not_silence_a_codex_user(self):
-        """The mirror of the Claude-side test: `ide_opened_file` is Claude
-        Code's record, and a Codex user typing it is still a Codex user."""
-        text = "<ide_opened_file>what does this one mean?</ide_opened_file>"
+        """The mirror of the Claude-side test: `channel` is Claude Code's
+        record (the 2026-08-31 census still saw it on no Codex rollout), and a
+        Codex user typing it is still a Codex user. (`ide_opened_file` held
+        this seat until that census measured it on the Codex side too.)"""
+        text = "<channel>what does this one mean?</channel>"
         self.assertEqual(self._codex_user_texts(text), [text])
 
     def test_a_host_tag_inside_a_message_proves_nothing(self):
