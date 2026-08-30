@@ -41,6 +41,10 @@ transferred:
   spill it to a file and expose its path;
 - give compressed tool events a stable id and a one-call full-content retrieval
   path;
+- have each side's hook maintain a durable source catalog keyed by side and host
+  session id, independent of peer aliases and endpoint liveness; pruning a dead
+  peer must not make its unread transcript disappear, and the newest-three scan
+  may prioritize migration discovery but never define completeness;
 - replace timestamp-only cursors with source generation, byte offset and record
   hash anchors that detect truncation, replacement and rotation;
 - use a lock beside each peer cursor, not the project-wide registry lock;
@@ -59,6 +63,9 @@ transferred:
   the host spill path.
 - An event larger than the current transcript tail and a transcript outside the
   newest three are still found when their source is known.
+- A catalogued source remains pageable after its endpoint closes, and a
+  pre-catalog migration inventories older matching sources without treating the
+  newest three as the complete set.
 - A user message beginning with `<` is not mistaken for bridge metadata.
 - Rotation, same-timestamp events, concurrent hook/tool reads, migration, and
   path traversal all have regression tests on Python 3.9 and the current Python.
