@@ -2860,10 +2860,20 @@ def _cursor_entry(key, value):
         return "invalid cursor state"
     if key in ("last_pushed_claude", "last_pushed_codex"):
         # These two shipped before structured paging and status has always
-        # rendered their delivery-deduplication summary. Keep that exact
-        # compatibility surface; do not generalise it by prefix, because an
-        # unknown newer sibling may contain private path or session metadata.
-        return truncate(str(value), 80) if value else "—"
+        # rendered their delivery-deduplication summary. Keep that surface for
+        # the fingerprint shape only: the pre-fingerprint format stored the raw
+        # text of the last pushed message, and status output is what people
+        # paste into issues, so a legacy value must stay unprinted. Do not
+        # generalise the allowlist by prefix either — an unknown newer sibling
+        # may contain private path or session metadata.
+        if not value:
+            return "—"
+        if isinstance(value, dict) and all(
+                isinstance(v, str) and len(v) == 64
+                and all(c in "0123456789abcdef" for c in v)
+                for v in value.values()):
+            return truncate(str(value), 80)
+        return "legacy delivery record (rewritten on the next push)"
     return "opaque cursor state"
 
 
