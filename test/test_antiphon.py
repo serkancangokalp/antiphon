@@ -26,6 +26,10 @@ from unittest.mock import Mock, patch
 os.environ.pop("ANTIPHON_NAME", None)
 
 
+def page_advance(sources=None, has_more=False, replay_reason=None):
+    return antiphon.PageAdvance(sources or {}, has_more, replay_reason)
+
+
 def only_the_process_table(failure):
     """A `subprocess.run` that permits the registry's identity lookup and
     nothing else.
@@ -374,7 +378,8 @@ class AntiphonTest(unittest.TestCase):
                           io.StringIO(json.dumps(self._call("antiphon_read")) + "\n")), \
              patch.object(antiphon, "build_summary",
                           return_value=("## something happened",
-                                       {"s1": {"gen": "g", "offset": 1000}}, 1)), \
+                                       page_advance({"s1": {
+                                           "gen": "g", "offset": 1000}}), 1)), \
              patch.object(antiphon, "read_cursor", return_value={}), \
              patch.object(antiphon, "write_cursor",
                           side_effect=lambda *a, **k: record.append("advance") or True), \
@@ -394,7 +399,8 @@ class AntiphonTest(unittest.TestCase):
                           io.StringIO(json.dumps(self._call("antiphon_read")) + "\n")), \
              patch.object(antiphon, "build_summary",
                           return_value=("## something happened",
-                                       {"s1": {"gen": "g", "offset": 1000}}, 1)), \
+                                       page_advance({"s1": {
+                                           "gen": "g", "offset": 1000}}), 1)), \
              patch.object(antiphon, "read_cursor", return_value={}), \
              patch.object(antiphon, "write_cursor",
                           side_effect=lambda *a, **k: record.append("advance") or True), \
@@ -418,7 +424,8 @@ class AntiphonTest(unittest.TestCase):
                               io.StringIO(json.dumps(self._call("antiphon_read")) + "\n")), \
                  patch.object(antiphon, "build_summary",
                               return_value=("## something happened",
-                                           {"s1": {"gen": "g", "offset": 1000}}, 1)), \
+                                           page_advance({"s1": {
+                                               "gen": "g", "offset": 1000}}), 1)), \
                  patch.object(antiphon, "read_cursor", return_value={}), \
                  patch.object(antiphon, "write_cursor",
                               side_effect=lambda *a, **k: record.append("advance") or True), \
@@ -712,7 +719,8 @@ class AntiphonTest(unittest.TestCase):
              patch.object(antiphon, "write_cursor"), \
              patch.object(antiphon, "build_summary",
                           return_value=("summary",
-                                        {"s1": {"gen": "g", "offset": 123}}, 2)), \
+                                        page_advance({"s1": {
+                                            "gen": "g", "offset": 123}}), 2)), \
              patch.object(antiphon.sys, "stdin",
                           io.StringIO(json.dumps({"cwd": project}))), \
              contextlib.redirect_stdout(out):
@@ -726,8 +734,10 @@ class AntiphonTest(unittest.TestCase):
         with patch.object(antiphon, "project_dir", return_value="/tmp/project"), \
              patch.object(antiphon, "claude_transcripts", return_value=[]), \
              patch.object(antiphon, "codex_rollout_files", return_value=[]), \
-             patch.object(antiphon, "read_cursor",
-                          return_value={"codex_seen": 1.0, "last_pushed_claude": "message"}), \
+             patch.object(antiphon, "_read_cursor_state",
+                          return_value=({"codex_seen": 1.0,
+                                         "last_pushed_claude": "message"},
+                                        "valid")), \
              patch.object(antiphon, "build_summary", return_value=("", 0.0, 0)), \
              contextlib.redirect_stdout(out):
             self.assertEqual(antiphon.status(), 0)
@@ -1207,19 +1217,11 @@ class AntiphonTest(unittest.TestCase):
             texts = [e[2] for e in events]
         self.assertEqual(texts, ["zebra first", "apple second"])
 
-    def test_cross_file_order_follows_the_path_not_the_text(self):
-        """Across files the order is arbitrary until the paging plan gives each
-        source a real id — but it must be the same on every read, and it must
-        not be the text. The contents here are deliberately in the opposite
-        alphabetical order to the filenames, so today's text sort and the
-        path tie-break cannot agree by accident.
-
-        Ordering by the file's mtime is rejected for the same reason it is not
-        tested here: a copy or a restore rewrites it, and the delivered history
-        would silently rearrange itself. The discovery order is varied instead,
-        because that is what a mtime sort would change."""
-        contents = {"a.jsonl": "zebra, in the first file",
-                    "b.jsonl": "apple, in the second"}
+    def test_cross_file_order_follows_source_identity_not_path_or_text(self):
+        """A move may reverse pathname order; source identity remains stable."""
+        first = "/z-path/01a04f6b-4485-7290-afbd-9eae74405ec8.jsonl"
+        second = "/a-path/4eecac24-1c21-47ad-ab11-a650708f3098.jsonl"
+        contents = {first: "zebra, source one", second: "apple, source two"}
 
         def per_file(path, offset=0):
             line = json.dumps({"type": "assistant",
@@ -1228,13 +1230,13 @@ class AntiphonTest(unittest.TestCase):
                                                         "text": contents[path]}]}})
             return _as_records([line])(path, offset)
 
-        for discovery in (["b.jsonl", "a.jsonl"], ["a.jsonl", "b.jsonl"]):
+        for discovery in ([second, first], [first, second]):
             with patch.object(antiphon, "claude_transcripts", return_value=discovery), \
                  patch.object(antiphon, "read_records", side_effect=per_file):
                 events, _ = antiphon.claude_events("/tmp/project")
                 texts = [e[2] for e in events]
-            self.assertEqual(texts, ["zebra, in the first file",
-                                     "apple, in the second"], discovery)
+            self.assertEqual(texts, ["zebra, source one", "apple, source two"],
+                             discovery)
 
     # ---- a multi-block message is joined without losing content ----
 
@@ -2017,8 +2019,7 @@ class PagedSummaryModelTest(unittest.TestCase):
         self.assertEqual(advance.replay_reason, "cursor_recovery")
         empty, no_advance, empty_count = self.page([], {}, replay_reason="cursor_recovery")
         self.assertEqual(empty, "")
-        self.assertEqual(no_advance.sources, {})
-        self.assertIsNone(no_advance.replay_reason)
+        self.assertIsNone(no_advance)
         self.assertEqual(empty_count, 0)
 
 
@@ -2128,7 +2129,8 @@ class OffsetReadingTest(unittest.TestCase):
                                            "offset": 0}})
         self.assertEqual([e[2] for e in events], ["new"],
                          "the source is offered again rather than skipped")
-        self.assertIn(sid, err.getvalue())
+        self.assertNotIn(sid, err.getvalue())
+        self.assertNotIn(sid[:8], err.getvalue())
         self.assertIn("replaced", err.getvalue())
 
     def test_a_truncated_source_restarts_and_says_so(self):
@@ -2144,7 +2146,8 @@ class OffsetReadingTest(unittest.TestCase):
                 events, _ = antiphon.claude_events(
                     "/tmp/project", {sid: {"gen": gen, "offset": 999_999}})
         self.assertEqual([e[2] for e in events], ["short"])
-        self.assertIn(sid, err.getvalue())
+        self.assertNotIn(sid, err.getvalue())
+        self.assertNotIn(sid[:8], err.getvalue())
         self.assertIn("shorter", err.getvalue())
 
     def test_an_unchanged_source_says_nothing(self):
@@ -2173,16 +2176,11 @@ class OffsetReadingTest(unittest.TestCase):
 
 
 class PositionCursorTest(unittest.TestCase):
-    """The parsers read from a per-source position instead of a fixed tail
-    window, and the cursor records one instead of a timestamp.
+    """Paging records a safe delivered prefix for every discovered source.
 
-    `reached` is the parser's own high-water mark: the end of the last
-    complete record read from each source, not of the last record that
-    produced an event. `positions_for` reads whichever cursor version is on
-    disk — a float `since` for the pre-existing timestamp cursor, or a v2
-    positions map — and the cursor still advances past everything read, not
-    only what a summary kept, because selection stays newest-first until the
-    next plan pages oldest-first.
+    Parser high-water marks may pass filtered records, but a visible record
+    beyond the selected page remains the next frontier. The page cursor moves
+    only after delivery and therefore drains each source in offset order.
     """
 
     def test_an_event_carries_the_source_and_offset_it_came_from(self):
@@ -2267,11 +2265,13 @@ class PositionCursorTest(unittest.TestCase):
         exactly one record repeated at the boundary. The repeat is deliberate —
         records sharing that timestamp may include ones the old EVENT_LIMIT
         slice dropped while the cursor jumped past them anyway."""
-        positions, since = antiphon.positions_for({"claude_seen": 1000.0}, "claude")
+        positions, since, replay = antiphon.positions_for(
+            {"claude_seen": 1000.0}, "claude")
         self.assertEqual(positions, {})
-        self.assertEqual(since, 1000.0)
+        self.assertIsNone(since)
+        self.assertEqual(replay, "legacy_upgrade")
 
-    def test_a_v2_cursor_is_read_as_positions(self):
+    def test_a_v2_cursor_triggers_conservative_upgrade_replay(self):
         """`since` still comes back as the lookback, even for a valid v2 map:
         a source *with* a recorded entry never consults `since` at all -- it
         resumes from that entry when trusted, or restarts from byte zero,
@@ -2281,9 +2281,10 @@ class PositionCursorTest(unittest.TestCase):
         newest three -- and that source needs the same floor a brand-new
         source gets rather than none at all."""
         cursor = {"claude_seen": {"v": 2, "sources": {"s1": {"gen": "g", "offset": 12}}}}
-        positions, since = antiphon.positions_for(cursor, "claude")
-        self.assertEqual(positions, {"s1": {"gen": "g", "offset": 12}})
-        self.assertIsNotNone(since)
+        positions, since, replay = antiphon.positions_for(cursor, "claude")
+        self.assertEqual(positions, {})
+        self.assertIsNone(since)
+        self.assertEqual(replay, "legacy_upgrade")
 
     def test_a_cursor_entry_that_is_not_a_position_is_refused(self):
         """`cursor.json` gets hand-edited, restored from the wrong place, and
@@ -2295,32 +2296,47 @@ class PositionCursorTest(unittest.TestCase):
         for broken in (42, "bad", [], {"gen": "g"}, {"gen": "g", "offset": "5"},
                        {"gen": "g", "offset": -1}, {"gen": "g", "offset": True},
                        {"gen": 5, "offset": 5}):
-            cursor = {"claude_seen": {"v": 2, "sources": {"s1": broken}}}
-            positions, since = antiphon.positions_for(cursor, "claude")
+            cursor = {"claude_pages": {"v": 3, "sources": {"s1": broken}}}
+            positions, since, replay = antiphon.positions_for(cursor, "claude")
             self.assertEqual(positions, {}, repr(broken))
-            self.assertIsNotNone(since, repr(broken))
+            self.assertIsNone(since, repr(broken))
+            self.assertEqual(replay, "cursor_recovery")
 
-    def test_the_advance_covers_every_record_read_not_only_those_shown(self):
-        """Selection is still newest-first. Advancing only over what was shown
-        would either skip the records in between for good, or move nothing at
-        all and re-read the same backlog every turn."""
+    def test_the_advance_drains_every_visible_record_once_in_offset_order(self):
+        now = time.strftime("%Y-%m-%dT%H:%M:%S.000Z", time.gmtime())
         many = [json.dumps({"type": "assistant",
-                            "timestamp": "2026-08-30T10:00:00.000Z",
+                            "timestamp": now,
                             "message": {"content": [{"type": "text",
-                                                     "text": "line %d" % i}]}})
+                                                     "text": "record-%02d-END" % i}]}})
                 for i in range(antiphon.EVENT_LIMIT + 5)]
         sid = "4eecac24-1c21-47ad-ab11-a650708f3098"
-        with tempfile.TemporaryDirectory() as d:
-            path = os.path.join(d, sid + ".jsonl")
+        with tempfile.TemporaryDirectory() as project:
+            path = os.path.join(project, sid + ".jsonl")
             with open(path, "w", encoding="utf-8") as f:
                 f.write("\n".join(many) + "\n")
-            size = os.path.getsize(path)
-            with patch.object(antiphon, "codex_rollout_files", return_value=[]), \
-                 patch.object(antiphon, "claude_transcripts", return_value=[path]):
-                text, reached, _count = antiphon.build_summary("/tmp/project", "codex")
-        self.assertTrue(text)
-        self.assertEqual(reached[sid]["offset"], size,
-                         "past the last record read, not the last shown")
+            cursor = {}
+            pages = []
+            with patch.object(antiphon, "claude_transcripts", return_value=[path]):
+                for _ in range(3):
+                    positions, since, replay = antiphon.positions_for(
+                        cursor, "codex")
+                    text, advance, _count = antiphon.build_summary(
+                        project, "codex", positions, since, replay)
+                    pages.append(text)
+                    self.assertTrue(antiphon._advance_page_cursor(
+                        project, "codex", cursor, "codex", positions, advance))
+                    cursor = antiphon.read_cursor(project, "codex")
+        self.assertIn("record-00-END", pages[0])
+        self.assertIn("record-39-END", pages[0])
+        self.assertNotIn("record-40-END", pages[0])
+        self.assertIn("has_more: true", pages[0])
+        self.assertIn("record-40-END", pages[1])
+        self.assertIn("record-44-END", pages[1])
+        self.assertIn("has_more: false", pages[1])
+        self.assertEqual(pages[2], "")
+        for index in range(antiphon.EVENT_LIMIT + 5):
+            marker = "record-%02d-END" % index
+            self.assertEqual(sum(marker in page for page in pages[:2]), 1)
 
     def test_a_v1_cursor_migrates_without_redelivering_a_quiet_source(self):
         """Measured end to end on real transcripts: a source whose starting
@@ -2406,7 +2422,7 @@ class PositionCursorTest(unittest.TestCase):
         self.assertEqual((first_code, second_code), (0, 0))
         self.assertEqual(first_out, "")
         self.assertEqual(second_out, "")
-        self.assertEqual(cursor["codex_seen"]["sources"][sid]["offset"], size,
+        self.assertEqual(cursor["codex_pages"]["sources"][sid]["offset"], size,
                          "the position passed the filtered records after "
                          "the first run")
 
@@ -2439,12 +2455,14 @@ class PositionCursorTest(unittest.TestCase):
                              "no generation must mean no entry, not a null one")
 
             cursor = {}
-            self.assertTrue(antiphon._advance_cursor(
-                project, "codex", cursor, "codex_seen", {}, reached))
+            advance = page_advance(reached)
+            self.assertTrue(antiphon._advance_page_cursor(
+                project, "codex", cursor, "codex", {}, advance))
 
-            positions, since = antiphon.positions_for(cursor, "codex")
+            positions, since, replay = antiphon.positions_for(cursor, "codex")
             self.assertEqual(positions, reached,
                              "the good source's position must survive intact")
+            self.assertIsNone(replay)
 
             # And the next run must not re-read it from the lookback either.
             with patch.object(antiphon, "claude_transcripts",
@@ -2480,14 +2498,13 @@ class PositionCursorTest(unittest.TestCase):
                                                              "text": "ancient, never read"}]}}) + "\n")
             cursor = {"claude_seen": {"v": 2, "sources":
                       {known_sid: {"gen": gen, "offset": size}}}}
-            positions, since = antiphon.positions_for(cursor, "claude")
+            positions, since, replay = antiphon.positions_for(cursor, "claude")
             with patch.object(antiphon, "claude_transcripts",
                               return_value=[known_path, new_path]):
                 events, _reached = antiphon.claude_events(d, positions, since)
-        self.assertEqual([e[2] for e in events], [],
-                         "the never-before-seen source's pre-lookback record "
-                         "must not appear just because it had no recorded "
-                         "position of its own")
+        self.assertEqual({e[2] for e in events},
+                         {"already delivered", "ancient, never read"})
+        self.assertEqual(replay, "legacy_upgrade")
 
     def test_a_replaced_source_still_delivers_its_pre_lookback_record(self):
         """`_start_offset` used to share one fallback line between two
@@ -2513,12 +2530,12 @@ class PositionCursorTest(unittest.TestCase):
             cursor_path = os.path.join(project, ".antiphon", "cursor.json")
             os.makedirs(os.path.dirname(cursor_path))
             with open(cursor_path, "w", encoding="utf-8") as f:
-                json.dump({"claude_seen": {"v": 2, "sources":
+                json.dump({"claude_pages": {"v": 3, "sources":
                            {sid: {"gen": "a-generation-from-before",
                                   "offset": 0}}}}, f)
 
             cursor = antiphon.read_cursor(project, "claude")
-            positions, since = antiphon.positions_for(cursor, "claude")
+            positions, since, replay = antiphon.positions_for(cursor, "claude")
             err = io.StringIO()
             with patch.object(antiphon, "claude_transcripts",
                               return_value=[path]), \
@@ -2544,11 +2561,11 @@ class PositionCursorTest(unittest.TestCase):
             cursor_path = os.path.join(project, ".antiphon", "cursor.json")
             os.makedirs(os.path.dirname(cursor_path))
             with open(cursor_path, "w", encoding="utf-8") as f:
-                json.dump({"claude_seen": {"v": 2, "sources":
+                json.dump({"claude_pages": {"v": 3, "sources":
                            {sid: {"gen": gen, "offset": 999_999}}}}, f)
 
             cursor = antiphon.read_cursor(project, "claude")
-            positions, since = antiphon.positions_for(cursor, "claude")
+            positions, since, replay = antiphon.positions_for(cursor, "claude")
             err = io.StringIO()
             with patch.object(antiphon, "claude_transcripts",
                               return_value=[path]), \
@@ -2560,20 +2577,22 @@ class PositionCursorTest(unittest.TestCase):
         self.assertIn("shorter", err.getvalue())
 
     def test_a_source_not_rediscovered_this_turn_is_not_dropped_from_the_cursor(self):
-        """`_advance_cursor` merges `reached` onto a copy of `positions`, not
-        the other way around, so a source that is in the cursor but was not
-        among this turn's newest-three transcripts keeps its recorded
-        position instead of vanishing from the map -- and being read whole,
-        from byte zero, the turn it rotates back in."""
+        """The page writer merges its frontier onto the prior positions.
+
+        A source that is in the cursor but was not rediscovered this turn
+        therefore keeps its recorded position instead of vanishing from the
+        map and being read whole from byte zero when it rotates back in.
+        """
         with tempfile.TemporaryDirectory() as project:
             positions = {"s1": {"gen": "g1", "offset": 100},
                          "s2": {"gen": "g2", "offset": 200}}
             reached = {"s1": {"gen": "g1", "offset": 150}}
             cursor = {}
-            self.assertTrue(antiphon._advance_cursor(
-                project, "codex", cursor, "codex_seen", positions, reached))
+            self.assertTrue(antiphon._advance_page_cursor(
+                project, "codex", cursor, "codex", positions,
+                page_advance(reached)))
             written = antiphon.read_cursor(project, "codex")
-        sources = written["codex_seen"]["sources"]
+        sources = written["codex_pages"]["sources"]
         self.assertEqual(sources["s1"], {"gen": "g1", "offset": 150},
                          "the rediscovered source's position moved forward")
         self.assertEqual(sources["s2"], {"gen": "g2", "offset": 200},
@@ -2585,16 +2604,913 @@ class PositionCursorTest(unittest.TestCase):
         `offset` means, and a shape-only check would misread it as v2 instead
         of refusing it -- the direction every other unrecognised shape
         already takes."""
-        cursor = {"claude_seen": {"v": 3, "sources":
+        cursor = {"claude_pages": {"v": 4, "sources":
                   {"s1": {"gen": "g", "offset": 12}}}}
-        positions, since = antiphon.positions_for(cursor, "claude")
+        positions, since, replay = antiphon.positions_for(cursor, "claude")
         self.assertEqual(positions, {})
-        self.assertIsNotNone(since)
+        self.assertIsNone(since)
+        self.assertEqual(replay, "cursor_recovery")
 
-        cursor = {"claude_seen": {"sources": {"s1": {"gen": "g", "offset": 12}}}}
-        positions, since = antiphon.positions_for(cursor, "claude")
+        cursor = {"claude_pages": {"sources": {"s1": {"gen": "g", "offset": 12}}}}
+        positions, since, replay = antiphon.positions_for(cursor, "claude")
         self.assertEqual(positions, {})
-        self.assertIsNotNone(since)
+        self.assertIsNone(since)
+        self.assertEqual(replay, "cursor_recovery")
+
+
+class BoundedLookaheadTest(unittest.TestCase):
+    """Production parsing stops after one page plus one visible record per source."""
+
+    SID_A = "4eecac24-1c21-47ad-ab11-a650708f3098"
+    SID_B = "01a04f6b-4485-7290-afbd-9eae74405ec8"
+    SID_C = "019c9f33-77aa-7f11-a003-0242ac120002"
+
+    @staticmethod
+    def _assistant(text, second=0, blocks=None):
+        content = blocks if blocks is not None else [{"type": "text", "text": text}]
+        return json.dumps({
+            "type": "assistant",
+            "timestamp": "2026-08-30T10:%02d:00.000Z" % second,
+            "message": {"content": content},
+        })
+
+    @staticmethod
+    def _filtered(second=0):
+        return json.dumps({
+            "type": "assistant", "isMeta": True,
+            "timestamp": "2026-08-30T11:%02d:00.000Z" % second,
+            "message": {"content": [{"type": "text", "text": "filtered"}]},
+        })
+
+    @classmethod
+    def _write(cls, directory, sid, records, final_newline=True):
+        path = os.path.join(directory, sid + ".jsonl")
+        with open(path, "w", encoding="utf-8") as f:
+            f.write("\n".join(records))
+            if final_newline:
+                f.write("\n")
+        return path
+
+    @staticmethod
+    def _page(events, reached):
+        return antiphon._build_page(events, reached, "codex")
+
+    def test_bounded_lookahead_reads_only_page_plus_one_visible_record(self):
+        records = [self._assistant("record %d" % i, i % 60)
+                   for i in range(antiphon.EVENT_LIMIT + 2)]
+        with tempfile.TemporaryDirectory() as directory:
+            path = self._write(directory, self.SID_A, records)
+            real_read = antiphon.read_records
+            read = []
+
+            def tracked(*args, **kwargs):
+                for record in real_read(*args, **kwargs):
+                    read.append(record)
+                    yield record
+
+            with patch.object(antiphon, "claude_transcripts", return_value=[path]), \
+                 patch.object(antiphon, "read_records", side_effect=tracked):
+                events, reached = antiphon.claude_events(
+                    directory, visible_record_limit=antiphon.EVENT_LIMIT + 1)
+        text, advance, _count = self._page(events, reached)
+        self.assertEqual(len(read), antiphon.EVENT_LIMIT + 1)
+        self.assertIn("record 0", text)
+        self.assertIn("record 39", text)
+        self.assertNotIn("record 40", text)
+        self.assertEqual(advance.sources[self.SID_A]["offset"], events[-1].offset)
+
+    def test_bounded_lookahead_scans_a_filtered_tail_to_eof(self):
+        visible = [self._assistant("record %d" % i, i % 60)
+                   for i in range(antiphon.EVENT_LIMIT)]
+        records = visible + [self._filtered(i % 60) for i in range(20)]
+        with tempfile.TemporaryDirectory() as directory:
+            path = self._write(directory, self.SID_A, records)
+            with patch.object(antiphon, "claude_transcripts", return_value=[path]):
+                events, reached = antiphon.claude_events(
+                    directory, visible_record_limit=antiphon.EVENT_LIMIT + 1)
+            size = os.path.getsize(path)
+        _text, advance, _count = self._page(events, reached)
+        self.assertEqual(len(events), antiphon.EVENT_LIMIT)
+        self.assertEqual(reached[self.SID_A]["offset"], size)
+        self.assertFalse(advance.has_more)
+
+    def test_bounded_lookahead_passes_filtered_bytes_before_the_extra_record(self):
+        visible = [self._assistant("record %d" % i, i % 60)
+                   for i in range(antiphon.EVENT_LIMIT)]
+        records = visible + [self._filtered(i) for i in range(4)] + [
+            self._assistant("extra visible", 59)]
+        with tempfile.TemporaryDirectory() as directory:
+            path = self._write(directory, self.SID_A, records)
+            starts = [start for start, _end, _line in antiphon.read_records(path)]
+            with patch.object(antiphon, "claude_transcripts", return_value=[path]):
+                events, reached = antiphon.claude_events(
+                    directory, visible_record_limit=antiphon.EVENT_LIMIT + 1)
+        _text, advance, _count = self._page(events, reached)
+        self.assertEqual(events[-1].text, "extra visible")
+        self.assertEqual(events[-1].offset, starts[-1])
+        self.assertEqual(advance.sources[self.SID_A]["offset"], starts[-1])
+
+    def test_bounded_lookahead_counts_a_multiblock_record_once(self):
+        records = [self._assistant("record %d" % i, i % 60)
+                   for i in range(antiphon.EVENT_LIMIT)]
+        records.append(self._assistant("", 59, [
+            {"type": "text", "text": "block one"},
+            {"type": "tool_use", "name": "Read", "input": {"file_path": "x"}},
+            {"type": "text", "text": "block two"},
+        ]))
+        records.append(self._assistant("must not be read", 59))
+        with tempfile.TemporaryDirectory() as directory:
+            path = self._write(directory, self.SID_A, records)
+            with patch.object(antiphon, "claude_transcripts", return_value=[path]):
+                events, reached = antiphon.claude_events(
+                    directory, visible_record_limit=antiphon.EVENT_LIMIT + 1)
+        texts = [event.text for event in events]
+        self.assertIn("block one", texts)
+        self.assertIn("Read x", texts)
+        self.assertIn("block two", texts)
+        self.assertNotIn("must not be read", texts)
+        self.assertEqual(len({(e.offset, e.end) for e in events}), antiphon.EVENT_LIMIT + 1)
+
+    def test_bounded_lookahead_matches_unbounded_adversarial_source_merge(self):
+        with tempfile.TemporaryDirectory() as directory:
+            paths = []
+            for source_number, sid in enumerate((self.SID_A, self.SID_B, self.SID_C)):
+                records = [self._assistant(
+                    "%s record %d" % (sid[-4:], i),
+                    (59 - i if source_number == 0 else (i * 7 + source_number) % 60))
+                           for i in range(antiphon.EVENT_LIMIT + 4)]
+                paths.append(self._write(directory, sid, records))
+            with patch.object(antiphon, "claude_transcripts", return_value=paths):
+                bounded_events, bounded_reached = antiphon.claude_events(
+                    directory, visible_record_limit=antiphon.EVENT_LIMIT + 1)
+                all_events, all_reached = antiphon.claude_events(directory)
+        bounded = self._page(bounded_events, bounded_reached)
+        unbounded = self._page(all_events, all_reached)
+        self.assertEqual(bounded[0], unbounded[0])
+        self.assertEqual(bounded[1].sources, unbounded[1].sources)
+        self.assertEqual(bounded[2], unbounded[2])
+
+    def test_bounded_lookahead_matches_unbounded_byte_and_oversized_pages(self):
+        fixtures = [
+            [self._assistant("small"), self._assistant("é" * 3900, 1),
+             self._assistant("later", 2)],
+            [self._assistant("X" * (antiphon.PAGE_BUDGET + 100)),
+             self._assistant("normal next", 1)],
+        ]
+        with tempfile.TemporaryDirectory() as directory:
+            path = self._write(directory, self.SID_A, fixtures[0])
+            with patch.object(antiphon, "claude_transcripts", return_value=[path]):
+                bounded_events, bounded_reached = antiphon.claude_events(
+                    directory, visible_record_limit=antiphon.EVENT_LIMIT + 1)
+                all_events, all_reached = antiphon.claude_events(directory)
+            first_pair = (self._page(bounded_events, bounded_reached),
+                          self._page(all_events, all_reached))
+            path = self._write(directory, self.SID_A, fixtures[1])
+            with patch.object(antiphon, "claude_transcripts", return_value=[path]):
+                bounded_events, bounded_reached = antiphon.claude_events(
+                    directory, visible_record_limit=antiphon.EVENT_LIMIT + 1)
+                all_events, all_reached = antiphon.claude_events(directory)
+            second_pair = (self._page(bounded_events, bounded_reached),
+                           self._page(all_events, all_reached))
+        for bounded, unbounded in (first_pair, second_pair):
+            self.assertEqual(bounded, unbounded)
+
+    def test_bounded_lookahead_stops_before_a_partial_final_record(self):
+        complete = [self._assistant("record %d" % i, i % 60)
+                    for i in range(antiphon.EVENT_LIMIT)]
+        final = self._assistant("completed later", 59)
+        with tempfile.TemporaryDirectory() as directory:
+            path = self._write(directory, self.SID_A, complete + [final],
+                               final_newline=False)
+            partial_start = sum(len((line + "\n").encode("utf-8")) for line in complete)
+            with patch.object(antiphon, "claude_transcripts", return_value=[path]):
+                events, reached = antiphon.claude_events(
+                    directory, visible_record_limit=antiphon.EVENT_LIMIT + 1)
+            self.assertEqual(reached[self.SID_A]["offset"], partial_start)
+            with open(path, "a", encoding="utf-8") as f:
+                f.write("\n")
+            positions = {self.SID_A: {"gen": antiphon.source_generation(path),
+                                      "offset": partial_start}}
+            with patch.object(antiphon, "claude_transcripts", return_value=[path]):
+                resumed, _ = antiphon.claude_events(
+                    directory, positions, visible_record_limit=antiphon.EVENT_LIMIT + 1)
+        self.assertEqual(len(events), antiphon.EVENT_LIMIT)
+        self.assertEqual([event.text for event in resumed], ["completed later"])
+
+    def test_bounded_lookahead_limit_is_per_source(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path_a = self._write(directory, self.SID_A, [
+                self._assistant("A %d" % i, i % 60)
+                for i in range(antiphon.EVENT_LIMIT + 2)])
+            path_b = self._write(directory, self.SID_B, [self._assistant("B first", 1)])
+            real_read = antiphon.read_records
+            counts = {path_a: 0, path_b: 0}
+
+            def tracked(path, offset=0):
+                for record in real_read(path, offset):
+                    counts[path] += 1
+                    yield record
+
+            with patch.object(antiphon, "claude_transcripts",
+                              return_value=[path_a, path_b]), \
+                 patch.object(antiphon, "read_records", side_effect=tracked):
+                events, _reached = antiphon.claude_events(
+                    directory, visible_record_limit=antiphon.EVENT_LIMIT + 1)
+        self.assertEqual(counts[path_a], antiphon.EVENT_LIMIT + 1)
+        self.assertEqual(counts[path_b], 1)
+        self.assertIn("B first", [event.text for event in events])
+
+    def test_bounded_lookahead_tool_only_record_consumes_one_slot(self):
+        records = [self._assistant("record %d" % i, i % 60)
+                   for i in range(antiphon.EVENT_LIMIT)]
+        records.extend([
+            self._assistant("", 58, [{"type": "tool_use", "name": "Read",
+                                       "input": {"file_path": "tool-only"}}]),
+            self._assistant("must not be read", 59),
+        ])
+        with tempfile.TemporaryDirectory() as directory:
+            path = self._write(directory, self.SID_A, records)
+            with patch.object(antiphon, "claude_transcripts", return_value=[path]):
+                events, _reached = antiphon.claude_events(
+                    directory, visible_record_limit=antiphon.EVENT_LIMIT + 1)
+        self.assertIn("Read tool-only", [event.text for event in events])
+        self.assertNotIn("must not be read", [event.text for event in events])
+
+    def test_bounded_lookahead_filtered_only_source_reaches_eof(self):
+        records = [self._filtered(i % 60) for i in range(75)]
+        with tempfile.TemporaryDirectory() as directory:
+            path = self._write(directory, self.SID_A, records)
+            with patch.object(antiphon, "claude_transcripts", return_value=[path]):
+                events, reached = antiphon.claude_events(
+                    directory, visible_record_limit=antiphon.EVENT_LIMIT + 1)
+            size = os.path.getsize(path)
+        self.assertEqual(events, [])
+        self.assertEqual(reached[self.SID_A]["offset"], size)
+
+
+class InvalidCursorFilePagingTest(unittest.TestCase):
+    """An existing unreadable cursor restarts conservatively and is preserved."""
+
+    SID = "4eecac24-1c21-47ad-ab11-a650708f3098"
+
+    def _source(self, project):
+        path = os.path.join(project, self.SID + ".jsonl")
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(json.dumps({
+                "type": "assistant", "timestamp": "2020-01-01T00:00:00.000Z",
+                "message": {"content": [{"type": "text", "text": "old recovery record"}]},
+            }) + "\n")
+        return path
+
+    @staticmethod
+    def _cursor(project, contents):
+        path = os.path.join(project, ".antiphon", "cursor.json")
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(contents)
+        return path
+
+    @staticmethod
+    def _hook(project, source, deliver=None):
+        out, err = io.StringIO(), io.StringIO()
+        patches = [
+            patch.object(antiphon, "claude_transcripts", return_value=[source]),
+            patch.object(antiphon, "record_codex_session"),
+            patch.object(antiphon.sys, "stdin", io.StringIO(json.dumps({
+                "cwd": project, "hook_event_name": "UserPromptSubmit"}))),
+        ]
+        if deliver is not None:
+            patches.append(patch.object(antiphon, "_deliver", side_effect=deliver))
+        with contextlib.ExitStack() as stack:
+            for item in patches:
+                stack.enter_context(item)
+            stack.enter_context(contextlib.redirect_stdout(out))
+            stack.enter_context(contextlib.redirect_stderr(err))
+            code = antiphon.hook("codex")
+        return code, out.getvalue(), err.getvalue()
+
+    @staticmethod
+    def _mcp(project, source):
+        request = {"jsonrpc": "2.0", "id": 7, "method": "tools/call",
+                   "params": {"name": "antiphon_read", "arguments": {}}}
+        out, err = io.StringIO(), io.StringIO()
+        with patch.object(antiphon, "project_dir", return_value=project), \
+             patch.object(antiphon, "register_codex_peer", return_value=None), \
+             patch.object(antiphon, "claude_transcripts", return_value=[source]), \
+             patch.object(antiphon.sys, "stdin",
+                          io.StringIO(json.dumps(request) + "\n")), \
+             contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            antiphon.mcp()
+        return json.loads(out.getvalue()), err.getvalue()
+
+    def _assert_private_recovery(self, text, err, source, generation):
+        self.assertIn("old recovery record", text)
+        self.assertIn(antiphon.REPLAY_NOTICES["cursor_recovery"], text)
+        self.assertIn("cursor", err.lower())
+        for secret in (self.SID, source, generation, self.SID[:8], generation[:8]):
+            self.assertNotIn(secret, err)
+
+    def test_truncated_json_hook_restarts_from_zero_and_establishes_v3(self):
+        with tempfile.TemporaryDirectory() as project:
+            source = self._source(project)
+            generation = antiphon.source_generation(source)
+            self._cursor(project, '{"codex_seen":')
+            code, out, err = self._hook(project, source)
+            cursor = antiphon.read_cursor(project, "codex")
+        self.assertEqual(code, 0)
+        self._assert_private_recovery(out, err, source, generation)
+        self.assertEqual(cursor[antiphon.page_cursor_key("codex")]["v"],
+                         antiphon.PAGE_CURSOR_VERSION)
+
+    def test_non_object_array_mcp_restarts_from_zero_and_establishes_v3(self):
+        with tempfile.TemporaryDirectory() as project:
+            source = self._source(project)
+            generation = antiphon.source_generation(source)
+            self._cursor(project, "[]")
+            response, err = self._mcp(project, source)
+            cursor = antiphon.read_cursor(project, "codex")
+        text = response["result"]["content"][0]["text"]
+        self._assert_private_recovery(text, err, source, generation)
+        self.assertEqual(cursor[antiphon.page_cursor_key("codex")]["v"],
+                         antiphon.PAGE_CURSOR_VERSION)
+
+    def test_non_object_null_hook_restarts_from_zero_and_establishes_v3(self):
+        with tempfile.TemporaryDirectory() as project:
+            source = self._source(project)
+            generation = antiphon.source_generation(source)
+            self._cursor(project, "null")
+            code, out, err = self._hook(project, source)
+            cursor = antiphon.read_cursor(project, "codex")
+        self.assertEqual(code, 0)
+        self._assert_private_recovery(out, err, source, generation)
+        self.assertEqual(cursor[antiphon.page_cursor_key("codex")]["v"],
+                         antiphon.PAGE_CURSOR_VERSION)
+
+    def test_failed_output_preserves_invalid_bytes_and_the_same_recovery_page(self):
+        original = b'{"codex_seen":'
+        attempted = []
+        with tempfile.TemporaryDirectory() as project:
+            source = self._source(project)
+            cursor_path = self._cursor(project, original.decode("utf-8"))
+            code, _out, _err = self._hook(
+                project, source, deliver=lambda line: attempted.append(line) or False)
+            with open(cursor_path, "rb") as f:
+                after = f.read()
+            _code, repeated, _err = self._hook(project, source)
+        self.assertEqual(code, 1)
+        self.assertEqual(after, original)
+        self.assertIn("old recovery record", attempted[0])
+        self.assertIn(antiphon.REPLAY_NOTICES["cursor_recovery"], repeated)
+
+    def test_update_cursor_refuses_to_mutate_or_replace_invalid_file(self):
+        original = b'{"codex_seen":'
+        called = []
+        with tempfile.TemporaryDirectory() as project:
+            cursor_path = self._cursor(project, original.decode("utf-8"))
+
+            def mutate(cursor):
+                called.append(cursor)
+                cursor["unrelated"] = "fingerprint"
+                return cursor
+
+            err = io.StringIO()
+            with contextlib.redirect_stderr(err):
+                result = antiphon.update_cursor(project, "codex", mutate)
+            with open(cursor_path, "rb") as f:
+                after = f.read()
+        self.assertFalse(result)
+        self.assertEqual(called, [])
+        self.assertEqual(after, original)
+        self.assertIn("cursor", err.getvalue().lower())
+
+
+class _PagingIntegrationCase(unittest.TestCase):
+    SID_A = "4eecac24-1c21-47ad-ab11-a650708f3098"
+    SID_B = "01a04f6b-4485-7290-afbd-9eae74405ec8"
+
+    @staticmethod
+    def _timestamp(index=0, old=False):
+        if old:
+            return "2020-01-01T00:%02d:00.000Z" % (index % 60)
+        return time.strftime("%Y-%m-%dT%H:%M:%S.000Z",
+                             time.gmtime(time.time() + index))
+
+    @classmethod
+    def _claude_record(cls, text, index=0, blocks=None, filtered=False, old=False):
+        return json.dumps({
+            "type": "assistant", "isMeta": filtered,
+            "timestamp": cls._timestamp(index, old),
+            "message": {"content": blocks if blocks is not None else [
+                {"type": "text", "text": text}]},
+        })
+
+    @classmethod
+    def _codex_record(cls, text, index=0, old=False):
+        return json.dumps({
+            "type": "response_item", "timestamp": cls._timestamp(index, old),
+            "payload": {"type": "message", "role": "assistant",
+                        "content": [{"type": "output_text", "text": text}]},
+        })
+
+    @staticmethod
+    def _write_source(project, sid, records, codex=False):
+        name = ("rollout-2026-08-30T00-00-00-%s.jsonl" % sid
+                if codex else sid + ".jsonl")
+        path = os.path.join(project, name)
+        with open(path, "w", encoding="utf-8") as f:
+            f.write("\n".join(records) + "\n")
+        return path
+
+    @staticmethod
+    def _hook(project, claude_paths=(), codex_paths=(), side="codex", deliver=None):
+        out, err = io.StringIO(), io.StringIO()
+        patches = [
+            patch.object(antiphon, "claude_transcripts", return_value=list(claude_paths)),
+            patch.object(antiphon, "codex_rollout_files", return_value=list(codex_paths)),
+            patch.object(antiphon, "record_codex_session"),
+            patch.object(antiphon.sys, "stdin", io.StringIO(json.dumps({
+                "cwd": project, "hook_event_name": "UserPromptSubmit"}))),
+        ]
+        if deliver is not None:
+            patches.append(patch.object(antiphon, "_deliver", side_effect=deliver))
+        with contextlib.ExitStack() as stack:
+            for item in patches:
+                stack.enter_context(item)
+            stack.enter_context(contextlib.redirect_stdout(out))
+            stack.enter_context(contextlib.redirect_stderr(err))
+            code = antiphon.hook(side)
+        raw = out.getvalue().strip()
+        text = ""
+        if raw:
+            text = json.loads(raw)["hookSpecificOutput"]["additionalContext"]
+        return code, text, err.getvalue(), raw
+
+    @staticmethod
+    def _mcp(project, claude_paths):
+        request = {"jsonrpc": "2.0", "id": 11, "method": "tools/call",
+                   "params": {"name": "antiphon_read", "arguments": {}}}
+        out, err = io.StringIO(), io.StringIO()
+        with patch.object(antiphon, "project_dir", return_value=project), \
+             patch.object(antiphon, "register_codex_peer", return_value=None), \
+             patch.object(antiphon, "claude_transcripts",
+                          return_value=list(claude_paths)), \
+             patch.object(antiphon.sys, "stdin",
+                          io.StringIO(json.dumps(request) + "\n")), \
+             contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            antiphon.mcp()
+        return json.loads(out.getvalue())["result"], err.getvalue()
+
+
+class PagedDeliveryTest(_PagingIntegrationCase):
+    """Hook, MCP, and status deliver the same whole-record page transaction."""
+
+    def test_hook_delivers_page_one_then_page_two_then_empty(self):
+        records = [self._claude_record("hook record %d" % i, i)
+                   for i in range(antiphon.EVENT_LIMIT + 5)]
+        with tempfile.TemporaryDirectory() as project:
+            path = self._write_source(project, self.SID_A, records)
+            size = os.path.getsize(path)
+            first = self._hook(project, [path])[1]
+            second = self._hook(project, [path])[1]
+            third = self._hook(project, [path])[1]
+        self.assertIn("hook record 0", first)
+        self.assertIn("hook record 39", first)
+        self.assertNotIn("hook record 40", first)
+        self.assertIn("has_more: true", first)
+        self.assertIn("hook record 40", second)
+        self.assertIn("hook record 44", second)
+        self.assertIn("has_more: false", second)
+        self.assertEqual(third, "")
+
+    def test_antiphon_read_delivers_page_one_then_page_two_then_nothing_new(self):
+        records = [self._claude_record("mcp record %d" % i, i)
+                   for i in range(antiphon.EVENT_LIMIT + 5)]
+        with tempfile.TemporaryDirectory() as project:
+            path = self._write_source(project, self.SID_A, records)
+            results = [self._mcp(project, [path])[0] for _ in range(3)]
+        texts = [result["content"][0]["text"] for result in results]
+        self.assertIn("mcp record 0", texts[0])
+        self.assertIn("mcp record 40", texts[1])
+        self.assertIn("Nothing new", texts[2])
+
+    def test_multiblock_source_record_is_not_split_by_hook_or_mcp_limits(self):
+        blocks = [{"type": "text", "text": "first atomic block"},
+                  {"type": "tool_use", "name": "Read",
+                   "input": {"file_path": "atomic.txt"}},
+                  {"type": "text", "text": "second atomic block"}]
+        records = [self._claude_record("", 0, blocks),
+                   self._claude_record("later record", 1)]
+        with tempfile.TemporaryDirectory() as project:
+            path = self._write_source(project, self.SID_A, records)
+            with patch.object(antiphon, "EVENT_LIMIT", 1):
+                hook_text = self._hook(project, [path])[1]
+            os.unlink(os.path.join(project, ".antiphon", "cursor.json"))
+            with patch.object(antiphon, "EVENT_LIMIT", 1):
+                mcp_text = self._mcp(project, [path])[0]["content"][0]["text"]
+        for text in (hook_text, mcp_text):
+            self.assertIn("first atomic block", text)
+            self.assertIn("Read atomic.txt", text)
+            self.assertIn("second atomic block", text)
+            self.assertNotIn("later record", text)
+
+    def test_interleaved_sources_preserve_independent_offset_prefixes(self):
+        with tempfile.TemporaryDirectory() as project:
+            path_a = self._write_source(project, self.SID_A, [
+                self._claude_record("A first", 0),
+                self._claude_record("A second with regressed time", -5)])
+            path_b = self._write_source(project, self.SID_B, [
+                self._claude_record("B first", 1),
+                self._claude_record("B second", 2)])
+            with patch.object(antiphon, "EVENT_LIMIT", 2):
+                first = self._hook(project, [path_a, path_b])[1]
+                first_cursor = antiphon.read_cursor(project, "codex")
+                second = self._hook(project, [path_a, path_b])[1]
+            cursor = antiphon.read_cursor(project, "codex")
+        self.assertIn("A first", first)
+        self.assertIn("A second", first)
+        self.assertNotIn("B first", first)
+        self.assertNotIn("B second", first)
+        self.assertIn("B first", second)
+        self.assertIn("B second", second)
+        self.assertLess(first.index("A first"), first.index("A second"))
+        self.assertLess(second.index("B first"), second.index("B second"))
+        first_sources = first_cursor["codex_pages"]["sources"]
+        self.assertEqual(first_sources[self.SID_B]["offset"], 0)
+        sources = cursor["codex_pages"]["sources"]
+        self.assertEqual(len(sources), 2)
+        self.assertGreater(sources[self.SID_A]["offset"], 0)
+        self.assertGreater(sources[self.SID_B]["offset"], 0)
+
+    def test_production_page_caps_each_parser_at_page_plus_one_records(self):
+        records_a = [self._claude_record("A %d" % i, i) for i in range(50)]
+        records_b = [self._claude_record("B %d" % i, i,
+                     blocks=[{"type": "text", "text": "B block one"},
+                             {"type": "text", "text": "B block two"}]
+                     if i == antiphon.EVENT_LIMIT else None) for i in range(50)]
+        with tempfile.TemporaryDirectory() as project:
+            paths = [self._write_source(project, self.SID_A, records_a),
+                     self._write_source(project, self.SID_B, records_b)]
+            real_read = antiphon.read_records
+            counts = {path: 0 for path in paths}
+
+            def tracked(path, offset=0):
+                for record in real_read(path, offset):
+                    counts[path] += 1
+                    yield record
+
+            with patch.object(antiphon, "claude_transcripts", return_value=paths), \
+                 patch.object(antiphon, "read_records", side_effect=tracked):
+                antiphon.build_summary(project, "codex")
+        self.assertEqual(counts, {path: antiphon.EVENT_LIMIT + 1 for path in paths})
+
+    def test_filtered_only_hook_persists_v3_and_preserves_legacy_bytes(self):
+        seeded = {"v": 2, "sources": {"legacy": {"gen": "old", "offset": 17}}}
+        records = [self._claude_record("filtered", i, filtered=True) for i in range(3)]
+        with tempfile.TemporaryDirectory() as project:
+            path = self._write_source(project, self.SID_A, records)
+            size = os.path.getsize(path)
+            antiphon.write_cursor(project, {"codex_seen": seeded}, "codex")
+            code, text, _err, _raw = self._hook(project, [path])
+            cursor = antiphon.read_cursor(project, "codex")
+        self.assertEqual(code, 0)
+        self.assertIn(antiphon.REPLAY_NOTICES["legacy_upgrade"], text)
+        self.assertIn("has_more: false", text)
+        self.assertEqual(cursor["codex_seen"], seeded)
+        self.assertEqual(cursor["codex_pages"]["v"], 3)
+        self.assertEqual(cursor["codex_pages"]["sources"][self.SID_A]["offset"],
+                         size)
+
+    def test_filtered_only_mcp_persists_v3_and_preserves_legacy_bytes(self):
+        seeded = {"v": 2, "sources": {"legacy": {"gen": "old", "offset": 19}}}
+        records = [self._claude_record("filtered", i, filtered=True) for i in range(3)]
+        with tempfile.TemporaryDirectory() as project:
+            path = self._write_source(project, self.SID_A, records)
+            size = os.path.getsize(path)
+            generation = antiphon.source_generation(path)
+            antiphon.write_cursor(project, {"codex_seen": seeded}, "codex")
+            result, _err = self._mcp(project, [path])
+            cursor = antiphon.read_cursor(project, "codex")
+        self.assertIn(antiphon.REPLAY_NOTICES["legacy_upgrade"],
+                      result["content"][0]["text"])
+        self.assertEqual(cursor["codex_seen"], seeded)
+        self.assertEqual(cursor["codex_pages"], {"v": 3, "sources": {
+            self.SID_A: {"gen": generation, "offset": size}}})
+
+    def test_failed_hook_write_leaves_first_page_and_cursor_untouched(self):
+        records = [self._claude_record("retry me", 0)]
+        original = {"keep": "byte-for-byte"}
+        attempted = []
+        with tempfile.TemporaryDirectory() as project:
+            path = self._write_source(project, self.SID_A, records)
+            antiphon.write_cursor(project, original, "codex")
+            cursor_path = os.path.join(project, ".antiphon", "cursor.json")
+            with open(cursor_path, "rb") as f:
+                before = f.read()
+            code = self._hook(
+                project, [path], deliver=lambda line: attempted.append(line) or False)[0]
+            with open(cursor_path, "rb") as f:
+                after = f.read()
+        self.assertEqual(code, 1)
+        self.assertIn("retry me", attempted[0])
+        self.assertEqual(after, before)
+
+    def test_oversized_hook_writes_whole_then_advances_without_spill(self):
+        oversized = "oversized-start\n" + "X" * (antiphon.PAGE_BUDGET + 500) + "\noversized-end"
+        order = []
+        delivered = []
+        with tempfile.TemporaryDirectory() as project:
+            path = self._write_source(project, self.SID_A,
+                                      [self._claude_record(oversized)])
+            size = os.path.getsize(path)
+            real_write = antiphon.write_cursor
+
+            def deliver(line):
+                order.append("write")
+                delivered.append(line)
+                return True
+
+            def write_cursor(cwd, data, kind):
+                order.append("advance")
+                self.assertEqual(order[:2], ["write", "advance"])
+                return real_write(cwd, data, kind)
+
+            with patch.object(antiphon, "write_cursor", side_effect=write_cursor):
+                code = self._hook(project, [path], deliver=deliver)[0]
+            cursor = antiphon.read_cursor(project, "codex")
+            created = [name for name in os.listdir(project)
+                       if name not in (os.path.basename(path), ".antiphon")]
+        self.assertEqual(code, 0)
+        delivered_text = json.loads(delivered[0])["hookSpecificOutput"]["additionalContext"]
+        self.assertIn(oversized, delivered_text)
+        self.assertEqual(created, [])
+        self.assertEqual(cursor["codex_pages"]["sources"][self.SID_A]["offset"],
+                         size)
+
+    def test_oversized_mcp_refuses_without_advancing_or_spilling(self):
+        oversized = "mcp-oversized-start\n" + "Y" * (antiphon.PAGE_BUDGET + 500)
+        original = {"keep": "same"}
+        with tempfile.TemporaryDirectory() as project:
+            path = self._write_source(project, self.SID_A,
+                                      [self._claude_record(oversized)])
+            antiphon.write_cursor(project, original, "codex")
+            cursor_path = os.path.join(project, ".antiphon", "cursor.json")
+            with open(cursor_path, "rb") as f:
+                before = f.read()
+            result, _err = self._mcp(project, [path])
+            with open(cursor_path, "rb") as f:
+                after = f.read()
+            created = [name for name in os.listdir(project)
+                       if name not in (os.path.basename(path), ".antiphon")]
+        self.assertEqual(result.get("isError"), True)
+        text = result["content"][0]["text"]
+        self.assertIn("next prompt", text)
+        self.assertIn("nothing was read", text.lower())
+        self.assertEqual(after, before)
+        self.assertEqual(created, [])
+
+    def test_status_clips_each_private_peer_preview_from_its_own_snapshot(self):
+        secret = "4f412a2c-6b47-48cf-a476-f0a6f8f39c40"
+        huge = "é" * (antiphon.PAGE_BUDGET // 2 + 500)
+        with tempfile.TemporaryDirectory() as project, \
+             patch.dict(os.environ, {"ANTIPHON_NAME": "ui"}):
+            claude_path = self._write_source(
+                project, self.SID_A, [self._claude_record("CLAUDE-NEXT " + huge)])
+            codex_path = self._write_source(
+                project, self.SID_B, [self._codex_record("CODEX-NEXT " + huge)], codex=True)
+            antiphon.write_cursor(project, {
+                "claude_pages": {"v": 3, "sources": {
+                    self.SID_B: {"gen": "replaced-" + secret, "offset": 1}}},
+                "leaky_pages": {"v": 999, "sources": {secret: secret}},
+            }, "claude")
+            antiphon.write_cursor(project, {
+                "codex_pages": {"v": 999, "sources": {secret: secret}},
+            }, "codex")
+            out, err = io.StringIO(), io.StringIO()
+            with patch.object(antiphon, "project_dir", return_value=project), \
+                 patch.object(antiphon, "claude_transcripts", return_value=[claude_path]), \
+                 patch.object(antiphon, "codex_rollout_files", return_value=[codex_path]), \
+                 patch.object(antiphon, "_live_by_kind",
+                              return_value={"claude": [], "codex": []}), \
+                 contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+                self.assertEqual(antiphon.status(), 0)
+        shown = out.getvalue()
+        self.assertIn("CLAUDE-NEXT", shown)
+        self.assertIn("CODEX-NEXT", shown)
+        self.assertIn("status preview ends here", shown)
+        previews = shown.split("=== what ")[1:]
+        self.assertTrue(all(len(preview.encode("utf-8")) <= antiphon.PAGE_BUDGET + 200
+                            for preview in previews))
+        direct_preview = antiphon._status_preview(huge)
+        self.assertLessEqual(len(direct_preview.encode("utf-8")),
+                             antiphon.PAGE_BUDGET)
+        self.assertIn("status preview ends here", direct_preview)
+        for stream in (shown, err.getvalue()):
+            self.assertNotIn(secret, stream)
+            self.assertNotIn(secret[:8], stream)
+            self.assertNotIn(claude_path, stream)
+            self.assertNotIn(codex_path, stream)
+
+    def test_explicit_summary_prints_full_oversized_page_without_advancing(self):
+        oversized = "summary-start\n" + "Z" * (antiphon.PAGE_BUDGET + 500) + "\nsummary-end"
+        original = {"keep": "unchanged"}
+        with tempfile.TemporaryDirectory() as project:
+            path = self._write_source(project, self.SID_A,
+                                      [self._claude_record(oversized)])
+            antiphon.write_cursor(project, original, "codex")
+            cursor_path = os.path.join(project, ".antiphon", "cursor.json")
+            with open(cursor_path, "rb") as f:
+                before = f.read()
+            out = io.StringIO()
+            with patch.object(antiphon, "project_dir", return_value=project), \
+                 patch.object(antiphon, "claude_transcripts", return_value=[path]), \
+                 contextlib.redirect_stdout(out):
+                self.assertEqual(antiphon.print_summary("codex"), 0)
+            with open(cursor_path, "rb") as f:
+                after = f.read()
+        self.assertIn(oversized, out.getvalue())
+        self.assertEqual(after, before)
+
+    def test_oversized_first_record_advances_only_to_normal_second_record(self):
+        oversized = "first-overlarge " + "Q" * (antiphon.PAGE_BUDGET + 500)
+        with tempfile.TemporaryDirectory() as project:
+            path = self._write_source(project, self.SID_A, [
+                self._claude_record(oversized, 0),
+                self._claude_record("normal page two", 1)])
+            first = self._hook(project, [path])[1]
+            cursor = antiphon.read_cursor(project, "codex")
+            second = self._hook(project, [path])[1]
+            starts = list(antiphon.read_records(path))
+        self.assertIn(oversized, first)
+        self.assertIn("has_more: true", first)
+        self.assertNotIn("normal page two", first)
+        self.assertEqual(cursor["codex_pages"]["sources"][self.SID_A]["offset"],
+                         starts[1][0])
+        self.assertIn("normal page two", second)
+
+    def test_page_hook_and_mcp_preserve_exact_non_tool_whitespace(self):
+        exact = "  leading indent\n\n   \nfinal newline\n"
+        records = [self._claude_record(exact)]
+        with tempfile.TemporaryDirectory() as project:
+            path = self._write_source(project, self.SID_A, records)
+            hook_text = self._hook(project, [path])[1]
+            os.unlink(os.path.join(project, ".antiphon", "cursor.json"))
+            mcp_text = self._mcp(project, [path])[0]["content"][0]["text"]
+        expected = "Claude:\n" + exact
+        self.assertIn(expected, hook_text)
+        self.assertIn(expected, mcp_text)
+
+
+class RollingUpgradePagingTest(_PagingIntegrationCase):
+    """Old v2 writers can overlap v3 paging without creating a delivery gap."""
+
+    @staticmethod
+    def _legacy_write(project, side, value):
+        key = "%s_seen" % side
+
+        def mutate(cursor):
+            cursor[key] = value
+            return cursor
+
+        return antiphon.update_cursor(project, side, mutate)
+
+    def test_legacy_v2_replays_all_discovered_history_until_final_page(self):
+        seeded = {"v": 2, "sources": {
+            self.SID_A: {"gen": "copied-old-generation", "offset": 999999}}}
+        records = [self._claude_record("migration %d" % i, i, old=True)
+                   for i in range(5)]
+        with tempfile.TemporaryDirectory() as project:
+            path = self._write_source(project, self.SID_A, records)
+            antiphon.write_cursor(project, {"codex_seen": seeded}, "codex")
+            pages = []
+            cursors = []
+            with patch.object(antiphon, "EVENT_LIMIT", 2):
+                for _ in range(4):
+                    pages.append(self._hook(project, [path])[1])
+                    cursors.append(antiphon.read_cursor(project, "codex"))
+        self.assertIn("migration 0", pages[0])
+        self.assertIn("migration 2", pages[1])
+        self.assertIn("migration 4", pages[2])
+        self.assertEqual(pages[3], "")
+        for page in pages[:3]:
+            self.assertIn(antiphon.REPLAY_NOTICES["legacy_upgrade"], page)
+        self.assertEqual(cursors[0]["codex_pages"]["replay"], "legacy_upgrade")
+        self.assertEqual(cursors[1]["codex_pages"]["replay"], "legacy_upgrade")
+        self.assertNotIn("replay", cursors[2]["codex_pages"])
+        self.assertTrue(all(cursor["codex_seen"] == seeded for cursor in cursors))
+
+    def test_old_writer_advancing_v2_after_page_one_cannot_skip_page_two(self):
+        seeded = {"v": 2, "sources": {}}
+        records = [self._claude_record("overlap %d" % i, i, old=True)
+                   for i in range(3)]
+        with tempfile.TemporaryDirectory() as project:
+            path = self._write_source(project, self.SID_A, records)
+            antiphon.write_cursor(project, {"codex_seen": seeded}, "codex")
+            with patch.object(antiphon, "EVENT_LIMIT", 1):
+                first = self._hook(project, [path])[1]
+                first_cursor = antiphon.read_cursor(project, "codex")
+                old_value = {"v": 2, "sources": {self.SID_A: {
+                    "gen": antiphon.source_generation(path),
+                    "offset": os.path.getsize(path)}}}
+                self.assertTrue(self._legacy_write(project, "codex", old_value))
+                second = self._hook(project, [path])[1]
+                second_cursor = antiphon.read_cursor(project, "codex")
+        self.assertIn("overlap 0", first)
+        self.assertIn("overlap 1", second)
+        self.assertIn(antiphon.REPLAY_NOTICES["legacy_upgrade"], second)
+        self.assertEqual(first_cursor["codex_pages"]["replay"], "legacy_upgrade")
+        self.assertEqual(second_cursor["codex_seen"], old_value)
+
+    def test_malformed_v3_ignores_farther_v2_and_keeps_recovery_until_final_page(self):
+        records = [self._claude_record("recovery %d" % i, i, old=True)
+                   for i in range(3)]
+        with tempfile.TemporaryDirectory() as project:
+            path = self._write_source(project, self.SID_A, records)
+            legacy = {"v": 2, "sources": {self.SID_A: {
+                "gen": antiphon.source_generation(path),
+                "offset": os.path.getsize(path)}}}
+            antiphon.write_cursor(project, {
+                "codex_seen": legacy,
+                "codex_pages": {"v": 999, "sources": {"secret-source": "bad"}},
+            }, "codex")
+            pages = []
+            cursors = []
+            errors = []
+            with patch.object(antiphon, "EVENT_LIMIT", 2):
+                for _ in range(2):
+                    result = self._hook(project, [path])
+                    pages.append(result[1])
+                    errors.append(result[2])
+                    cursors.append(antiphon.read_cursor(project, "codex"))
+        self.assertIn("recovery 0", pages[0])
+        self.assertIn("recovery 2", pages[1])
+        for page in pages:
+            self.assertIn(antiphon.REPLAY_NOTICES["cursor_recovery"], page)
+        self.assertEqual(cursors[0]["codex_pages"]["replay"], "cursor_recovery")
+        self.assertNotIn("replay", cursors[1]["codex_pages"])
+        self.assertIn("cursor", "".join(errors).lower())
+        self.assertNotIn("secret-source", "".join(errors))
+
+    def test_old_writer_reaching_eof_before_v3_still_triggers_full_upgrade_replay(self):
+        records = [self._claude_record("older omitted record", 0, old=True),
+                   self._claude_record("newer old record", 1, old=True)]
+        with tempfile.TemporaryDirectory() as project:
+            path = self._write_source(project, self.SID_A, records)
+            old_value = {"v": 2, "sources": {self.SID_A: {
+                "gen": antiphon.source_generation(path),
+                "offset": os.path.getsize(path)}}}
+            antiphon.write_cursor(project, {"codex_seen": old_value}, "codex")
+            page = self._hook(project, [path])[1]
+        self.assertIn("older omitted record", page)
+        self.assertIn(antiphon.REPLAY_NOTICES["legacy_upgrade"], page)
+
+    def test_genuinely_new_side_uses_lookback_without_replay(self):
+        records = [self._claude_record("ancient excluded", 0, old=True),
+                   self._claude_record("recent included", 1)]
+        with tempfile.TemporaryDirectory() as project:
+            path = self._write_source(project, self.SID_A, records)
+            page = self._hook(project, [path])[1]
+        self.assertIn("recent included", page)
+        self.assertNotIn("ancient excluded", page)
+        self.assertNotIn("replay:", page)
+
+    def test_malformed_replay_metadata_keeps_positions_and_heals_on_write(self):
+        records = [self._claude_record("already delivered", 0),
+                   self._claude_record("next trusted record", 1)]
+        with tempfile.TemporaryDirectory() as project:
+            path = self._write_source(project, self.SID_A, records)
+            spans = list(antiphon.read_records(path))
+            antiphon.write_cursor(project, {"codex_pages": {
+                "v": 3,
+                "sources": {self.SID_A: {
+                    "gen": antiphon.source_generation(path), "offset": spans[1][0]}},
+                "replay": {"secret": "must-not-render"},
+            }}, "codex")
+            result = self._hook(project, [path])
+            page, err = result[1], result[2]
+            cursor = antiphon.read_cursor(project, "codex")
+        self.assertNotIn("already delivered", page)
+        self.assertIn("next trusted record", page)
+        self.assertNotIn("replay:", page)
+        self.assertNotIn("replay", cursor["codex_pages"])
+        self.assertIn("replay", err.lower())
+        self.assertNotIn("must-not-render", err)
+
+    def test_recovery_with_no_sources_waits_then_clears_after_notice_only_page(self):
+        legacy = 123.0
+        with tempfile.TemporaryDirectory() as project:
+            antiphon.write_cursor(project, {"codex_seen": legacy}, "codex")
+            empty = self._hook(project, [])[1]
+            before = antiphon.read_cursor(project, "codex")
+            path = self._write_source(project, self.SID_A, [
+                self._claude_record("filtered only", 0, filtered=True, old=True)])
+            notice = self._hook(project, [path])[1]
+            after = antiphon.read_cursor(project, "codex")
+        self.assertEqual(empty, "")
+        self.assertEqual(before, {"codex_seen": legacy})
+        self.assertIn(antiphon.REPLAY_NOTICES["legacy_upgrade"], notice)
+        self.assertIn("has_more: false", notice)
+        self.assertEqual(after["codex_seen"], legacy)
+        self.assertNotIn("replay", after["codex_pages"])
 
 
 class MalformedStateTest(unittest.TestCase):
@@ -2684,16 +3600,15 @@ class MalformedStateTest(unittest.TestCase):
             code = antiphon.hook(side)
         return code, summary.call_args.args[3]
 
-    def test_the_hook_starts_from_the_lookback_when_the_cursor_holds_no_time(self):
+    def test_the_hook_replays_when_a_legacy_or_invalid_cursor_holds_no_time(self):
         for contents in ('{"claude_seen": NaN}', '{"claude_seen": Infinity}',
                          '{"claude_seen": 1e308}', '{"claude_seen": "soon"}', "[]"):
             with self._cursor(contents) as (project, _):
                 code, start = self._hook_start(project)
             self.assertEqual(code, 0, contents)
-            self.assertAlmostEqual(start, time.time() - antiphon.LOOKBACK,
-                                   delta=5, msg=contents)
+            self.assertIsNone(start, contents)
 
-    def test_antiphon_read_starts_from_the_lookback_when_the_cursor_holds_no_time(self):
+    def test_antiphon_read_replays_when_a_legacy_or_invalid_cursor_holds_no_time(self):
         """A traceback here ends the MCP session and takes every tool with it."""
         request = {"jsonrpc": "2.0", "id": 1, "method": "tools/call",
                    "params": {"name": "antiphon_read"}}
@@ -2710,16 +3625,15 @@ class MalformedStateTest(unittest.TestCase):
                     antiphon.mcp()
                 start = summary.call_args.args[3]
             self.assertTrue(out.getvalue().strip(), contents)
-            self.assertAlmostEqual(start, time.time() - antiphon.LOOKBACK,
-                                   delta=5, msg=contents)
+            self.assertIsNone(start, contents)
 
     def test_status_reports_a_cursor_it_cannot_read_as_a_time(self):
         """The command someone runs *because* something is wrong is the last one
         allowed to raise. The value is still shown, as what it literally holds."""
-        for contents, shown in (('{"claude_seen": NaN}', "nan"),
-                                ('{"claude_seen": Infinity}', "inf"),
-                                ('{"claude_seen": "soon"}', "soon"),
-                                ('{"claude_seen": 1e308}', "1e+308")):
+        for contents in ('{"claude_seen": NaN}',
+                         '{"claude_seen": Infinity}',
+                         '{"claude_seen": "soon"}',
+                         '{"claude_seen": 1e308}'):
             with self._cursor(contents) as (project, _):
                 out = io.StringIO()
                 with patch.object(antiphon, "project_dir", return_value=project), \
@@ -2729,7 +3643,8 @@ class MalformedStateTest(unittest.TestCase):
                                   return_value=("", 0.0, 0)), \
                      contextlib.redirect_stdout(out):
                     self.assertEqual(antiphon.status(), 0, contents)
-                self.assertIn(f"cursor claude_seen: {shown}", out.getvalue())
+                self.assertIn("cursor claude_seen: invalid cursor state",
+                              out.getvalue())
 
     def test_status_survives_a_cursor_that_is_not_an_object(self):
         with self._cursor("[]") as (project, _):
@@ -2773,7 +3688,7 @@ class MalformedStateTest(unittest.TestCase):
             cursor_path = os.path.join(project, ".antiphon", "cursor.json")
             os.makedirs(os.path.dirname(cursor_path))
             with open(cursor_path, "w", encoding="utf-8") as f:
-                json.dump({"codex_seen": {"v": 2, "sources":
+                json.dump({"codex_pages": {"v": 3, "sources":
                            {sid: {"gen": gen, "offset": seen_through}}}}, f)
             out = io.StringIO()
             with patch.dict(os.environ, {}):
@@ -2814,10 +3729,11 @@ class MalformedStateTest(unittest.TestCase):
         # a count that includes the entry it could not read.
         for broken in ({"v": 2, "sources": {"s1": 42}},
                        {"v": 2, "sources": {"s1": {"gen": "g", "offset": 1}, "s2": 42}},
-                       {"v": 2, "sources": "not-a-dict"},
-                       {"v": 2, "sources": {}}):
+                       {"v": 2, "sources": "not-a-dict"}):
             self.assertEqual(antiphon._cursor_entry("codex_seen", broken),
-                             antiphon.truncate(str(broken), 80), repr(broken))
+                             "invalid cursor state", repr(broken))
+        self.assertEqual(antiphon._cursor_entry(
+            "codex_seen", {"v": 2, "sources": {}}), "0 sources, at —")
 
     # ---- a channel reply of the wrong shape ----
 
@@ -2937,7 +3853,8 @@ class CodexPeerWiringTest(unittest.TestCase):
 
     def _deliver_hook(self, project, stdout, record=None, name="",
                       summary=("## something happened",
-                               {"s1": {"gen": "g", "offset": 1000}}, 1),
+                               page_advance({"s1": {
+                                   "gen": "g", "offset": 1000}}), 1),
                       side="claude"):
         """One prompt through the hook, against a real project directory, with a
         stdout of the test's choosing.
@@ -3029,7 +3946,7 @@ class CodexPeerWiringTest(unittest.TestCase):
         record = []
         with tempfile.TemporaryDirectory() as project:
             code = self._deliver_hook(project, _Recording(record), record,
-                                      summary=("", 0.0, 0))
+                                      summary=("", None, 0))
         self.assertEqual(record, [])
         self.assertEqual(code, 0)
 
@@ -3420,7 +4337,8 @@ class CodexPeerWiringTest(unittest.TestCase):
             with tempfile.TemporaryDirectory() as project:
                 code, out, _, _ = self._hook(project, event=event,
                                              session_id=self.UUID,
-                                             summary=("news", {"s1": {"gen": "g", "offset": 5}}, 1))
+                                             summary=("news", page_advance({"s1": {
+                                                 "gen": "g", "offset": 5}}), 1))
                 self.assertEqual(code, 0, event)
                 self.assertEqual(out, "", event)
 
@@ -3448,11 +4366,13 @@ class CodexPeerWiringTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as project:
             _, _, _, written = self._hook(project, event="SessionStart",
                                           session_id=self.UUID,
-                                          summary=("news", {"s1": {"gen": "g", "offset": 5}}, 1))
+                                          summary=("news", page_advance({"s1": {
+                                              "gen": "g", "offset": 5}}), 1))
             self.assertEqual(written, [], "nothing was read, so nothing is seen")
             _, out, _, written = self._hook(project, event="UserPromptSubmit",
                                             session_id=self.UUID,
-                                            summary=("news", {"s1": {"gen": "g", "offset": 5}}, 1))
+                                            summary=("news", page_advance({"s1": {
+                                                "gen": "g", "offset": 5}}), 1))
         self.assertEqual(written, ["codex"])
         self.assertIn("news", out)
 
@@ -3461,7 +4381,8 @@ class CodexPeerWiringTest(unittest.TestCase):
         the prompt one. Guessing silence there would cost every injection."""
         with tempfile.TemporaryDirectory() as project:
             _, out, _, _ = self._hook(project, event=None, session_id=self.UUID,
-                                      summary=("news", {"s1": {"gen": "g", "offset": 5}}, 1))
+                                      summary=("news", page_advance({"s1": {
+                                          "gen": "g", "offset": 5}}), 1))
         self.assertIn("news", out)
 
     def test_the_claude_hook_touches_no_part_of_the_codex_registry(self):
@@ -3493,7 +4414,8 @@ class CodexPeerWiringTest(unittest.TestCase):
                           side_effect=OSError("disk gone")):
             _, out, err, _ = self._hook(project, event="UserPromptSubmit",
                                         session_id=self.UUID,
-                                        summary=("news", {"s1": {"gen": "g", "offset": 5}}, 1))
+                                        summary=("news", page_advance({"s1": {
+                                            "gen": "g", "offset": 5}}), 1))
         self.assertIn("news", out)
         self.assertIn("disk gone", err)
 
@@ -3501,7 +4423,8 @@ class CodexPeerWiringTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as project:
             self._register(project)
             _, out, _, _ = self._hook(project, event="UserPromptSubmit",
-                                      session_id=None, summary=("news", {"s1": {"gen": "g", "offset": 5}}, 1))
+                                      session_id=None, summary=("news", page_advance({
+                                          "s1": {"gen": "g", "offset": 5}}), 1))
             self.assertIsNone(antiphon.peers.read_peers(project, "codex")[0]["address"])
         self.assertIn("news", out)
 

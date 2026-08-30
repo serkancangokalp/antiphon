@@ -53,20 +53,17 @@ CLAUDE_PROJECTS = os.path.join(HOME, ".claude", "projects")
 CODEX_SESSIONS = os.path.join(HOME, ".codex", "sessions")
 
 TAIL_BYTES = 300_000      # amount to read from the tail of each transcript file
-SUMMARY_BUDGET = 2600     # character budget for the injected summary
-EVENT_BUDGET = 420        # character budget for a single non-tool event
+# Retained until the documentation task replaces the old public limit contract;
+# neither value cuts passive pull content after paging is enabled.
+SUMMARY_BUDGET = 2600
+EVENT_BUDGET = 420
 EVENT_LIMIT = 40          # completed source records per page
 PAGE_BUDGET = 8_000       # UTF-8 bytes in an ordinary complete page envelope
 RECENT_FILES = 3          # transcript files per side the summary reads at all
 LOOKBACK = 6 * 3600       # anything older than this doesn't count as part of "this session"
 
-# SUMMARY_BUDGET, EVENT_BUDGET, EVENT_LIMIT and RECENT_FILES are named rather
-# than spelled inline because the README states each one as a limit a user is
-# asked to plan around, and a contract test reads them back off this module. It
-# has to: every one of these cuts is permanent — the cursor advances past
-# whatever they dropped — so a number that changed here and not there would go
-# on being believed by the person deciding what is safe to send. Removing that
-# permanence is the P0 item in BACKLOG.md.
+# EVENT_LIMIT and PAGE_BUDGET bound a complete page. RECENT_FILES still bounds
+# discovery; it does not authorize cutting any record selected from that set.
 
 # A marker at the start of a line in a reply says that line should be pushed
 # to the target. The line-start requirement is deliberate: mentioning the
@@ -504,19 +501,22 @@ def _translate_cursor_keys(data):
     return {LEGACY_KEYS.get(k, k): v for k, v in data.items()}
 
 
-def read_cursor(cwd, kind):
+def _read_cursor_state(cwd, kind):
+    """Return ``(cursor, state)`` without confusing absence with corruption."""
     new_path = state_path(cwd, kind)
     try:
         with open(new_path, encoding="utf-8") as f:
             data = json.load(f)
-    except (OSError, json.JSONDecodeError):
-        return {}
+    except FileNotFoundError:
+        return {}, "missing"
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+        print("antiphon: the existing cursor could not be read safely; "
+              "restarting discovered transcript history", file=sys.stderr)
+        return {}, "invalid"
     if not isinstance(data, dict):
-        # Valid JSON, and not a cursor. `[]`, `null` and `3` all parse, and none
-        # of them has `.items()`. Read as no state at all — and left on disk
-        # exactly as found, because a read is not the moment to overwrite
-        # whatever a person was in the middle of looking at.
-        return {}
+        print("antiphon: the existing cursor is not a usable object; "
+              "restarting discovered transcript history", file=sys.stderr)
+        return {}, "invalid"
 
     # Translated for the caller and not written back. This runs inside the
     # delivery hold, and `flock` is per open file description, so taking the
@@ -524,7 +524,12 @@ def read_cursor(cwd, kind):
     # would let a read put back a snapshot from before somebody's advance.
     # The translation is idempotent, so the next write from a locked path
     # persists it and nothing behaves differently until then.
-    return _translate_cursor_keys(data)
+    return _translate_cursor_keys(data), "valid"
+
+
+def read_cursor(cwd, kind):
+    """Return the translated cursor object for backwards-compatible callers."""
+    return _read_cursor_state(cwd, kind)[0]
 
 
 def cursor_time(cursor, key, default=None):
@@ -571,6 +576,11 @@ def cursor_time(cursor, key, default=None):
 
 
 CURSOR_VERSION = 2
+PAGE_CURSOR_VERSION = 3
+
+
+def page_cursor_key(side):
+    return "%s_pages" % side
 
 
 def _valid_position(entry):
@@ -588,51 +598,54 @@ def _valid_position(entry):
             and entry["offset"] >= 0)
 
 
-def positions_for(cursor, side):
-    """`(positions, since)` for one side, whichever cursor version is on disk.
+def positions_for(cursor, side, loader_state="valid"):
+    """Return ``(positions, since, replay_reason)`` for one paging reader.
 
-    A float under `<side>_seen` is the timestamp cursor every installed bridge
-    holds today: no offsets yet, so it comes back as a `since` and each source
-    is placed once. A dict is already offsets, but `since` still comes back as
-    the lookback rather than `None`: a source with a recorded entry never
-    consults `since` at all -- it resumes from that entry when it is still
-    trusted, or restarts from byte zero, not the lookback, when it is not --
-    but a v2 map can still meet a source it has no entry for -- an old session
-    resumed, or a fourth transcript rotating into the newest three -- and that
-    source needs the same floor a brand-new one gets, not the whole file with
-    nothing holding it back. Nothing here writes — the migration is finished
-    by the first successful delivery, under the lock, like every other cursor
-    write.
+    A v2 value is deliberately never reinterpreted as a delivered page
+    frontier. Its presence requests a bounded byte-zero replay under the
+    separate v3 key, which keeps an overlapping old process from advancing a
+    new reader past content it did not deliver.
     """
-    value = cursor.get("%s_seen" % side) if isinstance(cursor, dict) else None
-    if (isinstance(value, dict) and value.get("v") == CURSOR_VERSION
-            and isinstance(value.get("sources"), dict)):
-        sources = {sid: entry for sid, entry in value["sources"].items()
-                   if _valid_position(entry)}
-        if len(sources) == len(value["sources"]):
-            return sources, cursor_time(cursor, "%s_seen" % side)
-        # Something in there is not a position. Rather than trust the rest of a
-        # file that has clearly been through something, fall back whole.
-        print("antiphon: %s_seen holds an entry that is not a position; "
-              "reading from the lookback instead" % side, file=sys.stderr)
-    return {}, cursor_time(cursor, "%s_seen" % side)
+    if loader_state == "invalid":
+        return {}, None, "cursor_recovery"
+    cursor = cursor if isinstance(cursor, dict) else {}
+    key = page_cursor_key(side)
+    legacy_key = "%s_seen" % side
+    since = time.time() - LOOKBACK
+    if key in cursor:
+        value = cursor.get(key)
+        if (isinstance(value, dict)
+                and value.get("v") == PAGE_CURSOR_VERSION
+                and isinstance(value.get("sources"), dict)):
+            sources = {sid: entry for sid, entry in value["sources"].items()
+                       if _valid_position(entry)}
+            if len(sources) == len(value["sources"]):
+                replay = value.get("replay")
+                if (replay is not None
+                        and (not isinstance(replay, str)
+                             or replay not in REPLAY_NOTICES)):
+                    print("antiphon: cursor replay metadata was invalid and was "
+                          "ignored", file=sys.stderr)
+                    replay = None
+                return sources, since, replay
+        print("antiphon: paging cursor state was invalid; restarting discovered "
+              "transcript history", file=sys.stderr)
+        return {}, None, "cursor_recovery"
+    if legacy_key in cursor:
+        return {}, None, "legacy_upgrade"
+    return {}, since, None
 
 
-def _advance_cursor(cwd, kind, cursor, key, positions, reached):
-    """Merge `reached` into `positions` and persist it as the v2 cursor.
-
-    Every record a parser read moves its source's mark forward, whether or
-    not that record produced anything visible: a turn with nothing to show
-    still has to leave the read position behind it, or the same bytes are
-    read again next turn. It is a no-op, reporting success, when there is
-    nothing to record. Returns whether the state that needed writing was
-    written; the caller decides what, if anything, to say about a failure.
-    """
-    if not reached:
+def _advance_page_cursor(cwd, kind, cursor, side, positions, advance):
+    """Persist the delivered source prefix and replay lifecycle as one value."""
+    if advance is None:
         return True
     merged = dict(positions)
-    merged.update(reached)
-    cursor[key] = {"v": CURSOR_VERSION, "sources": merged}
+    merged.update(advance.sources)
+    value = {"v": PAGE_CURSOR_VERSION, "sources": merged}
+    if advance.has_more and advance.replay_reason in REPLAY_NOTICES:
+        value["replay"] = advance.replay_reason
+    cursor[page_cursor_key(side)] = value
     return write_cursor(cwd, cursor, kind)
 
 
@@ -685,7 +698,10 @@ def update_cursor(cwd, kind, mutate):
     with cursor_lock(cwd, kind) as locked:
         if not locked:
             return False
-        before = read_cursor(cwd, kind)
+        before, state = _read_cursor_state(cwd, kind)
+        if state == "invalid":
+            print("antiphon: refusing to update an invalid cursor", file=sys.stderr)
+            return False
         updated = mutate(json.loads(json.dumps(before)))
         if not isinstance(updated, dict):
             print(f"antiphon: mutate returned {type(updated).__name__}, not a "
@@ -869,18 +885,17 @@ def _start_offset(path, sid, generation, positions, since):
         # this bridge accepts everywhere else. That fallback answers a
         # different question: a source with no recorded entry at all.
         if recorded.get("gen") != generation:
-            print("antiphon: %s was replaced since it was last read (was %s, "
-                  "now %s); reading it again"
-                  % (sid, recorded.get("gen"), generation), file=sys.stderr)
+            print("antiphon: a transcript was replaced since it was last read; "
+                  "reading it again", file=sys.stderr)
             return 0
         size = _source_size(path)
         if size is None:
-            print("antiphon: %s could not be measured; reading it again"
-                  % sid, file=sys.stderr)
+            print("antiphon: a transcript could not be measured; reading it again",
+                  file=sys.stderr)
             return 0
         if recorded["offset"] > size:
-            print("antiphon: %s is shorter than the %d bytes already read "
-                  "from it; reading it again" % (sid, recorded["offset"]),
+            print("antiphon: a transcript is shorter than the %d bytes already "
+                  "read from it; reading it again" % recorded["offset"],
                   file=sys.stderr)
             return 0
         return recorded["offset"]
@@ -963,91 +978,79 @@ def claude_transcripts(cwd):
     return files
 
 
-def claude_events(cwd, positions=None, since=None):
-    """`([Event], reached)` — `Event.kind` is one of: you | claude | tool
+def claude_events(cwd, positions=None, since=None, visible_record_limit=None):
+    """Return visible events and the safe scanned position for each source.
 
-    Ordered by when each record was written, never by its text. Several blocks
-    of one message share a timestamp, and a sort that breaks that tie on the
-    text delivers the message scrambled with nothing to show for it. Across
-    files the path breaks the tie: it is stable between reads, which mtime is
-    not, and cross-file write order is not knowable here anyway.
-
-    `reached` is the end of the last complete record read from each source,
-    whether or not it produced an event — a host record or a system entry
-    still has to be passed, or the next read pays for it again.
+    A completed JSONL record consumes at most one visible lookahead slot even
+    when it contains several text and tool blocks. Filtered records consume no
+    slot, so the scanner can pass them to EOF or to the next visible record.
     """
     events = []
     reached = {}
     position = itertools.count()
     for path in claude_transcripts(cwd)[:RECENT_FILES]:
+        visible_records = 0
         sid = source_id(path)
         gen = source_generation(path)
         offset = _start_offset(path, sid, gen, positions, since)
-        # Seeded here, not only inside the loop below: a source whose start
-        # is already at the end of the file yields no records at all, and a
-        # mark that only the loop writes would never enter `reached` for it.
-        # The next run would then see no entry, treat the source as new, and
-        # read it again from byte zero -- measured end to end, re-delivering
-        # a whole source the turn after a v1 cursor migrates.
-        #
-        # Guarded on `gen is not None`, in both places: a source with no
-        # generation -- a file whose first line has no newline yet, or one
-        # `source_generation` could not read at all -- yields no complete
-        # records either way, so recording nothing here costs it nothing.
-        # Recording `{"gen": None, ...}` instead used to fail
-        # `_valid_position` on the next run and take every *other* source's
-        # position down with it: `positions_for` refuses a map with one bad
-        # entry in it whole, not just the entry that is wrong.
         if gen is not None:
             reached[sid] = {"gen": gen, "offset": offset}
         for start, end, line in read_records(path, offset):
             if gen is not None:
                 reached[sid] = {"gen": gen, "offset": end}
+            before = len(events)
             try:
                 d = json.loads(line)
             except json.JSONDecodeError:
-                continue
-            if d.get("isMeta"):
-                continue
-            ts = iso_epoch(d.get("timestamp"))
-            kind = d.get("type")
-            msg = d.get("message") or {}
-            content = msg.get("content")
-            if kind == "user":
-                text = ""
-                if isinstance(content, str):
-                    text = content
-                elif isinstance(content, list):
-                    # The break between two blocks is content: joined by a
-                    # space, a sentence and the code block under it become one
-                    # run-on line and nothing says where either ended.
-                    text = _join_text_blocks(
-                        c.get("text", "") for c in content
-                        if isinstance(c, dict) and c.get("type") == "text")
-                # tool results and host records are not the user's own words
-                if (text != ""
-                        and not _is_host_record(text, CLAUDE_WRAPPER_OPENING,
-                                                d.get("promptSource"))
-                        and not _is_self_injected(text)):
-                    events.append((ts, path, next(position),
-                                  Event(ts, "you", text, sid, gen, start, end)))
-            elif kind == "assistant":
-                for c in content if isinstance(content, list) else []:
-                    if c.get("type") == "text":
-                        text = c.get("text")
-                        if isinstance(text, str) and text != "":
-                            events.append((ts, path, next(position),
-                                          Event(ts, "claude", text,
-                                                sid, gen, start, end)))
-                    elif c.get("type") == "tool_use":
-                        i = c.get("input") or {}
-                        detail = i.get("file_path") or i.get("command") or i.get("pattern") or ""
+                d = None
+            if isinstance(d, dict) and not d.get("isMeta"):
+                ts = iso_epoch(d.get("timestamp"))
+                kind = d.get("type")
+                msg = d.get("message") or {}
+                content = msg.get("content") if isinstance(msg, dict) else None
+                if kind == "user":
+                    text = ""
+                    if isinstance(content, str):
+                        text = content
+                    elif isinstance(content, list):
+                        text = _join_text_blocks(
+                            c.get("text", "") for c in content
+                            if isinstance(c, dict) and c.get("type") == "text")
+                    if (text != ""
+                            and not _is_host_record(text, CLAUDE_WRAPPER_OPENING,
+                                                    d.get("promptSource"))
+                            and not _is_self_injected(text)):
                         events.append((ts, path, next(position),
-                                      Event(ts, "tool",
-                                            f"{c.get('name', '?')} {detail}".strip(),
-                                            sid, gen, start, end)))
-    events.sort(key=lambda e: (e[0], e[1], e[2]))
-    return [e[3] for e in events], reached
+                                      Event(ts, "you", text, sid, gen, start, end)))
+                elif kind == "assistant":
+                    for c in content if isinstance(content, list) else []:
+                        if not isinstance(c, dict):
+                            continue
+                        if c.get("type") == "text":
+                            text = c.get("text")
+                            if isinstance(text, str) and text != "":
+                                events.append((ts, path, next(position),
+                                              Event(ts, "claude", text,
+                                                    sid, gen, start, end)))
+                        elif c.get("type") == "tool_use":
+                            arguments = c.get("input") or {}
+                            arguments = arguments if isinstance(arguments, dict) else {}
+                            detail = (arguments.get("file_path")
+                                      or arguments.get("command")
+                                      or arguments.get("pattern") or "")
+                            events.append((ts, path, next(position),
+                                          Event(ts, "tool",
+                                                f"{c.get('name', '?')} {detail}".strip(),
+                                                sid, gen, start, end)))
+            if len(events) > before:
+                visible_records += 1
+                if (visible_record_limit is not None
+                        and visible_records >= visible_record_limit):
+                    break
+    events.sort(key=lambda item: (
+        item[0], item[3].source, item[3].generation or "",
+        item[3].offset, item[2]))
+    return [item[3] for item in events], reached
 
 
 # ---------- Codex side ----------
@@ -1103,81 +1106,65 @@ def codex_rollout_files(cwd, days=3):
     return matched
 
 
-def codex_events(cwd, positions=None, since=None):
-    """`([Event], reached)` — `Event.kind` is one of: you | codex | tool
-
-    Ordered by when each record was written, never by its text. Several blocks
-    of one message share a timestamp, and a sort that breaks that tie on the
-    text delivers the message scrambled with nothing to show for it. Across
-    files the path breaks the tie: it is stable between reads, which mtime is
-    not, and cross-file write order is not knowable here anyway.
-
-    `reached` is the end of the last complete record read from each source,
-    whether or not it produced an event — a host record or a system entry
-    still has to be passed, or the next read pays for it again.
-    """
+def codex_events(cwd, positions=None, since=None, visible_record_limit=None):
+    """Return visible events and the safe scanned position for each rollout."""
     events = []
     reached = {}
     position = itertools.count()
     for path in codex_rollout_files(cwd)[:RECENT_FILES]:
+        visible_records = 0
         sid = source_id(path)
         gen = source_generation(path)
         offset = _start_offset(path, sid, gen, positions, since)
-        # Seeded here, not only inside the loop below: a source whose start
-        # is already at the end of the file yields no records at all, and a
-        # mark that only the loop writes would never enter `reached` for it.
-        # The next run would then see no entry, treat the source as new, and
-        # read it again from byte zero -- measured end to end, re-delivering
-        # a whole source the turn after a v1 cursor migrates.
-        #
-        # Guarded on `gen is not None`, in both places: a source with no
-        # generation -- a file whose first line has no newline yet, or one
-        # `source_generation` could not read at all -- yields no complete
-        # records either way, so recording nothing here costs it nothing.
-        # Recording `{"gen": None, ...}` instead used to fail
-        # `_valid_position` on the next run and take every *other* source's
-        # position down with it: `positions_for` refuses a map with one bad
-        # entry in it whole, not just the entry that is wrong.
         if gen is not None:
             reached[sid] = {"gen": gen, "offset": offset}
         for start, end, line in read_records(path, offset):
             if gen is not None:
                 reached[sid] = {"gen": gen, "offset": end}
+            before = len(events)
             try:
                 d = json.loads(line)
             except json.JSONDecodeError:
-                continue
-            ts = iso_epoch(d.get("timestamp"))
-            kind, p = d.get("type"), d.get("payload") or {}
-            if kind == "response_item" and p.get("type") == "message":
-                role = p.get("role")
-                text = _join_text_blocks(
-                    (c.get("text") or c.get("input_text") or "")
-                    for c in p.get("content") or [] if isinstance(c, dict))
-                if text == "" or role == "developer":
-                    continue
-                if role == "user":
-                    # No `promptSource` on this side: a Codex rollout records no
-                    # provenance field, so a known wrapper tag is the only
-                    # evidence available. Anything else is a person's words.
-                    if (_is_host_record(text, CODEX_WRAPPER_OPENING)
-                            or _is_self_injected(text)):
-                        continue
-                    events.append((ts, path, next(position),
-                                  Event(ts, "you", text, sid, gen, start, end)))
-                elif role == "assistant":
-                    events.append((ts, path, next(position),
-                                  Event(ts, "codex", text, sid, gen, start, end)))
-            elif kind == "event_msg" and p.get("type") == "exec_command_begin":
-                cmd = p.get("command")
-                if isinstance(cmd, list):
-                    cmd = " ".join(cmd)
-                if cmd:
-                    events.append((ts, path, next(position),
-                                  Event(ts, "tool", f"shell {cmd}",
-                                        sid, gen, start, end)))
-    events.sort(key=lambda e: (e[0], e[1], e[2]))
-    return [e[3] for e in events], reached
+                d = None
+            if isinstance(d, dict):
+                ts = iso_epoch(d.get("timestamp"))
+                kind, payload = d.get("type"), d.get("payload") or {}
+                payload = payload if isinstance(payload, dict) else {}
+                if kind == "response_item" and payload.get("type") == "message":
+                    role = payload.get("role")
+                    text = _join_text_blocks(
+                        (c.get("text") or c.get("input_text") or "")
+                        for c in payload.get("content") or []
+                        if isinstance(c, dict))
+                    if text != "" and role != "developer":
+                        if role == "user":
+                            if (not _is_host_record(text, CODEX_WRAPPER_OPENING)
+                                    and not _is_self_injected(text)):
+                                events.append((ts, path, next(position),
+                                              Event(ts, "you", text, sid, gen,
+                                                    start, end)))
+                        elif role == "assistant":
+                            events.append((ts, path, next(position),
+                                          Event(ts, "codex", text, sid, gen,
+                                                start, end)))
+                elif (kind == "event_msg"
+                      and payload.get("type") == "exec_command_begin"):
+                    command = payload.get("command")
+                    if isinstance(command, list):
+                        command = " ".join(command)
+                    if command:
+                        events.append((ts, path, next(position),
+                                      Event(ts, "tool", f"shell {command}",
+                                            sid, gen, start, end)))
+            if len(events) > before:
+                visible_records += 1
+                if (visible_record_limit is not None
+                        and visible_records >= visible_record_limit):
+                    break
+    events.sort(key=lambda item: (
+        item[0], item[3].source, item[3].generation or "",
+        item[3].offset, item[2]))
+    return [item[3] for item in events], reached
 
 
 # ---------- summary ----------
@@ -1321,7 +1308,9 @@ def _build_page(events, scanned, side, replay_reason=None):
         raise ValueError("unknown replay reason")
     records = _ordered_records(events)
     if not records:
-        if not scanned or replay_reason is None:
+        if not scanned:
+            return "", None, 0
+        if replay_reason is None:
             return "", PageAdvance(dict(scanned), False, None), 0
         text = _render_page(side, [], False, replay_reason)
         return text, PageAdvance(dict(scanned), False, replay_reason), 0
@@ -1347,62 +1336,21 @@ def _build_page(events, scanned, side, replay_reason=None):
     return text, PageAdvance(frontier, has_more, replay_reason), count
 
 
-def build_summary(cwd, side, positions=None, since=None):
+def build_summary(cwd, side, positions=None, since=None, replay_reason=None):
     """`side` is the side that will READ the summary ('claude' | 'codex').
     Turns what happened on the other side, and what the user said, into
     compact text.
 
-    Returns: (text, reached, message_count). `message_count` doesn't count
-    tool calls — the notice shown in the terminal uses it. `reached` is the
-    parser's own high-water mark, covering every record it read — not only
-    the ones kept below, since selection is newest-first and the cursor still
-    has to advance past everything read, or the same backlog is read and
-    dropped again next turn."""
+    Returns ``(text, page_advance, message_count)``. The page advance is the
+    safe contiguous delivered prefix, plus filtered bytes before the first
+    undelivered visible record; it is not the parser's scanned EOF."""
     if side == "claude":
-        events, reached = codex_events(cwd, positions, since)
+        events, reached = codex_events(
+            cwd, positions, since, visible_record_limit=EVENT_LIMIT + 1)
     else:
-        events, reached = claude_events(cwd, positions, since)
-    other = OTHER_SIDE[side][1]
-
-    if not events:
-        # Nothing to show, but `reached` still has to reach the caller: a
-        # source whose only unread records were filtered, or one a v1 cursor
-        # just placed, produces no event and must not look like a source that
-        # was never read at all.
-        return "", reached, 0
-
-    shown = events[-EVENT_LIMIT:]
-    count = sum(1 for e in shown if e.kind != "tool")
-
-    lines = []
-    tools = []
-    for e in shown:
-        if e.kind == "tool":
-            tools.append(truncate(e.text, 70))
-            continue
-        if tools:
-            lines.append(f"  · {len(tools)} tool calls: " + truncate(" | ".join(tools[-3:]), 130))
-            tools = []
-        clock = datetime.fromtimestamp(e.time).strftime("%H:%M")
-        lines.append(f"[{clock}] {LABEL.get(e.kind, e.kind)}: {truncate(e.text, EVENT_BUDGET)}")
-    if tools:
-        lines.append(f"  · {len(tools)} tool calls: " + truncate(" | ".join(tools[-3:]), 130))
-
-    body = "\n".join(lines)
-    truncated = False
-    if len(body) > SUMMARY_BUDGET:
-        # keep the newest; trim from the front
-        while len(body) > SUMMARY_BUDGET and len(lines) > 1:
-            lines.pop(0)
-            body = "\n".join(lines)
-        truncated = True
-
-    head = f"## What happened on the {other} side (since your last turn)"
-    foot = ("\nThis record belongs to the Antiphon bridge — this is what actually happened "
-            "there. Do not assume anything that is not in it.")
-    if truncated:
-        foot = "\n(older lines were cut for budget)" + foot
-    return f"{head}\n{body}{foot}", reached, count
+        events, reached = claude_events(
+            cwd, positions, since, visible_record_limit=EVENT_LIMIT + 1)
+    return _build_page(events, reached, side, replay_reason)
 
 
 # ---------- hook (both sides share the same contract) ----------
@@ -1453,19 +1401,21 @@ def hook(side="claude"):
             # counterpart with nothing to say.
             print("antiphon: context not delivered this turn", file=sys.stderr)
             return 1
-        cursor = read_cursor(cwd, side)
-        key = f"{side}_seen"
-        positions, since = positions_for(cursor, side)
-        text, reached, _ = build_summary(cwd, side, positions, since)
+        cursor, cursor_state = _read_cursor_state(cwd, side)
+        positions, since, replay_reason = positions_for(
+            cursor, side, cursor_state)
+        text, advance, _ = build_summary(
+            cwd, side, positions, since, replay_reason)
         if not text:
             # Nothing to deliver this turn, so the write-then-advance order
             # below does not protect anything -- there is no page to lose.
             # The parser's own high-water mark still has to move, or a
             # source with nothing visible in it (filtered records, or one a
             # v1 cursor just placed) is read again from scratch every turn.
-            if not _advance_cursor(cwd, side, cursor, key, positions, reached):
-                print(f"antiphon: nothing to show, but could not record "
-                      f"progress in {state_path(cwd, side)}", file=sys.stderr)
+            if not _advance_page_cursor(
+                    cwd, side, cursor, side, positions, advance):
+                print("antiphon: nothing to show, but could not record cursor "
+                      "progress", file=sys.stderr)
             return 0
 
         # The hook prints nothing to the terminal. The counter used to say
@@ -1482,7 +1432,8 @@ def hook(side="claude"):
             # and the cursor stays where it was. The next turn offers it again.
             print("antiphon: could not write this turn's context", file=sys.stderr)
             return 1
-        if not _advance_cursor(cwd, side, cursor, key, positions, reached):
+        if not _advance_page_cursor(
+                cwd, side, cursor, side, positions, advance):
             # The page WAS delivered, so the exit code stays 0: a non-zero
             # exit suppresses plain-text stdout as context, and whether it
             # also suppresses `additionalContext` is undocumented and
@@ -1490,8 +1441,8 @@ def hook(side="claude"):
             # cursor failure would trade a visible repeat for a silent
             # loss. The symptom of this branch is the same context
             # arriving every turn.
-            print(f"antiphon: delivered, but could not record it in "
-                  f"{state_path(cwd, side)}", file=sys.stderr)
+            print("antiphon: delivered, but could not record the cursor",
+                  file=sys.stderr)
         return 0
 
 
@@ -2271,11 +2222,25 @@ def _mcp_serve(cwd, alias=None):
                             "another read is in flight; nothing was read and "
                             "nothing was marked seen — try again in a moment"))
                     else:
-                        cursor = read_cursor(cwd, "codex")
-                        positions, since = positions_for(cursor, "codex")
-                        text, reached, _ = build_summary(cwd, "codex", positions, since)
-                        output = text or ("Nothing new on the Claude Code side "
-                                          "since your last turn.")
+                        cursor, cursor_state = _read_cursor_state(cwd, "codex")
+                        positions, since, replay_reason = positions_for(
+                            cursor, "codex", cursor_state)
+                        text, advance, _ = build_summary(
+                            cwd, "codex", positions, since, replay_reason)
+                        oversized = (text
+                                     and len(text.encode("utf-8")) > PAGE_BUDGET)
+                        if oversized:
+                            output = _tool_error(
+                                "The next complete record is too large for a safe "
+                                "antiphon_read result. Nothing was read or marked "
+                                "seen; the next prompt hook will deliver it whole.")
+                        else:
+                            output = {"content": [{
+                                "type": "text",
+                                "text": text or (
+                                    "Nothing new on the Claude Code side "
+                                    "since your last turn."),
+                            }]}
                         # Answer first, mark seen second — the same order as
                         # the hook, for the same reason: a result that was
                         # never written is a page the model never saw. That
@@ -2284,17 +2249,20 @@ def _mcp_serve(cwd, alias=None):
                         # depends on it, and the parser's own high-water mark
                         # still has to move, or a source with nothing visible
                         # in it is read again from scratch every turn.
-                        delivered = _mcp_result(
-                            mid, {"content": [{"type": "text", "text": output}]})
-                        if not text:
-                            if not _advance_cursor(cwd, "codex", cursor,
-                                                   "codex_seen", positions, reached):
+                        delivered = _mcp_result(mid, output)
+                        if oversized:
+                            continue
+                        if not text and delivered:
+                            if not _advance_page_cursor(
+                                    cwd, "codex", cursor, "codex", positions,
+                                    advance):
                                 print("antiphon: could not record progress "
-                                      f"in {state_path(cwd, 'codex')}",
+                                      "in the cursor",
                                       file=sys.stderr)
                         elif delivered:
-                            if not _advance_cursor(cwd, "codex", cursor,
-                                                   "codex_seen", positions, reached):
+                            if not _advance_page_cursor(
+                                    cwd, "codex", cursor, "codex", positions,
+                                    advance):
                                 # Symmetric with the hook: the page was
                                 # delivered, so the tool result already went
                                 # out and this stays a diagnostic rather than
@@ -2302,7 +2270,7 @@ def _mcp_serve(cwd, alias=None):
                                 # would just see the same context again next
                                 # turn.
                                 print("antiphon: delivered, but could not "
-                                      f"record it in {state_path(cwd, 'codex')}",
+                                      "record the cursor",
                                       file=sys.stderr)
             elif name == "antiphon_send":
                 arguments = p.get("arguments")
@@ -2863,25 +2831,33 @@ def _cursor_entry(key, value):
             return datetime.fromtimestamp(value).strftime("%H:%M:%S")
         except (ValueError, OverflowError, OSError):
             pass
-    if key.endswith("_seen") and isinstance(value, dict) \
-            and isinstance(value.get("sources"), dict):
-        # A v2 position map. A raw repr here is a clipped, unreadable dict —
-        # the one command someone runs *because* something is already wrong
-        # deserves the source count and its progress instead. Never a source
-        # id or any prefix of one: `status` is what people paste into issues,
-        # and a source id is the host's own session id.
-        sources = value["sources"]
-        offsets = [entry.get("offset") for entry in sources.values()
-                   if isinstance(entry, dict) and isinstance(entry.get("offset"), int)]
-        if offsets and len(offsets) == len(sources):
+    if key.endswith("_seen") or key.endswith("_pages"):
+        expected = PAGE_CURSOR_VERSION if key.endswith("_pages") else CURSOR_VERSION
+        if (isinstance(value, dict) and value.get("v") == expected
+                and isinstance(value.get("sources"), dict)
+                and all(_valid_position(entry)
+                        for entry in value["sources"].values())):
+            sources = value["sources"]
+            offsets = sorted((entry["offset"] for entry in sources.values()),
+                             reverse=True)
             noun = "source" if len(sources) == 1 else "sources"
+            progress = ", ".join(str(offset) for offset in offsets) or "—"
             return truncate("%d %s, at %s"
-                            % (len(sources), noun,
-                               ", ".join(str(o) for o in sorted(offsets, reverse=True))), 80)
-        # `sources` held something that is not a position, or was empty: fall
-        # through below, shown literally rather than raising or claiming a
-        # count that misdescribes what is actually inside.
+                            % (len(sources), noun, progress), 80)
+        return "invalid cursor state"
     return truncate(str(value), 80) if value else "—"
+
+
+def _status_preview(text):
+    """Clip only a display preview, preserving UTF-8 and delivery semantics."""
+    encoded = text.encode("utf-8")
+    if len(encoded) <= PAGE_BUDGET:
+        return text
+    marker = "\n(status preview ends here; the oversized next record remains unread)"
+    marker_bytes = marker.encode("utf-8")
+    prefix = encoded[:PAGE_BUDGET - len(marker_bytes)].decode(
+        "utf-8", errors="ignore")
+    return prefix + marker
 
 
 def status():
@@ -2901,16 +2877,34 @@ def status():
     print(f"Claude channel:     {channel}")
     for line in _peer_report(live):
         print(line)
-    cursor = read_cursor(cwd, "claude")
-    for k, v in (cursor or {}).items():
-        print(f"cursor {k}: {_cursor_entry(k, v)}")
+    snapshots = {}
+    by_path = {}
     for side in ("claude", "codex"):
-        positions, since = positions_for(cursor, side)
-        text, _, count = build_summary(cwd, side, positions, since)
+        path = state_path(cwd, side)
+        if path not in by_path:
+            by_path[path] = _read_cursor_state(cwd, side)
+        snapshots[side] = by_path[path]
+    printed = set()
+    distinct = len(by_path) > 1
+    for side in ("claude", "codex"):
+        path = state_path(cwd, side)
+        if path in printed:
+            continue
+        printed.add(path)
+        cursor, _state = snapshots[side]
+        label = side + " " if distinct else ""
+        for key, value in (cursor or {}).items():
+            print(f"cursor {label}{key}: {_cursor_entry(key, value)}")
+    for side in ("claude", "codex"):
+        cursor, cursor_state = snapshots[side]
+        positions, since, replay_reason = positions_for(
+            cursor, side, cursor_state)
+        text, _, count = build_summary(
+            cwd, side, positions, since, replay_reason)
         print(f"\n=== what {side} would see ===")
         if count:
             print(notice_text(side, count))
-        print(text or "(nothing new)")
+        print(_status_preview(text) if text else "(nothing new)")
     return 0
 
 
