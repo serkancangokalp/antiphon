@@ -2831,10 +2831,10 @@ def _peer_report(live):
 def _cursor_entry(key, value):
     """How one cursor entry reads in `status`.
 
-    A `_seen` that is not a time is shown as what it literally holds rather than
-    taken to `datetime.fromtimestamp`, which raises on `NaN`, on an infinity and
-    on a year past 9999. This is the command someone runs *because* something is
-    wrong; it is the last one allowed to stop at the broken entry.
+    Known cursor formats expose only the progress a person can act on. Unknown
+    sibling entries are preserved on disk for rolling compatibility, but their
+    values stay opaque here: a newer format may contain transcript paths,
+    session ids or generation fingerprints that status must never print.
     """
     if key.endswith("_seen") and isinstance(value, (int, float)) \
             and not isinstance(value, bool) and math.isfinite(value):
@@ -2858,7 +2858,13 @@ def _cursor_entry(key, value):
             return truncate("%d %s, at %s"
                             % (len(sources), noun, progress), 80)
         return "invalid cursor state"
-    return truncate(str(value), 80) if value else "—"
+    if key in ("last_pushed_claude", "last_pushed_codex"):
+        # These two shipped before structured paging and status has always
+        # rendered their delivery-deduplication summary. Keep that exact
+        # compatibility surface; do not generalise it by prefix, because an
+        # unknown newer sibling may contain private path or session metadata.
+        return truncate(str(value), 80) if value else "—"
+    return "opaque cursor state"
 
 
 def _status_preview(text):

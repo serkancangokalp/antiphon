@@ -2260,26 +2260,22 @@ class PositionCursorTest(unittest.TestCase):
                     "/tmp/project", since=time.time() - antiphon.LOOKBACK)
         self.assertEqual([e[2] for e in events], ["recent"])
 
-    def test_a_timestamp_cursor_becomes_a_lookback_and_repeats_its_boundary(self):
-        """Measured against real cursors: no gap in either direction, and
-        exactly one record repeated at the boundary. The repeat is deliberate —
-        records sharing that timestamp may include ones the old EVENT_LIMIT
-        slice dropped while the cursor jumped past them anyway."""
+    def test_a_timestamp_cursor_starts_conservative_byte_zero_replay(self):
+        """A timestamp is a scanned high-water mark, not a delivered prefix.
+        Reinterpreting it would let an overlapping old writer move the new
+        reader past content it never delivered, so the v3 reader deliberately
+        replays every discovered source from byte zero."""
         positions, since, replay = antiphon.positions_for(
             {"claude_seen": 1000.0}, "claude")
         self.assertEqual(positions, {})
         self.assertIsNone(since)
         self.assertEqual(replay, "legacy_upgrade")
 
-    def test_a_v2_cursor_triggers_conservative_upgrade_replay(self):
-        """`since` still comes back as the lookback, even for a valid v2 map:
-        a source *with* a recorded entry never consults `since` at all -- it
-        resumes from that entry when trusted, or restarts from byte zero,
-        not the lookback, when it is not -- so this changes nothing for it
-        either way. A v2 map can still meet a source it has no entry for --
-        an old session resumed, or a fourth transcript rotating into the
-        newest three -- and that source needs the same floor a brand-new
-        source gets rather than none at all."""
+    def test_a_v2_cursor_starts_conservative_byte_zero_replay(self):
+        """A v2 source map records how far parsing scanned, not what a page
+        delivered. The separate v3 key therefore starts all discovered sources
+        from byte zero and marks the replay explicitly instead of trusting the
+        old offsets and risking a permanent gap."""
         cursor = {"claude_seen": {"v": 2, "sources": {"s1": {"gen": "g", "offset": 12}}}}
         positions, since, replay = antiphon.positions_for(cursor, "claude")
         self.assertEqual(positions, {})
@@ -2338,12 +2334,10 @@ class PositionCursorTest(unittest.TestCase):
             marker = "record-%02d-END" % index
             self.assertEqual(sum(marker in page for page in pages[:2]), 1)
 
-    def test_a_v1_cursor_migrates_without_redelivering_a_quiet_source(self):
-        """Measured end to end on real transcripts: a source whose starting
-        offset lands at the end of its file on the turn a v1 cursor migrates
-        produces no event of its own, and used to be silently dropped from
-        the v2 map -- invisible to the next run, which then read that file
-        again from byte zero and re-delivered its already-seen content."""
+    def test_a_v1_cursor_replays_a_quiet_2020_source_once_then_stays_quiet(self):
+        """Conservative migration does not treat a quiet old source as seen.
+        Its 2020 record is replayed from byte zero with a visible upgrade
+        notice, recorded as delivered, and therefore absent on the next turn."""
         fresh_sid = "4eecac24-1c21-47ad-ab11-a650708f3098"
         quiet_sid = "01a04f6b-4485-7290-afbd-9eae74405ec8"
         now = time.strftime("%Y-%m-%dT%H:%M:%S.000Z", time.gmtime())
@@ -2379,6 +2373,8 @@ class PositionCursorTest(unittest.TestCase):
             first_code, first_out = run()
             self.assertEqual(first_code, 0)
             self.assertIn("fresh news", first_out)
+            self.assertIn("stale echo", first_out)
+            self.assertIn(antiphon.REPLAY_NOTICES["legacy_upgrade"], first_out)
 
             second_code, second_out = run()
         self.assertEqual(second_code, 0)
@@ -6010,6 +6006,45 @@ class StatusTest(unittest.TestCase):
         self.assertNotIn("1 files", text, "and one of something is not plural")
         self.assertIn("1 source, at 42", text,
                       "the cursor's own progress is still shown, and singular")
+
+    def test_status_keeps_unknown_cursor_siblings_opaque_and_untouched(self):
+        """A newer writer may add state this version must preserve without
+        understanding it. `status` used to print that value's raw repr, which
+        turned rolling compatibility into a path and session-id disclosure."""
+        secret_uuid = "709c9330-8e36-4cd9-8ff4-f02d13735c26"
+        secret_prefix = secret_uuid[:8]
+        secret_path = "/private/transcripts/%s/rollout.jsonl" % secret_uuid
+        secret_generation = "generation-private-" + secret_uuid
+        cursor = {
+            "codex_pages": {"v": 3, "sources": {
+                "known-source": {"gen": "known-generation", "offset": 42},
+            }},
+            "future_cursor_state": {
+                "session_id": secret_uuid,
+                "transcript_path": secret_path,
+                "generation": secret_generation,
+                "session_prefix": secret_prefix,
+            },
+        }
+        with tempfile.TemporaryDirectory() as project:
+            path = os.path.join(project, ".antiphon", "cursor.json")
+            os.makedirs(os.path.dirname(path))
+            with open(path, "w", encoding="utf-8") as f:
+                json.dump(cursor, f)
+            with open(path, "rb") as f:
+                before = f.read()
+
+            _, text = self._status(project)
+
+            with open(path, "rb") as f:
+                after = f.read()
+
+        self.assertIn("cursor codex_pages: 1 source, at 42", text)
+        self.assertIn("cursor future_cursor_state: opaque cursor state", text)
+        for secret in (secret_uuid, secret_prefix, secret_path, secret_generation):
+            self.assertNotIn(secret, text, secret)
+        self.assertEqual(after, before,
+                         "unknown state is preserved for a newer writer")
 
     def test_the_counts_are_written_the_way_a_person_writes_them(self):
         with tempfile.TemporaryDirectory() as project:
