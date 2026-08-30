@@ -1168,6 +1168,193 @@ class AntiphonTest(unittest.TestCase):
 
 
 
+class MalformedStateTest(unittest.TestCase):
+    """State that parses as JSON and still isn't what the reader expects.
+
+    `cursor.json` is a file: it gets hand-edited, restored from the wrong
+    place, or written by a version that stored something else. A channel reply
+    comes off a socket. Every one of these is valid JSON of the wrong shape,
+    and each used to reach a `.get`, a `float` or a `datetime` that raises —
+    inside a hook, an MCP request loop, or the one command a person runs to
+    find out what is wrong.
+    """
+
+    @staticmethod
+    @contextlib.contextmanager
+    def _cursor(contents):
+        """A project whose cursor file literally holds `contents`."""
+        with tempfile.TemporaryDirectory() as project:
+            path = os.path.join(project, ".antiphon", "cursor.json")
+            os.makedirs(os.path.dirname(path))
+            with open(path, "w", encoding="utf-8") as f:
+                f.write(contents)
+            with patch.dict(os.environ, {}):
+                os.environ.pop("ANTIPHON_NAME", None)
+                yield project, path
+
+    # ---- reading a cursor of the wrong shape ----
+
+    def test_a_cursor_that_is_not_an_object_reads_as_no_state(self):
+        """`[]`, `null` and `3` all parse. None of them has `.items()`."""
+        for contents in ("[]", "null", "3", '"seen"'):
+            with self._cursor(contents) as (project, _):
+                self.assertEqual(antiphon.read_cursor(project, "claude"), {},
+                                 contents)
+
+    def test_a_cursor_of_the_wrong_shape_is_left_on_disk_untouched(self):
+        """Reading is not the moment to destroy state. Whatever a person was in
+        the middle of stays there for them to look at."""
+        with self._cursor("[1, 2, 3]") as (project, path):
+            antiphon.read_cursor(project, "claude")
+            with open(path, encoding="utf-8") as f:
+                self.assertEqual(f.read(), "[1, 2, 3]")
+
+    # ---- the timestamp parser ----
+
+    def test_a_cursor_time_that_is_not_a_time_falls_back_to_the_lookback(self):
+        """`float()` raises on `"soon"` and waves `NaN` and `Infinity` through —
+        and `json` parses both of those literals by default. A NaN start makes
+        every comparison against it false, so nothing is ever new again."""
+        default = time.time() - antiphon.LOOKBACK
+        for value in ("soon", "", float("nan"), float("inf"), float("-inf"),
+                      None, True, [], {}, 0):
+            self.assertAlmostEqual(
+                antiphon.cursor_time({"claude_seen": value}, "claude_seen"),
+                default, delta=5, msg=repr(value))
+
+    def test_a_cursor_time_no_clock_can_represent_falls_back_to_the_lookback(self):
+        """`1e308` is finite, so it passes every check `NaN` and `Infinity` fail,
+        and it is still not a time: no clock renders it and no transcript line
+        will ever be newer. `status` already refuses to render it; the hook and
+        `antiphon_read` would take it as their start and go quiet forever."""
+        default = time.time() - antiphon.LOOKBACK
+        for value in (1e308, "1e308", -1e308):
+            self.assertAlmostEqual(
+                antiphon.cursor_time({"claude_seen": value}, "claude_seen"),
+                default, delta=5, msg=repr(value))
+
+    def test_a_cursor_time_that_is_a_time_is_kept_exactly(self):
+        """Including the numeric string an older cursor may hold: `float()` took
+        it before, so a peer upgrading must not silently replay six hours."""
+        for value, expected in ((1700000000.5, 1700000000.5), (1700000000, 1700000000.0),
+                                ("1700000000.5", 1700000000.5)):
+            self.assertEqual(
+                antiphon.cursor_time({"codex_seen": value}, "codex_seen"),
+                expected, repr(value))
+
+    # ---- the three surfaces that consume one ----
+
+    def _hook_start(self, project, side="claude"):
+        """The `start` the hook derives from whatever is on disk."""
+        out = io.StringIO()
+        with patch.object(antiphon.sys, "stdin",
+                          io.StringIO(json.dumps({"cwd": project}))), \
+             patch.object(antiphon, "build_summary",
+                          return_value=("", None, 0)) as summary, \
+             contextlib.redirect_stdout(out):
+            code = antiphon.hook(side)
+        return code, summary.call_args.args[2]
+
+    def test_the_hook_starts_from_the_lookback_when_the_cursor_holds_no_time(self):
+        for contents in ('{"claude_seen": NaN}', '{"claude_seen": Infinity}',
+                         '{"claude_seen": 1e308}', '{"claude_seen": "soon"}', "[]"):
+            with self._cursor(contents) as (project, _):
+                code, start = self._hook_start(project)
+            self.assertEqual(code, 0, contents)
+            self.assertAlmostEqual(start, time.time() - antiphon.LOOKBACK,
+                                   delta=5, msg=contents)
+
+    def test_antiphon_read_starts_from_the_lookback_when_the_cursor_holds_no_time(self):
+        """A traceback here ends the MCP session and takes every tool with it."""
+        request = {"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                   "params": {"name": "antiphon_read"}}
+        for contents in ('{"codex_seen": NaN}', '{"codex_seen": Infinity}',
+                         '{"codex_seen": 1e308}', '{"codex_seen": "soon"}', "null"):
+            with self._cursor(contents) as (project, _):
+                out, err = io.StringIO(), io.StringIO()
+                with patch.object(antiphon, "project_dir", return_value=project), \
+                     patch.object(antiphon.sys, "stdin",
+                                  io.StringIO(json.dumps(request) + "\n")), \
+                     patch.object(antiphon, "build_summary",
+                                  return_value=("", None, 0)) as summary, \
+                     contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+                    antiphon.mcp()
+                start = summary.call_args.args[2]
+            self.assertTrue(out.getvalue().strip(), contents)
+            self.assertAlmostEqual(start, time.time() - antiphon.LOOKBACK,
+                                   delta=5, msg=contents)
+
+    def test_status_reports_a_cursor_it_cannot_read_as_a_time(self):
+        """The command someone runs *because* something is wrong is the last one
+        allowed to raise. The value is still shown, as what it literally holds."""
+        for contents, shown in (('{"claude_seen": NaN}', "nan"),
+                                ('{"claude_seen": Infinity}', "inf"),
+                                ('{"claude_seen": "soon"}', "soon"),
+                                ('{"claude_seen": 1e308}', "1e+308")):
+            with self._cursor(contents) as (project, _):
+                out = io.StringIO()
+                with patch.object(antiphon, "project_dir", return_value=project), \
+                     patch.object(antiphon, "claude_transcripts", return_value=[]), \
+                     patch.object(antiphon, "codex_rollout_files", return_value=[]), \
+                     patch.object(antiphon, "build_summary",
+                                  return_value=("", 0.0, 0)), \
+                     contextlib.redirect_stdout(out):
+                    self.assertEqual(antiphon.status(), 0, contents)
+                self.assertIn(f"cursor claude_seen: {shown}", out.getvalue())
+
+    def test_status_survives_a_cursor_that_is_not_an_object(self):
+        with self._cursor("[]") as (project, _):
+            out = io.StringIO()
+            with patch.object(antiphon, "project_dir", return_value=project), \
+                 patch.object(antiphon, "claude_transcripts", return_value=[]), \
+                 patch.object(antiphon, "codex_rollout_files", return_value=[]), \
+                 patch.object(antiphon, "build_summary", return_value=("", 0.0, 0)), \
+                 contextlib.redirect_stdout(out):
+                self.assertEqual(antiphon.status(), 0)
+        self.assertIn("=== what claude would see ===", out.getvalue())
+
+    def test_status_still_renders_a_cursor_time_it_can_read(self):
+        with self._cursor('{"codex_seen": 1700000000.0}') as (project, _):
+            out = io.StringIO()
+            with patch.object(antiphon, "project_dir", return_value=project), \
+                 patch.object(antiphon, "claude_transcripts", return_value=[]), \
+                 patch.object(antiphon, "codex_rollout_files", return_value=[]), \
+                 patch.object(antiphon, "build_summary", return_value=("", 0.0, 0)), \
+                 contextlib.redirect_stdout(out):
+                self.assertEqual(antiphon.status(), 0)
+        expected = antiphon.datetime.fromtimestamp(1700000000.0).strftime("%H:%M:%S")
+        self.assertIn(f"cursor codex_seen: {expected}", out.getvalue())
+
+    # ---- a channel reply of the wrong shape ----
+
+    def test_a_channel_reply_that_is_not_an_object_is_an_invalid_response(self):
+        """Valid JSON, and not an answer. `.get` on it raises out of the send
+        path, where the caller is only ever told success or a reason."""
+        for reply in (b"[]", b"null", b"42", b'"ok"'):
+            sock = self._FakeSocket(reply)
+            with patch.object(antiphon.socket, "socket", return_value=sock):
+                ok, detail = antiphon.send_to_claude("/tmp/project", "test")
+            self.assertFalse(ok, reply)
+            self.assertIn("invalid response", detail)
+
+    class _FakeSocket:
+        def __init__(self, reply):
+            self.reply, self.received = reply, False
+
+        def __enter__(self): return self
+        def __exit__(self, *_): return False
+        def settimeout(self, _): pass
+        def connect(self, path): pass
+        def sendall(self, data): pass
+        def shutdown(self, _): pass
+
+        def recv(self, _):
+            if self.received:
+                return b""
+            self.received = True
+            return self.reply
+
+
 class CodexPeerWiringTest(unittest.TestCase):
     """The two Codex writers, wired to the processes that actually run them.
 

@@ -31,6 +31,7 @@ import glob
 import errno
 import hashlib
 import json
+import math
 import os
 import re
 import socket
@@ -340,11 +341,60 @@ def read_cursor(cwd, kind):
             data = json.load(f)
     except (OSError, json.JSONDecodeError):
         return {}
+    if not isinstance(data, dict):
+        # Valid JSON, and not a cursor. `[]`, `null` and `3` all parse, and none
+        # of them has `.items()`. Read as no state at all — and left on disk
+        # exactly as found, because a read is not the moment to overwrite
+        # whatever a person was in the middle of looking at.
+        return {}
 
     translated = _translate_cursor_keys(data)
     if translated != data:
         write_cursor(cwd, translated, kind)
     return translated
+
+
+def cursor_time(cursor, key, default=None):
+    """The timestamp `key` holds, or the normal lookback when it holds no time.
+
+    Every reader of a `_seen` value went through `float(cursor.get(key) or ...)`,
+    which raises on a string that is not a number and passes `NaN` and
+    `Infinity` straight through — and `json` parses both of those literals by
+    default, so a cursor really can hold them. A `NaN` start makes every
+    comparison against it false, so nothing is ever new again and the bridge
+    goes quiet without saying so; an infinite one survives that far and raises
+    in `datetime.fromtimestamp` instead. So does a finite `1e308`, which is a
+    number and not any time this machine can name. All of them are answered the
+    way a missing value already is: the normal lookback.
+
+    Finite numeric strings are still accepted, because `float()` accepted them
+    and a peer upgrading with one on disk must not silently replay six hours.
+    """
+    if default is None:
+        default = time.time() - LOOKBACK
+    value = cursor.get(key) if isinstance(cursor, dict) else None
+    if isinstance(value, bool) or not value:
+        # `True` is an `int` and `float(True)` is 1.0 — a 1970 start that would
+        # replay the whole transcript. It is not a time; neither is 0 or None.
+        return default
+    if isinstance(value, str):
+        try:
+            value = float(value)
+        except ValueError:
+            return default
+    if not isinstance(value, (int, float)):
+        return default
+    try:
+        value = float(value)
+        datetime.fromtimestamp(value)
+    except (ValueError, OverflowError, OSError):
+        # Finite, and still not a time. `1e308` passes every check `NaN` and the
+        # infinities fail, and no clock can render it — used as a start it makes
+        # every transcript line look old, so the bridge goes quiet and stays
+        # quiet. `fromtimestamp` is the only authority on what this platform can
+        # hold as a local time, so asking it is the whole check.
+        return default
+    return value
 
 
 def write_cursor(cwd, data, kind):
@@ -706,7 +756,7 @@ def hook(side="claude"):
 
     cursor = read_cursor(cwd, side)
     key = f"{side}_seen"
-    start = float(cursor.get(key) or (time.time() - LOOKBACK))
+    start = cursor_time(cursor, key)
     text, last, _ = build_summary(cwd, side, start)
     if text and last:
         cursor[key] = last
@@ -1082,6 +1132,11 @@ def send_to_claude(cwd, text, alias=None, sender_alias=None, message_id=None):
         result = json.loads(reply_bytes.decode())
     except (UnicodeDecodeError, json.JSONDecodeError):
         return False, "Claude MCP Channel returned an invalid response"
+    if not isinstance(result, dict):
+        # Decoded, and not an answer: `[]` and `null` are valid JSON and `.get`
+        # on either raises out of a path whose caller is only ever told success
+        # or a reason.
+        return False, "Claude MCP Channel returned an invalid response"
     if not result.get("ok"):
         return False, str(result.get("error") or "channel delivery failed")[:200]
     return True, ""
@@ -1405,7 +1460,7 @@ def _mcp_serve(cwd, alias=None):
             name = p.get("name")
             if name == "antiphon_read":
                 cursor = read_cursor(cwd, "codex")
-                start = float(cursor.get("codex_seen") or (time.time() - LOOKBACK))
+                start = cursor_time(cursor, "codex_seen")
                 text, last, _ = build_summary(cwd, "codex", start)
                 if text and last:
                     cursor["codex_seen"] = last
@@ -1955,6 +2010,25 @@ def _peer_report(live):
     return lines
 
 
+def _cursor_entry(key, value):
+    """How one cursor entry reads in `status`.
+
+    A `_seen` that is not a time is shown as what it literally holds rather than
+    taken to `datetime.fromtimestamp`, which raises on `NaN`, on an infinity and
+    on a year past 9999. This is the command someone runs *because* something is
+    wrong; it is the last one allowed to stop at the broken entry.
+    """
+    if key.endswith("_seen") and isinstance(value, (int, float)) \
+            and not isinstance(value, bool) and math.isfinite(value):
+        if not value:
+            return "—"
+        try:
+            return datetime.fromtimestamp(value).strftime("%H:%M:%S")
+        except (ValueError, OverflowError, OSError):
+            pass
+    return truncate(str(value), 80) if value else "—"
+
+
 def status():
     cwd = project_dir()
     print(f"project: {cwd}\n")
@@ -1974,13 +2048,9 @@ def status():
         print(line)
     cursor = read_cursor(cwd, "claude")
     for k, v in (cursor or {}).items():
-        if k.endswith("_seen") and isinstance(v, (int, float)):
-            shown = datetime.fromtimestamp(v).strftime('%H:%M:%S') if v else '—'
-        else:
-            shown = truncate(str(v), 80) if v else '—'
-        print(f"cursor {k}: {shown}")
+        print(f"cursor {k}: {_cursor_entry(k, v)}")
     for side in ("claude", "codex"):
-        start = float((cursor or {}).get(f"{side}_seen") or (time.time() - LOOKBACK))
+        start = cursor_time(cursor, f"{side}_seen")
         text, _, count = build_summary(cwd, side, start)
         print(f"\n=== what {side} would see ===")
         if count:
