@@ -1082,6 +1082,59 @@ class AntiphonTest(unittest.TestCase):
             self.assertEqual(texts, ["zebra, in the first file",
                                      "apple, in the second"], discovery)
 
+    def test_a_block_boundary_survives_the_join(self):
+        """Two blocks joined by a space silently become one paragraph."""
+        line = json.dumps({"type": "user", "promptSource": "typed",
+                           "timestamp": "2026-08-30T10:00:00.000Z",
+                           "message": {"content": [
+                               {"type": "text", "text": "here is the query"},
+                               {"type": "text", "text": "SELECT 1;"}]}})
+        with patch.object(antiphon, "claude_transcripts", return_value=["t.jsonl"]), \
+             patch.object(antiphon, "tail_lines", return_value=[line]):
+            texts = [e[2] for e in antiphon.claude_events("/tmp/project")]
+        self.assertEqual(texts, ["here is the query\n\nSELECT 1;"])
+
+    def test_the_join_does_not_become_a_per_block_strip(self):
+        """Indentation and a trailing newline inside a block are content. A
+        generator that strips each block to test it for emptiness deletes them
+        on the way past, and nothing downstream can put them back."""
+        line = json.dumps({"type": "user", "promptSource": "typed",
+                           "timestamp": "2026-08-30T10:00:00.000Z",
+                           "message": {"content": [
+                               {"type": "text", "text": "def f():\n    return 1\n"},
+                               {"type": "text", "text": "  indented note"}]}})
+        with patch.object(antiphon, "claude_transcripts", return_value=["t.jsonl"]), \
+             patch.object(antiphon, "tail_lines", return_value=[line]):
+            texts = [e[2] for e in antiphon.claude_events("/tmp/project")]
+        self.assertEqual(texts, ["def f():\n    return 1\n\n\n  indented note"])
+
+    def test_an_empty_block_adds_no_boundary(self):
+        """A blank block is not a paragraph break of its own."""
+        line = json.dumps({"type": "user", "promptSource": "typed",
+                           "timestamp": "2026-08-30T10:00:00.000Z",
+                           "message": {"content": [
+                               {"type": "text", "text": "one"},
+                               {"type": "text", "text": "   "},
+                               {"type": "text", "text": "two"}]}})
+        with patch.object(antiphon, "claude_transcripts", return_value=["t.jsonl"]), \
+             patch.object(antiphon, "tail_lines", return_value=[line]):
+            self.assertEqual([e[2] for e in antiphon.claude_events("/tmp/project")],
+                             ["one\n\ntwo"])
+
+    def test_the_codex_parser_keeps_its_block_boundaries(self):
+        line = json.dumps({"type": "response_item",
+                           "timestamp": "2026-08-30T10:00:00.000Z",
+                           "payload": {"type": "message", "role": "user",
+                                       "content": [
+                                           {"type": "input_text",
+                                            "text": "here is the query"},
+                                           {"type": "input_text",
+                                            "text": "SELECT 1;"}]}})
+        with patch.object(antiphon, "codex_rollout_files", return_value=["r.jsonl"]), \
+             patch.object(antiphon, "tail_lines", return_value=[line]):
+            self.assertEqual([e[2] for e in antiphon.codex_events("/tmp/project")],
+                             ["here is the query\n\nSELECT 1;"])
+
     # ---- Important 2: upgrading a legacy hook must not leave a duplicate ----
 
     @staticmethod

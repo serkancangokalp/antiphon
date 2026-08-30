@@ -623,8 +623,15 @@ def claude_events(cwd, start=0.0):
                 if isinstance(content, str):
                     text = content
                 elif isinstance(content, list):
-                    text = " ".join(c.get("text", "") for c in content
-                                    if isinstance(c, dict) and c.get("type") == "text")
+                    # The break between two blocks is content: joined by a
+                    # space, a sentence and the code block under it become one
+                    # run-on line and nothing says where either ended. The
+                    # emptiness test strips; the joined block never does, or
+                    # the indentation goes with it.
+                    text = "\n\n".join(
+                        c.get("text", "") for c in content
+                        if isinstance(c, dict) and c.get("type") == "text"
+                        and c.get("text", "").strip())
                 text = text.strip()
                 # tool results and host records are not the user's own words
                 if (text
@@ -721,10 +728,11 @@ def codex_events(cwd, start=0.0):
             kind, p = d.get("type"), d.get("payload") or {}
             if kind == "response_item" and p.get("type") == "message":
                 role = p.get("role")
-                text = " ".join(
-                    c.get("text") or c.get("input_text") or ""
-                    for c in p.get("content") or [] if isinstance(c, dict)
-                ).strip()
+                text = "\n\n".join(
+                    block for block in
+                    ((c.get("text") or c.get("input_text") or "")
+                     for c in p.get("content") or [] if isinstance(c, dict))
+                    if block.strip()).strip()
                 if not text or role == "developer":
                     continue
                 if role == "user":
