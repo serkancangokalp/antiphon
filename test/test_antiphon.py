@@ -203,19 +203,20 @@ class AntiphonTest(unittest.TestCase):
     def test_push_claude_target(self):
         sent = []
         written = []
-        input_data = {"cwd": "/tmp/project", "transcript_path": "/tmp/rollout"}
-        with patch.object(antiphon.os.path, "exists", return_value=True), \
-             patch.object(antiphon, "last_codex_reply", return_value="@claude test"), \
-             patch.object(antiphon, "read_cursor", return_value={}), \
-             patch.object(antiphon, "write_cursor",
-                          side_effect=lambda cwd, data, kind: written.append(dict(data))), \
-             patch.object(antiphon, "send_to_claude",
-                          side_effect=lambda cwd, msg, alias=None, **_:
-                              sent.append((cwd, msg)) or (True, "")), \
-             patch.object(antiphon.sys, "stdin", io.StringIO(json.dumps(input_data))), \
-             contextlib.redirect_stderr(io.StringIO()):
-            self.assertEqual(antiphon.push("claude"), 0)
-        self.assertEqual(sent, [("/tmp/project", "test")])
+        with tempfile.TemporaryDirectory() as project:
+            input_data = {"cwd": project, "transcript_path": "/tmp/rollout"}
+            with patch.object(antiphon.os.path, "exists", return_value=True), \
+                 patch.object(antiphon, "last_codex_reply", return_value="@claude test"), \
+                 patch.object(antiphon, "read_cursor", return_value={}), \
+                 patch.object(antiphon, "write_cursor",
+                              side_effect=lambda cwd, data, kind: written.append(dict(data))), \
+                 patch.object(antiphon, "send_to_claude",
+                              side_effect=lambda cwd, msg, alias=None, **_:
+                                  sent.append((cwd, msg)) or (True, "")), \
+                 patch.object(antiphon.sys, "stdin", io.StringIO(json.dumps(input_data))), \
+                 contextlib.redirect_stderr(io.StringIO()):
+                self.assertEqual(antiphon.push("claude"), 0)
+        self.assertEqual(sent, [(project, "test")])
         # The record is now a fingerprint per recipient rather than the last
         # text: keeping the text resent both lines for ever when one reply
         # addressed the same peer twice.
@@ -224,35 +225,37 @@ class AntiphonTest(unittest.TestCase):
                          {"": antiphon.batch_fingerprint(["test"])})
 
     def test_push_uses_separate_dedupe_cursors(self):
-        input_data = {"cwd": "/tmp/project", "transcript_path": "/tmp/rollout"}
-        with patch.object(antiphon.os.path, "exists", return_value=True), \
-             patch.object(antiphon, "last_codex_reply", return_value="@claude same"), \
-             patch.object(antiphon, "read_cursor",
-                          return_value={"last_pushed_claude": {"": antiphon.batch_fingerprint(["same"])},
-                                        "last_pushed_codex": {"": "other"}}), \
-             patch.object(antiphon, "write_cursor"), \
-             patch.object(antiphon, "send_to_claude") as send, \
-             patch.object(antiphon.sys, "stdin", io.StringIO(json.dumps(input_data))):
-            self.assertEqual(antiphon.push("claude"), 0)
-            send.assert_not_called()
+        with tempfile.TemporaryDirectory() as project:
+            input_data = {"cwd": project, "transcript_path": "/tmp/rollout"}
+            with patch.object(antiphon.os.path, "exists", return_value=True), \
+                 patch.object(antiphon, "last_codex_reply", return_value="@claude same"), \
+                 patch.object(antiphon, "read_cursor",
+                              return_value={"last_pushed_claude": {"": antiphon.batch_fingerprint(["same"])},
+                                            "last_pushed_codex": {"": "other"}}), \
+                 patch.object(antiphon, "write_cursor"), \
+                 patch.object(antiphon, "send_to_claude") as send, \
+                 patch.object(antiphon.sys, "stdin", io.StringIO(json.dumps(input_data))):
+                self.assertEqual(antiphon.push("claude"), 0)
+                send.assert_not_called()
 
     def test_a_cursor_in_the_old_string_format_does_not_resend_on_upgrade(self):
         """Installed bridges hold the joined text, not a digest. Comparing the
         two is always unequal, so the last message would go out once more the
         first time the new code ran."""
-        input_data = {"cwd": "/tmp/project", "transcript_path": "/tmp/rollout"}
         written = []
-        with patch.object(antiphon.os.path, "exists", return_value=True), \
-             patch.object(antiphon, "last_codex_reply", return_value="@claude same"), \
-             patch.object(antiphon, "read_cursor",
-                          return_value={"last_pushed_claude": "same"}), \
-             patch.object(antiphon, "write_cursor",
-                          side_effect=lambda cwd, data, kind: written.append(dict(data))), \
-             patch.object(antiphon, "send_to_claude") as send, \
-             patch.object(antiphon.sys, "stdin", io.StringIO(json.dumps(input_data))), \
-             contextlib.redirect_stderr(io.StringIO()):
-            self.assertEqual(antiphon.push("claude"), 0)
-            send.assert_not_called()
+        with tempfile.TemporaryDirectory() as project:
+            input_data = {"cwd": project, "transcript_path": "/tmp/rollout"}
+            with patch.object(antiphon.os.path, "exists", return_value=True), \
+                 patch.object(antiphon, "last_codex_reply", return_value="@claude same"), \
+                 patch.object(antiphon, "read_cursor",
+                              return_value={"last_pushed_claude": "same"}), \
+                 patch.object(antiphon, "write_cursor",
+                              side_effect=lambda cwd, data, kind: written.append(dict(data))), \
+                 patch.object(antiphon, "send_to_claude") as send, \
+                 patch.object(antiphon.sys, "stdin", io.StringIO(json.dumps(input_data))), \
+                 contextlib.redirect_stderr(io.StringIO()):
+                self.assertEqual(antiphon.push("claude"), 0)
+                send.assert_not_called()
         self.assertEqual(written[0]["last_pushed_claude"],
                          {"": antiphon.batch_fingerprint(["same"])},
                          "and the record migrates to the new form")
@@ -261,34 +264,36 @@ class AntiphonTest(unittest.TestCase):
         """A batch holding one empty marker and one real message is not empty, so
         a per-batch check let the empty line disappear without a word."""
         sent = []
-        input_data = {"cwd": "/tmp/project", "transcript_path": "/tmp/rollout"}
         err = io.StringIO()
-        with patch.object(antiphon.os.path, "exists", return_value=True), \
-             patch.object(antiphon, "last_codex_reply",
-                          return_value="@claude\n@claude run it"), \
-             patch.object(antiphon, "read_cursor", return_value={}), \
-             patch.object(antiphon, "write_cursor"), \
-             patch.object(antiphon, "send_to_claude",
-                          side_effect=lambda cwd, msg, alias=None, **_:
-                              sent.append(msg) or (True, "")), \
-             patch.object(antiphon.sys, "stdin", io.StringIO(json.dumps(input_data))), \
-             contextlib.redirect_stderr(err):
-            self.assertEqual(antiphon.push("claude"), 0)
+        with tempfile.TemporaryDirectory() as project:
+            input_data = {"cwd": project, "transcript_path": "/tmp/rollout"}
+            with patch.object(antiphon.os.path, "exists", return_value=True), \
+                 patch.object(antiphon, "last_codex_reply",
+                              return_value="@claude\n@claude run it"), \
+                 patch.object(antiphon, "read_cursor", return_value={}), \
+                 patch.object(antiphon, "write_cursor"), \
+                 patch.object(antiphon, "send_to_claude",
+                              side_effect=lambda cwd, msg, alias=None, **_:
+                                  sent.append(msg) or (True, "")), \
+                 patch.object(antiphon.sys, "stdin", io.StringIO(json.dumps(input_data))), \
+                 contextlib.redirect_stderr(err):
+                self.assertEqual(antiphon.push("claude"), 0)
         self.assertEqual(sent, ["run it"], "the real message still goes")
         self.assertEqual(err.getvalue().count("carried no message"), 1,
                          "and the empty line is reported, not swallowed")
 
     def test_an_empty_named_marker_names_the_recipient_it_meant(self):
-        input_data = {"cwd": "/tmp/project", "transcript_path": "/tmp/rollout"}
         err = io.StringIO()
-        with patch.object(antiphon.os.path, "exists", return_value=True), \
-             patch.object(antiphon, "last_codex_reply",
-                          return_value="@claude:api\n@claude:api run"), \
-             patch.object(antiphon, "read_cursor", return_value={}), \
-             patch.object(antiphon, "write_cursor"), \
-             patch.object(antiphon.sys, "stdin", io.StringIO(json.dumps(input_data))), \
-             contextlib.redirect_stderr(err):
-            self.assertEqual(antiphon.push("claude"), 0)
+        with tempfile.TemporaryDirectory() as project:
+            input_data = {"cwd": project, "transcript_path": "/tmp/rollout"}
+            with patch.object(antiphon.os.path, "exists", return_value=True), \
+                 patch.object(antiphon, "last_codex_reply",
+                              return_value="@claude:api\n@claude:api run"), \
+                 patch.object(antiphon, "read_cursor", return_value={}), \
+                 patch.object(antiphon, "write_cursor"), \
+                 patch.object(antiphon.sys, "stdin", io.StringIO(json.dumps(input_data))), \
+                 contextlib.redirect_stderr(err):
+                self.assertEqual(antiphon.push("claude"), 0)
         self.assertIn("@claude:api line carried no message", err.getvalue())
 
     # A mock that stands in for a transport nobody should touch must raise, not
@@ -301,10 +306,9 @@ class AntiphonTest(unittest.TestCase):
         """A name that does not resolve is refused out loud. Delivering it to
         whoever is around instead would be the silent misroute wearing a
         recipient's name."""
-        input_data = {"cwd": "/tmp/project", "transcript_path": "/tmp/rollout"}
         err = io.StringIO()
         with tempfile.TemporaryDirectory() as project:
-            input_data["cwd"] = project
+            input_data = {"cwd": project, "transcript_path": "/tmp/rollout"}
             with patch.object(antiphon.os.path, "exists", return_value=True), \
                  patch.object(antiphon, "last_codex_reply",
                               return_value="@claude:api run"), \
@@ -317,7 +321,10 @@ class AntiphonTest(unittest.TestCase):
                  contextlib.redirect_stderr(err):
                 self.assertEqual(antiphon.push("claude"), 0)
                 sock.assert_not_called()
-                write.assert_not_called()
+                # `update_cursor` takes the lock and persists once called,
+                # regardless of whether anything changed — the record it
+                # writes back here is the same empty cursor it read.
+                write.assert_called_once_with(project, {}, "codex")
         self.assertIn("api", err.getvalue())
         self.assertIn("not delivered", err.getvalue())
 
@@ -325,20 +332,21 @@ class AntiphonTest(unittest.TestCase):
         """Each recipient stands alone. A name that cannot be resolved must cost
         that line and nothing else."""
         sent = []
-        input_data = {"cwd": "/tmp/project", "transcript_path": "/tmp/rollout"}
-        with patch.object(antiphon.os.path, "exists", return_value=True), \
-             patch.object(antiphon, "last_codex_reply",
-                          return_value="@claude:api named\n@claude bare"), \
-             patch.object(antiphon, "read_cursor", return_value={}), \
-             patch.object(antiphon, "write_cursor"), \
-             patch.object(antiphon, "send_to_claude",
-                          side_effect=lambda cwd, msg, alias=None, **_:
-                              (False, "not delivered: no live claude peer named "
-                                      f"{alias!r}") if alias
-                              else (sent.append(msg) or (True, ""))), \
-             patch.object(antiphon.sys, "stdin", io.StringIO(json.dumps(input_data))), \
-             contextlib.redirect_stderr(io.StringIO()):
-            self.assertEqual(antiphon.push("claude"), 0)
+        with tempfile.TemporaryDirectory() as project:
+            input_data = {"cwd": project, "transcript_path": "/tmp/rollout"}
+            with patch.object(antiphon.os.path, "exists", return_value=True), \
+                 patch.object(antiphon, "last_codex_reply",
+                              return_value="@claude:api named\n@claude bare"), \
+                 patch.object(antiphon, "read_cursor", return_value={}), \
+                 patch.object(antiphon, "write_cursor"), \
+                 patch.object(antiphon, "send_to_claude",
+                              side_effect=lambda cwd, msg, alias=None, **_:
+                                  (False, "not delivered: no live claude peer named "
+                                          f"{alias!r}") if alias
+                                  else (sent.append(msg) or (True, ""))), \
+                 patch.object(antiphon.sys, "stdin", io.StringIO(json.dumps(input_data))), \
+                 contextlib.redirect_stderr(io.StringIO()):
+                self.assertEqual(antiphon.push("claude"), 0)
         self.assertEqual(sent, ["bare"])
 
     # ---- the Codex-side MCP server ----
@@ -480,7 +488,11 @@ class AntiphonTest(unittest.TestCase):
         without recording it, so ending the turn with the same `@codex` line sent
         the message a second time."""
         written = []
-        with patch.object(antiphon, "project_dir", return_value="/tmp/project"), \
+        # `_record_delivery` now goes through `update_cursor`, which takes a
+        # real lock beside the cursor — a fixed path would leave a lock file
+        # on a real developer's machine.
+        with tempfile.TemporaryDirectory() as project, \
+             patch.object(antiphon, "project_dir", return_value=project), \
              patch.object(antiphon, "codex_session_id", return_value="sess"), \
              patch.object(antiphon, "send_to_codex", return_value=(True, "")), \
              patch.object(antiphon, "read_cursor", return_value={}), \
@@ -676,12 +688,16 @@ class AntiphonTest(unittest.TestCase):
                             antiphon.claude_socket_path("/tmp/b"))
 
     def test_channel_reply_goes_to_codex_queue_with_agent_label(self):
-        with patch.object(antiphon, "project_dir", return_value="/tmp/project"), \
+        # `_record_delivery` goes through `update_cursor`, which takes a real
+        # lock beside the cursor — a fixed path would leave a lock file on a
+        # real developer's machine.
+        with tempfile.TemporaryDirectory() as project, \
+             patch.object(antiphon, "project_dir", return_value=project), \
              patch.object(antiphon, "send_to_codex", return_value=(True, "")) as send, \
              patch.object(antiphon.sys, "stdin",
                           io.StringIO('{"text":"reply"}')):
             self.assertEqual(antiphon.reply(), 0)
-        self.assertEqual(send.call_args.args[0], "/tmp/project")
+        self.assertEqual(send.call_args.args[0], project)
         self.assertTrue(send.call_args.args[1].startswith(
             "[Antiphon channel] Claude:"))
 
@@ -1076,7 +1092,11 @@ class AntiphonTest(unittest.TestCase):
     def test_push_and_reply_use_the_same_labels_the_guard_matches(self):
         """The guard is derived from the constants push() and reply() send, so the
         two can never drift apart."""
-        with patch.object(antiphon, "project_dir", return_value="/tmp/project"), \
+        # `_record_delivery` goes through `update_cursor`, which takes a real
+        # lock beside the cursor — a fixed path would leave a lock file on a
+        # real developer's machine.
+        with tempfile.TemporaryDirectory() as project, \
+             patch.object(antiphon, "project_dir", return_value=project), \
              patch.object(antiphon, "send_to_codex", return_value=(True, "")) as send, \
              patch.object(antiphon.sys, "stdin", io.StringIO('{"text":"reply"}')):
             self.assertEqual(antiphon.reply(), 0)
@@ -1572,9 +1592,12 @@ class AntiphonTest(unittest.TestCase):
             self.assertEqual(antiphon.state_path("/tmp/project", "codex"),
                              os.path.join("/tmp/project", ".antiphon", "cursor.json"))
 
-    def test_cursor_keys_from_the_turkish_era_are_translated_in_place(self):
+    def test_cursor_keys_from_the_turkish_era_are_translated_for_the_reader(self):
         """A cursor written before the English rename carries Turkish keys; reading
-        it must translate them and persist the translation."""
+        it must translate them for the caller. It no longer persists the
+        translation — that would be a write hidden inside a read, and the read
+        runs inside the delivery hold where a second lock acquisition would
+        block this process against itself."""
         with tempfile.TemporaryDirectory() as project:
             os.makedirs(os.path.join(project, ".antiphon"))
             path = os.path.join(project, ".antiphon", "cursor.json")
@@ -1586,10 +1609,15 @@ class AntiphonTest(unittest.TestCase):
                 "last_pushed_claude": "hello",
             })
             with open(path, encoding="utf-8") as f:
+                self.assertEqual(json.load(f), {"codex_gordu": 12.0,
+                                                "son_itilen_claude": "hello"},
+                                 "a read leaves the file alone")
+            antiphon.update_cursor(project, "claude", lambda c: c)
+            with open(path, encoding="utf-8") as f:
                 self.assertEqual(json.load(f), {
                     "codex_seen": 12.0,
                     "last_pushed_claude": "hello",
-                })
+                }, "the next write persists the translation")
 
 
 
@@ -1900,7 +1928,8 @@ class CodexPeerWiringTest(unittest.TestCase):
                 raise OSError("stdout is gone")
 
         record = []
-        with tempfile.TemporaryDirectory() as project:
+        with tempfile.TemporaryDirectory() as project, \
+             contextlib.redirect_stderr(io.StringIO()):
             code = self._deliver_hook(project, Broken(), record)
         self.assertEqual(record, [], "a page nobody received is not seen")
         self.assertNotEqual(code, 0, "the failure has to be reportable")
@@ -1915,7 +1944,8 @@ class CodexPeerWiringTest(unittest.TestCase):
                 raise OSError("broken pipe")
 
         record = []
-        with tempfile.TemporaryDirectory() as project:
+        with tempfile.TemporaryDirectory() as project, \
+             contextlib.redirect_stderr(io.StringIO()):
             code = self._deliver_hook(project, Unflushable(), record)
         self.assertEqual(record, [])
         self.assertNotEqual(code, 0)
@@ -2003,6 +2033,60 @@ class CodexPeerWiringTest(unittest.TestCase):
              patch.object(antiphon.peers, "_registry_lock", refuse):
             self.assertEqual(self._deliver_hook(project, out), 0)
         self.assertTrue(out.getvalue())
+
+    def test_a_later_writer_cannot_undo_a_delivery(self):
+        """`cursor.json` holds both the `_seen` timestamps and the push
+        fingerprints, and every writer rewrites the whole object. A writer
+        holding a snapshot from before a delivery puts the old `_seen` back,
+        and the next delivery hands out the page again — no crash, ordinary
+        operation. Measured on this codebase: an advance from 1.0 to 2.0 came
+        back as 1.0."""
+        with tempfile.TemporaryDirectory() as project, self._named(""):
+            antiphon.write_cursor(project, {"codex_seen": 1.0}, "codex")
+            stale = antiphon.read_cursor(project, "codex")
+            with antiphon.cursor_lock(project, "codex") as locked:
+                self.assertTrue(locked)
+                live = antiphon.read_cursor(project, "codex")
+                live["codex_seen"] = 2.0
+                antiphon.write_cursor(project, live, "codex")
+            self.assertEqual(stale["codex_seen"], 1.0, "the snapshot is stale")
+            # What a writer looks like once it goes through the lock: it names
+            # the field it owns and never carries the rest of the object in.
+            antiphon.update_cursor(
+                project, "codex",
+                lambda c: dict(c, last_pushed_claude={"": "fingerprint"}))
+            after = antiphon.read_cursor(project, "codex")
+            self.assertEqual(after["codex_seen"], 2.0,
+                             "the advance survived a later writer")
+            self.assertEqual(after["last_pushed_claude"], {"": "fingerprint"})
+
+    def test_update_cursor_reads_the_file_not_a_snapshot(self):
+        """The invariant, stated directly: what `mutate` is handed is what was
+        on disk when the lock was taken. A helper that read before locking
+        would reintroduce the whole bug behind a tidier name."""
+        seen = []
+        with tempfile.TemporaryDirectory() as project, self._named(""):
+            antiphon.write_cursor(project, {"codex_seen": 1.0}, "codex")
+            antiphon.write_cursor(project, {"codex_seen": 2.0}, "codex")
+            antiphon.update_cursor(project, "codex",
+                                   lambda c: seen.append(c["codex_seen"]) or c)
+        self.assertEqual(seen, [2.0])
+
+    def test_reading_the_cursor_never_writes_it(self):
+        """`read_cursor` runs inside the delivery hold, and `flock` is per open
+        file description — a second acquisition from this same process would
+        block against itself. So the read cannot take the lock, which means it
+        must not write at all."""
+        with tempfile.TemporaryDirectory() as project, self._named(""):
+            path = antiphon.state_path(project, "codex")
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            with open(path, "w", encoding="utf-8") as f:
+                json.dump({"codex_gordu": 12.0}, f)
+            before = os.stat(path).st_mtime_ns
+            self.assertEqual(antiphon.read_cursor(project, "codex"),
+                             {"codex_seen": 12.0}, "still translated for the caller")
+            self.assertEqual(os.stat(path).st_mtime_ns, before,
+                             "and the file was not touched")
 
     @staticmethod
     def _run_mcp(project, *requests, name=None, owner="300:x"):
@@ -2677,7 +2761,10 @@ class RoutingTest(unittest.TestCase):
                  contextlib.redirect_stderr(io.StringIO()) as err:
                 self.assertEqual(antiphon.push("codex"), 0)
             queued.assert_not_called()
-            write.assert_not_called()
+            # `update_cursor` takes the lock and persists once called,
+            # regardless of whether anything changed — the record it writes
+            # back here is the same empty cursor it read.
+            write.assert_called_once_with(project, {}, "claude")
         self.assertIn("not discoverable", err.getvalue())
 
     # ---- nothing registered: the unnamed pair, exactly as before ----

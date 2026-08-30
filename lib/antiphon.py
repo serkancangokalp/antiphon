@@ -500,10 +500,13 @@ def read_cursor(cwd, kind):
         # whatever a person was in the middle of looking at.
         return {}
 
-    translated = _translate_cursor_keys(data)
-    if translated != data:
-        write_cursor(cwd, translated, kind)
-    return translated
+    # Translated for the caller and not written back. This runs inside the
+    # delivery hold, and `flock` is per open file description, so taking the
+    # lock here would block this process against itself; writing without it
+    # would let a read put back a snapshot from before somebody's advance.
+    # The translation is idempotent, so the next write from a locked path
+    # persists it and nothing behaves differently until then.
+    return _translate_cursor_keys(data)
 
 
 def cursor_time(cursor, key, default=None):
@@ -564,6 +567,25 @@ def write_cursor(cwd, data, kind):
         except OSError:
             pass
         return False
+
+
+def update_cursor(cwd, kind, mutate):
+    """Read-modify-write one peer's cursor inside its lock.
+
+    Every writer of `cursor.json` goes through here. The file holds both the
+    `_seen` timestamps and the push fingerprints, and each writer rewrites the
+    whole object, so a snapshot read outside the lock and written inside it
+    silently reverts whatever happened in between — measured: an advance from
+    1.0 to 2.0 undone by a push that had read the file first.
+
+    `mutate` is called with the freshly read cursor and returns the object to
+    write. Returns whether the write succeeded, or False if the lock could not
+    be taken — in which case nothing was read, changed or written.
+    """
+    with cursor_lock(cwd, kind) as locked:
+        if not locked:
+            return False
+        return write_cursor(cwd, mutate(read_cursor(cwd, kind)), kind)
 
 
 def truncate(s, n):
@@ -1081,12 +1103,7 @@ def push(target="codex"):
         return 0
 
     side = sender_side(target)
-    cursor = read_cursor(cwd, side)
     key = f"last_pushed_{target}"
-    sent, already = migrate_pushed(cursor.get(key), batches.get(None) or [])
-    if already:
-        sent[""] = batch_fingerprint(batches[None])
-    before = dict(sent)
 
     # Once for the turn, not once per recipient. Who is speaking cannot change
     # between two lines of one reply, and working it out again for each would
@@ -1114,13 +1131,23 @@ def push(target="codex"):
             print(f"antiphon: delivery failed — {detail}", file=sys.stderr)
         return ok
 
-    updated = forget_superseded(deliver_batches(batches, sent, deliver))
-    # Written only when something actually moved: a delivery landed, or the old
-    # string format was recognised and needs recording in the new one. A turn
-    # that delivered nothing leaves the cursor file alone.
-    if updated != before or already:
-        cursor[key] = updated
-        write_cursor(cwd, cursor, side)
+    def mutate(cursor):
+        # `cursor` is what update_cursor just read under the lock — never the
+        # stale value a read before the lock would have carried in, which is
+        # how a delivery's advance used to come back undone.
+        sent, already = migrate_pushed(cursor.get(key), batches.get(None) or [])
+        if already:
+            sent[""] = batch_fingerprint(batches[None])
+        before = dict(sent)
+        updated = forget_superseded(deliver_batches(batches, sent, deliver))
+        # Changed only when something actually moved: a delivery landed, or the
+        # old string format was recognised and needs recording in the new one.
+        # A turn that delivered nothing leaves this key alone.
+        if updated != before or already:
+            cursor[key] = updated
+        return cursor
+
+    update_cursor(cwd, side, mutate)
     return 0
 
 
@@ -1408,15 +1435,18 @@ def _record_delivery(cwd, target, text, alias=None):
     would resend the last unaddressed message once.
     """
     side = sender_side(target)
-    cursor = read_cursor(cwd, side)
     key = f"last_pushed_{target}"
-    held = cursor.get(key)
-    sent = dict(held) if isinstance(held, dict) else {}
-    if isinstance(held, str):
-        sent[LEGACY_SLOT] = held
-    sent["" if alias is None else f"@{alias}"] = batch_fingerprint([text])
-    cursor[key] = forget_superseded(sent)
-    write_cursor(cwd, cursor, side)
+
+    def mutate(cursor):
+        held = cursor.get(key)
+        sent = dict(held) if isinstance(held, dict) else {}
+        if isinstance(held, str):
+            sent[LEGACY_SLOT] = held
+        sent["" if alias is None else f"@{alias}"] = batch_fingerprint([text])
+        cursor[key] = forget_superseded(sent)
+        return cursor
+
+    update_cursor(cwd, side, mutate)
 
 
 def register_peer(*_):
