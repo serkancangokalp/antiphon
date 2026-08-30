@@ -602,6 +602,24 @@ def positions_for(cursor, side):
     return {}, cursor_time(cursor, "%s_seen" % side)
 
 
+def _advance_cursor(cwd, kind, cursor, key, positions, reached):
+    """Merge `reached` into `positions` and persist it as the v2 cursor.
+
+    Every record a parser read moves its source's mark forward, whether or
+    not that record produced anything visible: a turn with nothing to show
+    still has to leave the read position behind it, or the same bytes are
+    read again next turn. A no-op, reporting success, when there is nothing
+    to record. Returns whether the state that needed writing was written;
+    the caller decides what, if anything, to say about a failure.
+    """
+    if not reached:
+        return True
+    merged = dict(positions)
+    merged.update(reached)
+    cursor[key] = {"v": CURSOR_VERSION, "sources": merged}
+    return write_cursor(cwd, cursor, kind)
+
+
 def write_cursor(cwd, data, kind):
     path = state_path(cwd, kind)
     os.makedirs(os.path.dirname(path), exist_ok=True)
@@ -904,6 +922,13 @@ def claude_events(cwd, positions=None, since=None):
         sid = source_id(path)
         gen = source_generation(path)
         offset = _start_offset(path, sid, gen, positions, since)
+        # Seeded here, not only inside the loop below: a source whose start
+        # is already at the end of the file yields no records at all, and a
+        # mark that only the loop writes would never enter `reached` for it.
+        # The next run would then see no entry, treat the source as new, and
+        # read it again from byte zero -- measured end to end, re-delivering
+        # a whole source the turn after a v1 cursor migrates.
+        reached[sid] = {"gen": gen, "offset": offset}
         for start, end, line in read_records(path, offset):
             reached[sid] = {"gen": gen, "offset": end}
             try:
@@ -1028,6 +1053,13 @@ def codex_events(cwd, positions=None, since=None):
         sid = source_id(path)
         gen = source_generation(path)
         offset = _start_offset(path, sid, gen, positions, since)
+        # Seeded here, not only inside the loop below: a source whose start
+        # is already at the end of the file yields no records at all, and a
+        # mark that only the loop writes would never enter `reached` for it.
+        # The next run would then see no entry, treat the source as new, and
+        # read it again from byte zero -- measured end to end, re-delivering
+        # a whole source the turn after a v1 cursor migrates.
+        reached[sid] = {"gen": gen, "offset": offset}
         for start, end, line in read_records(path, offset):
             reached[sid] = {"gen": gen, "offset": end}
             try:
@@ -1099,7 +1131,11 @@ def build_summary(cwd, side, positions=None, since=None):
     other = OTHER_SIDE[side][1]
 
     if not events:
-        return "", {}, 0
+        # Nothing to show, but `reached` still has to reach the caller: a
+        # source whose only unread records were filtered, or one a v1 cursor
+        # just placed, produces no event and must not look like a source that
+        # was never read at all.
+        return "", reached, 0
 
     shown = events[-EVENT_LIMIT:]
     count = sum(1 for e in shown if e.kind != "tool")
@@ -1188,6 +1224,14 @@ def hook(side="claude"):
         positions, since = positions_for(cursor, side)
         text, reached, _ = build_summary(cwd, side, positions, since)
         if not text:
+            # Nothing to deliver this turn, so the write-then-advance order
+            # below does not protect anything -- there is no page to lose.
+            # The parser's own high-water mark still has to move, or a
+            # source with nothing visible in it (filtered records, or one a
+            # v1 cursor just placed) is read again from scratch every turn.
+            if not _advance_cursor(cwd, side, cursor, key, positions, reached):
+                print(f"antiphon: nothing to show, but could not record "
+                      f"progress in {state_path(cwd, side)}", file=sys.stderr)
             return 0
 
         # The hook prints nothing to the terminal. The counter used to say
@@ -1204,20 +1248,16 @@ def hook(side="claude"):
             # and the cursor stays where it was. The next turn offers it again.
             print("antiphon: could not write this turn's context", file=sys.stderr)
             return 1
-        if reached:
-            merged = dict(positions)
-            merged.update(reached)
-            cursor[key] = {"v": CURSOR_VERSION, "sources": merged}
-            if not write_cursor(cwd, cursor, side):
-                # The page WAS delivered, so the exit code stays 0: a non-zero
-                # exit suppresses plain-text stdout as context, and whether it
-                # also suppresses `additionalContext` is undocumented and
-                # unmeasured. Risking the page we just handed over to report a
-                # cursor failure would trade a visible repeat for a silent
-                # loss. The symptom of this branch is the same context
-                # arriving every turn.
-                print(f"antiphon: delivered, but could not record it in "
-                      f"{state_path(cwd, side)}", file=sys.stderr)
+        if not _advance_cursor(cwd, side, cursor, key, positions, reached):
+            # The page WAS delivered, so the exit code stays 0: a non-zero
+            # exit suppresses plain-text stdout as context, and whether it
+            # also suppresses `additionalContext` is undocumented and
+            # unmeasured. Risking the page we just handed over to report a
+            # cursor failure would trade a visible repeat for a silent
+            # loss. The symptom of this branch is the same context
+            # arriving every turn.
+            print(f"antiphon: delivered, but could not record it in "
+                  f"{state_path(cwd, side)}", file=sys.stderr)
         return 0
 
 
@@ -2002,16 +2042,25 @@ def _mcp_serve(cwd, alias=None):
                         text, reached, _ = build_summary(cwd, "codex", positions, since)
                         output = text or ("Nothing new on the Claude Code side "
                                           "since your last turn.")
-                        # Answer first, mark seen second — the same order as the
-                        # hook, for the same reason: a result that was never
-                        # written is a page the model never saw.
+                        # Answer first, mark seen second — the same order as
+                        # the hook, for the same reason: a result that was
+                        # never written is a page the model never saw. That
+                        # ordering protects a page that was actually
+                        # selected; when there is nothing to deliver, no page
+                        # depends on it, and the parser's own high-water mark
+                        # still has to move, or a source with nothing visible
+                        # in it is read again from scratch every turn.
                         delivered = _mcp_result(
                             mid, {"content": [{"type": "text", "text": output}]})
-                        if delivered and text and reached:
-                            merged = dict(positions)
-                            merged.update(reached)
-                            cursor["codex_seen"] = {"v": CURSOR_VERSION, "sources": merged}
-                            if not write_cursor(cwd, cursor, "codex"):
+                        if not text:
+                            if not _advance_cursor(cwd, "codex", cursor,
+                                                   "codex_seen", positions, reached):
+                                print("antiphon: could not record progress "
+                                      f"in {state_path(cwd, 'codex')}",
+                                      file=sys.stderr)
+                        elif delivered:
+                            if not _advance_cursor(cwd, "codex", cursor,
+                                                   "codex_seen", positions, reached):
                                 # Symmetric with the hook: the page was
                                 # delivered, so the tool result already went
                                 # out and this stays a diagnostic rather than
@@ -2584,17 +2633,19 @@ def _cursor_entry(key, value):
             and isinstance(value.get("sources"), dict):
         # A v2 position map. A raw repr here is a clipped, unreadable dict —
         # the one command someone runs *because* something is already wrong
-        # deserves the source count and each source's own progress instead.
+        # deserves the source count and its progress instead. Never a source
+        # id or any prefix of one: `status` is what people paste into issues,
+        # and a source id is the host's own session id.
         sources = value["sources"]
-        if not sources:
-            return "—"
-        parts = ["%s@%s" % (sid[:8], entry.get("offset"))
-                 for sid, entry in sorted(sources.items())
-                 if isinstance(entry, dict)]
-        if parts:
-            return truncate("%d sources: %s" % (len(sources), ", ".join(parts)), 80)
-        # `sources` held nothing shaped like a position: fall through below,
-        # shown literally rather than raising or claiming a count that lies.
+        offsets = [entry.get("offset") for entry in sources.values()
+                   if isinstance(entry, dict) and isinstance(entry.get("offset"), int)]
+        if offsets and len(offsets) == len(sources):
+            return truncate("%d sources, at %s"
+                            % (len(sources),
+                               ", ".join(str(o) for o in sorted(offsets, reverse=True))), 80)
+        # `sources` held something that is not a position, or was empty: fall
+        # through below, shown literally rather than raising or claiming a
+        # count that misdescribes what is actually inside.
     return truncate(str(value), 80) if value else "—"
 
 

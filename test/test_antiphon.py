@@ -1869,6 +1869,94 @@ class PositionCursorTest(unittest.TestCase):
         self.assertEqual(reached[sid]["offset"], size,
                          "past the last record read, not the last shown")
 
+    def test_a_v1_cursor_migrates_without_redelivering_a_quiet_source(self):
+        """Measured end to end on real transcripts: a source whose starting
+        offset lands at the end of its file on the turn a v1 cursor migrates
+        produces no event of its own, and used to be silently dropped from
+        the v2 map -- invisible to the next run, which then read that file
+        again from byte zero and re-delivered its already-seen content."""
+        fresh_sid = "4eecac24-1c21-47ad-ab11-a650708f3098"
+        quiet_sid = "01a04f6b-4485-7290-afbd-9eae74405ec8"
+        now = time.strftime("%Y-%m-%dT%H:%M:%S.000Z", time.gmtime())
+        fresh = json.dumps({"type": "assistant", "timestamp": now,
+                            "message": {"content": [{"type": "text",
+                                                     "text": "fresh news"}]}})
+        stale = json.dumps({"type": "assistant",
+                            "timestamp": "2020-01-01T00:00:00.000Z",
+                            "message": {"content": [{"type": "text",
+                                                     "text": "stale echo"}]}})
+        with tempfile.TemporaryDirectory() as project:
+            fresh_path = os.path.join(project, fresh_sid + ".jsonl")
+            quiet_path = os.path.join(project, quiet_sid + ".jsonl")
+            with open(fresh_path, "w", encoding="utf-8") as f:
+                f.write(fresh + "\n")
+            with open(quiet_path, "w", encoding="utf-8") as f:
+                f.write(stale + "\n")
+            antiphon.write_cursor(project, {"codex_seen": time.time() - 30}, "codex")
+
+            def run():
+                out = io.StringIO()
+                with patch.object(antiphon, "project_dir", return_value=project), \
+                     patch.object(antiphon, "claude_transcripts",
+                                  return_value=[fresh_path, quiet_path]), \
+                     patch.object(antiphon.sys, "stdin",
+                                  io.StringIO(json.dumps(
+                                      {"cwd": project,
+                                       "hook_event_name": "UserPromptSubmit"}))), \
+                     contextlib.redirect_stdout(out):
+                    code = antiphon.hook("codex")
+                return code, out.getvalue()
+
+            first_code, first_out = run()
+            self.assertEqual(first_code, 0)
+            self.assertIn("fresh news", first_out)
+
+            second_code, second_out = run()
+        self.assertEqual(second_code, 0)
+        self.assertEqual(second_out, "",
+                         "the second run must deliver nothing new")
+
+    def test_a_source_whose_records_are_all_filtered_still_advances_the_cursor(self):
+        """Measured on real sources: 11 records and 6,013 bytes on the Claude
+        side that produced no event were re-read on every single turn,
+        because `build_summary`'s empty case threw the parser's own
+        `reached` away. A turn with nothing to show still has to leave the
+        read position behind it."""
+        now = time.strftime("%Y-%m-%dT%H:%M:%S.000Z", time.gmtime())
+        filtered = [json.dumps({"type": "assistant", "isMeta": True,
+                                "timestamp": now,
+                                "message": {"content": [{"type": "text",
+                                                         "text": "meta %d" % i}]}})
+                   for i in range(3)]
+        sid = "4eecac24-1c21-47ad-ab11-a650708f3098"
+        with tempfile.TemporaryDirectory() as project:
+            path = os.path.join(project, sid + ".jsonl")
+            with open(path, "w", encoding="utf-8") as f:
+                f.write("\n".join(filtered) + "\n")
+            size = os.path.getsize(path)
+
+            def run():
+                out = io.StringIO()
+                with patch.object(antiphon, "project_dir", return_value=project), \
+                     patch.object(antiphon, "claude_transcripts", return_value=[path]), \
+                     patch.object(antiphon.sys, "stdin",
+                                  io.StringIO(json.dumps(
+                                      {"cwd": project,
+                                       "hook_event_name": "UserPromptSubmit"}))), \
+                     contextlib.redirect_stdout(out):
+                    code = antiphon.hook("codex")
+                return code, out.getvalue()
+
+            first_code, first_out = run()
+            cursor = antiphon.read_cursor(project, "codex")
+            second_code, second_out = run()
+        self.assertEqual((first_code, second_code), (0, 0))
+        self.assertEqual(first_out, "")
+        self.assertEqual(second_out, "")
+        self.assertEqual(cursor["codex_seen"]["sources"][sid]["offset"], size,
+                         "the position passed the filtered records after "
+                         "the first run")
+
 
 class MalformedStateTest(unittest.TestCase):
     """State that parses as JSON and still isn't what the reader expects.
@@ -2065,10 +2153,12 @@ class MalformedStateTest(unittest.TestCase):
     def test_cursor_entry_renders_a_v2_map_readably_and_a_malformed_one_literally(self):
         """A raw Python repr here — the one command someone runs *because*
         something is already wrong — is clipped and unreadable; the source
-        count and each source's own offset are the useful part. An entry that
-        is not a position, or a `sources` that is not a dict at all, must not
-        raise, and must not be reported as a source count that lies about
-        what is actually inside."""
+        count and each source's own progress are the useful part. A source id
+        is the host's own session id, and `status` prints none of it, not
+        even a prefix: only the count and the offsets. An entry that is not a
+        position, or a `sources` that is not a dict at all, must not raise,
+        and must not be reported as a source count that lies about what is
+        actually inside."""
         value = {"v": 2, "sources": {
             "4eecac24-1c21-47ad-ab11-a650708f3098": {"gen": "16777232:5:abc",
                                                       "offset": 4096},
@@ -2076,15 +2166,17 @@ class MalformedStateTest(unittest.TestCase):
                                                       "offset": 128},
         }}
         shown = antiphon._cursor_entry("codex_seen", value)
-        self.assertIn("2 sources", shown)
-        self.assertIn("4eecac24@4096", shown)
-        self.assertIn("01a04f6b@128", shown)
+        self.assertEqual(shown, "2 sources, at 4096, 128")
+        for sid in value["sources"]:
+            self.assertNotIn(sid, shown)
+            self.assertNotIn(sid[:8], shown, "not even a prefix of the id")
 
-        self.assertEqual(
-            antiphon._cursor_entry("codex_seen", {"v": 2, "sources": {}}), "—")
-
+        # A mixed map — one valid position, one that is not — must not report
+        # a count that includes the entry it could not read.
         for broken in ({"v": 2, "sources": {"s1": 42}},
-                       {"v": 2, "sources": "not-a-dict"}):
+                       {"v": 2, "sources": {"s1": {"gen": "g", "offset": 1}, "s2": 42}},
+                       {"v": 2, "sources": "not-a-dict"},
+                       {"v": 2, "sources": {}}):
             self.assertEqual(antiphon._cursor_entry("codex_seen", broken),
                              antiphon.truncate(str(broken), 80), repr(broken))
 
@@ -4290,6 +4382,14 @@ class StatusTest(unittest.TestCase):
                                     "/tmp/antiphon-secret-ui.sock",
                                     pid=os.getpid())
             self._codex_peer(project, "build", "300:build", self.UUID)
+            # A v2 cursor names its sources by the host's own session id — the
+            # same kind of identity this test already refuses everywhere else,
+            # and the source count rendering must not leak even a prefix of it.
+            os.makedirs(os.path.join(project, ".antiphon"), exist_ok=True)
+            with open(os.path.join(project, ".antiphon", "cursor.json"), "w",
+                      encoding="utf-8") as f:
+                json.dump({"claude_seen": {"v": 2, "sources":
+                           {self.UUID: {"gen": "g", "offset": 42}}}}, f)
             with patch.object(antiphon, "claude_transcripts",
                               return_value=["/home/me/.claude/projects/x/"
                                             "a1b2c3d4-dead-beef-cafe-0123456789ab.jsonl"]), \
@@ -4298,11 +4398,13 @@ class StatusTest(unittest.TestCase):
                                             f"rollout-2026-08-30T00-00-00-{self.UUID}.jsonl"]):
                 _, text = self._status(project)
         for secret in ("antiphon-secret-ui.sock", ".sock", self.UUID,
-                       "a1b2c3d4-dead-beef-cafe-0123456789ab", ".jsonl",
-                       antiphon.claude_socket_path(project)):
+                       self.UUID[:8], "a1b2c3d4-dead-beef-cafe-0123456789ab",
+                       ".jsonl", antiphon.claude_socket_path(project)):
             self.assertNotIn(secret, text, secret)
         self.assertIn("1 file", text, "the counts are still there")
         self.assertNotIn("1 files", text, "and one of something is not plural")
+        self.assertIn("1 sources, at 42", text,
+                      "the cursor's own progress is still shown")
 
     def test_the_counts_are_written_the_way_a_person_writes_them(self):
         with tempfile.TemporaryDirectory() as project:
