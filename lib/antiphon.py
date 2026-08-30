@@ -585,16 +585,21 @@ def positions_for(cursor, side):
 
     A float under `<side>_seen` is the timestamp cursor every installed bridge
     holds today: no offsets yet, so it comes back as a `since` and each source
-    is placed once. A dict is already offsets. Nothing here writes — the
-    migration is finished by the first successful delivery, under the lock,
-    like every other cursor write.
+    is placed once. A dict is already offsets, but `since` still comes back as
+    the lookback rather than `None`: a source with a recorded entry resumes
+    from it and never looks at `since`, but a v2 map can still meet a source
+    it has no entry for -- an old session resumed, or a fourth transcript
+    rotating into the newest three -- and that source needs the same floor a
+    brand-new one gets, not the whole file with nothing holding it back.
+    Nothing here writes — the migration is finished by the first successful
+    delivery, under the lock, like every other cursor write.
     """
     value = cursor.get("%s_seen" % side) if isinstance(cursor, dict) else None
     if isinstance(value, dict) and isinstance(value.get("sources"), dict):
         sources = {sid: entry for sid, entry in value["sources"].items()
                    if _valid_position(entry)}
         if len(sources) == len(value["sources"]):
-            return sources, None
+            return sources, cursor_time(cursor, "%s_seen" % side)
         # Something in there is not a position. Rather than trust the rest of a
         # file that has clearly been through something, fall back whole.
         print("antiphon: %s_seen holds an entry that is not a position; "
@@ -936,9 +941,20 @@ def claude_events(cwd, positions=None, since=None):
         # The next run would then see no entry, treat the source as new, and
         # read it again from byte zero -- measured end to end, re-delivering
         # a whole source the turn after a v1 cursor migrates.
-        reached[sid] = {"gen": gen, "offset": offset}
+        #
+        # Guarded on `gen is not None`, in both places: a source with no
+        # generation -- a file whose first line has no newline yet, or one
+        # `source_generation` could not read at all -- yields no complete
+        # records either way, so recording nothing here costs it nothing.
+        # Recording `{"gen": None, ...}` instead used to fail
+        # `_valid_position` on the next run and take every *other* source's
+        # position down with it: `positions_for` refuses a map with one bad
+        # entry in it whole, not just the entry that is wrong.
+        if gen is not None:
+            reached[sid] = {"gen": gen, "offset": offset}
         for start, end, line in read_records(path, offset):
-            reached[sid] = {"gen": gen, "offset": end}
+            if gen is not None:
+                reached[sid] = {"gen": gen, "offset": end}
             try:
                 d = json.loads(line)
             except json.JSONDecodeError:
@@ -1067,9 +1083,20 @@ def codex_events(cwd, positions=None, since=None):
         # The next run would then see no entry, treat the source as new, and
         # read it again from byte zero -- measured end to end, re-delivering
         # a whole source the turn after a v1 cursor migrates.
-        reached[sid] = {"gen": gen, "offset": offset}
+        #
+        # Guarded on `gen is not None`, in both places: a source with no
+        # generation -- a file whose first line has no newline yet, or one
+        # `source_generation` could not read at all -- yields no complete
+        # records either way, so recording nothing here costs it nothing.
+        # Recording `{"gen": None, ...}` instead used to fail
+        # `_valid_position` on the next run and take every *other* source's
+        # position down with it: `positions_for` refuses a map with one bad
+        # entry in it whole, not just the entry that is wrong.
+        if gen is not None:
+            reached[sid] = {"gen": gen, "offset": offset}
         for start, end, line in read_records(path, offset):
-            reached[sid] = {"gen": gen, "offset": end}
+            if gen is not None:
+                reached[sid] = {"gen": gen, "offset": end}
             try:
                 d = json.loads(line)
             except json.JSONDecodeError:

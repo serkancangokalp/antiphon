@@ -1893,10 +1893,16 @@ class PositionCursorTest(unittest.TestCase):
         self.assertEqual(since, 1000.0)
 
     def test_a_v2_cursor_is_read_as_positions(self):
+        """`since` still comes back as the lookback, even for a valid v2 map:
+        a source *with* a recorded entry resumes from it and never consults
+        `since`, so this changes nothing for it, but a v2 map can meet a
+        source it has no entry for -- an old session resumed, or a fourth
+        transcript rotating into the newest three -- and that source needs
+        the same floor a brand-new source gets rather than none at all."""
         cursor = {"claude_seen": {"v": 2, "sources": {"s1": {"gen": "g", "offset": 12}}}}
         positions, since = antiphon.positions_for(cursor, "claude")
         self.assertEqual(positions, {"s1": {"gen": "g", "offset": 12}})
-        self.assertIsNone(since)
+        self.assertIsNotNone(since)
 
     def test_a_cursor_entry_that_is_not_a_position_is_refused(self):
         """`cursor.json` gets hand-edited, restored from the wrong place, and
@@ -2022,6 +2028,84 @@ class PositionCursorTest(unittest.TestCase):
         self.assertEqual(cursor["codex_seen"]["sources"][sid]["offset"], size,
                          "the position passed the filtered records after "
                          "the first run")
+
+    def test_a_source_with_no_generation_does_not_poison_the_cursor(self):
+        """`source_generation` returns None for a file whose first line has no
+        trailing newline yet (or for one raising OSError). Measured before
+        this fix: both parsers wrote `{"gen": None, "offset": ...}` for it
+        anyway, `_valid_position` refused that one entry because `gen` was
+        not a `str`, and `positions_for` then discarded the *entire* map
+        rather than just that source -- a source with a real, valid position
+        got sent back to the lookback too, and re-delivered whole."""
+        good_sid = "4eecac24-1c21-47ad-ab11-a650708f3098"
+        torn_sid = "01a04f6b-4485-7290-afbd-9eae74405ec8"
+        with tempfile.TemporaryDirectory() as project:
+            good_path = os.path.join(project, good_sid + ".jsonl")
+            torn_path = os.path.join(project, torn_sid + ".jsonl")
+            with open(good_path, "w", encoding="utf-8") as f:
+                f.write(json.dumps({"type": "assistant",
+                                    "timestamp": "2026-08-30T10:00:00.000Z",
+                                    "message": {"content": [{"type": "text",
+                                                             "text": "steady"}]}}) + "\n")
+            with open(torn_path, "w", encoding="utf-8") as f:
+                f.write("not yet a complete line")  # no trailing \n: no generation
+
+            with patch.object(antiphon, "claude_transcripts",
+                              return_value=[good_path, torn_path]):
+                _events, reached = antiphon.claude_events(project)
+            self.assertIn(good_sid, reached)
+            self.assertNotIn(torn_sid, reached,
+                             "no generation must mean no entry, not a null one")
+
+            cursor = {}
+            self.assertTrue(antiphon._advance_cursor(
+                project, "codex", cursor, "codex_seen", {}, reached))
+
+            positions, since = antiphon.positions_for(cursor, "codex")
+            self.assertEqual(positions, reached,
+                             "the good source's position must survive intact")
+
+            # And the next run must not re-read it from the lookback either.
+            with patch.object(antiphon, "claude_transcripts",
+                              return_value=[good_path, torn_path]):
+                resumed_events, _resumed = antiphon.claude_events(project, positions)
+        self.assertEqual(resumed_events, [], "already-read content is not repeated")
+
+    def test_a_source_with_no_entry_under_a_v2_cursor_is_bounded_by_the_lookback(self):
+        """A v2 map used to hand back `since=None`, so `_start_offset` fell to
+        `else 0` for any source with no recorded entry -- an old session
+        resumed, or a fourth transcript rotating into the newest three -- and
+        its entire history entered the event pool. Measured: a fresh source
+        plus an eight-day-old 200-record source produced 39 of 40 kept slots
+        from the stale one. `positions_for` must still hand back the lookback
+        as a floor even for an otherwise-valid v2 map; a source *with* an
+        entry never consults it, so steady state is unchanged."""
+        known_sid = "4eecac24-1c21-47ad-ab11-a650708f3098"
+        new_sid = "01a04f6b-4485-7290-afbd-9eae74405ec8"
+        old_ts = "2020-01-01T00:00:00.000Z"
+        with tempfile.TemporaryDirectory() as d:
+            known_path = os.path.join(d, known_sid + ".jsonl")
+            new_path = os.path.join(d, new_sid + ".jsonl")
+            with open(known_path, "w", encoding="utf-8") as f:
+                f.write(json.dumps({"type": "assistant", "timestamp": old_ts,
+                                    "message": {"content": [{"type": "text",
+                                                             "text": "already delivered"}]}}) + "\n")
+            gen = antiphon.source_generation(known_path)
+            size = os.path.getsize(known_path)
+            with open(new_path, "w", encoding="utf-8") as f:
+                f.write(json.dumps({"type": "assistant", "timestamp": old_ts,
+                                    "message": {"content": [{"type": "text",
+                                                             "text": "ancient, never read"}]}}) + "\n")
+            cursor = {"claude_seen": {"v": 2, "sources":
+                      {known_sid: {"gen": gen, "offset": size}}}}
+            positions, since = antiphon.positions_for(cursor, "claude")
+            with patch.object(antiphon, "claude_transcripts",
+                              return_value=[known_path, new_path]):
+                events, _reached = antiphon.claude_events(d, positions, since)
+        self.assertEqual([e[2] for e in events], [],
+                         "the never-before-seen source's pre-lookback record "
+                         "must not appear just because it had no recorded "
+                         "position of its own")
 
 
 class MalformedStateTest(unittest.TestCase):
