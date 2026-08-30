@@ -1570,13 +1570,14 @@ def last_claude_reply(transcript_path):
     """Returns every assistant text of the last Claude turn, joined in order.
 
     A thin wrapper over `_claude_turn`, which also names the turn's boundary
-    record for `push`'s dedupe scoping; see its docstring for the rule.
+    record for `push`'s dedupe scoping; see its docstring for the rule. This
+    is the stable public name; `push` reads through the pair.
     """
     return _claude_turn(transcript_path)[0]
 
 
-def last_codex_reply(transcript_path, turn_id=None):
-    """Returns the assistant text(s) of the turn the Stop hook is reporting on.
+def _codex_turn(transcript_path, turn_id=None):
+    """(text, bound_key) for the turn the Codex Stop hook is reporting on.
 
     `turn_id` is the hook payload's own id, threaded in from `push()`; a
     missing key, `null`, `""`, or any non-string value all mean "no id" —
@@ -1584,6 +1585,14 @@ def last_codex_reply(transcript_path, turn_id=None):
     exactly; anything short of a provable boundary falls open to every
     assistant text in the window instead of guessing, because a duplicate of
     an old turn's tail is recoverable and a lost `@claude` marker is not.
+
+    `bound_key` is that matched id, and only that: `""` wherever this reader
+    fails open or has no id to match, because there the returned text is not
+    a turn's text but a window's. `push` scopes its dedupe fingerprint to it,
+    and a key naming a turn the text was never cut to is worse than no key —
+    measured, a clipped window whose marker never changes re-delivered it
+    once per turn (four sends over four turns) purely because the hook
+    reported a new id each time.
     """
     records = []
     for line in tail_lines(transcript_path):
@@ -1632,13 +1641,13 @@ def last_codex_reply(transcript_path, turn_id=None):
             if task_marker(d) == ("task_started", turn_id):
                 # Case 1: bounded by this turn's own close, or EOF — a
                 # nested child's complete carries a different id and does
-                # not end it.
-                return span_after(i + 1, "task_complete", turn_id)
+                # not end it. The only branch that names the turn it read.
+                return span_after(i + 1, "task_complete", turn_id), turn_id
         # Case 2: a real id whose start already scrolled out of the window.
         # Binding to a different task_started would attribute this reply to
         # the wrong turn; clipping at a task_complete can cut current-turn
         # text sitting after a closed nested span. Return everything visible.
-        return all_visible_texts()
+        return all_visible_texts(), ""
 
     # Case 3: no id to match against — decided on the window alone, since
     # the reader never sees what came before or after it.
@@ -1652,10 +1661,12 @@ def last_codex_reply(transcript_path, turn_id=None):
                 last_start = i
     if last_start is not None:
         # The current turn is still open while the hook runs, so nothing —
-        # not even its own task_complete — clips this span.
-        return span_after(last_start + 1)
+        # not even its own task_complete — clips this span. The start's own
+        # id is not the key: nothing proves it is the turn the hook is
+        # reporting on, which is the whole reason case 1 needs the payload.
+        return span_after(last_start + 1), ""
     if any_marker:
-        return all_visible_texts()          # an orphan task_complete: same fail-open
+        return all_visible_texts(), ""      # an orphan task_complete: same fail-open
 
     # No task marker at all in the window: today's newest-message behaviour.
     chunks = []
@@ -1663,7 +1674,17 @@ def last_codex_reply(transcript_path, turn_id=None):
         texts = message_texts(d)
         if texts:
             chunks = texts
-    return "\n".join(chunks).strip()
+    return "\n".join(chunks).strip(), ""
+
+
+def last_codex_reply(transcript_path, turn_id=None):
+    """Returns the assistant text(s) of the turn the Stop hook is reporting on.
+
+    A thin wrapper over `_codex_turn`, which also names the turn it bound the
+    text to for `push`'s dedupe scoping; see its docstring for the rule. This
+    is the stable public name; `push` reads through the pair.
+    """
+    return _codex_turn(transcript_path, turn_id)[0]
 
 
 def codex_session_id(cwd):
@@ -1714,10 +1735,12 @@ def push(target="codex"):
         turn_key = boundary_uuid or ""
     else:
         # Only Codex's own Stop hook carries this id; Claude's hook has
-        # nothing of the kind for `last_claude_reply` to use.
-        turn_id = input_data.get("turn_id")
-        turn_key = turn_id if isinstance(turn_id, str) and turn_id else ""
-        reply_text = last_codex_reply(transcript, turn_id)
+        # nothing of the kind for `_claude_turn` to use. One read again, and
+        # the key is the reader's, not the payload's: the hook id names a
+        # turn, the reader says whether the text it returned was actually cut
+        # to that turn. Where it was not, there is no key.
+        reply_text, turn_key = _codex_turn(transcript,
+                                           input_data.get("turn_id"))
     batches = {}
     for recipient, messages in group_by_recipient(target, reply_text).items():
         # Reported per line, not per recipient: a batch holding one empty marker
