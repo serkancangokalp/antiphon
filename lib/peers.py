@@ -1,4 +1,4 @@
-"""Peer identity: naming and the socket key.
+"""Peer identity: naming, the socket key, and the registry both sides read.
 
 A peer is one agent session working in one project directory. Antiphon assumed
 exactly one per side and never said so; this module is the part that lets
@@ -10,6 +10,13 @@ transcript UUID, so the two would invent different automatic names for one
 session. When `ANTIPHON_NAME` is set they read the same value from the inherited
 environment and agree. Automatic names identify a session in listings; they do
 not isolate it.
+
+A Codex peer is written by two processes that never meet. The MCP server owns
+`endpoint.json` and knows the pid; the hook owns `session.json` and knows the
+session id, which is the address. Each writes its own file, so neither can lose
+the other's fields, and `read_peers` joins the two on the owner key when it is
+read. Anything that cannot be joined is listed as live and unroutable rather
+than guessed at.
 """
 
 import contextlib
@@ -30,6 +37,11 @@ KIND_PATTERN = re.compile(r"claude|codex")
 # below produces it. A bare pid is refused deliberately: it is the recycled
 # number the start time exists to rule out.
 OWNER_PATTERN = re.compile(r"[1-9][0-9]*:\S(?:.*\S)?")
+# The canonical UUID a Codex session is named by, lowercase as the CLI writes it
+# and as `antiphon.SESSION_ID` reads it back off a rollout file name. A contract
+# test keeps the two spellings from drifting apart.
+SESSION_ID_PATTERN = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-"
+                                r"[0-9a-f]{4}-[0-9a-f]{12}")
 
 
 def explicit_name():
@@ -63,6 +75,17 @@ def valid_owner_key(key):
     return isinstance(key, str) and bool(OWNER_PATTERN.fullmatch(key))
 
 
+def valid_session_id(value):
+    """A canonical UUID and nothing else.
+
+    This becomes an address. An id that is not one routes a message at nothing
+    and does it silently, which is the whole failure this registry exists to
+    end. `fullmatch`, like every other pattern here: `$` also matches before a
+    trailing newline.
+    """
+    return isinstance(value, str) and bool(SESSION_ID_PATTERN.fullmatch(value))
+
+
 def socket_key(cwd, name=""):
     """Hashed, never appended: the path must not grow past the platform's limit.
 
@@ -91,6 +114,16 @@ def _peer_file(cwd, kind, name):
     fields.
     """
     return os.path.join(peer_dir(cwd, kind, name), "endpoint.json")
+
+
+def _session_file(cwd, kind, name):
+    """The hook's record, beside the server's.
+
+    The server knows the pid and never the session id; the hook knows the
+    session id and must never claim a pid, having usually exited by the time
+    anyone reads it. Two files, one writer each.
+    """
+    return os.path.join(peer_dir(cwd, kind, name), "session.json")
 
 
 @contextlib.contextmanager
@@ -159,6 +192,30 @@ def _addressless(record):
             and _owner_of(record) is not None)
 
 
+def _session_address(cwd, peer):
+    """The session id an addressless Codex endpoint answers to, or None.
+
+    The two halves are joined on the owner key and nothing else. A missing
+    session record, one with no owner, one from a different owner, and one whose
+    id is not a canonical UUID all read the same way: live, not routable. There
+    is no rule that reaches for the likeliest session, because reaching for the
+    likeliest is what the silent misrouting was.
+
+    `.get`, never `[...]`: a half-written record must not raise out of every
+    read of the registry. `name` is validated before it becomes a path — it
+    comes off disk, and `../..` would read a record from outside the project.
+    """
+    kind, name = peer.get("kind"), peer.get("name")
+    if not (valid_kind(kind) and valid_name(name)):
+        return None
+    owner = _owner_of(peer)
+    session = _read_record(_session_file(cwd, kind, name))
+    if not (owner and session and session.get("owner") == owner):
+        return None
+    claimed = session.get("session_id")
+    return claimed if valid_session_id(claimed) else None
+
+
 def _started_at(record):
     """The record's timestamp as a float, or 0. Sorting a float against a string
     raises, and it would raise inside every read of the registry."""
@@ -221,16 +278,35 @@ def _prune(cwd, kind, name, dead_pid):
 
 
 def _scan(cwd):
-    """Every readable record, unlocked and unpruned. Safe to call under the lock."""
+    """Every readable record that agrees with the directory holding it.
+
+    Unlocked and unpruned; safe to call under the lock.
+
+    The directory is a peer's real identity — it is where every writer for that
+    peer puts its files. The `kind` and `name` inside a record are what the rest
+    of this module builds paths and decisions from, so a record claiming a name
+    other than its own directory's would send the session join looking inside
+    another peer, and report an address for an endpoint that does not exist. A
+    record that disagrees with where it lives is not read at all.
+
+    Split at the first hyphen only: neither kind contains one, so everything
+    after it belongs to the alias and `codex-my-build` keeps its name.
+    """
     try:
         entries = sorted(os.listdir(peers_dir(cwd)))
     except OSError:
         return []
     records = []
     for entry in entries:
+        kind, _, name = entry.partition("-")
+        if not (valid_kind(kind) and valid_name(name)):
+            continue
         record = _read_record(os.path.join(peers_dir(cwd), entry, "endpoint.json"))
-        if record is not None:
-            records.append(record)
+        if record is None:
+            continue
+        if record.get("kind") != kind or record.get("name") != name:
+            continue
+        records.append(record)
     return records
 
 
@@ -242,6 +318,11 @@ def read_peers(cwd, kind=None):
     can name is a peer an ambiguity refusal cannot mention. This is the single
     public reading of the registry, so every caller that intends to *deliver*
     something has to check the address it got rather than assume one.
+
+    It is also where the two halves of a Codex peer are joined: an addressless
+    endpoint takes the session id its own hook recorded, and only its own. The
+    join happens on the way out rather than at either write, so neither writer
+    ever has to read the other's file.
 
     A record that cannot be parsed is skipped rather than raised: a half-written
     entry must never take the bridge down with it.
@@ -257,6 +338,8 @@ def read_peers(cwd, kind=None):
             _prune(cwd, peer.get("kind"), peer.get("name"), peer_pid)
             continue
         if kind is None or peer.get("kind") == kind:
+            if _addressless(peer):
+                peer["address"] = _session_address(cwd, peer)
             found.append(peer)
     found.sort(key=_started_at, reverse=True)
     return found
@@ -372,6 +455,61 @@ def unregister(cwd, kind, name, pid=None):
             os.unlink(path)
         except OSError:
             pass
+
+
+def read_session(cwd, kind, name):
+    """The hook's record for an alias as a dict, or None."""
+    if not (valid_kind(kind) and valid_name(name)):
+        return None
+    return _read_record(_session_file(cwd, kind, name))
+
+
+def write_session(cwd, kind, name, session_id, transcript, owner):
+    """Records which session is behind an alias. Returns (ok, detail).
+
+    Refuses when a live endpoint holds the alias for a different owner, and
+    touches nothing at all in that case: the session that got there first keeps
+    working and this one is told. The guard is on the **endpoint**, not on any
+    session record already present. A guard that compared session owners could
+    only refuse a second owner once the first one's hook had run, and a server
+    that has registered without an id yet is precisely the peer that is live and
+    about to become routable.
+
+    An alias no endpoint holds is writable: the hook can fire before the server
+    registers, and the record simply waits. It is not a peer until an endpoint
+    appears — the registry is listed from `endpoint.json`, so a session record
+    on its own describes nobody.
+
+    No pid is written. The hook has usually exited by the time anyone reads
+    this, and a pid it left behind would mark the peer dead on the next read.
+    """
+    if not (valid_kind(kind) and valid_name(name)):
+        return False, f"invalid peer {kind!r}/{name!r}"
+    if not valid_session_id(session_id):
+        return False, (f"invalid session id {session_id!r}: expected a canonical "
+                       "UUID")
+    if not valid_owner_key(owner):
+        return False, (f"invalid owner key {owner!r}: expected a pid and the "
+                       "start time that tells it from a recycled one")
+    with _registry_lock(cwd):
+        endpoint = _read_record(_peer_file(cwd, kind, name))
+        if endpoint and _owner_of(endpoint) != owner and alive(_pid_of(endpoint)):
+            return False, (f"alias {name!r} is held by another live {kind} session "
+                           f"(pid {_pid_of(endpoint)}); its record was not touched")
+        record = {"kind": kind, "name": name, "owner": owner,
+                  "session_id": session_id}
+        if isinstance(transcript, str) and transcript.strip():
+            # Nothing is ever delivered to a transcript path. Refusing the whole
+            # record over a missing one would cost the session its address for a
+            # field no message travels through.
+            record["transcript"] = transcript
+        path = _session_file(cwd, kind, name)
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        tmp = f"{path}.{os.getpid()}.tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(record, f, ensure_ascii=False)
+        os.replace(tmp, path)
+    return True, ""
 
 
 # ---------- owner key: pairing two writers on one session ----------

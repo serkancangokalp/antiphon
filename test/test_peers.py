@@ -672,5 +672,357 @@ class AddresslessEndpointTest(unittest.TestCase):
             self.assertTrue(ok, detail)
 
 
+class SessionRecordTest(unittest.TestCase):
+    """The hook's half of a Codex peer, and how the two halves join.
+
+    Two writers, one peer. The server owns `endpoint.json` and knows the pid;
+    the hook owns `session.json` and knows the session id. Neither reads,
+    modifies and writes the other's file, so neither can lose the other's
+    fields — and the join between them is the owner key, never a guess.
+    """
+
+    UUID = "1d5a03e0-0548-4339-87c3-45c5dbf7e9d7"
+    OTHER = "2e6b14f1-1659-544a-98d4-56d6eca8fa48"
+    KEY = "300:first"
+    OTHER_KEY = "301:second"
+
+    def _endpoint(self, project, owner=None):
+        owner = owner or self.KEY
+        ok, detail = peers.register(project, "codex", "build", None,
+                                    pid=os.getpid(), owner_key=owner)
+        self.assertTrue(ok, detail)
+
+    def _session_path(self, project):
+        return os.path.join(peers.peer_dir(project, "codex", "build"),
+                            "session.json")
+
+    def _write_raw(self, project, text):
+        directory = peers.peer_dir(project, "codex", "build")
+        os.makedirs(directory, exist_ok=True)
+        with open(self._session_path(project), "w", encoding="utf-8") as f:
+            f.write(text)
+
+    # ---- the join ----
+
+    def test_an_addressless_endpoint_takes_its_own_sessions_id_as_its_address(self):
+        with tempfile.TemporaryDirectory() as project:
+            self._endpoint(project)
+            ok, detail = peers.write_session(project, "codex", "build", self.UUID,
+                                             "/t/r.jsonl", self.KEY)
+            self.assertTrue(ok, detail)
+            peer = peers.read_peers(project, "codex")[0]
+        self.assertEqual(peer["address"], self.UUID)
+        self.assertEqual(peer["pid"], os.getpid())
+
+    def test_an_endpoint_with_no_session_record_stays_unroutable(self):
+        with tempfile.TemporaryDirectory() as project:
+            self._endpoint(project)
+            peer = peers.read_peers(project, "codex")[0]
+        self.assertIsNone(peer["address"], "live, but nothing can reach it yet")
+
+    def test_a_session_record_from_another_owner_is_not_an_address(self):
+        """No match, no record, and a record from somebody else all read the
+        same way: live, not routable. The join is the owner key or nothing."""
+        with tempfile.TemporaryDirectory() as project:
+            self._endpoint(project)
+            for owner in (self.OTHER_KEY, None, "", 300):
+                record = {"session_id": self.UUID}
+                if owner is not None:
+                    record["owner"] = owner
+                self._write_raw(project, json.dumps(record))
+                peer = peers.read_peers(project, "codex")[0]
+                self.assertIsNone(peer["address"], repr(owner))
+
+    def test_an_endpoint_without_an_owner_joins_nothing(self):
+        """An endpoint with no key cannot prove a session record is its own."""
+        with tempfile.TemporaryDirectory() as project:
+            directory = peers.peer_dir(project, "codex", "build")
+            os.makedirs(directory)
+            with open(os.path.join(directory, "endpoint.json"), "w",
+                      encoding="utf-8") as f:
+                json.dump({"kind": "codex", "name": "build", "pid": os.getpid(),
+                           "address": None, "started_at": 1.0}, f)
+            self._write_raw(project, json.dumps({"session_id": self.UUID}))
+            self.assertEqual(peers.read_peers(project), [],
+                             "no owner is not the accepted addressless shape")
+
+    def test_a_session_id_that_is_not_a_canonical_uuid_never_becomes_an_address(self):
+        """It is about to be used as an address. An id that is not one routes a
+        message at nothing, and does it silently."""
+        with tempfile.TemporaryDirectory() as project:
+            self._endpoint(project)
+            for claimed in (None, 12, "not-a-uuid", self.UUID.upper(),
+                            self.UUID + "\n", self.UUID[:-1], ""):
+                record = {"owner": self.KEY}
+                if claimed is not None:
+                    record["session_id"] = claimed
+                self._write_raw(project, json.dumps(record))
+                peer = peers.read_peers(project, "codex")[0]
+                self.assertIsNone(peer["address"], repr(claimed))
+
+    def test_a_malformed_session_file_leaves_the_peer_unroutable(self):
+        """A half-written record must not take down every read of the registry."""
+        with tempfile.TemporaryDirectory() as project:
+            self._endpoint(project)
+            for text in ("[not an object", "[]", "null", ""):
+                self._write_raw(project, text)
+                peer = peers.read_peers(project, "codex")[0]
+                self.assertIsNone(peer["address"], repr(text))
+
+    def test_a_legacy_endpoint_with_a_real_address_is_left_alone(self):
+        """The merge touches one shape. A Codex endpoint written before any of
+        this keeps the address it already serves."""
+        with tempfile.TemporaryDirectory() as project:
+            directory = peers.peer_dir(project, "codex", "build")
+            os.makedirs(directory)
+            with open(os.path.join(directory, "endpoint.json"), "w",
+                      encoding="utf-8") as f:
+                json.dump({"kind": "codex", "name": "build", "pid": os.getpid(),
+                           "address": "rollout-old"}, f)
+            self._write_raw(project, json.dumps({"owner": self.KEY,
+                                                 "session_id": self.UUID}))
+            peer = peers.read_peers(project, "codex")[0]
+        self.assertEqual(peer["address"], "rollout-old")
+
+    def test_a_session_record_without_an_endpoint_is_not_a_peer(self):
+        """An endpoint is what makes a peer exist; the hook only describes one."""
+        with tempfile.TemporaryDirectory() as project:
+            ok, detail = peers.write_session(project, "codex", "build", self.UUID,
+                                             "/t/r.jsonl", self.KEY)
+            self.assertTrue(ok, detail)
+            self.assertEqual(peers.read_peers(project), [])
+
+    def test_a_hook_that_ran_first_joins_when_its_endpoint_appears(self):
+        """Either order works. The hook can fire before the server registers."""
+        with tempfile.TemporaryDirectory() as project:
+            peers.write_session(project, "codex", "build", self.UUID,
+                                "/t/r.jsonl", self.KEY)
+            self._endpoint(project)
+            peer = peers.read_peers(project, "codex")[0]
+        self.assertEqual(peer["address"], self.UUID)
+
+    def test_a_session_record_left_by_a_pruned_endpoint_does_not_revive_it(self):
+        """The endpoint is pruned when its process dies. A stale session record
+        beside it must not make the alias look routable to the next reader."""
+        with tempfile.TemporaryDirectory() as project:
+            self._endpoint(project)
+            peers.write_session(project, "codex", "build", self.UUID,
+                                "/t/r.jsonl", self.KEY)
+            with patch.object(peers, "alive", return_value=False):
+                self.assertEqual(peers.read_peers(project), [])
+            self.assertTrue(os.path.exists(self._session_path(project)))
+            self.assertEqual(peers.read_peers(project), [],
+                             "a session record alone is not a peer")
+
+    ESCAPE = "x/../../../escape"
+
+    def _plant(self, project):
+        """A session record where an unguarded join would land: outside
+        `.antiphon` altogether, at `<project>/escape/session.json`. Without it
+        this test cannot tell a guard from a lucky miss."""
+        os.makedirs(os.path.join(peers.peers_dir(project), "codex-x"),
+                    exist_ok=True)
+        planted = peers._session_file(project, "codex", self.ESCAPE)
+        os.makedirs(os.path.dirname(planted), exist_ok=True)
+        with open(planted, "w", encoding="utf-8") as f:
+            json.dump({"owner": self.KEY, "session_id": self.UUID}, f)
+        self.assertEqual(os.path.realpath(planted),
+                         os.path.realpath(os.path.join(project, "escape",
+                                                       "session.json")),
+                         "the escape must really escape, or this proves nothing")
+        return planted
+
+    def test_a_record_that_disagrees_with_its_own_directory_is_not_read(self):
+        """The directory is where every writer for a peer puts its files, so it
+        is the peer's identity. A record claiming another alias would send the
+        join into another peer's directory and report an address for an
+        endpoint that does not exist at all."""
+        with tempfile.TemporaryDirectory() as project:
+            impostor = peers.peer_dir(project, "codex", "build")
+            os.makedirs(impostor)
+            with open(os.path.join(impostor, "endpoint.json"), "w",
+                      encoding="utf-8") as f:
+                json.dump({"kind": "codex", "name": "review", "pid": os.getpid(),
+                           "address": None, "owner": self.KEY}, f)
+            victim = peers.peer_dir(project, "codex", "review")
+            os.makedirs(victim)
+            with open(os.path.join(victim, "session.json"), "w",
+                      encoding="utf-8") as f:
+                json.dump({"owner": self.KEY, "session_id": self.UUID}, f)
+            self.assertEqual(peers.read_peers(project), [],
+                             "no review endpoint exists; nothing may be routable")
+
+    def test_an_alias_with_a_hyphen_survives_the_directory_check(self):
+        with tempfile.TemporaryDirectory() as project:
+            ok, detail = peers.register(project, "codex", "my-build", None,
+                                        pid=os.getpid(), owner_key=self.KEY)
+            self.assertTrue(ok, detail)
+            self.assertEqual([p["name"] for p in peers.read_peers(project)],
+                             ["my-build"])
+
+    def test_an_endpoint_that_cannot_name_itself_is_not_a_peer(self):
+        """`name` comes off disk and goes straight into a path. A record whose
+        name is not a name cannot be addressed, cannot be pruned, and must not
+        be listed as though it were somebody."""
+        with tempfile.TemporaryDirectory() as project:
+            directory = peers.peer_dir(project, "codex", "build")
+            os.makedirs(directory)
+            with open(os.path.join(directory, "endpoint.json"), "w",
+                      encoding="utf-8") as f:
+                json.dump({"kind": "codex", "name": self.ESCAPE,
+                           "pid": os.getpid(), "address": None,
+                           "owner": self.KEY}, f)
+            self._plant(project)
+            self.assertEqual(peers.read_peers(project), [])
+
+    def test_the_session_path_is_never_built_from_an_unchecked_name(self):
+        """The join checks the name itself rather than trusting its caller to
+        have done it. Two guards, because this one builds the path."""
+        with tempfile.TemporaryDirectory() as project:
+            self._plant(project)
+            for kind, name in (("codex", self.ESCAPE), ("elsewhere", "build")):
+                peer = {"kind": kind, "name": name, "pid": os.getpid(),
+                        "address": None, "owner": self.KEY}
+                self.assertIsNone(peers._session_address(project, peer),
+                                  f"{kind} {name!r}")
+
+    # ---- who may write ----
+
+    def test_a_live_endpoint_owned_by_another_session_refuses_the_write(self):
+        """The hole this closes, stated as the test that proves it.
+
+        The guard is on the endpoint, not on any existing session record. A
+        guard that only compared session owners would let the second owner write
+        whenever the first one's hook had not run yet — and a server that has
+        registered and not yet been given its id is exactly the peer that is
+        live and about to become routable."""
+        with tempfile.TemporaryDirectory() as project:
+            self._endpoint(project)
+            endpoint = os.path.join(peers.peer_dir(project, "codex", "build"),
+                                    "endpoint.json")
+            with open(endpoint, "rb") as f:
+                before = f.read()
+            ok, detail = peers.write_session(project, "codex", "build", self.OTHER,
+                                             "/t/second.jsonl", self.OTHER_KEY)
+            self.assertFalse(ok, "no session record existed, and it is still refused")
+            self.assertIn("build", detail)
+            self.assertFalse(os.path.exists(self._session_path(project)),
+                             "a refused write must leave nothing behind")
+            with open(endpoint, "rb") as f:
+                self.assertEqual(f.read(), before, "the holder is untouched")
+            self.assertTrue(peers.write_session(project, "codex", "build",
+                                                self.UUID, "/t/r.jsonl",
+                                                self.KEY)[0])
+            self.assertEqual(peers.read_peers(project, "codex")[0]["address"],
+                             self.UUID, "the first session still becomes routable")
+
+    def test_the_same_owner_overwrites_its_own_record(self):
+        """One session's next turn, not a clash with itself."""
+        with tempfile.TemporaryDirectory() as project:
+            self._endpoint(project)
+            peers.write_session(project, "codex", "build", self.UUID,
+                                "/t/first.jsonl", self.KEY)
+            ok, detail = peers.write_session(project, "codex", "build", self.OTHER,
+                                             "/t/second.jsonl", self.KEY)
+            self.assertTrue(ok, detail)
+            self.assertEqual(peers.read_peers(project, "codex")[0]["address"],
+                             self.OTHER)
+
+    def test_another_owner_may_write_once_the_endpoint_is_gone_or_dead(self):
+        """An alias whose holder has died would otherwise be unusable for the
+        rest of the project's life."""
+        with tempfile.TemporaryDirectory() as project:
+            ok, detail = peers.write_session(project, "codex", "build", self.UUID,
+                                             "/t/r.jsonl", self.OTHER_KEY)
+            self.assertTrue(ok, detail)              # no endpoint holds the alias
+        with tempfile.TemporaryDirectory() as project:
+            self._endpoint(project)
+            with patch.object(peers, "alive", return_value=False):
+                ok, detail = peers.write_session(project, "codex", "build",
+                                                 self.OTHER, "/t/r.jsonl",
+                                                 self.OTHER_KEY)
+            self.assertTrue(ok, detail)              # the holder is gone
+
+    def test_an_endpoint_that_identifies_nobody_does_not_hold_the_alias(self):
+        """A record with an unusable pid names no process, so it cannot be
+        checked for liveness and must not block a writer either."""
+        with tempfile.TemporaryDirectory() as project:
+            directory = peers.peer_dir(project, "codex", "build")
+            os.makedirs(directory)
+            with open(os.path.join(directory, "endpoint.json"), "w",
+                      encoding="utf-8") as f:
+                json.dump({"kind": "codex", "name": "build", "pid": "nonsense",
+                           "address": None, "owner": self.KEY}, f)
+            ok, detail = peers.write_session(project, "codex", "build", self.UUID,
+                                             "/t/r.jsonl", self.OTHER_KEY)
+            self.assertTrue(ok, detail)
+
+    # ---- the record itself ----
+
+    def test_the_hook_never_writes_a_pid(self):
+        """Liveness belongs to the process that has it. A pid written by a hook
+        that has already exited would mark the peer dead on the next read."""
+        with tempfile.TemporaryDirectory() as project:
+            peers.write_session(project, "codex", "build", self.UUID,
+                                "/t/r.jsonl", self.KEY)
+            record = peers.read_session(project, "codex", "build")
+        self.assertNotIn("pid", record)
+        self.assertEqual(record["owner"], self.KEY)
+        self.assertEqual(record["session_id"], self.UUID)
+        self.assertEqual(record["transcript"], "/t/r.jsonl")
+
+    def test_a_write_refuses_what_it_cannot_record_honestly(self):
+        with tempfile.TemporaryDirectory() as project:
+            refused = [
+                ("codex", "build", "not-a-uuid", self.KEY),
+                ("codex", "build", None, self.KEY),
+                ("codex", "build", self.UUID, "300"),
+                ("codex", "build", self.UUID, None),
+                ("codex", "Build!", self.UUID, self.KEY),
+                ("elsewhere", "build", self.UUID, self.KEY),
+            ]
+            for kind, alias, session_id, owner in refused:
+                ok, _ = peers.write_session(project, kind, alias, session_id,
+                                            "/t/r.jsonl", owner)
+                self.assertFalse(ok, f"{kind} {alias!r} {session_id!r} {owner!r}")
+            self.assertFalse(os.path.exists(peers.peers_dir(project)))
+
+    def test_a_missing_transcript_is_recorded_as_absent_not_as_a_refusal(self):
+        """Nothing routes on the transcript. Refusing the whole record over it
+        would cost the session its address for a field nobody delivers to."""
+        with tempfile.TemporaryDirectory() as project:
+            ok, detail = peers.write_session(project, "codex", "build", self.UUID,
+                                             None, self.KEY)
+            self.assertTrue(ok, detail)
+            record = peers.read_session(project, "codex", "build")
+        self.assertNotIn("transcript", record)
+
+    def test_no_temporary_file_survives_a_write(self):
+        """The record is replaced, never rewritten in place: a reader must find
+        the old document or the new one, never half of either."""
+        with tempfile.TemporaryDirectory() as project:
+            self._endpoint(project)
+            peers.write_session(project, "codex", "build", self.UUID,
+                                "/t/r.jsonl", self.KEY)
+            leftovers = [e for e in os.listdir(peers.peer_dir(project, "codex",
+                                                              "build"))
+                         if e.endswith(".tmp") or ".tmp." in e]
+        self.assertEqual(leftovers, [])
+
+    def test_reading_a_session_for_an_unusable_alias_returns_nothing(self):
+        with tempfile.TemporaryDirectory() as project:
+            self.assertIsNone(peers.read_session(project, "codex", "../../escape"))
+            self.assertIsNone(peers.read_session(project, "elsewhere", "build"))
+            self.assertIsNone(peers.read_session(project, "codex", "build"))
+
+    def test_a_canonical_uuid_is_the_only_session_id(self):
+        for good in (self.UUID, self.OTHER,
+                     "01a04870-bd35-7732-9dea-e564f731dba7"):
+            self.assertTrue(peers.valid_session_id(good), good)
+        for bad in ("", None, 12, self.UUID.upper(), self.UUID + "\n",
+                    self.UUID.replace("-", ""), "g" + self.UUID[1:]):
+            self.assertFalse(peers.valid_session_id(bad), repr(bad))
+
+
 if __name__ == "__main__":
     unittest.main()

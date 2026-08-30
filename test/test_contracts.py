@@ -135,6 +135,19 @@ class CrossBoundaryContractTest(unittest.TestCase):
                         serve_body.index("\nawait mkdir("),
                         "the bind must sit inside serveSocket, after the claim")
 
+    def test_the_id_read_off_a_rollout_is_one_the_registry_will_store(self):
+        """`antiphon.SESSION_ID` pulls the id out of a rollout file name;
+        `peers.valid_session_id` decides whether it may become an address. Two
+        patterns, one shape — and if they drift, a real session id is read and
+        then silently refused, leaving a peer live and unroutable forever."""
+        for name in ("rollout-2026-08-28T15-55-43-"
+                     "01a04870-bd35-7732-9dea-e564f731dba7.jsonl",
+                     "rollout-2026-08-30T00-01-02-"
+                     "1d5a03e0-0548-4339-87c3-45c5dbf7e9d7.jsonl"):
+            match = antiphon.SESSION_ID.search(name)
+            self.assertIsNotNone(match, name)
+            self.assertTrue(peers.valid_session_id(match.group(1)), name)
+
     def test_both_sides_agree_on_the_channel_message_limit(self):
         """The sender refuses before transport and the server refuses on arrival.
         If the two numbers drift the sender lets through what the server then
