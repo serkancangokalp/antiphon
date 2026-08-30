@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
 import { spawn } from "node:child_process";
-import { existsSync, mkdirSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readdirSync, readFileSync, symlinkSync, writeFileSync } from "node:fs";
 import { mkdtemp, rm } from "node:fs/promises";
 import { Socket, connect } from "node:net";
 import { once } from "node:events";
@@ -185,6 +185,192 @@ function registeredPeers(dir) {
     .map((entry) => join(root, entry, "endpoint.json"))
     .filter((path) => existsSync(path))
     .map((path) => JSON.parse(readFileSync(path, "utf8")));
+}
+
+// Four sessions, four real process trees, nothing planted. Every earlier test
+// here builds a piece of this by hand — a registry record written directly, a
+// peer whose owner key came from a patch — which is the right way to test a
+// piece and the wrong way to believe the whole. This one starts two Claude
+// channel servers and two Codex MCP servers for real and makes them talk.
+//
+// `owner_key` finds the nearest ancestor whose `ps` command is `claude` or
+// `codex`, so each session needs a real process of that name above it. A
+// symlink to `/bin/sh` gives one: the kernel runs the real shell while argv[0],
+// and therefore `ps`, says `claude`. A copied binary is killed on macOS for
+// having lost its signature, and a `#!/bin/sh` script shows up as `sh`.
+//
+// The danger in a harness like this is that it silently proves nothing: if the
+// fake roots did not work, every session would walk past them to the real
+// `claude` running the suite and they would all share one owner key — and the
+// assertions would still pass. So the identities are checked directly.
+async function fourLiveSessionsRouteByName() {
+  const dir = await mkdtemp(join(tmpdir(), "antiphon-four-"));
+  const roots = await mkdtemp(join(tmpdir(), "antiphon-roots-"));
+  const stub = await makeCodexStub();
+  symlinkSync("/bin/sh", join(roots, "claude"));
+  symlinkSync("/bin/sh", join(roots, "codex"));
+  const SESSIONS = {
+    build: "1d5a03e0-0548-4339-87c3-45c5dbf7e9d7",
+    review: "2e6b14f1-1659-544a-98d4-56d6eca8fa48",
+  };
+  const open = [];
+  const sockets = ["ui", "api"].map((name) => socketFor(dir, name));
+
+  const connect = async (root, name, script) => {
+    const env = { ...process.env, ANTIPHON_CWD: dir, ANTIPHON_NAME: name };
+    env.PATH = `${stub.dir}:${process.env.PATH}`;
+    const transport = new StdioClientTransport({
+      command: join(roots, root), args: ["-c", script], env, stderr: "pipe",
+    });
+    const seen = [];
+    const client = new Client({ name: `antiphon-${name}`, version: "1.0.0" });
+    await client.connect(transport);
+    const passThrough = transport.onmessage;
+    transport.onmessage = (message) => {
+      if (message.method === "notifications/claude/channel") seen.push(message);
+      passThrough(message);
+    };
+    let stderr = "";
+    transport.stderr?.setEncoding("utf8");
+    transport.stderr?.on("data", (chunk) => { stderr += chunk; });
+    open.push(client);
+    return { name, client, seen, stderr: () => stderr };
+  };
+
+  // Two commands, never one: `sh -c` with a single command replaces itself with
+  // it, and the root this whole test depends on would vanish before the child
+  // it is supposed to parent.
+  const claudeSession = (name) =>
+    connect("claude", name, "node lib/channel.mjs; exit");
+
+  const codexSession = async (name) => {
+    // The hook runs first and as a child of the same root, which is how the
+    // two halves of a Codex peer find each other: same walk, same owner key,
+    // no shared state and no coordination. Its stdout goes nowhere — the MCP
+    // stream begins with the second command.
+    const payload = join(dir, `${name}-session.json`);
+    writeFileSync(payload, JSON.stringify({
+      cwd: dir, hook_event_name: "SessionStart",
+      session_id: SESSIONS[name], transcript_path: `/tmp/${name}.jsonl`,
+    }));
+    return connect("codex", name,
+      `python3 lib/antiphon.py hook codex < ${payload} > /dev/null; ` +
+      "python3 lib/antiphon.py mcp");
+  };
+
+  const named = (kind, name) => registeredPeers(dir)
+    .find((peer) => peer.kind === kind && peer.name === name);
+
+  try {
+    const ui = await claudeSession("ui");
+    const api = await claudeSession("api");
+    const build = await codexSession("build");
+    const review = await codexSession("review");
+    const everyone = [ui, api, build, review];
+
+    assert.ok(await waitFor(() =>
+      ["ui", "api"].every((n) => named("claude", n)) &&
+      ["build", "review"].every((n) => named("codex", n))),
+      `not all four registered: ${everyone.map((s) => s.stderr()).join("\n")}`);
+
+    // The check that keeps this test honest. Four sessions under four roots
+    // means four owner keys; one key would mean the roots were never used and
+    // everything below proves nothing.
+    const owners = [named("claude", "ui"), named("claude", "api"),
+                    named("codex", "build"), named("codex", "review")]
+      .map((peer) => peer.owner);
+    assert.ok(owners.every(Boolean), `a session identified nobody: ${owners}`);
+    assert.equal(new Set(owners).size, 4,
+      `four sessions must have four identities, got ${JSON.stringify(owners)}`);
+
+    // ---- Codex → Claude, by name ----
+    await build.client.callTool({
+      name: "antiphon_send", arguments: { text: "for api only", to: "api" },
+    });
+    assert.ok(await waitFor(() => api.seen.length === 1), "api never heard build");
+    assert.equal(api.seen[0].params.content, "for api only");
+    assert.equal(api.seen[0].params.meta.sender_alias, "build");
+    // Each delivery is identified, and separately. The channel server mints an
+    // id when the sender sends none, so this cannot show which side produced
+    // it — that belongs to the Python tests. What it does show is that two
+    // deliveries are never one.
+    assert.ok(api.seen[0].params.meta.message_id, "the delivery must be identified");
+    assert.equal(ui.seen.length, 0, "and nobody else may hear it");
+
+    await review.client.callTool({
+      name: "antiphon_send", arguments: { text: "for ui only", to: "ui" },
+    });
+    assert.ok(await waitFor(() => ui.seen.length === 1), "ui never heard review");
+    assert.equal(ui.seen[0].params.meta.sender_alias, "review");
+    assert.equal(api.seen.length, 1, "api must not hear it a second time");
+    assert.notEqual(ui.seen[0].params.meta.message_id,
+                    api.seen[0].params.meta.message_id,
+                    "two deliveries are two attempts");
+
+    // ---- Codex → Claude, unaddressed ----
+    const refused = await build.client.callTool({
+      name: "antiphon_send", arguments: { text: "to whom?" },
+    });
+    assert.ok(refused.isError, "two live Claude peers cannot be chosen between");
+    const said = JSON.stringify(refused.content);
+    assert.match(said, /ui/);
+    assert.match(said, /api/);
+    assert.equal(ui.seen.length + api.seen.length, 2, "and nothing was delivered");
+
+    // ---- Claude → Codex, by name ----
+    await ui.client.callTool({
+      name: "reply_to_codex", arguments: { text: "for review", to: "review" },
+    });
+    const queued = readFileSync(stub.log, "utf8");
+    assert.match(queued, new RegExp(`--thread ${SESSIONS.review}`),
+      `the message must go to review's own session: ${queued}`);
+    assert.match(queued, /\[from=ui id=/, "and say which Claude peer sent it");
+    assert.ok(!queued.includes(SESSIONS.build), "never to the other one");
+
+    // ---- Claude → Codex, unaddressed ----
+    await assert.rejects(
+      () => api.client.callTool({
+        name: "reply_to_codex", arguments: { text: "to whom?" },
+      }),
+      /build|review|discoverable/,
+      "two live Codex peers cannot be chosen between either",
+    );
+    assert.equal(readFileSync(stub.log, "utf8").split("\n").filter(Boolean).length,
+      1, "and still only the one addressed message was queued");
+
+    // ---- two leave, two carry on ----
+    await ui.client.close();
+    await build.client.close();
+    open.splice(open.indexOf(ui.client), 1);
+    open.splice(open.indexOf(build.client), 1);
+    assert.ok(await waitFor(() =>
+      !named("claude", "ui") && !named("codex", "build") &&
+      !existsSync(socketFor(dir, "ui"))),
+      "a session that leaves must take its claim and its socket with it");
+
+    const survivors = registeredPeers(dir)
+      .map((peer) => `${peer.kind} ${peer.name}`).sort();
+    assert.deepEqual(survivors, ["claude api", "codex review"]);
+
+    await review.client.callTool({
+      name: "antiphon_send", arguments: { text: "still here", to: "api" },
+    });
+    assert.ok(await waitFor(() => api.seen.length === 2), "api stopped hearing");
+    assert.equal(api.seen[1].params.meta.sender_alias, "review");
+
+    await api.client.callTool({
+      name: "reply_to_codex", arguments: { text: "so am i", to: "review" },
+    });
+    assert.match(readFileSync(stub.log, "utf8"), /\[from=api id=/,
+      "and the survivor still signs its own name");
+    console.log("four sessions route by name: ok");
+  } finally {
+    for (const client of open) await client.close().catch(() => {});
+    for (const path of sockets) await rm(path, { force: true }).catch(() => {});
+    for (const path of [dir, roots, stub.dir]) {
+      await rm(path, { recursive: true, force: true }).catch(() => {});
+    }
+  }
 }
 
 async function onlyTheSessionThatWonTheNameSignsItsMessages() {
@@ -535,6 +721,7 @@ await aRefusedClientCannotKeepStreaming();
 await aStalledClientDoesNotBlockShutdown();
 await aSocketPathItCannotClearDoesNotKillTheSession();
 await onlyTheSessionThatWonTheNameSignsItsMessages();
+await fourLiveSessionsRouteByName();
 await onlyOneUnnamedSessionGetsTheChannel(false);   // a second terminal, later
 await onlyOneUnnamedSessionGetsTheChannel(true);    // both started together
 console.log("per-peer sockets: ok");
@@ -647,6 +834,11 @@ try {
   // Each step runs even if an earlier one throws. A close that fails would
   // otherwise leave a project directory and a stub `codex` behind on every run.
   await client.close().catch(() => {});
+  // The server unlinks its own socket on a clean exit, so this only matters
+  // when it did not get one — a killed process leaves the path behind, and a
+  // hundred and eighty of them piled up in the shared temp directory before
+  // anybody looked.
+  await rm(socketPath, { force: true }).catch(() => {});
   await rm(projectDir, { recursive: true, force: true }).catch(() => {});
   await rm(stubDir, { recursive: true, force: true }).catch(() => {});
 }
