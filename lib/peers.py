@@ -26,6 +26,10 @@ NAME_PATTERN = re.compile(r"[a-z0-9][a-z0-9_-]{0,31}")
 # before a trailing newline, so `re.match` accepted "ui\n" as a peer name and it
 # would have gone straight into a file name and a socket seed.
 KIND_PATTERN = re.compile(r"claude|codex")
+# A pid and the start time that tells it from a recycled one, as `owner_key`
+# below produces it. A bare pid is refused deliberately: it is the recycled
+# number the start time exists to rule out.
+OWNER_PATTERN = re.compile(r"[1-9][0-9]*:\S(?:.*\S)?")
 
 
 def explicit_name():
@@ -47,6 +51,16 @@ def valid_kind(kind):
     """`kind` is concatenated into a directory name; unvalidated, `../..` walks
     out of the project."""
     return bool(kind) and bool(KIND_PATTERN.fullmatch(kind))
+
+
+def valid_owner_key(key):
+    """A key the registry is willing to record as an identity.
+
+    Anything else is refused rather than stored and ignored: a malformed key
+    would register cleanly and then join nothing, which looks like a peer that
+    simply never came back.
+    """
+    return isinstance(key, str) and bool(OWNER_PATTERN.fullmatch(key))
 
 
 def socket_key(cwd, name=""):
@@ -119,6 +133,30 @@ def _address_of(record):
     if not isinstance(address, str) or not address.strip():
         return None
     return address
+
+
+def _owner_of(record):
+    """The record's owner key, or None. Never its pid: they are two different
+    identities, and a reader that takes one for the other joins nothing."""
+    owner = record.get("owner") if hasattr(record, "get") else None
+    return owner if valid_owner_key(owner) else None
+
+
+def _addressless(record):
+    """True for the one shape that is live without being reachable.
+
+    A Codex server is handed a project directory and nothing else; the rollout
+    id it answers to arrives with the first message. Between those two moments
+    the peer exists and can be named, which is what an ambiguity refusal needs,
+    and it is stored with its address explicitly `None`.
+
+    Every other unusable address stays skipped — empty, blank, wrong type, or
+    absent altogether. Those say nothing about being on their way, and reading
+    silence as a claim is the guess this registry exists to refuse.
+    """
+    return (record.get("kind") == "codex"
+            and record.get("address", "") is None
+            and _owner_of(record) is not None)
 
 
 def _started_at(record):
@@ -199,6 +237,12 @@ def _scan(cwd):
 def read_peers(cwd, kind=None):
     """Live peers, newest first. Records left by dead processes are removed.
 
+    Live is not the same as reachable. A Codex peer that has not been given its
+    address yet is listed with `address` set to `None`, because a peer nobody
+    can name is a peer an ambiguity refusal cannot mention. This is the single
+    public reading of the registry, so every caller that intends to *deliver*
+    something has to check the address it got rather than assume one.
+
     A record that cannot be parsed is skipped rather than raised: a half-written
     entry must never take the bridge down with it.
     """
@@ -207,8 +251,8 @@ def read_peers(cwd, kind=None):
         peer_pid = _pid_of(peer)
         if peer_pid is None:
             continue                  # identifies nobody; not a peer, not prunable
-        if _address_of(peer) is None:
-            continue                  # reaches nobody; must never be routed to
+        if _address_of(peer) is None and not _addressless(peer):
+            continue                  # reaches nobody, and is not on its way
         if not alive(peer_pid):
             _prune(cwd, peer.get("kind"), peer.get("name"), peer_pid)
             continue
@@ -218,7 +262,7 @@ def read_peers(cwd, kind=None):
     return found
 
 
-def register(cwd, kind, name, address, pid=None):
+def register(cwd, kind, name, address, pid=None, owner_key=None):
     """Claims `name` for `pid`. Returns (ok, detail).
 
     `pid` is the process whose life the peer's life follows, and it is often not
@@ -233,6 +277,19 @@ def register(cwd, kind, name, address, pid=None):
     time with `O_EXCL` and exactly one wins under the lock. The bridge is
     Unix-only already, so a lock file costs nothing in portability.
 
+    `owner_key` is the session two writers share, and it is kept strictly apart
+    from `pid`, which is the process whose life the record follows. The
+    parameter is not called `owner` because that was already the local holding
+    the resolved pid; the two would have shadowed each other and written a
+    number where the join expects a key. The local is `owner_pid` now, and the
+    field the record stores the key under is `owner`.
+
+    A `None` address is accepted from a Codex peer that has a valid owner key,
+    and from nothing else. It is stored as `None` rather than as a sentinel: a
+    `"pending"` string would be an address as far as the collision check is
+    concerned, and the second Codex server would be refused for one the first
+    does not really serve.
+
     There is deliberately no `transcript` parameter. That field belongs to
     `session.json`, whose only writer is the hook; accepting it here would invite
     exactly the cross-writer overwrite the split exists to prevent.
@@ -242,21 +299,42 @@ def register(cwd, kind, name, address, pid=None):
     if not valid_name(name):
         return False, (f"invalid peer name {name!r}: "
                        "expected [a-z0-9][a-z0-9_-]{0,31}")
-    if _address_of({"address": address}) is None:
+    if address is None:
+        if kind != "codex":
+            return False, (f"invalid peer address {address!r}: only a Codex peer "
+                           "may register before it has one")
+        if not valid_owner_key(owner_key):
+            return False, (f"invalid peer address {address!r}: omitting it takes a "
+                           f"valid owner key, got {owner_key!r}")
+    elif _address_of({"address": address}) is None:
         return False, f"invalid peer address {address!r}: expected a non-empty string"
-    owner = _pid_of({"pid": pid}) if pid is not None else os.getpid()
-    if owner is None:
+    if owner_key is not None and not valid_owner_key(owner_key):
+        return False, (f"invalid owner key {owner_key!r}: expected a pid and the "
+                       "start time that tells it from a recycled one")
+    owner_pid = _pid_of({"pid": pid}) if pid is not None else os.getpid()
+    if owner_pid is None:
         return False, f"invalid owner pid {pid!r}: expected a positive integer"
     with _registry_lock(cwd):
         for other in _scan(cwd):
             other_pid = _pid_of(other)
-            if other_pid is None or other_pid == owner or not alive(other_pid):
+            if other_pid is None or not alive(other_pid):
                 continue
             if other.get("kind") != kind:
                 continue                  # a rollout id and a socket path never collide
             if other.get("name") == name:
+                if other_pid == owner_pid:
+                    continue              # this process refreshing its own record
+                if owner_key and _owner_of(other) == owner_key:
+                    # Codex can bring up a second MCP server for one CLI session
+                    # before the first has exited. Judged by pid alone the
+                    # newcomer looks like an intruder, and the session locks
+                    # itself out of its own name until its predecessor is
+                    # reaped. A shared key excuses a differing pid; a dead owner
+                    # is already gone above, so it never excuses a missing
+                    # process.
+                    continue
                 return False, f"peer name {name!r} is already held by pid {other_pid}"
-            if _address_of(other) == address:
+            if address is not None and _address_of(other) == address:
                 # The contended resource is the address, not the name. Two
                 # sessions that both found a socket path free would bind it in
                 # turn and register under different automatic names carrying the
@@ -266,8 +344,10 @@ def register(cwd, kind, name, address, pid=None):
                                f"{other.get('name')!r} (pid {other_pid})")
         path = _peer_file(cwd, kind, name)
         os.makedirs(os.path.dirname(path), exist_ok=True)
-        record = {"kind": kind, "name": name, "pid": owner,
+        record = {"kind": kind, "name": name, "pid": owner_pid,
                   "address": address, "started_at": time.time()}
+        if owner_key:
+            record["owner"] = owner_key
         tmp = f"{path}.{os.getpid()}.tmp"
         with open(tmp, "w", encoding="utf-8") as f:
             json.dump(record, f, ensure_ascii=False)

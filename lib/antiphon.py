@@ -763,8 +763,9 @@ def resolve_claude_target(cwd):
         # project-wide path, and it is a working peer.
         return claude_socket_path(cwd), ""
     if len(live) == 1:
-        # `read_peers` drops records without a usable address, so a live peer
-        # always has one; no silent fallback can hide behind a missing field.
+        # A peer may now be live without being reachable, but only on the
+        # Codex side, so a live Claude peer still always carries a usable
+        # address; no silent fallback can hide behind a missing field.
         return live[0]["address"], ""
     names = ", ".join(sorted(p.get("name") or "?" for p in live))
     return None, (f"not delivered: {len(live)} Claude peers are live ({names}); "

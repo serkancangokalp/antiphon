@@ -457,5 +457,220 @@ class OwnerKeyTest(unittest.TestCase):
         self.assertTrue(start.strip())
 
 
+class AddresslessEndpointTest(unittest.TestCase):
+    """A Codex peer is knowable before it is reachable.
+
+    Codex hands its MCP server a project directory and nothing else; the rollout
+    id that serves as the address arrives only with the first message. Refusing
+    to register until then makes the peer invisible, and an invisible peer
+    cannot be named in an ambiguity refusal — the sender is told one peer is
+    live while two are.
+
+    A `"pending"` sentinel would not do: two Codex servers would both carry it
+    and the second would be refused for an address the first does not really
+    serve. Absence is absence, and it stays absent in the record.
+    """
+
+    def test_two_codex_peers_may_both_be_registered_without_an_address(self):
+        """Neither is routable yet; that is not a collision."""
+        with tempfile.TemporaryDirectory() as project:
+            first, _ = peers.register(project, "codex", "build", None,
+                                      pid=os.getpid(), owner_key="300:a")
+            second, detail = peers.register(project, "codex", "review", None,
+                                            pid=os.getppid(), owner_key="301:b")
+            self.assertTrue(first)
+            self.assertTrue(second, detail)
+            self.assertEqual(len(peers.read_peers(project, "codex")), 2)
+
+    def test_only_a_codex_peer_with_an_owner_may_omit_its_address(self):
+        """The shipped contract refuses a missing address for a reason. This
+        widens it by exactly one shape and no further."""
+        with tempfile.TemporaryDirectory() as project:
+            refused = [
+                ("claude", "ui", None, "300:a"),       # Claude knows its socket
+                ("codex", "build", None, None),        # nothing could join it
+            ]
+            for kind, alias, address, key in refused:
+                ok, detail = peers.register(project, kind, alias, address,
+                                            pid=os.getpid(), owner_key=key)
+                self.assertFalse(ok, f"{kind} {address!r} {key!r}")
+                self.assertIn("address", detail)
+            self.assertEqual(peers.read_peers(project), [])
+
+    def test_a_malformed_address_is_still_refused_for_every_kind(self):
+        with tempfile.TemporaryDirectory() as project:
+            for kind in ("claude", "codex"):
+                for address in ("", "   ", 0, ["/tmp/x.sock"]):
+                    ok, _ = peers.register(project, kind, "ui", address,
+                                           pid=os.getpid(), owner_key="300:a")
+                    self.assertFalse(ok, f"{kind} {address!r}")
+            self.assertEqual(peers.read_peers(project), [])
+
+    def test_a_malformed_owner_key_is_refused_rather_than_ignored(self):
+        """A bare pid is not a key: numbers are recycled, and the start time is
+        the half that makes the join safe. Storing one anyway would leave a peer
+        that registers cleanly and never pairs with anything."""
+        with tempfile.TemporaryDirectory() as project:
+            for key in ("", "   ", "300", ":x", "300:", "300:   ", "abc:x",
+                        "0:x", "300:x\n", 300):
+                ok, detail = peers.register(project, "codex", "build", None,
+                                            pid=os.getpid(), owner_key=key)
+                self.assertFalse(ok, repr(key))
+                self.assertIn("owner key", detail)
+            ok, detail = peers.register(project, "codex", "build", "rollout-a",
+                                        pid=os.getpid(), owner_key="300")
+            self.assertFalse(ok, "a real address does not excuse a broken key")
+            self.assertEqual(peers.read_peers(project), [])
+
+    def test_a_hand_written_record_without_an_address_is_not_listed(self):
+        """Only a record in the accepted shape counts."""
+        with tempfile.TemporaryDirectory() as project:
+            directory = peers.peer_dir(project, "codex", "build")
+            os.makedirs(directory)
+            with open(os.path.join(directory, "endpoint.json"), "w",
+                      encoding="utf-8") as f:
+                json.dump({"kind": "codex", "name": "build", "pid": os.getpid()}, f)
+            self.assertEqual(peers.read_peers(project), [],
+                             "no address and no owner is not a peer")
+
+    def test_an_absent_address_field_is_not_the_same_as_a_null_one(self):
+        """The accepted shape says the address is known to be missing. A record
+        with no such field says nothing, and a reader that treats silence as a
+        claim is guessing."""
+        with tempfile.TemporaryDirectory() as project:
+            directory = peers.peer_dir(project, "codex", "build")
+            os.makedirs(directory)
+            with open(os.path.join(directory, "endpoint.json"), "w",
+                      encoding="utf-8") as f:
+                json.dump({"kind": "codex", "name": "build", "pid": os.getpid(),
+                           "owner": "300:a"}, f)
+            self.assertEqual(peers.read_peers(project), [])
+
+    def test_a_legacy_addressed_codex_record_keeps_working(self):
+        """Written before owner keys existed; it must not stop being routable."""
+        with tempfile.TemporaryDirectory() as project:
+            directory = peers.peer_dir(project, "codex", "build")
+            os.makedirs(directory)
+            with open(os.path.join(directory, "endpoint.json"), "w",
+                      encoding="utf-8") as f:
+                json.dump({"kind": "codex", "name": "build", "pid": os.getpid(),
+                           "address": "rollout-old"}, f)
+            live = peers.read_peers(project, "codex")
+        self.assertEqual([p["address"] for p in live], ["rollout-old"])
+
+    def test_an_addressless_peer_is_listed_but_not_routable(self):
+        with tempfile.TemporaryDirectory() as project:
+            peers.register(project, "codex", "build", None, pid=os.getpid(),
+                           owner_key="300:a")
+            peer = peers.read_peers(project, "codex")[0]
+        self.assertIsNone(peer["address"])
+        self.assertEqual(peer["name"], "build")
+
+    def test_the_pid_and_the_owner_key_are_stored_as_different_things(self):
+        """`owner` was already a local for the resolved pid in this function. A
+        parameter of the same name would shadow it and write a number where the
+        join expects a key."""
+        with tempfile.TemporaryDirectory() as project:
+            peers.register(project, "codex", "build", None, pid=os.getpid(),
+                           owner_key="300:x")
+            peer = peers.read_peers(project, "codex")[0]
+        self.assertEqual(peer["pid"], os.getpid())
+        self.assertEqual(peer["owner"], "300:x")
+        self.assertNotEqual(peer["owner"], peer["pid"])
+
+    def test_two_peers_still_cannot_claim_one_real_address(self):
+        with tempfile.TemporaryDirectory() as project:
+            peers.register(project, "codex", "build", "rollout-a", pid=os.getpid(),
+                           owner_key="300:a")
+            ok, detail = peers.register(project, "codex", "review", "rollout-a",
+                                        pid=os.getppid(), owner_key="301:b")
+        self.assertFalse(ok)
+        self.assertIn("build", detail)
+
+    def test_an_alias_held_by_a_different_live_owner_is_refused(self):
+        with tempfile.TemporaryDirectory() as project:
+            peers.register(project, "codex", "build", "rollout-a",
+                           pid=os.getppid(), owner_key="300:a")
+            ok, detail = peers.register(project, "codex", "build", "rollout-b",
+                                        pid=os.getpid(), owner_key="301:b")
+        self.assertFalse(ok)
+        self.assertIn("build", detail)
+
+    def test_a_second_server_in_one_session_may_take_over_its_alias(self):
+        """Codex can bring up a second MCP server for one CLI session before the
+        first has exited. Judged by pid alone the newcomer looks like an
+        intruder, and the session locks itself out of its own alias until its
+        predecessor is reaped."""
+        with tempfile.TemporaryDirectory() as project:
+            peers.register(project, "codex", "build", None,
+                           pid=os.getppid(), owner_key="300:a")
+            ok, detail = peers.register(project, "codex", "build", "rollout-a",
+                                        pid=os.getpid(), owner_key="300:a")
+            self.assertTrue(ok, detail)
+            live = peers.read_peers(project, "codex")
+        self.assertEqual([(p["name"], p["address"], p["pid"]) for p in live],
+                         [("build", "rollout-a", os.getpid())])
+
+    def test_one_owner_may_not_serve_one_address_under_two_aliases(self):
+        """The skip that lets a session refresh its own record ran before the
+        address check, so a peer could register a second alias carrying the
+        address it already serves. Two names and one socket: the registry would
+        show two peers while a message to either arrived at the same place.
+
+        Refreshing is about one alias. Claiming a second one is a new peer, and
+        it meets the same address rule as anybody else."""
+        with tempfile.TemporaryDirectory() as project:
+            peers.register(project, "codex", "build", "rollout-a",
+                           pid=os.getpid(), owner_key="300:a")
+            same_process, detail = peers.register(project, "codex", "review",
+                                                  "rollout-a", pid=os.getpid(),
+                                                  owner_key="300:a")
+            self.assertFalse(same_process, "one process, two aliases, one address")
+            self.assertIn("build", detail)
+            same_session, detail = peers.register(project, "codex", "review",
+                                                  "rollout-a", pid=os.getppid(),
+                                                  owner_key="300:a")
+            self.assertFalse(same_session, "one session, two aliases, one address")
+            self.assertIn("build", detail)
+
+    def test_a_keyless_record_keeps_its_alias_against_a_keyed_claimant(self):
+        """A record written before owner keys existed carries none, so a
+        claimant cannot show it is the same session. The registry never resolves
+        that doubt in the newcomer's favour."""
+        with tempfile.TemporaryDirectory() as project:
+            directory = peers.peer_dir(project, "codex", "build")
+            os.makedirs(directory)
+            with open(os.path.join(directory, "endpoint.json"), "w",
+                      encoding="utf-8") as f:
+                json.dump({"kind": "codex", "name": "build", "pid": os.getppid(),
+                           "address": "rollout-old", "started_at": 1.0}, f)
+            ok, detail = peers.register(project, "codex", "build", "rollout-new",
+                                        pid=os.getpid(), owner_key="300:a")
+        self.assertFalse(ok)
+        self.assertIn("build", detail)
+
+    def test_an_addressless_record_left_by_a_dead_process_is_pruned(self):
+        """The address check used to run before the liveness check, so a record
+        without one never reached it. Left behind, it would hold its alias for
+        the life of the project."""
+        with tempfile.TemporaryDirectory() as project:
+            peers.register(project, "codex", "build", None,
+                           pid=999999, owner_key="300:a")
+            with patch.object(peers, "alive", return_value=False):
+                self.assertEqual(peers.read_peers(project), [])
+            self.assertFalse(os.path.exists(
+                os.path.join(peers.peer_dir(project, "codex", "build"),
+                             "endpoint.json")))
+
+    def test_an_alias_left_by_a_dead_owner_can_be_claimed(self):
+        """An owner key excuses a differing pid, never a missing process."""
+        with tempfile.TemporaryDirectory() as project:
+            peers.register(project, "codex", "build", None,
+                           pid=999999, owner_key="300:a")
+            ok, detail = peers.register(project, "codex", "build", "rollout-b",
+                                        pid=os.getpid(), owner_key="301:b")
+            self.assertTrue(ok, detail)
+
+
 if __name__ == "__main__":
     unittest.main()
