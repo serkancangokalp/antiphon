@@ -78,18 +78,24 @@ function spawnChannel(dir, name) {
 // Every test removes exactly the socket it created and nothing else. Killing
 // the child and deleting only the project directory leaves the socket in the
 // shared temp directory: 163 of them had piled up before this was noticed.
+// `once(child, "exit")` never fires for a child that has already gone: the event
+// is in the past. Waiting on it therefore costs the full timeout every time,
+// which is how a suite of fast tests came to take fourteen seconds. Check the
+// recorded outcome first — and check `signalCode` too, since a child killed by a
+// signal leaves `exitCode` null and looks alive to a naive test.
+async function waitForExit(child, timeoutMs) {
+  if (child.exitCode !== null || child.signalCode !== null) return true;
+  return Promise.race([
+    once(child, "exit").then(() => true),
+    new Promise((resolve) => setTimeout(() => resolve(false), timeoutMs)),
+  ]);
+}
+
 async function cleanUp(session, dir) {
   session.child.kill("SIGTERM");
-  await Promise.race([
-    once(session.child, "exit"),
-    new Promise((resolve) => setTimeout(resolve, 2_000)),
-  ]);
-  if (session.child.exitCode === null) {
+  if (!(await waitForExit(session.child, 2_000))) {
     session.child.kill("SIGKILL");
-    await Promise.race([
-      once(session.child, "exit"),
-      new Promise((resolve) => setTimeout(resolve, 2_000)),
-    ]);
+    await waitForExit(session.child, 2_000);
   }
   await rm(session.socketPath, { force: true });
   await rm(dir, { recursive: true, force: true });
@@ -257,11 +263,8 @@ async function aStalledClientDoesNotBlockShutdown() {
     await once(idle, "connect");
 
     session.child.kill("SIGTERM");
-    const exited = await Promise.race([
-      once(session.child, "exit").then(() => true),
-      new Promise((resolve) => setTimeout(() => resolve(false), 5_000)),
-    ]);
-    assert.ok(exited, "SIGTERM must not hang on a client that sent nothing");
+    assert.ok(await waitForExit(session.child, 5_000),
+      "SIGTERM must not hang on a client that sent nothing");
     assert.ok(!existsSync(session.socketPath), "it must remove its own socket");
     assert.deepEqual(registeredPeers(dir), [], "it must release its own claim");
   } finally {
@@ -322,11 +325,8 @@ async function losingTheStdioClientEndsTheSession() {
     assert.ok(await waitFor(() => existsSync(session.socketPath)), session.stderr());
 
     session.child.stdin.end();                    // EOF, no signal
-    const exited = await Promise.race([
-      once(session.child, "exit").then(() => true),
-      new Promise((resolve) => setTimeout(() => resolve(false), 5_000)),
-    ]);
-    assert.ok(exited, "the session must exit when its stdio client goes away");
+    assert.ok(await waitForExit(session.child, 5_000),
+      "the session must exit when its stdio client goes away");
     assert.equal(session.child.exitCode, 0, "and exit cleanly");
     assert.ok(!existsSync(session.socketPath), "it must remove its own socket");
     assert.deepEqual(registeredPeers(dir), [], "it must release its own claim");
@@ -335,7 +335,7 @@ async function losingTheStdioClientEndsTheSession() {
   }
 }
 
-async function theWrapperTakesItsChannelDownWithIt() {
+async function theWrapperTakesItsChannelDownWithIt(signal) {
   // The installed command is `antiphon channel`, a wrapper that spawns
   // channel.mjs. It used to exit under a signal without passing it on, leaving
   // the server orphaned under PPID 1 — which is how the real leak happened,
@@ -349,14 +349,11 @@ async function theWrapperTakesItsChannelDownWithIt() {
   try {
     assert.ok(await waitFor(() => existsSync(socketPath)), "wrapper never served");
 
-    wrapper.kill("SIGTERM");
-    const exited = await Promise.race([
-      once(wrapper, "exit").then(() => true),
-      new Promise((resolve) => setTimeout(() => resolve(false), 5_000)),
-    ]);
-    assert.ok(exited, "the wrapper must exit on a signal");
+    wrapper.kill(signal);
+    assert.ok(await waitForExit(wrapper, 5_000), `the wrapper must exit on ${signal}`);
+    assert.equal(wrapper.exitCode, 0, `${signal} must be a clean exit, not a kill`);
     assert.ok(await waitFor(() => !existsSync(socketPath), 3_000),
-      "the channel it started must clean up its socket, not outlive it");
+      `the channel started by the wrapper must clean up its socket on ${signal}`);
     assert.deepEqual(registeredPeers(dir), [],
       "and release its registry claim");
   } finally {
@@ -367,7 +364,9 @@ async function theWrapperTakesItsChannelDownWithIt() {
 }
 
 await losingTheStdioClientEndsTheSession();
-await theWrapperTakesItsChannelDownWithIt();
+for (const signal of ["SIGTERM", "SIGINT", "SIGHUP"]) {
+  await theWrapperTakesItsChannelDownWithIt(signal);
+}
 await anOversizedMessageIsRefusedWithoutKillingTheSession();
 await aRefusedClientCannotKeepStreaming();
 await aStalledClientDoesNotBlockShutdown();
