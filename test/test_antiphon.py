@@ -508,6 +508,24 @@ class AntiphonTest(unittest.TestCase):
             data, self.reply = self.reply, b""
             return data
 
+    def test_a_named_message_waits_for_the_peer_to_publish_its_alias(self):
+        """The MCP handshake completes before `channel.mjs` runs its registry
+        claim. After named routing was added, an early `to="ui"` therefore
+        failed in the resolver before the existing socket retry could run."""
+        chan = self._Channel()
+        absent = "not delivered: no live claude peer named 'ui'"
+        with tempfile.TemporaryDirectory() as project, \
+             patch.object(antiphon.socket, "socket", chan), \
+             patch.object(antiphon, "resolve_target",
+                          side_effect=[(None, absent), (None, absent),
+                                       ("/tmp/ui.sock", "")]) as resolve:
+            ok, detail = antiphon.send_to_claude(
+                project, "the first named message", alias="ui")
+        self.assertTrue(ok, detail)
+        self.assertEqual(resolve.call_count, 3)
+        self.assertEqual(chan.connects, 1,
+                         "the socket is touched only after the alias exists")
+
     def test_a_message_sent_before_the_socket_exists_still_arrives(self):
         """Measured: the MCP handshake completes 27-41ms before the channel socket
         is bound, so a message sent the moment the channel looked ready was

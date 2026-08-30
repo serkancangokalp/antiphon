@@ -1097,7 +1097,18 @@ def send_to_claude(cwd, text, alias=None, sender_alias=None, message_id=None):
         # which moves the address from the project-wide path to its own.
         address, detail = resolve_target(cwd, "claude", alias)
         if address is None:
-            return False, detail      # waiting cannot make two peers into one
+            # `mcp.connect` finishes before channel.mjs publishes its registry
+            # claim. With an explicit, valid alias the first lookup can
+            # therefore miss the peer altogether, before there is even an
+            # address to connect to. That absence is as transient and as
+            # indistinguishable from a real outage as ENOENT below. Invalid
+            # aliases and bare ambiguity are decisions, not readiness races,
+            # and still fail immediately.
+            if (alias is not None and peers.valid_name(alias)
+                    and time.monotonic() < deadline):
+                time.sleep(CONNECT_RETRY_DELAY)
+                continue
+            return False, detail
         sock = None
         try:
             sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
