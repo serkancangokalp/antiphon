@@ -820,9 +820,17 @@ def _start_offset(path, sid, generation, positions, since):
     adds the part where somebody is told which reason applied.
     """
     recorded = (positions or {}).get(sid)
-    if (recorded and recorded.get("gen") == generation
-            and recorded["offset"] <= _source_size(path)):
-        return recorded["offset"]
+    if recorded:
+        if recorded.get("gen") != generation:
+            print("antiphon: %s was replaced since it was last read (was %s, "
+                  "now %s); reading it again from the start of the window"
+                  % (sid, recorded.get("gen"), generation), file=sys.stderr)
+        elif recorded["offset"] > _source_size(path):
+            print("antiphon: %s is shorter than the %d bytes already read from "
+                  "it; reading it again" % (sid, recorded["offset"]),
+                  file=sys.stderr)
+        else:
+            return recorded["offset"]
     return offset_at_or_after(path, since) if since is not None else 0
 
 

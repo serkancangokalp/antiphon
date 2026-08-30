@@ -1726,6 +1726,72 @@ class OffsetReadingTest(unittest.TestCase):
             self.assertIsNone(antiphon.source_generation(os.path.join(d, "gone.jsonl")))
             self.assertEqual(list(antiphon.read_records(os.path.join(d, "gone.jsonl"))), [])
 
+    def _one_record_source(self, directory, text):
+        sid = "4eecac24-1c21-47ad-ab11-a650708f3098"
+        path = os.path.join(directory, sid + ".jsonl")
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(json.dumps({"type": "assistant",
+                                "timestamp": "2026-08-30T10:00:00.000Z",
+                                "message": {"content": [{"type": "text",
+                                                         "text": text}]}}) + "\n")
+        return sid, path
+
+    def test_a_replaced_source_restarts_and_says_so(self):
+        """Rotation puts a different file at the same name. Resuming at the old
+        offset would land in the middle of an unrelated record."""
+        err = io.StringIO()
+        with tempfile.TemporaryDirectory() as d:
+            sid, path = self._one_record_source(d, "new")
+            with patch.object(antiphon, "claude_transcripts", return_value=[path]), \
+                 contextlib.redirect_stderr(err):
+                events, _ = antiphon.claude_events(
+                    "/tmp/project", {sid: {"gen": "a-generation-from-before",
+                                           "offset": 0}})
+        self.assertEqual([e[2] for e in events], ["new"],
+                         "the source is offered again rather than skipped")
+        self.assertIn(sid, err.getvalue())
+        self.assertIn("replaced", err.getvalue())
+
+    def test_a_truncated_source_restarts_and_says_so(self):
+        """A file shorter than the recorded offset was rewritten in place. The
+        generation can survive that — same inode, same first record — so the
+        length is the check that catches it."""
+        err = io.StringIO()
+        with tempfile.TemporaryDirectory() as d:
+            sid, path = self._one_record_source(d, "short")
+            gen = antiphon.source_generation(path)
+            with patch.object(antiphon, "claude_transcripts", return_value=[path]), \
+                 contextlib.redirect_stderr(err):
+                events, _ = antiphon.claude_events(
+                    "/tmp/project", {sid: {"gen": gen, "offset": 999_999}})
+        self.assertEqual([e[2] for e in events], ["short"])
+        self.assertIn(sid, err.getvalue())
+        self.assertIn("shorter", err.getvalue())
+
+    def test_an_unchanged_source_says_nothing(self):
+        """The diagnostic has to be rare enough to mean something."""
+        err = io.StringIO()
+        with tempfile.TemporaryDirectory() as d:
+            sid, path = self._one_record_source(d, "same")
+            gen = antiphon.source_generation(path)
+            with patch.object(antiphon, "claude_transcripts", return_value=[path]), \
+                 contextlib.redirect_stderr(err):
+                antiphon.claude_events("/tmp/project", {sid: {"gen": gen, "offset": 0}})
+        self.assertEqual(err.getvalue(), "")
+
+    def test_a_source_with_no_recorded_position_says_nothing(self):
+        """A source nobody has read is not a source that changed. Measured on
+        this machine: `source_generation` returns None only for a file whose
+        first line has no newline yet, and a new source has no recorded
+        position to compare against, so this path must stay quiet."""
+        err = io.StringIO()
+        with tempfile.TemporaryDirectory() as d:
+            _sid, path = self._one_record_source(d, "brand new")
+            with patch.object(antiphon, "claude_transcripts", return_value=[path]), \
+                 contextlib.redirect_stderr(err):
+                antiphon.claude_events("/tmp/project", {})
+        self.assertEqual(err.getvalue(), "")
+
 
 class PositionCursorTest(unittest.TestCase):
     """The parsers read from a per-source position instead of a fixed tail
