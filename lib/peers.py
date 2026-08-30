@@ -20,7 +20,11 @@ import os
 import re
 import time
 
-NAME_PATTERN = re.compile(r"^[a-z0-9][a-z0-9_-]{0,31}$")
+NAME_PATTERN = re.compile(r"[a-z0-9][a-z0-9_-]{0,31}")
+# Both sides are matched with `fullmatch`, never `match`: `$` also matches just
+# before a trailing newline, so `re.match` accepted "ui\n" as a peer name and it
+# would have gone straight into a file name and a socket seed.
+KIND_PATTERN = re.compile(r"claude|codex")
 
 
 def explicit_name():
@@ -35,7 +39,13 @@ def auto_name(kind, session_id):
 
 
 def valid_name(name):
-    return bool(name) and bool(NAME_PATTERN.match(name))
+    return bool(name) and bool(NAME_PATTERN.fullmatch(name))
+
+
+def valid_kind(kind):
+    """`kind` is concatenated into a directory name; unvalidated, `../..` walks
+    out of the project."""
+    return bool(kind) and bool(KIND_PATTERN.fullmatch(kind))
 
 
 def socket_key(cwd, name=""):
@@ -83,11 +93,27 @@ def _peer_lock(cwd, kind, name):
 
 
 def _read_record(path):
+    """The record as a dict, or None. Valid JSON of the wrong shape is not a
+    record: a bare array used to raise out of `read_peers` on `.get`."""
     try:
         with open(path, encoding="utf-8") as f:
-            return json.load(f)
+            record = json.load(f)
     except (OSError, ValueError):
         return None
+    return record if isinstance(record, dict) else None
+
+
+def _pid_of(record):
+    """A usable owner pid, or None when the record identifies nobody.
+
+    Anything that is not a positive integer names no process, so it cannot be
+    checked for liveness and must not hold a name hostage either.
+    """
+    try:
+        pid = int(record.get("pid"))
+    except (AttributeError, TypeError, ValueError):
+        return None
+    return pid if pid > 0 else None
 
 
 def alive(pid):
@@ -113,15 +139,16 @@ def _prune(cwd, kind, name, dead_pid):
     record would leave a live peer invisible. The directory stays, so a peer
     returning under the same name finds its cursor where it left it.
     """
-    if not (kind and valid_name(name)):
+    if not (valid_kind(kind) and valid_name(name)):
         return
     with _peer_lock(cwd, kind, name):
+        held = _read_record(_peer_file(cwd, kind, name))
+        held_pid = _pid_of(held) if held else None
+        if held_pid is None or held_pid != dead_pid:
+            return
+        if alive(held_pid):
+            return
         path = _peer_file(cwd, kind, name)
-        held = _read_record(path)
-        if not held or int(held.get("pid") or -1) != int(dead_pid or -1):
-            return
-        if alive(held.get("pid")):
-            return
         try:
             os.unlink(path)
         except OSError:
@@ -143,8 +170,11 @@ def read_peers(cwd, kind=None):
         peer = _read_record(os.path.join(peers_dir(cwd), entry, "endpoint.json"))
         if peer is None:
             continue
-        if not alive(peer.get("pid")):
-            _prune(cwd, peer.get("kind"), peer.get("name"), peer.get("pid"))
+        peer_pid = _pid_of(peer)
+        if peer_pid is None:
+            continue                  # identifies nobody; not a peer, not prunable
+        if not alive(peer_pid):
+            _prune(cwd, peer.get("kind"), peer.get("name"), peer_pid)
             continue
         if kind is None or peer.get("kind") == kind:
             found.append(peer)
@@ -171,15 +201,20 @@ def register(cwd, kind, name, address, pid=None):
     `session.json`, whose only writer is the hook; accepting it here would invite
     exactly the cross-writer overwrite the split exists to prevent.
     """
+    if not valid_kind(kind):
+        return False, f"invalid peer kind {kind!r}: expected 'claude' or 'codex'"
     if not valid_name(name):
         return False, (f"invalid peer name {name!r}: "
                        "expected [a-z0-9][a-z0-9_-]{0,31}")
-    owner = int(pid or os.getpid())
+    owner = _pid_of({"pid": pid}) if pid is not None else os.getpid()
+    if owner is None:
+        return False, f"invalid owner pid {pid!r}: expected a positive integer"
     with _peer_lock(cwd, kind, name):
         path = _peer_file(cwd, kind, name)
         held = _read_record(path)
-        if held and int(held.get("pid") or -1) != owner and alive(held.get("pid")):
-            return False, f"peer name {name!r} is already held by pid {held.get('pid')}"
+        held_pid = _pid_of(held) if held else None
+        if held_pid is not None and held_pid != owner and alive(held_pid):
+            return False, f"peer name {name!r} is already held by pid {held_pid}"
         record = {"kind": kind, "name": name, "pid": owner,
                   "address": address, "started_at": time.time()}
         tmp = f"{path}.{os.getpid()}.tmp"
@@ -191,13 +226,16 @@ def register(cwd, kind, name, address, pid=None):
 
 def unregister(cwd, kind, name, pid=None):
     """Releases a name, but only if this owner still holds it."""
-    if not valid_name(name):
+    if not (valid_kind(kind) and valid_name(name)):
         return
-    owner = int(pid or os.getpid())
+    owner = _pid_of({"pid": pid}) if pid is not None else os.getpid()
+    if owner is None:
+        return
     with _peer_lock(cwd, kind, name):
         path = _peer_file(cwd, kind, name)
         held = _read_record(path)
-        if held and int(held.get("pid") or -1) != owner:
+        held_pid = _pid_of(held) if held else None
+        if held_pid is not None and held_pid != owner:
             return
         try:
             os.unlink(path)

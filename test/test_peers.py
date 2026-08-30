@@ -33,6 +33,20 @@ class PeerNameTest(unittest.TestCase):
         for name in ("", "-ui", "UI", "a/b", "a.b", "x" * 33, None):
             self.assertFalse(peers.valid_name(name), repr(name))
 
+    def test_valid_name_rejects_a_trailing_newline(self):
+        """`re.match` with `$` accepts a final newline, so `ui\n` passed and would
+        have become a file name and a socket seed carrying a line break."""
+        for name in ("ui\n", "ui\n\n", "a/b\n"):
+            self.assertFalse(peers.valid_name(name), repr(name))
+
+    def test_valid_kind_allows_only_the_two_sides(self):
+        """`kind` is concatenated into a directory name. Unvalidated, `../..`
+        walks out of the project."""
+        self.assertTrue(peers.valid_kind("claude"))
+        self.assertTrue(peers.valid_kind("codex"))
+        for kind in ("", None, "../..", "Claude", "claude\n"):
+            self.assertFalse(peers.valid_kind(kind), repr(kind))
+
     def test_an_unnamed_peer_keeps_todays_socket_key(self):
         """The backward-compatibility contract: an unnamed session must land on
         exactly the socket path it lands on today, or every existing install
@@ -181,6 +195,40 @@ class PeerRegistryTest(unittest.TestCase):
                 worker.join(20)
             self.assertEqual(sorted(results), [False, True],
                              f"exactly one claimant must win, got {list(results)}")
+
+    def test_a_record_that_is_not_an_object_is_ignored(self):
+        """A JSON array where an object was expected used to raise straight out of
+        `read_peers` and take the bridge down with it."""
+        with tempfile.TemporaryDirectory() as project:
+            peers.register(project, "claude", "ui", "/tmp/ui.sock")
+            odd = peers.peer_dir(project, "claude", "odd")
+            os.makedirs(odd)
+            with open(os.path.join(odd, "endpoint.json"), "w", encoding="utf-8") as f:
+                f.write("[]")
+            self.assertEqual([p["name"] for p in peers.read_peers(project)], ["ui"])
+
+    def test_a_record_with_an_unusable_pid_is_ignored_and_frees_its_name(self):
+        """A pid that is not a positive integer identifies nobody, so the record
+        cannot be trusted and must not block the name forever."""
+        with tempfile.TemporaryDirectory() as project:
+            broken = peers.peer_dir(project, "claude", "ui")
+            os.makedirs(broken)
+            for bad in ('"abc"', "0", "-1", "null"):
+                with open(os.path.join(broken, "endpoint.json"), "w",
+                          encoding="utf-8") as f:
+                    f.write('{"kind":"claude","name":"ui","pid":%s,'
+                            '"address":"/tmp/x.sock"}' % bad)
+                self.assertEqual(peers.read_peers(project), [], bad)
+                ok, detail = peers.register(project, "claude", "ui", "/tmp/mine.sock")
+                self.assertTrue(ok, f"{bad}: {detail}")
+                os.unlink(os.path.join(broken, "endpoint.json"))
+
+    def test_an_unknown_kind_is_refused_rather_than_becoming_a_path(self):
+        with tempfile.TemporaryDirectory() as project:
+            ok, detail = peers.register(project, "../..", "ui", "/tmp/x.sock")
+            self.assertFalse(ok)
+            self.assertIn("claude", detail)
+            self.assertEqual(peers.read_peers(project), [])
 
     def test_unregister_releases_only_your_own_name(self):
         with tempfile.TemporaryDirectory() as project:

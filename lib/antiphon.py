@@ -36,6 +36,8 @@ import subprocess
 import sys
 import time
 import uuid
+
+import peers
 from datetime import datetime
 
 HOME = os.path.expanduser("~")
@@ -675,6 +677,29 @@ def _record_delivery(cwd, target, text):
     write_cursor(cwd, cursor)
 
 
+def register_peer(*_):
+    """Records a peer on behalf of the Node channel server.
+
+    Kept in Python so the registry has exactly one implementation; the channel
+    server shells out here the way it already does for `reply`. The `pid` in the
+    payload is the long-lived owner — this process exits immediately, and a
+    record carrying its pid would read as dead at once.
+    """
+    try:
+        data = json.load(sys.stdin)
+    except (json.JSONDecodeError, ValueError):
+        data = {}
+    kind, name, address = data.get("kind"), data.get("name"), data.get("address")
+    if kind not in ("claude", "codex") or not isinstance(address, str):
+        print("register_peer: kind and address are required", file=sys.stderr)
+        return 1
+    ok, detail = peers.register(project_dir(), kind, name, address, pid=data.get("pid"))
+    if not ok:
+        print(f"register_peer: {detail}", file=sys.stderr)
+        return 1
+    return 0
+
+
 # ---------- Codex MCP server ----------
 
 def _tool_error(message):
@@ -1195,7 +1220,7 @@ def print_summary(side="claude"):
 
 COMMANDS = {
     "setup": setup, "status": status, "hook": hook, "summary": print_summary,
-    "push": push, "reply": reply, "mcp": mcp,
+    "push": push, "reply": reply, "mcp": mcp, "register_peer": register_peer,
     # Legacy aliases for old local installs, kept during the transition period.
     "kur": setup, "durum": status, "kanca": hook, "ozet": print_summary,
     "it": push, "yanit": reply,

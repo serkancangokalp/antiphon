@@ -10,11 +10,13 @@ fail the test, never quietly pass."""
 import sys, os
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "lib"))
 import antiphon
+import peers
 
 import contextlib
 import io
 import json
 import re
+import subprocess
 import tempfile
 import unittest
 from unittest.mock import patch
@@ -89,6 +91,29 @@ class CrossBoundaryContractTest(unittest.TestCase):
         for entry in sorted(os.listdir(os.path.join(ROOT, "lib"))):
             if entry.endswith((".py", ".mjs")):
                 self.assertIn(f"lib/{entry}", listed, entry)
+
+    def test_subcommands_the_channel_server_calls_are_dispatchable(self):
+        """`channel.mjs` runs `antiphon.py <subcommand>`. A function that exists
+        but is missing from COMMANDS fails only at runtime, inside a hook, with
+        the usage text printed where nobody reads it."""
+        source = read("lib", "channel.mjs")
+        called = set(re.findall(r'bridgeScript,\s*"([a-z_]+)"', source))
+        self.assertTrue(called, "no subcommand call found in channel.mjs")
+        for name in sorted(called):
+            self.assertIn(name, antiphon.COMMANDS, name)
+
+    def test_node_and_python_derive_the_same_socket_key(self):
+        """Two languages spelling one hash. When they drifted before, the bridge
+        went quiet and nothing failed anywhere."""
+        probe = subprocess.run(
+            ["node", "-e",
+             "const {createHash}=require('node:crypto');"
+             "const d=process.argv[1],n=process.argv[2];"
+             "console.log(createHash('sha256').update(n?`${d}\\0${n}`:d)"
+             ".digest('hex').slice(0,20))",
+             "--", "/tmp/project", "ui"],
+            capture_output=True, text=True, check=True)
+        self.assertEqual(probe.stdout.strip(), peers.socket_key("/tmp/project", "ui"))
 
 
 if __name__ == "__main__":

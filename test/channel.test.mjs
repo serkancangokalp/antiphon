@@ -1,7 +1,10 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
+import { spawn } from "node:child_process";
+import { existsSync } from "node:fs";
 import { mkdtemp, rm } from "node:fs/promises";
 import { connect } from "node:net";
+import { once } from "node:events";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -49,6 +52,90 @@ function sendToSocket(payload) {
     attempt();
   });
 }
+
+// ---- one socket per peer -------------------------------------------------
+// Two sessions in one project used to share a socket path. The second bound
+// over the first, and then whichever exited first deleted the survivor's
+// socket, leaving a live session that nothing could reach and no error anywhere.
+
+function socketFor(dir, name) {
+  const seed = name ? `${dir}\0${name}` : dir;
+  const key = createHash("sha256").update(seed).digest("hex").slice(0, 20);
+  return join(process.env.TMPDIR || "/tmp", `antiphon-channel-${key}.sock`);
+}
+
+function spawnChannel(dir, name) {
+  const env = { ...process.env, ANTIPHON_CWD: dir };
+  if (name) env.ANTIPHON_NAME = name;
+  else delete env.ANTIPHON_NAME;
+  const child = spawn("node", ["lib/channel.mjs"], { env, stdio: ["pipe", "pipe", "pipe"] });
+  let stderr = "";
+  child.stderr.setEncoding("utf8");
+  child.stderr.on("data", (chunk) => { stderr += chunk; });
+  return { child, socketPath: socketFor(dir, name), stderr: () => stderr };
+}
+
+async function waitFor(predicate, timeoutMs = 5_000) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (predicate()) return true;
+    await new Promise((resolve) => setTimeout(resolve, 25));
+  }
+  return false;
+}
+
+async function twoNamedPeersKeepSeparateSockets() {
+  const dir = await mkdtemp(join(tmpdir(), "antiphon-peers-"));
+  const ui = spawnChannel(dir, "ui");
+  const api = spawnChannel(dir, "api");
+  try {
+    assert.notEqual(ui.socketPath, api.socketPath, "named peers must not share a path");
+    assert.ok(await waitFor(() => existsSync(ui.socketPath)), `ui socket: ${ui.stderr()}`);
+    assert.ok(await waitFor(() => existsSync(api.socketPath)), `api socket: ${api.stderr()}`);
+
+    ui.child.kill("SIGTERM");
+    await once(ui.child, "exit");
+    assert.ok(existsSync(api.socketPath),
+      "closing one peer must not remove another peer's socket");
+  } finally {
+    ui.child.kill("SIGKILL");
+    api.child.kill("SIGKILL");
+    await rm(dir, { recursive: true, force: true });
+  }
+}
+
+async function anUnnamedSecondSessionRefusesToTakeTheSocket() {
+  const dir = await mkdtemp(join(tmpdir(), "antiphon-unnamed-"));
+  const first = spawnChannel(dir, "");
+  // Wait for the first to be serving before the second starts: that is the real
+  // shape of the mistake — a second terminal opened in a project that already
+  // has one — and it is the case the guard has to catch.
+  assert.ok(await waitFor(() => existsSync(first.socketPath)), first.stderr());
+  const second = spawnChannel(dir, "");
+  try {
+    assert.ok(await waitFor(() => /already serves/.test(second.stderr())),
+      `second session should refuse the socket, said: ${second.stderr()}`);
+    assert.match(second.stderr(), /ANTIPHON_NAME/,
+      "the warning must say how to run both");
+    assert.ok(existsSync(first.socketPath), "the first session keeps its socket");
+
+    // The refusing session must also leave the socket alone on the way out.
+    // Unlinking the path unconditionally in shutdown is what let a session that
+    // never owned the socket delete it for the one that did.
+    second.child.kill("SIGTERM");
+    await once(second.child, "exit");
+    assert.ok(existsSync(first.socketPath),
+      "a session that never bound the socket must not remove it when it exits");
+  } finally {
+    first.child.kill("SIGKILL");
+    second.child.kill("SIGKILL");
+    await rm(dir, { recursive: true, force: true });
+  }
+}
+
+await twoNamedPeersKeepSeparateSockets();
+await anUnnamedSecondSessionRefusesToTakeTheSocket();
+console.log("per-peer sockets: ok");
 
 try {
   await client.connect(transport);
