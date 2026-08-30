@@ -639,6 +639,71 @@ def tail_lines(path):
         return []
 
 
+def source_id(path):
+    """What a transcript is, as opposed to where it currently sits.
+
+    Both hosts name a transcript after the session that wrote it — Claude Code
+    as `<uuid>.jsonl`, Codex as `rollout-<timestamp>-<uuid>.jsonl` — and that
+    uuid outlives a move, a rename of the project directory, or a copy. A path
+    does not, and a cursor keyed on one would start again from nothing the
+    first time anything moved. Anything without a uuid falls back to the
+    basename, which is still narrower than the path.
+    """
+    match = SESSION_ID.search(path)
+    return match.group(1) if match else os.path.basename(path)
+
+
+def source_generation(path):
+    """An identity for *this* file at this path, or None if it cannot be read.
+
+    An offset is only meaningful inside one immutable run of a file. Rotation
+    puts a different file at the same name and an offset into the old one lands
+    anywhere in the new one, so something has to be able to say "no, this is not
+    what you were reading". Device and inode catch a replacement; the hash of
+    the first record catches the case where an inode is reused, which happens
+    more often than it sounds on a busy temporary filesystem.
+    """
+    try:
+        st = os.stat(path)
+        with open(path, "rb") as f:
+            first = f.readline()
+            if not first.endswith(b"\n"):
+                # A file whose only line is still being written has no stable
+                # first record yet. Treat it as unidentifiable rather than
+                # fingerprinting a half-line that will change.
+                return None
+    except OSError:
+        return None
+    digest = hashlib.sha256(first).hexdigest()[:16]
+    return "%d:%d:%s" % (st.st_dev, st.st_ino, digest)
+
+
+def read_records(path, offset=0):
+    """Yield `(start, end, line)` for each complete line at or after `offset`.
+
+    `line` is decoded text without its newline; `start` and `end` are byte
+    offsets, so `end` of the last record is where the next read begins. A
+    trailing partial line is not a record: it yields nothing and leaves `end`
+    before it, so the writer can finish it and the next read picks it up whole.
+
+    This replaces reading a fixed window at the end of the file. That window
+    made a record larger than itself invisible — not truncated, never seen —
+    while an offset costs only the bytes that are actually new.
+    """
+    try:
+        with open(path, "rb") as f:
+            if offset:
+                f.seek(offset)
+            position = offset
+            for raw in f:
+                if not raw.endswith(b"\n"):
+                    return          # incomplete: not a record yet
+                start, position = position, position + len(raw)
+                yield start, position, raw[:-1].decode("utf-8", "replace")
+    except OSError:
+        return
+
+
 def head_lines(path, limit=12, num_bytes=64 * 1024):
     """Returns the lines at the start of the file, used for session metadata."""
     try:

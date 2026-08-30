@@ -1626,6 +1626,89 @@ class AntiphonTest(unittest.TestCase):
                 }, "the next write persists the translation")
 
 
+class OffsetReadingTest(unittest.TestCase):
+    """`read_records` reads a transcript forward from a byte offset instead of
+    seeking a fixed window from its end, and `source_generation` says when the
+    file at a path is no longer the file the offset was measured against."""
+
+    def test_a_record_larger_than_the_tail_window_is_read(self):
+        """`tail_lines` seeks to the last TAIL_BYTES and drops the partial line
+        it lands in, so a record larger than that window is not truncated — it
+        is never seen. Measured on this code before the change: a 400,000
+        character record followed by a small one returned only the small one."""
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "t.jsonl")
+            big = "X" * (antiphon.TAIL_BYTES + 100_000)
+            with open(path, "w", encoding="utf-8") as f:
+                f.write(big + "\n")
+                f.write("small\n")
+            lines = [line for _s, _e, line in antiphon.read_records(path)]
+        self.assertEqual(lines, [big, "small"])
+
+    def test_an_incomplete_final_line_is_not_a_record_yet(self):
+        """A transcript is appended to while it is read. Half a line is not a
+        record, and consuming it would make the other half unreachable."""
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "t.jsonl")
+            with open(path, "w", encoding="utf-8") as f:
+                f.write("first\nsecond\nhalf-a-li")
+            records = list(antiphon.read_records(path))
+        self.assertEqual([line for _s, _e, line in records], ["first", "second"])
+        self.assertEqual(records[-1][1], len("first\nsecond\n"),
+                         "the offset stops before the partial line, not after it")
+
+    def test_reading_resumes_where_it_stopped(self):
+        """The offset a read returns is the byte the next read starts at."""
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "t.jsonl")
+            with open(path, "w", encoding="utf-8") as f:
+                f.write("first\nsecond\n")
+            first = list(antiphon.read_records(path))
+            resume = first[-1][1]
+            with open(path, "a", encoding="utf-8") as f:
+                f.write("third\n")
+            later = [line for _s, _e, line in antiphon.read_records(path, resume)]
+        self.assertEqual(later, ["third"], "no record is read twice, and none is skipped")
+
+    def test_a_generation_survives_appending_and_not_replacement(self):
+        """Rotation puts a different file at the same path. An offset into the
+        old one means nothing in the new one, so the offset alone cannot be the
+        state — something has to say "still the same source"."""
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "t.jsonl")
+            with open(path, "w", encoding="utf-8") as f:
+                f.write("first\n")
+            before = antiphon.source_generation(path)
+            with open(path, "a", encoding="utf-8") as f:
+                f.write("second\n")
+            self.assertEqual(antiphon.source_generation(path), before,
+                             "appending does not make it a different source")
+            os.unlink(path)
+            with open(path, "w", encoding="utf-8") as f:
+                f.write("something else entirely\n")
+            self.assertNotEqual(antiphon.source_generation(path), before)
+
+    def test_a_source_is_identified_by_its_session_not_its_path(self):
+        """A transcript can be moved or a project directory renamed. What the
+        cursor keys on has to survive that."""
+        uuid_name = "4eecac24-1c21-47ad-ab11-a650708f3098.jsonl"
+        self.assertEqual(antiphon.source_id("/a/b/" + uuid_name),
+                         "4eecac24-1c21-47ad-ab11-a650708f3098")
+        self.assertEqual(antiphon.source_id("/somewhere/else/" + uuid_name),
+                         antiphon.source_id("/a/b/" + uuid_name))
+        # A Codex rollout carries its uuid too, after a timestamped prefix.
+        self.assertEqual(
+            antiphon.source_id("/r/rollout-2026-08-30T00-27-05-"
+                               "01a04f6b-4485-7290-afbd-9eae74405ec8.jsonl"),
+            "01a04f6b-4485-7290-afbd-9eae74405ec8")
+        # Anything else falls back to the basename rather than the whole path.
+        self.assertEqual(antiphon.source_id("/a/b/notes.jsonl"), "notes.jsonl")
+
+    def test_a_source_that_cannot_be_read_has_no_generation(self):
+        with tempfile.TemporaryDirectory() as d:
+            self.assertIsNone(antiphon.source_generation(os.path.join(d, "gone.jsonl")))
+            self.assertEqual(list(antiphon.read_records(os.path.join(d, "gone.jsonl"))), [])
+
 
 class MalformedStateTest(unittest.TestCase):
     """State that parses as JSON and still isn't what the reader expects.
