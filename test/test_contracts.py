@@ -155,7 +155,7 @@ class CrossBoundaryContractTest(unittest.TestCase):
             self.assertTrue(peers.valid_session_id(match.group(1)), name)
 
     def test_every_surface_that_shows_the_event_shows_who_sent_it(self):
-        """Three places describe the same event to a reader: the channel
+        """Three places describe the same event to a Claude reader: the channel
         server's MCP instructions, the CLAUDE.md rule and the README. One of
         them omitting `sender_alias` teaches an agent that the field is not
         there, and it never passes it back as `to`."""
@@ -169,6 +169,22 @@ class CrossBoundaryContractTest(unittest.TestCase):
             example = re.search(r"<channel source=.{0,200}?>", text, re.S)
             self.assertIsNotNone(example, f"no example event in {where}")
             self.assertIn("sender_alias", example.group(0), where)
+
+    def test_the_codex_side_is_told_the_same_thing_in_its_own_form(self):
+        """The two directions carry identity differently — metadata one way, a
+        visible label the other — but an agent on either side needs the same
+        three facts: who spoke, how to answer that one, and what it means when
+        nobody can be named. Only the Claude surfaces said so at first, which
+        left a Codex agent unable to address a reply at all."""
+        for where, text in (("AGENTS.md rule", antiphon.AGENTS_RULE),
+                            ("README", read("README.md"))):
+            self.assertIn("[from=", text, where)
+            self.assertIn(antiphon.NO_ALIAS, text, where)
+        self.assertIn("antiphon_send(to=", antiphon.AGENTS_RULE)
+        self.assertIn("@claude:<alias>", antiphon.AGENTS_RULE)
+        # And the label the rule describes is the one the code produces.
+        self.assertIn(antiphon.queue_label("ui", "an-id"),
+                      "[from=ui id=an-id]")
 
     def test_both_tools_describe_their_recipient_argument_identically(self):
         """`antiphon_send` and `reply_to_codex` take the same argument for the
