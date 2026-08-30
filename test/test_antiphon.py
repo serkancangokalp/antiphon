@@ -859,9 +859,10 @@ class AntiphonTest(unittest.TestCase):
     # ---- Ruling 6 correction: the self-injection guard is a label test ----
 
     @staticmethod
-    def _claude_user_texts(text):
-        line = json.dumps({"type": "user", "timestamp": "2026-08-30T10:00:00.000Z",
-                           "message": {"content": text}})
+    def _claude_user_texts(text, **record):
+        line = json.dumps(dict({"type": "user",
+                                "timestamp": "2026-08-30T10:00:00.000Z",
+                                "message": {"content": text}}, **record))
         with patch.object(antiphon, "claude_transcripts", return_value=["t.jsonl"]), \
              patch.object(antiphon, "tail_lines", return_value=[line]):
             return [e[2] for e in antiphon.claude_events("/tmp/project")]
@@ -893,6 +894,68 @@ class AntiphonTest(unittest.TestCase):
             text = f"{label} run the tests"
             self.assertEqual(self._claude_user_texts(text), [], label)
             self.assertEqual(self._codex_user_texts(text), [], label)
+
+    def test_a_user_message_in_angle_brackets_is_delivered(self):
+        """The parser used to drop any user text beginning with `<`, guessing at
+        provenance from one character. Anyone pasting HTML, XML, JSX or a stack
+        trace was invisible to the other agent, and nothing recorded it."""
+        for text in ("<html><body>merhaba</body></html>",
+                     "<Component prop={1} />",
+                     "<stack trace at frame 0>"):
+            self.assertEqual(self._claude_user_texts(text, promptSource="typed"),
+                             [text], text)
+            # An older transcript carries no promptSource at all; unknown
+            # provenance still means content, never silence.
+            self.assertEqual(self._claude_user_texts(text), [text], text)
+
+    def test_a_record_the_host_wrote_is_not_the_users_words(self):
+        """What the dropped `<` test was actually for. Each of these is written
+        into the transcript by Claude Code, not typed by anyone."""
+        for text in ('<channel source="antiphon" sender="codex">hi</channel>',
+                     "<task-notification>\n<task-id>abc</task-id>\n</task-notification>"):
+            self.assertEqual(self._claude_user_texts(text, promptSource="system"),
+                             [], text)
+        # No promptSource — an older host, or a record that never carried one.
+        # The opening tag is a closed set of host wrappers, not "starts with <".
+        for text in ("<command-name>/mcp</command-name>",
+                     "<local-command-stdout>Reconnected.</local-command-stdout>",
+                     "<bash-input> gh auth login</bash-input>",
+                     "<ide_opened_file>lib/antiphon.py</ide_opened_file>",
+                     "<local-command-caveat>Caveat: …</local-command-caveat>"):
+            self.assertEqual(self._claude_user_texts(text), [], text)
+
+    def test_a_host_record_is_refused_under_the_source_that_carries_it(self):
+        """Measured: `<task-notification>` records carry `promptSource=sdk`, not
+        `system`. A rule reading any non-`system` value as "a person wrote it"
+        starts leaking the host's own bookkeeping into the other agent."""
+        text = "<task-notification>\n<task-id>abc</task-id>\n</task-notification>"
+        self.assertEqual(self._claude_user_texts(text, promptSource="sdk"), [])
+
+    def test_an_unmeasured_source_delivers_rather_than_silences(self):
+        """The other half of the same rule. A promptSource this code has never
+        seen is not evidence the host wrote the text, and the cost of being
+        wrong is asymmetric: a stray line, against a message nobody ever sees."""
+        text = "<task-notification>\n<task-id>abc</task-id>\n</task-notification>"
+        self.assertEqual(
+            self._claude_user_texts(text, promptSource="a-source-from-2027"),
+            [text])
+
+    def test_a_person_typing_a_host_tag_is_still_heard(self):
+        """Where the host says a person typed it, that answer wins over shape."""
+        text = "<command-name>/mcp</command-name> — why does this print twice?"
+        self.assertEqual(self._claude_user_texts(text, promptSource="typed"), [text])
+
+    def test_a_wrapper_name_is_matched_whole(self):
+        """`<commanders>` is not `<command-name>`, and a prefix test would eat it."""
+        for text in ("<commanders> are not host records",
+                     "<channels of communication>"):
+            self.assertEqual(self._claude_user_texts(text), [text], text)
+
+    def test_a_codex_only_wrapper_does_not_silence_a_claude_user(self):
+        """`recommended_plugins` is a Codex record. Held in one shared set it
+        would drop a Claude user who typed that text with no promptSource."""
+        text = "<recommended_plugins>which ones do you mean?</recommended_plugins>"
+        self.assertEqual(self._claude_user_texts(text), [text])
 
     def test_push_and_reply_use_the_same_labels_the_guard_matches(self):
         """The guard is derived from the constants push() and reply() send, so the

@@ -225,6 +225,67 @@ def _is_self_injected(text):
     return text.lstrip().lower().startswith(_SELF_INJECTION_PREFIXES)
 
 
+# A host writes records of its own into the same transcript a person types
+# into: slash commands, their output, task notifications, and this bridge's
+# own deliveries. They are recognised by what they are — the host's
+# `promptSource`, or a complete opening tag from a closed, measured set —
+# never by a leading `<`. A user pasting HTML, JSX or a stack trace starts
+# with `<` too, and used to vanish.
+#
+# The sets are per side because the tags are: `ide_opened_file` is Claude
+# Code's, `recommended_plugins` and `realtime_delegation` are Codex's. Shared,
+# one side's tag would silence the other side's user for typing that text.
+# `image` belongs in neither: it is a person's attachment.
+CLAUDE_HOST_WRAPPERS = (
+    "channel", "task-notification", "ide_opened_file",
+    "command-name", "command-message",
+    "local-command-caveat", "local-command-stdout", "local-command-stderr",
+    "bash-input", "bash-stdout", "bash-stderr",
+)
+
+CODEX_HOST_WRAPPERS = (
+    "task-notification", "recommended_plugins", "realtime_delegation",
+    "subagent_notification", "environment_context",
+    "command-name", "command-message",
+    "local-command-caveat", "local-command-stdout", "local-command-stderr",
+    "bash-input", "bash-stdout", "bash-stderr",
+)
+
+# `promptSource` values measured carrying host records as well as people's
+# words, so neither answer can be taken from the field alone and the shape of
+# the record decides. An absent field is the same case. Every other value,
+# including one this code has never seen, means a person: refusing an unknown
+# source would let a future host version silence someone in silence.
+MIXED_SOURCES = ("sdk",)
+
+
+def _wrapper_pattern(names):
+    """`(?=[\\s>/])` makes it a whole tag name: `<channels of …>` is not `<channel>`."""
+    return re.compile(r"<(?:" + "|".join(names) + r")(?=[\s>/])")
+
+
+CLAUDE_WRAPPER_OPENING = _wrapper_pattern(CLAUDE_HOST_WRAPPERS)
+CODEX_WRAPPER_OPENING = _wrapper_pattern(CODEX_HOST_WRAPPERS)
+
+
+def _is_host_record(text, wrappers, prompt_source=None):
+    """True if `text` is something the host put in the transcript.
+
+    `wrappers` is the compiled tag set for the side being read.
+    `prompt_source` is Claude Code's `promptSource` field, absent on the Codex
+    side and on older Claude records. `system` settles it: the host wrote this.
+    A value measured to carry both kinds — or no field at all — leaves only the
+    shape of the record, where a known wrapper tag is the one thing refused.
+    Any other value means a person. Unknown provenance delivers; it never
+    silences.
+    """
+    if prompt_source == "system":
+        return True
+    if prompt_source and prompt_source not in MIXED_SOURCES:
+        return False
+    return wrappers.match((text or "").lstrip()) is not None
+
+
 def sender_alias(candidate):
     """A candidate alias if it could be one, else None.
 
@@ -550,8 +611,11 @@ def claude_events(cwd, start=0.0):
                     text = " ".join(c.get("text", "") for c in content
                                     if isinstance(c, dict) and c.get("type") == "text")
                 text = text.strip()
-                # tool results and system injections are not the user's own words
-                if text and not text.startswith("<") and not _is_self_injected(text):
+                # tool results and host records are not the user's own words
+                if (text
+                        and not _is_host_record(text, CLAUDE_WRAPPER_OPENING,
+                                                d.get("promptSource"))
+                        and not _is_self_injected(text)):
                     events.append((ts, "you", text))
             elif kind == "assistant":
                 for c in content if isinstance(content, list) else []:
