@@ -17,10 +17,120 @@ from unittest.mock import patch
 
 
 class AntiphonTest(unittest.TestCase):
-    def test_push_markers_only_at_line_start(self):
-        self.assertEqual(antiphon.PUSH_MARKERS["codex"].findall("@codex one"), ["one"])
-        self.assertEqual(antiphon.PUSH_MARKERS["claude"].findall("  @claude: two"), ["two"])
-        self.assertEqual(antiphon.PUSH_MARKERS["claude"].findall("example @claude three"), [])
+    def test_markers_are_only_recognised_at_the_start_of_a_line(self):
+        self.assertEqual(antiphon.parse_markers("codex", "@codex one"), [(None, "one")])
+        self.assertEqual(antiphon.parse_markers("claude", "  @claude: two"),
+                         [(None, "two")])
+        self.assertEqual(antiphon.parse_markers("claude", "example @claude three"), [])
+
+    def test_a_marker_can_name_its_recipient(self):
+        self.assertEqual(antiphon.parse_markers("claude", "@claude:api run the tests"),
+                         [("api", "run the tests")])
+
+    def test_punctuation_after_a_name_is_not_part_of_it(self):
+        """People type `@claude:api, run it`. Reading the name as `api,` refuses
+        a peer that exists."""
+        for line in ("@claude:api, run it", "@claude:api. run it",
+                     "@claude:api; run it"):
+            self.assertEqual(antiphon.parse_markers("claude", line),
+                             [("api", "run it")], line)
+
+    def test_the_message_keeps_its_own_leading_punctuation(self):
+        """Stripping a set of characters after the marker turned `.NET issue`
+        into `NET issue`. A message that arrives altered and looks fine is worse
+        than one that does not arrive."""
+        for line, expected in (
+                ("@claude:api .NET issue", ("api", ".NET issue")),
+                ("@claude:api: :foo", ("api", ":foo")),
+                ("@claude .NET issue", (None, ".NET issue")),
+                ("@claude: .NET issue", (None, ".NET issue")),
+                ("@claude, ,leading comma", (None, ",leading comma")),
+                ("@claude:api ```py", ("api", "```py")),
+        ):
+            self.assertEqual(antiphon.parse_markers("claude", line), [expected], line)
+
+    def test_a_claimed_name_is_reported_even_when_it_is_not_usable(self):
+        """A name that vanishes because it was punctuated oddly is the failure
+        this bridge exists to remove. Routing refuses it; the parser reports it."""
+        for line, expected in (("@claude:BAD run", ("BAD", "run")),
+                               ("@claude:../etc fix", ("../etc", "fix")),
+                               ("@claude:: fix", ("", "fix"))):
+            self.assertEqual(antiphon.parse_markers("claude", line), [expected], line)
+
+    def test_a_marker_with_no_message_is_reported_not_dropped(self):
+        self.assertEqual(antiphon.parse_markers("claude", "@claude:api"),
+                         [("api", "")])
+        self.assertEqual(antiphon.parse_markers("claude", "@claude"), [(None, "")])
+
+    def test_each_marker_line_is_its_own_message(self):
+        text = "@claude:ui look at this\nsome prose\n@claude:api and this"
+        self.assertEqual(antiphon.parse_markers("claude", text),
+                         [("ui", "look at this"), ("api", "and this")])
+
+    def test_a_marker_for_the_other_side_is_not_ours(self):
+        self.assertEqual(antiphon.parse_markers("claude", "@codex:build run"), [])
+
+    # ---- grouping, fingerprinting and dedupe, as pure helpers ----
+
+    def test_messages_group_by_recipient_in_order(self):
+        text = "@claude:ui first\n@claude:api other\n@claude:ui second\n@claude bare"
+        self.assertEqual(antiphon.group_by_recipient("claude", text),
+                         {"ui": ["first", "second"], "api": ["other"],
+                          None: ["bare"]})
+
+    def test_an_unaddressed_line_and_an_empty_name_do_not_merge(self):
+        """`alias or ""` folds None and "" together and hands `@claude:: fix` to
+        the unaddressed path, undoing the parser telling them apart."""
+        groups = antiphon.group_by_recipient("claude", "@claude a\n@claude:: b")
+        self.assertEqual(groups, {None: ["a"], "": ["b"]})
+
+    def test_a_fingerprint_distinguishes_where_the_breaks_fall(self):
+        """A newline join collides: ["a\nb", "c"] and ["a", "b\nc"] hash the
+        same, so one batch would suppress a different one."""
+        self.assertNotEqual(antiphon.batch_fingerprint(["a\nb", "c"]),
+                            antiphon.batch_fingerprint(["a", "b\nc"]))
+        self.assertEqual(antiphon.batch_fingerprint(["a", "b"]),
+                         antiphon.batch_fingerprint(["a", "b"]))
+
+    def test_the_old_string_record_migrates_without_resending(self):
+        """The old format stored the joined text, not a digest. Compared against
+        a digest it is always unequal and would resend once on upgrade."""
+        sent, already = antiphon.migrate_pushed("one\ntwo", ["one", "two"])
+        self.assertEqual(sent, {})
+        self.assertTrue(already)
+
+        sent, already = antiphon.migrate_pushed("something else", ["one", "two"])
+        self.assertFalse(already)
+
+        sent, already = antiphon.migrate_pushed({"@ui": "abc"}, ["one"])
+        self.assertEqual(sent, {"@ui": "abc"})
+        self.assertFalse(already)
+
+    def test_a_batch_is_delivered_once_however_often_the_hook_repeats(self):
+        """Two markers to one name, pushed twice. Keeping only the last text per
+        name resends both for ever: the first differs from the stored last, then
+        the second differs from the newly stored first."""
+        calls = []
+        batches = antiphon.group_by_recipient("claude", "@claude:ui a\n@claude:ui b")
+        sent = antiphon.deliver_batches("claude", batches, {},
+                                        lambda r, m: calls.append((r, m)) or True)
+        antiphon.deliver_batches("claude", batches, sent,
+                                 lambda r, m: calls.append((r, m)) or True)
+        self.assertEqual(calls, [("ui", ["a", "b"])])
+
+    def test_only_the_recipient_that_succeeded_stops_being_retried(self):
+        batches = antiphon.group_by_recipient("claude", "@claude:ui a\n@claude:api b")
+        sent = antiphon.deliver_batches("claude", batches, {},
+                                        lambda r, m: r == "ui")
+        retried = []
+        antiphon.deliver_batches("claude", batches, sent,
+                                 lambda r, m: retried.append(r) or True)
+        self.assertEqual(retried, ["api"])
+
+    def test_the_unaddressed_slot_cannot_collide_with_a_peer_named_empty(self):
+        batches = antiphon.group_by_recipient("claude", "@claude a\n@claude:: b")
+        sent = antiphon.deliver_batches("claude", batches, {}, lambda r, m: True)
+        self.assertEqual(sorted(sent), ["", "@"])
 
     def test_last_codex_reply(self):
         lines = [
@@ -61,18 +171,80 @@ class AntiphonTest(unittest.TestCase):
              contextlib.redirect_stderr(io.StringIO()):
             self.assertEqual(antiphon.push("claude"), 0)
         self.assertEqual(sent, [("/tmp/project", "test")])
-        self.assertEqual(written, [{"last_pushed_claude": "test"}])
+        # The record is now a fingerprint per recipient rather than the last
+        # text: keeping the text resent both lines for ever when one reply
+        # addressed the same peer twice.
+        self.assertEqual(list(written[0]), ["last_pushed_claude"])
+        self.assertEqual(written[0]["last_pushed_claude"],
+                         {"": antiphon.batch_fingerprint(["test"])})
 
     def test_push_uses_separate_dedupe_cursors(self):
         input_data = {"cwd": "/tmp/project", "transcript_path": "/tmp/rollout"}
         with patch.object(antiphon.os.path, "exists", return_value=True), \
              patch.object(antiphon, "last_codex_reply", return_value="@claude same"), \
              patch.object(antiphon, "read_cursor",
-                          return_value={"last_pushed_claude": "same", "last_pushed_codex": "other"}), \
+                          return_value={"last_pushed_claude": {"": antiphon.batch_fingerprint(["same"])},
+                                        "last_pushed_codex": {"": "other"}}), \
+             patch.object(antiphon, "write_cursor"), \
              patch.object(antiphon, "send_to_claude") as send, \
              patch.object(antiphon.sys, "stdin", io.StringIO(json.dumps(input_data))):
             self.assertEqual(antiphon.push("claude"), 0)
             send.assert_not_called()
+
+    def test_a_cursor_in_the_old_string_format_does_not_resend_on_upgrade(self):
+        """Installed bridges hold the joined text, not a digest. Comparing the
+        two is always unequal, so the last message would go out once more the
+        first time the new code ran."""
+        input_data = {"cwd": "/tmp/project", "transcript_path": "/tmp/rollout"}
+        written = []
+        with patch.object(antiphon.os.path, "exists", return_value=True), \
+             patch.object(antiphon, "last_codex_reply", return_value="@claude same"), \
+             patch.object(antiphon, "read_cursor",
+                          return_value={"last_pushed_claude": "same"}), \
+             patch.object(antiphon, "write_cursor",
+                          side_effect=lambda cwd, data, kind: written.append(dict(data))), \
+             patch.object(antiphon, "send_to_claude") as send, \
+             patch.object(antiphon.sys, "stdin", io.StringIO(json.dumps(input_data))), \
+             contextlib.redirect_stderr(io.StringIO()):
+            self.assertEqual(antiphon.push("claude"), 0)
+            send.assert_not_called()
+        self.assertEqual(written[0]["last_pushed_claude"],
+                         {"": antiphon.batch_fingerprint(["same"])},
+                         "and the record migrates to the new form")
+
+    def test_a_named_marker_is_refused_until_routing_exists(self):
+        """Resolving a name is a later task. Refusing out loud is honest;
+        delivering it to whoever is around would not be."""
+        input_data = {"cwd": "/tmp/project", "transcript_path": "/tmp/rollout"}
+        err = io.StringIO()
+        with patch.object(antiphon.os.path, "exists", return_value=True), \
+             patch.object(antiphon, "last_codex_reply", return_value="@claude:api run"), \
+             patch.object(antiphon, "read_cursor", return_value={}), \
+             patch.object(antiphon, "write_cursor") as write, \
+             patch.object(antiphon, "send_to_claude") as send, \
+             patch.object(antiphon.sys, "stdin", io.StringIO(json.dumps(input_data))), \
+             contextlib.redirect_stderr(err):
+            self.assertEqual(antiphon.push("claude"), 0)
+            send.assert_not_called()
+            write.assert_not_called()
+        self.assertIn("not available yet", err.getvalue())
+        self.assertIn("api", err.getvalue())
+
+    def test_an_unaddressed_line_still_delivers_alongside_a_named_one(self):
+        """The refusal must not take the working path down with it."""
+        sent = []
+        input_data = {"cwd": "/tmp/project", "transcript_path": "/tmp/rollout"}
+        with patch.object(antiphon.os.path, "exists", return_value=True), \
+             patch.object(antiphon, "last_codex_reply",
+                          return_value="@claude:api named\n@claude bare"), \
+             patch.object(antiphon, "read_cursor", return_value={}), \
+             patch.object(antiphon, "write_cursor"), \
+             patch.object(antiphon, "send_to_claude",
+                          side_effect=lambda cwd, msg: (sent.append(msg) or (True, ""))), \
+             patch.object(antiphon.sys, "stdin", io.StringIO(json.dumps(input_data))), \
+             contextlib.redirect_stderr(io.StringIO()):
+            self.assertEqual(antiphon.push("claude"), 0)
+        self.assertEqual(sent, ["bare"])
 
     # ---- the Codex-side MCP server ----
 

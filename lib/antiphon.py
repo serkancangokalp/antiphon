@@ -53,10 +53,101 @@ LOOKBACK = 6 * 3600       # anything older than this doesn't count as part of "t
 # A marker at the start of a line in a reply says that line should be pushed
 # to the target. The line-start requirement is deliberate: mentioning the
 # marker inside prose shouldn't trigger it.
-PUSH_MARKERS = {
-    "codex": re.compile(r"^\s*@codex\b[:,]?\s*(.+)$", re.MULTILINE),
-    "claude": re.compile(r"^\s*@claude\b[:,]?\s*(.+)$", re.MULTILINE),
-}
+# Parsed in two stages so no line addressed at the other side can vanish. Every
+# single-regex version tried here dropped something silently: one refused
+# `@claude:BAD run` outright, another swallowed the comma in `@claude:api, run
+# it` into the name, a third lost `@claude:api,run it` entirely. A marker line
+# that disappears because its name was punctuated oddly is exactly the failure
+# this bridge exists to remove.
+MARKER_SIDES = ("claude", "codex")
+PUSH_MARKERS = re.compile(r"^\s*@(?P<side>claude|codex)\b(?P<rest>.*)$", re.MULTILINE)
+# A colon followed by whitespace is the unaddressed form and means what it has
+# always meant; a colon followed by anything else is a name being claimed,
+# however malformed.
+MARKER_ALIAS = re.compile(r"^:(?P<claim>\S+)")
+# The unaddressed form's delimiter, consumed once and only when no name was
+# claimed. Stripping a *set* of characters here ate the message's own
+# punctuation: `@claude:api .NET issue` arrived as "NET issue".
+MARKER_DELIMITER = re.compile(r"^[:,]?[ \t]*")
+
+
+def parse_markers(target, text):
+    """[(alias, message)] for every marker line addressed at `target`.
+
+    `alias` is None when no name was claimed, `""` when one was claimed and is
+    empty, and the raw string otherwise. `message` may be empty. Nothing is
+    filtered here: whether a name exists is routing's decision, and a line the
+    human wrote and the bridge swallowed without a word is the thing to avoid.
+    """
+    found = []
+    for match in PUSH_MARKERS.finditer(text or ""):
+        if match.group("side") != target:
+            continue
+        rest, alias = match.group("rest"), None
+        claim = MARKER_ALIAS.match(rest)
+        if claim:
+            # The claim already swallowed any delimiter attached to the name, so
+            # only whitespace separates it from the message. Anything else here
+            # belongs to the message.
+            alias = claim.group("claim").rstrip(",;:.")
+            rest = rest[claim.end():].lstrip(" \t")
+        else:
+            rest = MARKER_DELIMITER.sub("", rest, count=1)
+        found.append((alias, rest.rstrip()))
+    return found
+
+
+def group_by_recipient(target, text):
+    """{recipient or None: [messages]}, in the order they were written.
+
+    Keyed by the alias itself. `alias or ""` would fold None and "" together and
+    hand `@claude:: fix` to the unaddressed path, undoing the parser's care in
+    telling them apart.
+    """
+    batches = {}
+    for alias, message in parse_markers(target, text):
+        batches.setdefault(alias, []).append(message)
+    return batches
+
+
+def batch_fingerprint(messages):
+    """Canonical JSON, full digest.
+
+    A newline join collides: ["a\nb", "c"] and ["a", "b\nc"] hash identically,
+    so one batch would suppress a different one.
+    """
+    return hashlib.sha256(json.dumps(
+        messages, ensure_ascii=False, separators=(",", ":")).encode()).hexdigest()
+
+
+def migrate_pushed(sent, unaddressed):
+    """(record, already_delivered) for a cursor that may hold the old format.
+
+    The old format stored the joined text rather than a digest, so comparing it
+    against a digest is always unequal and would resend the last message once on
+    upgrade. It is compared in its own form instead.
+    """
+    if not isinstance(sent, str):
+        return dict(sent or {}), False
+    return {}, bool(unaddressed) and sent == "\n".join(unaddressed)
+
+
+def deliver_batches(target, batches, sent, deliver):
+    """Calls `deliver(recipient, messages)` for each batch that has not gone yet.
+
+    A recipient's fingerprint advances only if its own delivery succeeded, so one
+    failure does not suppress its retry while another recipient's success is
+    kept. The key is `""` for unaddressed and `"@alias"` otherwise, so a peer
+    named the empty string cannot collide with the unaddressed slot.
+    """
+    for recipient, messages in batches.items():
+        key = "" if recipient is None else f"@{recipient}"
+        fingerprint = batch_fingerprint(messages)
+        if sent.get(key) == fingerprint:
+            continue
+        if deliver(recipient, messages):
+            sent[key] = fingerprint
+    return sent
 SESSION_ID = re.compile(r"([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-"
                         r"[0-9a-f]{4}-[0-9a-f]{12})\.jsonl$")
 
@@ -553,7 +644,7 @@ def push(target="codex"):
     explicit `@codex` or `@claude` marker at the start of a line triggers a
     push.
     """
-    if target not in PUSH_MARKERS:
+    if target not in MARKER_SIDES:
         print(f"push: unknown target {target!r} (claude | codex)", file=sys.stderr)
         return 1
     try:
@@ -569,33 +660,57 @@ def push(target="codex"):
 
     reply_reader = last_claude_reply if target == "codex" else last_codex_reply
     reply_text = reply_reader(transcript)
-    messages = [m.strip() for m in PUSH_MARKERS[target].findall(reply_text) if m.strip()]
-    if not messages:
+    batches = {}
+    for recipient, messages in group_by_recipient(target, reply_text).items():
+        said = [m for m in messages if m.strip()]
+        if said:
+            batches[recipient] = said
+        else:
+            print(f"antiphon: a @{target} line carried no message, nothing sent",
+                  file=sys.stderr)
+    if not batches:
         return 0
 
-    outgoing = "\n".join(messages)
-    cursor = read_cursor(cwd, sender_side(target))
+    side = sender_side(target)
+    cursor = read_cursor(cwd, side)
     key = f"last_pushed_{target}"
-    previous = cursor.get(key)
-    if previous == outgoing:
-        return 0                          # don't push the same message twice
+    sent, already = migrate_pushed(cursor.get(key), batches.get(None) or [])
+    if already:
+        sent[""] = batch_fingerprint(batches[None])
+    before = dict(sent)
 
-    if target == "codex":
-        session_id = codex_session_id(cwd)
-        if not session_id:
-            print("antiphon: no Codex session found in this directory, not pushed", file=sys.stderr)
-            return 0
-        ok, detail = send_to_codex(session_id, f"{PUSH_LABEL} {outgoing}")
-    else:
-        ok, detail = send_to_claude(cwd, outgoing)
+    def deliver(recipient, messages):
+        # Resolving a named peer belongs to a later task. Until it exists a named
+        # marker is refused out loud rather than delivered to whoever is around,
+        # and the unaddressed path behaves exactly as it always has.
+        if recipient is not None:
+            print(f"antiphon: {recipient!r} not delivered — routing to a named "
+                  "peer is not available yet", file=sys.stderr)
+            return False
+        outgoing = "\n".join(messages)
+        if target == "codex":
+            session_id = codex_session_id(cwd)
+            if not session_id:
+                print("antiphon: no Codex session found in this directory, not pushed",
+                      file=sys.stderr)
+                return False
+            ok, detail = send_to_codex(session_id, f"{PUSH_LABEL} {outgoing}")
+        else:
+            ok, detail = send_to_claude(cwd, outgoing)
+        if ok:
+            print(f"antiphon: delivered to {target.title()} "
+                  f"({len(outgoing)} characters)", file=sys.stderr)
+        else:
+            print(f"antiphon: delivery failed — {detail}", file=sys.stderr)
+        return ok
 
-    if ok:
-        cursor[key] = outgoing
-        write_cursor(cwd, cursor, sender_side(target))
-        print(f"antiphon: delivered to {target.title()} ({len(outgoing)} characters)",
-              file=sys.stderr)
-    else:
-        print(f"antiphon: delivery failed — {detail}", file=sys.stderr)
+    updated = deliver_batches(target, batches, sent, deliver)
+    # Written only when something actually moved: a delivery landed, or the old
+    # string format was recognised and needs recording in the new one. A turn
+    # that delivered nothing leaves the cursor file alone.
+    if updated != before or already:
+        cursor[key] = updated
+        write_cursor(cwd, cursor, side)
     return 0
 
 
