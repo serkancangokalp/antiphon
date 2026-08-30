@@ -50,10 +50,15 @@ def codex_task_complete(turn_id):
     }})
 
 
-def claude_prompt(text):
+def claude_prompt(text, uuid=None):
     """A `user` record for one plain prompt — real content is a bare string
-    when there is nothing but typed text, not a content-block list."""
-    return json.dumps({"type": "user", "message": {"content": text}})
+    when there is nothing but typed text, not a content-block list. `uuid`
+    is the record's own top-level id, present on real transcripts and needed
+    by any fixture that exercises push's turn-scoped dedupe key."""
+    record = {"type": "user", "message": {"content": text}}
+    if uuid is not None:
+        record["uuid"] = uuid
+    return json.dumps(record)
 
 
 def claude_assistant(text):
@@ -383,6 +388,19 @@ class AntiphonTest(unittest.TestCase):
                 self.assertEqual(antiphon.last_codex_reply("rollout", blank),
                                  "child\nclosing", repr(blank))
 
+    def test_a_fresh_codex_turn_with_no_reply_pushes_nothing(self):
+        """A turn just opened and has not said anything yet — the previous
+        turn's text must not leak in as a stand-in reply, with or without a
+        hook id naming the fresh turn."""
+        lines = [
+            codex_msg("@claude OLD"),
+            codex_task_complete("A"),
+            codex_task_started("B"),
+        ]
+        with patch.object(antiphon, "tail_lines", return_value=lines):
+            self.assertEqual(antiphon.last_codex_reply("rollout"), "")
+            self.assertEqual(antiphon.last_codex_reply("rollout", "B"), "")
+
     def test_push_threads_the_hook_turn_id_into_last_codex_reply(self):
         """`push` reads `turn_id` off the hook payload itself — the reader
         cannot see it any other way — and only on the Codex→Claude side."""
@@ -512,6 +530,31 @@ class AntiphonTest(unittest.TestCase):
         with patch.object(antiphon, "tail_lines", return_value=lines):
             self.assertEqual(antiphon.last_claude_reply("transcript"),
                              "@codex BEFORE\nAFTER")
+
+    def test_a_fresh_claude_turn_with_no_reply_pushes_nothing(self):
+        """A new prompt just landed and nothing has been said in reply to it
+        yet — the previous turn's assistant text must not leak through as a
+        stand-in."""
+        lines = [
+            claude_prompt("ask"),
+            claude_assistant("@codex OLD"),
+            claude_prompt("new ask"),
+        ]
+        with patch.object(antiphon, "tail_lines", return_value=lines):
+            self.assertEqual(antiphon.last_claude_reply("transcript"), "")
+
+    def test_a_peer_record_is_a_boundary(self):
+        """`origin.kind="peer"` is not on the measured mid-turn allowlist —
+        an unmeasured kind stays a boundary, same as any other unknown one."""
+        lines = [
+            claude_prompt("ask"),
+            claude_assistant("@codex OLD"),
+            claude_meta_user("peer record contents", origin={"kind": "peer"}),
+            claude_assistant("reply to peer"),
+        ]
+        with patch.object(antiphon, "tail_lines", return_value=lines):
+            self.assertEqual(antiphon.last_claude_reply("transcript"),
+                             "reply to peer")
 
     def test_large_codex_rollout_reads_cwd_from_head(self):
         with tempfile.NamedTemporaryFile(prefix="rollout-", suffix=".jsonl") as f:
@@ -674,6 +717,87 @@ class AntiphonTest(unittest.TestCase):
                 second_payload = send.call_args.args[1]
                 self.assertIn("do NEW", second_payload)
                 self.assertNotIn("do OLD", second_payload)
+
+    # ---- push, end to end: the SAME marker in a NEW turn is not deduped away ----
+    #
+    # Content-only dedupe cannot tell "the same instruction, still pending
+    # from the turn that said it" from "the same instruction, said again in a
+    # later turn" — both hash identically. The fingerprint must fold in which
+    # turn produced the batch, not just what it says.
+
+    def test_the_same_marker_in_a_new_codex_turn_sends_again(self):
+        with tempfile.TemporaryDirectory() as project:
+            rollout = os.path.join(project, "rollout.jsonl")
+            with open(rollout, "w", encoding="utf-8") as f:
+                f.write("\n".join([
+                    codex_task_started("A"),
+                    codex_msg("@claude do SAME"),
+                ]) + "\n")
+
+            def run(turn_id):
+                payload = {"cwd": project, "transcript_path": rollout,
+                          "turn_id": turn_id}
+                with patch.object(antiphon.sys, "stdin",
+                                  io.StringIO(json.dumps(payload))), \
+                     contextlib.redirect_stderr(io.StringIO()):
+                    return antiphon.push("claude")
+
+            with patch.object(antiphon, "send_to_claude",
+                              return_value=(True, "")) as send:
+                self.assertEqual(run("A"), 0)
+                send.assert_called_once()
+
+                # Identical re-read, same turn: still deduped.
+                self.assertEqual(run("A"), 0)
+                send.assert_called_once()
+
+                # The turn closes and a new one repeats the exact same words.
+                with open(rollout, "a", encoding="utf-8") as f:
+                    f.write("\n".join([
+                        codex_task_complete("A"),
+                        codex_task_started("B"),
+                        codex_msg("@claude do SAME"),
+                    ]) + "\n")
+                self.assertEqual(run("B"), 0)
+                self.assertEqual(send.call_count, 2,
+                                 "the identical instruction, said again in a "
+                                 "new turn, must go out again")
+
+    def test_the_same_marker_in_a_new_claude_turn_sends_again(self):
+        with tempfile.TemporaryDirectory() as project:
+            transcript = os.path.join(project, "transcript.jsonl")
+            with open(transcript, "w", encoding="utf-8") as f:
+                f.write("\n".join([
+                    claude_prompt("ask", uuid="U1"),
+                    claude_assistant("@codex do SAME"),
+                ]) + "\n")
+
+            def run():
+                payload = {"cwd": project, "transcript_path": transcript}
+                with patch.object(antiphon.sys, "stdin",
+                                  io.StringIO(json.dumps(payload))), \
+                     contextlib.redirect_stderr(io.StringIO()):
+                    return antiphon.push("codex")
+
+            with patch.object(antiphon, "send_to_codex",
+                              return_value=(True, "")) as send:
+                self.assertEqual(run(), 0)
+                send.assert_called_once()
+
+                # Identical re-read, same turn: still deduped.
+                self.assertEqual(run(), 0)
+                send.assert_called_once()
+
+                # A new turn repeats the exact same words.
+                with open(transcript, "a", encoding="utf-8") as f:
+                    f.write("\n".join([
+                        claude_prompt("ask again", uuid="U2"),
+                        claude_assistant("@codex do SAME"),
+                    ]) + "\n")
+                self.assertEqual(run(), 0)
+                self.assertEqual(send.call_count, 2,
+                                 "the identical instruction, said again in a "
+                                 "new turn, must go out again")
 
     def test_an_empty_marker_is_reported_even_beside_a_real_one(self):
         """A batch holding one empty marker and one real message is not empty, so

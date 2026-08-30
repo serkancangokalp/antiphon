@@ -147,10 +147,24 @@ have one.
   present on only 554 of 556 sampled user records — corroboration for a
   boundary found another way, not something reliable enough to key on
   directly.
+- The dedupe fingerprint itself is turn-scoped, not content-only.
+  Content alone is not identity: the exact same `@claude`/`@codex` line
+  repeated in a later turn hashed identically to the one an earlier turn
+  already sent, so it was silently swallowed — measured, one send where two
+  turns each said it once. `push_fingerprint` now folds the turn's own
+  identity (the matched Codex `turn_id`, or the `uuid` of the Claude
+  boundary record that opened the turn) into the fingerprint before
+  hashing, as a structured pair that cannot collide with the flat
+  content-only shape; an empty key falls back to that original shape
+  unchanged, both for continuity with cursors already on disk and because
+  a repeat with no nameable turn is exactly what content-only dedupe was
+  always meant for.
 - Verified end to end: `push`, run against real transcript fixtures with only
   `send_to_claude`/`send_to_codex` mocked, delivers a marker from a non-final
-  message, stays quiet on an identical re-read, and delivers again — with the
-  old turn's text absent — once a new turn carries its own marker.
+  message, stays quiet on an identical re-read, delivers again — with the
+  old turn's text absent — once a new turn carries its own marker, and
+  delivers again when a later turn repeats the identical instruction
+  verbatim.
 
 ### Named limitations
 
@@ -159,11 +173,19 @@ have one.
 - An ephemeral Codex run reports `transcript_path: null`, and `push` no-ops
   before either reader runs — a marker written there never reaches the
   bridge.
-- Codex's two fail-open paths (unmatched id; no task marker visible) can
-  duplicate an old turn's tail into a fresh send — at-least-once by design,
-  the same trade the delivery layer already makes elsewhere. An identical
-  re-read is fingerprint-stable, but a later append can shift the tail
-  window and re-expose the old text.
+- Codex's two fail-open paths — an id present but unmatched, and no
+  `task_started` visible while an orphan `task_complete` is — return the
+  whole visible window and can duplicate an old turn's tail into a fresh
+  send: at-least-once by design, the same trade the delivery layer already
+  makes elsewhere. (The third no-id sub-branch, no task marker visible at
+  all, does not fail open; it falls back to today's newest-message
+  behaviour instead.) An identical re-read is fingerprint-stable, but a
+  later append can shift the tail window and re-expose the old text.
+- Where no turn key exists at all — a pre-`turn_id` Codex hook, or a Claude
+  window whose boundary record has scrolled out of the tail or carries no
+  `uuid` — the dedupe fingerprint stays content-only, so an identical
+  instruction repeated in a genuinely new turn is still silently deduped
+  away in that case.
 - On a CLI whose hook payload predates `turn_id`, the no-id case has two
   residual gaps: a closed nested span sitting inside the window still drops
   text written before that nested start, and the reader cannot distinguish a

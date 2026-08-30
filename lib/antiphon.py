@@ -185,17 +185,44 @@ def forget_superseded(record):
     return record
 
 
-def deliver_batches(batches, sent, deliver):
+def push_fingerprint(turn_key, messages):
+    """The dedupe fingerprint for one batch, scoped to the turn that said it.
+
+    Content alone is not identity: `@claude do SAME` in one turn and the exact
+    same line in a later turn hash identically under `batch_fingerprint`, so a
+    genuinely new instruction that happens to repeat old wording was silently
+    swallowed — measured, `send_to_claude` called once where two turns each
+    said it once. A non-empty `turn_key` (the matched Codex `turn_id`, or the
+    `uuid` of the Claude boundary record that opened the turn) folds the
+    turn's own identity into the fingerprint as a structured `[key, messages]`
+    pair, which cannot collide with the flat legacy shape below. An empty key
+    — no `turn_id` on a pre-`turn_id` Codex hook, or a Claude boundary that
+    scrolled out of the tail window or carries no `uuid` — has no turn to
+    scope to, and falls back to the original content-only digest unchanged:
+    both for continuity with every cursor already on disk, and because a
+    repeat with no nameable turn is exactly the case content-only dedupe was
+    always meant for.
+    """
+    if turn_key:
+        return batch_fingerprint([turn_key, messages])
+    return batch_fingerprint(messages)
+
+
+def deliver_batches(batches, sent, deliver, turn_key=""):
     """Calls `deliver(recipient, messages)` for each batch that has not gone yet.
 
     A recipient's fingerprint advances only if its own delivery succeeded, so one
     failure does not suppress its retry while another recipient's success is
     kept. The key is `""` for unaddressed and `"@alias"` otherwise, so a peer
     named the empty string cannot collide with the unaddressed slot.
+
+    `turn_key` scopes every fingerprint computed here to the turn `push`
+    resolved it from; see `push_fingerprint`. The default keeps every other
+    caller's content-only behaviour exactly as it was.
     """
     for recipient, messages in batches.items():
         key = "" if recipient is None else f"@{recipient}"
-        fingerprint = batch_fingerprint(messages)
+        fingerprint = push_fingerprint(turn_key, messages)
         if sent.get(key) == fingerprint:
             continue
         if deliver(recipient, messages):
@@ -1452,15 +1479,24 @@ def notice_text(side, count):
 
 # ---------- push (both directions) ----------
 
-def last_claude_reply(transcript_path):
-    """Returns every assistant text of the last Claude turn, joined in order.
+def _claude_turn(transcript_path):
+    """(text, boundary_uuid) for the last Claude turn in the window.
 
-    A turn can span several assistant records — one per model response
-    before and after each tool call in between — so the newest assistant
-    record alone is not the whole reply. The last turn is everything after
-    the last `user` record that is a real turn boundary; see `is_boundary`
-    for what disqualifies one. Claude's hook payload carries no turn id, so
-    unlike `last_codex_reply` this has only the window to decide with.
+    `text` is every assistant text of that turn, joined in order — a turn can
+    span several assistant records, one per model response before and after
+    each tool call in between, so the newest assistant record alone is not
+    the whole reply. The last turn is everything after the last `user` record
+    that is a real turn boundary; see `is_boundary` for what disqualifies one.
+    Claude's hook payload carries no turn id, so unlike `last_codex_reply`
+    this has only the window to decide with.
+
+    `boundary_uuid` is that boundary record's own top-level `uuid` — measured
+    present on 1,220 of 1,220 sampled boundary records — or `None` when the
+    window holds no boundary at all, or the boundary record itself carries
+    none. `push` uses it to scope the Claude-turn side of the dedupe
+    fingerprint to the turn that produced the text, so an identical
+    instruction repeated in a later turn is not silently deduped against the
+    one an earlier turn already sent.
     """
     records = []
     for line in tail_lines(transcript_path):
@@ -1507,7 +1543,23 @@ def last_claude_reply(transcript_path):
         texts = assistant_texts(d)
         if texts:
             chunks.extend(texts)
-    return "\n".join(chunks).strip()
+
+    boundary_uuid = None
+    if last_boundary != -1:
+        candidate = records[last_boundary].get("uuid")
+        if isinstance(candidate, str) and candidate:
+            boundary_uuid = candidate
+
+    return "\n".join(chunks).strip(), boundary_uuid
+
+
+def last_claude_reply(transcript_path):
+    """Returns every assistant text of the last Claude turn, joined in order.
+
+    A thin wrapper over `_claude_turn`, which also names the turn's boundary
+    record for `push`'s dedupe scoping; see its docstring for the rule.
+    """
+    return _claude_turn(transcript_path)[0]
 
 
 def last_codex_reply(transcript_path, turn_id=None):
@@ -1638,10 +1690,20 @@ def push(target="codex"):
 
     if target == "codex":
         reply_text = last_claude_reply(transcript)
+        # A second, independent read of the same window for the one thing
+        # `last_claude_reply`'s return value cannot carry without changing
+        # its contract: which turn produced the text. Cheap — the window is
+        # already `TAIL_BYTES`-bounded — and it lets `turn_key` agree with
+        # `reply_text` by construction rather than by trusting two calls to
+        # stay in step.
+        _, boundary_uuid = _claude_turn(transcript)
+        turn_key = boundary_uuid or ""
     else:
         # Only Codex's own Stop hook carries this id; Claude's hook has
         # nothing of the kind for `last_claude_reply` to use.
-        reply_text = last_codex_reply(transcript, input_data.get("turn_id"))
+        turn_id = input_data.get("turn_id")
+        turn_key = turn_id if isinstance(turn_id, str) and turn_id else ""
+        reply_text = last_codex_reply(transcript, turn_id)
     batches = {}
     for recipient, messages in group_by_recipient(target, reply_text).items():
         # Reported per line, not per recipient: a batch holding one empty marker
@@ -1712,9 +1774,11 @@ def push(target="codex"):
     if already:
         # The exact bare message already went out under the old string
         # format; nothing left to send for it, but the migration to the new
-        # shape still needs recording.
-        raw_sent[""] = batch_fingerprint(batches[None])
-    updated = forget_superseded(deliver_batches(batches, raw_sent, deliver))
+        # shape still needs recording — through the same scoped helper every
+        # other fingerprint in this function goes through, so the shapes
+        # cannot drift apart.
+        raw_sent[""] = push_fingerprint(turn_key, batches[None])
+    updated = forget_superseded(deliver_batches(batches, raw_sent, deliver, turn_key))
     # The delta: only the slots this call actually resolved — never the whole
     # map computed from the read above. Writing that map back, whole, would
     # reintroduce exactly the lost update the cursor lock exists to prevent:
