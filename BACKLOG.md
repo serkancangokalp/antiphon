@@ -160,6 +160,26 @@ a boundary for "this turn" rather than a wider join.
 Until then the workaround is the one people find by accident: put the marker in
 the last thing the turn says.
 
+## P2 — A refused active send does not say the message will still arrive
+
+When the direct channel refuses a send, the tools report the host's error and
+stop there. Observed twice in one session: the Codex host answered
+`direct app-server input is not allowed for unloaded spawned sub-agents`, so
+`reply_to_codex` failed. `antiphon status` then showed the same text waiting in
+the other side's pull queue — the passive path had it, and it was delivered on
+the peer's next prompt.
+
+The sender could not know that from the error. The reasonable reading of a
+failed send is that the message was lost, which invites repeating it, or
+proceeding as though the peer was never told. Both are worse than waiting.
+
+The bridge already knows the answer: passive pull carries everything either
+side wrote, and a refused *active* send changes only the timing. Say so in the
+failure — name the fallback and what it costs, which is a delay until the peer's
+next turn rather than a loss. Worth checking first whether any refusal exists
+that the pull path genuinely cannot cover; if one does, it needs a different
+message from the ones that merely arrive late.
+
 ## P1 — `antiphon doctor`
 
 Add one read-only command that explains the common “bridge is quiet” cases:
