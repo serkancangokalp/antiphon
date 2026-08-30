@@ -1783,11 +1783,22 @@ class PagedSummaryModelTest(unittest.TestCase):
         ])
 
     def test_the_complete_ordinary_envelope_stays_within_page_budget(self):
-        events = [self.event("é" * 3_800, offset=0, end=100)]
+        multibyte = "é" * 3_900
+        events = [
+            self.event("small first record", offset=0, end=100),
+            self.event(multibyte, offset=100, end=200, when=11),
+        ]
+        complete = antiphon._render_page(
+            "claude", antiphon._ordered_records(events), False, None)
+        self.assertLessEqual(len(complete), antiphon.PAGE_BUDGET)
+        self.assertGreater(len(complete.encode("utf-8")), antiphon.PAGE_BUDGET)
         text, advance, count = self.page(
             events, self.scanned(("source", "generation", 200)))
         self.assertLessEqual(len(text.encode("utf-8")), antiphon.PAGE_BUDGET)
-        self.assertFalse(advance.has_more)
+        self.assertIn("small first record", text)
+        self.assertNotIn(multibyte, text)
+        self.assertTrue(advance.has_more)
+        self.assertEqual(advance.sources["source"]["offset"], 100)
         self.assertEqual(count, 1)
 
     def test_a_first_oversized_record_is_returned_whole(self):
@@ -1903,9 +1914,18 @@ class PagedSummaryModelTest(unittest.TestCase):
 
     def test_replay_and_discovery_scope_are_part_of_the_byte_budget(self):
         events = [
-            self.event("A" * 7_500, offset=0, end=100),
+            self.event("A" * 7_450, offset=0, end=100),
             self.event("deferred " + "D" * 200, offset=100, end=200, when=11),
         ]
+        records = antiphon._ordered_records(events)
+        complete = antiphon._render_page(
+            "claude", records, False, "legacy_upgrade")
+        without_replay = antiphon._render_page("claude", records, False, None)
+        without_scope = complete.replace(
+            "has_more_scope: currently discovered sources\n", "", 1)
+        self.assertGreater(len(complete.encode("utf-8")), antiphon.PAGE_BUDGET)
+        self.assertLessEqual(len(without_replay.encode("utf-8")), antiphon.PAGE_BUDGET)
+        self.assertLessEqual(len(without_scope.encode("utf-8")), antiphon.PAGE_BUDGET)
         text, advance, count = self.page(
             events, self.scanned(("source", "generation", 200)),
             replay_reason="legacy_upgrade")
