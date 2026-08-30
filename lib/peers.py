@@ -18,6 +18,7 @@ import hashlib
 import json
 import os
 import re
+import subprocess
 import time
 
 NAME_PATTERN = re.compile(r"[a-z0-9][a-z0-9_-]{0,31}")
@@ -291,3 +292,60 @@ def unregister(cwd, kind, name, pid=None):
             os.unlink(path)
         except OSError:
             pass
+
+
+# ---------- owner key: pairing two writers on one session ----------
+
+CLI_ROOTS = ("claude", "codex")
+MAX_ANCESTRY = 8
+
+
+def _process_info(pid):
+    """(ppid, start time, command) for a live pid, or None.
+
+    Separated from the walk so tests can drive it without building real process
+    trees. The start time is `ps`'s `lstart`, a fixed 24 characters wide.
+    """
+    try:
+        out = subprocess.run(["ps", "-o", "ppid=,lstart=,command=", "-p", str(pid)],
+                             capture_output=True, text=True, timeout=5).stdout.strip()
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if not out:
+        return None
+    try:
+        ppid, rest = out.split(None, 1)
+    except ValueError:
+        return None
+    return ppid, rest[:24].strip(), rest[24:].strip()
+
+
+def owner_key(pid=None):
+    """`"<root pid>:<start time>"` for the CLI session above `pid`, or None.
+
+    On the Codex side no single process knows which session it belongs to: the
+    hook is handed a session id and exits, and the long-lived server is handed
+    only a project directory. They pair up by walking to the same CLI process.
+
+    The start time is part of the key because a pid alone is recycled, and a
+    recycled pid matching the wrong session is exactly the silent
+    misidentification this refuses to make. For the same reason there is no
+    environment override: a key anyone could set would let one session claim
+    another's identity.
+
+    None means no key, which means fall back to what the bridge does today. It
+    never returns a best guess.
+    """
+    current = str(pid or os.getpid())
+    for _ in range(MAX_ANCESTRY):
+        info = _process_info(current)
+        if not info:
+            return None
+        parent, start, command = info
+        head = os.path.basename((command.split() or [""])[0])
+        if head in CLI_ROOTS:
+            return f"{current}:{start}"
+        if parent in ("0", "1", current):
+            return None
+        current = parent
+    return None

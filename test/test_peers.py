@@ -8,6 +8,7 @@ import multiprocessing
 import subprocess
 import tempfile
 import unittest
+from types import SimpleNamespace
 from unittest.mock import patch
 
 
@@ -367,6 +368,93 @@ class PeerRegistryTest(unittest.TestCase):
                              "another owner's name must not be released")
             peers.unregister(project, "claude", "ui", pid=os.getpid())
             self.assertEqual(peers.read_peers(project), [])
+
+
+class OwnerKeyTest(unittest.TestCase):
+    """The key that lets a hook and a long-lived server on one Codex session
+    recognise each other without either being told which session it is."""
+
+    def test_the_key_names_the_cli_root_and_its_own_start_time(self):
+        """`_process_info(pid)` returns `(ppid, start, command)` where `start`
+        and `command` describe *that* pid; only `ppid` points at its parent.
+
+        Written as three answers so the pid whose command is `codex` is
+        unambiguous. Pairing one process's number with another's clock would
+        undo the reuse protection while still looking correct — and the shape
+        mirrors the real chain measured on this machine,
+        `python3 → node → codex`.
+        """
+        with patch.object(peers, "_process_info", side_effect=[
+                ("200", "Sat Aug 30 01:00:02 2026", "python3 antiphon.py mcp"),
+                ("300", "Sat Aug 30 01:00:01 2026", "node antiphon mcp"),
+                ("1", "Sat Aug 30 01:00:00 2026", "/usr/local/bin/codex")]):
+            self.assertEqual(peers.owner_key(100), "300:Sat Aug 30 01:00:00 2026")
+
+    def test_a_claude_root_is_recognised_too(self):
+        with patch.object(peers, "_process_info", side_effect=[
+                ("200", "Sat Aug 30 01:00:01 2026", "node lib/channel.mjs"),
+                ("300", "Sat Aug 30 01:00:00 2026", "/usr/local/bin/claude")]):
+            self.assertEqual(peers.owner_key(100), "200:Sat Aug 30 01:00:00 2026")
+
+    def test_an_orphan_has_nothing_to_join_on(self):
+        """A server whose parent died reports parent 1 — observed on this
+        machine. No key means fall back, never a best guess."""
+        with patch.object(peers, "_process_info", side_effect=[
+                ("1", "Sat Aug 30 01:00:00 2026", "node lib/channel.mjs")]):
+            self.assertIsNone(peers.owner_key(100))
+
+    def test_a_cycle_does_not_hang_the_hook_that_asked(self):
+        with patch.object(peers, "_process_info",
+                          return_value=("100", "Sat Aug 30 01:00:00 2026", "node x")):
+            self.assertIsNone(peers.owner_key(100))
+
+    def test_a_tree_deeper_than_the_limit_gives_up(self):
+        answers = [(str(200 + i), "Sat Aug 30 01:00:00 2026", "node x")
+                   for i in range(peers.MAX_ANCESTRY + 2)]
+        with patch.object(peers, "_process_info", side_effect=answers):
+            self.assertIsNone(peers.owner_key(100))
+
+    def test_an_unreadable_process_table_yields_no_key(self):
+        with patch.object(peers, "_process_info", return_value=None):
+            self.assertIsNone(peers.owner_key(100))
+
+    def test_a_real_ps_line_parses_into_its_three_parts(self):
+        """The 24-character slice is `lstart`'s fixed width. Taken from a live
+        line on this machine."""
+        line = "74544 Sun Aug 30 05:20:57 2026     /bin/zsh -c something"
+        with patch.object(peers.subprocess, "run",
+                          return_value=SimpleNamespace(stdout=line)):
+            self.assertEqual(peers._process_info(1),
+                             ("74544", "Sun Aug 30 05:20:57 2026",
+                              "/bin/zsh -c something"))
+
+    def test_a_dead_pid_reads_as_nothing_rather_than_raising(self):
+        with patch.object(peers.subprocess, "run",
+                          return_value=SimpleNamespace(stdout="")):
+            self.assertIsNone(peers._process_info(999999))
+
+    def test_a_process_table_that_cannot_be_run_reads_as_nothing(self):
+        with patch.object(peers.subprocess, "run", side_effect=OSError("no ps")):
+            self.assertIsNone(peers._process_info(1))
+
+    def test_the_key_is_never_taken_from_the_environment(self):
+        """There is no override. The owner key is what pairs a hook with its
+        server, so a value anyone can set would let a session claim another's
+        identity. A test seam, if one is ever needed, has to be narrower than an
+        environment variable."""
+        with patch.dict(os.environ, {"ANTIPHON_OWNER_KEY": "999:spoofed"}), \
+             patch.object(peers, "_process_info", return_value=None):
+            self.assertIsNone(peers.owner_key(100))
+
+    def test_the_walk_finds_this_session_for_real(self):
+        """Not a stub: this test process is running under a real CLI, so the
+        walk has something to find. Skipped where it is not."""
+        key = peers.owner_key()
+        if key is None:
+            self.skipTest("not running under a claude or codex process")
+        pid, _, start = key.partition(":")
+        self.assertTrue(pid.isdigit())
+        self.assertTrue(start.strip())
 
 
 if __name__ == "__main__":
