@@ -2447,6 +2447,51 @@ class ToolRecipientTest(unittest.TestCase):
                                     antiphon.sender_side(target)).get(
                                         f"last_pushed_{target}") or {}
 
+    def test_every_delivery_surface_writes_only_the_senders_cursor(self):
+        """The target and the cursor owner point in opposite directions.
+
+        Most dedupe assertions read the result through ``sender_side`` too. If
+        that mapping were reversed, the writer and the assertion could agree
+        on the same wrong file and keep the test green. Exercise both Stop
+        hooks and both mid-turn tools, then inspect the two concrete side
+        cursors without using the helper under test.
+        """
+        payload = {"cwd": None, "transcript_path": "/tmp/transcript"}
+        with tempfile.TemporaryDirectory() as project, \
+             patch.dict(os.environ, {"ANTIPHON_NAME": "speaker"}):
+            payload["cwd"] = project
+
+            with patch.object(antiphon, "send_to_claude",
+                              return_value=(True, "")):
+                antiphon._send_tool(project, "tool to Claude", "api")
+            with patch.object(antiphon, "send_to_codex",
+                              return_value=(True, "")):
+                code, err = self._reply(
+                    project, {"text": "tool to Codex", "to": "build"})
+                self.assertEqual(code, 0, err)
+
+            for target, reader, transport, marker in (
+                    ("claude", "last_codex_reply", "send_to_claude",
+                     "@claude:api Stop to Claude"),
+                    ("codex", "last_claude_reply", "send_to_codex",
+                     "@codex:build Stop to Codex")):
+                with patch.object(antiphon.os.path, "exists", return_value=True), \
+                     patch.object(antiphon, reader, return_value=marker), \
+                     patch.object(antiphon, transport, return_value=(True, "")), \
+                     patch.object(antiphon, "claimed_alias", return_value=None), \
+                     patch.object(antiphon.sys, "stdin",
+                                  io.StringIO(json.dumps(payload))), \
+                     contextlib.redirect_stderr(io.StringIO()):
+                    self.assertEqual(antiphon.push(target), 0)
+
+            codex_cursor = antiphon.read_cursor(project, "codex")
+            claude_cursor = antiphon.read_cursor(project, "claude")
+
+        self.assertEqual(set(codex_cursor), {"last_pushed_claude"},
+                         "Codex authored both sends whose target was Claude")
+        self.assertEqual(set(claude_cursor), {"last_pushed_codex"},
+                         "Claude authored both sends whose target was Codex")
+
     def test_a_named_tool_delivery_is_not_repeated_by_the_stop_hook(self):
         """The same text, sent mid-turn to `api` and then ending the turn as an
         `@claude:api` line, is one message."""
