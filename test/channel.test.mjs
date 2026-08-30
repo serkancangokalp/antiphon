@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
 import { spawn } from "node:child_process";
-import { existsSync, mkdirSync, readdirSync, readFileSync } from "node:fs";
+import { existsSync, mkdirSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
 import { mkdtemp, rm } from "node:fs/promises";
 import { Socket, connect } from "node:net";
 import { once } from "node:events";
@@ -25,6 +25,30 @@ const socketPath = join(process.env.TMPDIR || "/tmp", `antiphon-channel-${projec
 // `ANTIPHON_NAME=ui npm test` is a perfectly reasonable thing to do now.
 const mainEnv = { ...process.env, ANTIPHON_CWD: projectDir };
 delete mainEnv.ANTIPHON_NAME;
+
+// A `codex` that records instead of queueing. Without it the reply tool can
+// only ever be tested on its failure paths, and the sentence it hands back on
+// success — the one that has to name the peer — is never exercised at all.
+const stubDir = await mkdtemp(join(tmpdir(), "antiphon-stub-"));
+const queueLog = join(stubDir, "queued.txt");
+writeFileSync(join(stubDir, "codex"),
+  `#!/bin/sh\nprintf '%s\\n' "$*" >> ${JSON.stringify(queueLog)}\nexit 0\n`,
+  { mode: 0o755 });
+mainEnv.PATH = `${stubDir}:${process.env.PATH}`;
+
+const CODEX_SESSION = "1d5a03e0-0548-4339-87c3-45c5dbf7e9d7";
+
+function liveCodexPeer(dir, alias, owner, session) {
+  const peer = join(dir, ".antiphon", "peers", `codex-${alias}`);
+  mkdirSync(peer, { recursive: true });
+  writeFileSync(join(peer, "endpoint.json"), JSON.stringify({
+    kind: "codex", name: alias, pid: process.pid,
+    address: null, owner, started_at: Date.now() / 1000,
+  }));
+  writeFileSync(join(peer, "session.json"), JSON.stringify({
+    kind: "codex", name: alias, owner, session_id: session,
+  }));
+}
 const transport = new StdioClientTransport({
   command: "node",
   args: ["lib/channel.mjs"],
@@ -452,6 +476,24 @@ try {
     "a malformed argument is refused before the process is started",
   );
 
+  // End to end, with a `codex` that answers: the alias resolves, the message is
+  // queued against that peer's session, and the acknowledgement says which peer
+  // it reached. A sender that addressed the wrong one can only notice here.
+  liveCodexPeer(projectDir, "review", "301:review", CODEX_SESSION);
+  const named = await client.callTool({
+    name: "reply_to_codex", arguments: { text: "ship it", to: "review" },
+  });
+  assert.match(named.content[0].text, /review/,
+    "an explicit recipient must be named back");
+  assert.match(readFileSync(queueLog, "utf8"), new RegExp(CODEX_SESSION),
+    "and the message must be queued against that peer's session");
+
+  const bare = await client.callTool({
+    name: "reply_to_codex", arguments: { text: "and again" },
+  });
+  assert.equal(bare.content[0].text, "Channel reply delivered to Codex.",
+    "one live peer distinguishes nothing, so the general wording stands");
+
   const ack = await sendToSocket({ content: "identity test", message_id: "m-test" });
   assert.deepEqual(ack, { ok: true, message_id: "m-test" });
   const received = await Promise.race([
@@ -469,6 +511,9 @@ try {
   });
   console.log("MCP channel integration: ok");
 } finally {
-  await client.close();
-  await rm(projectDir, { recursive: true, force: true });
+  // Each step runs even if an earlier one throws. A close that fails would
+  // otherwise leave a project directory and a stub `codex` behind on every run.
+  await client.close().catch(() => {});
+  await rm(projectDir, { recursive: true, force: true }).catch(() => {});
+  await rm(stubDir, { recursive: true, force: true }).catch(() => {});
 }
