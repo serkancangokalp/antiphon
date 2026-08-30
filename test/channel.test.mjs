@@ -600,24 +600,19 @@ try {
   assert.ok(!readFileSync(queueLog, "utf8").includes("bare"),
     "and nothing was queued for the refused message");
 
-  // This server started unnamed, so it registered under a generated `peerId`.
-  // That name is a registry key, not something Codex could address a reply to,
-  // so it must not appear as a sender anywhere the other side can read.
-  // Only this channel server's own record: the project also holds the Codex
-  // peer planted above, and including it would let the assertion pass while
-  // proving nothing about the generated key.
-  const generated = registeredPeers(projectDir)
-    .filter((peer) => peer.kind === "claude" && /^claude-[0-9a-f]{3}$/.test(peer.name))
-    .map((peer) => peer.name);
-  assert.equal(generated.length, 1,
-    "the unnamed channel server must have registered under a generated key");
+  // This server started unnamed, so it holds the reserved key rather than a
+  // name. The project also holds the Codex peer planted above, so the filter
+  // has to pick out this server's own record or the assertion would pass while
+  // proving nothing.
+  const claudeRecords = registeredPeers(projectDir)
+    .filter((peer) => peer.kind === "claude");
+  assert.deepEqual(claudeRecords.map((peer) => peer.name), ["<unnamed>"],
+    "an unnamed channel server occupies the reserved key and invents no name");
   const queued = readFileSync(queueLog, "utf8");
   assert.match(queued, /\[from=<unnamed> id=/,
-    "an unnamed session says so rather than sending its generated key");
-  for (const name of generated) {
-    assert.ok(!queued.includes(`from=${name}`),
-      `the generated registry key leaked into a queued message: ${name}`);
-  }
+    "and says so rather than signing with anything addressable");
+  assert.doesNotMatch(queued, /\[from=claude-/,
+    "no generated name may reach the other side as a sender");
 
   // Claimed before sending, so this reads its own event rather than whichever
   // notification happened to arrive first.

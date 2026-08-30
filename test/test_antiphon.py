@@ -1766,6 +1766,51 @@ class RoutingTest(unittest.TestCase):
             self.assertEqual(antiphon.resolve_target(project, "claude"),
                              ("/tmp/ui.sock", ""))
 
+    # ---- an unnamed peer is counted, never addressed ----
+
+    def test_the_key_an_unnamed_peer_occupies_cannot_be_addressed(self):
+        """It reports `sender_alias: null` and labels itself `<unnamed>`. A
+        registry that also answered to a name for it would be telling the other
+        side two different things about the same peer."""
+        with tempfile.TemporaryDirectory() as project:
+            antiphon.peers.register(project, "claude", antiphon.peers.UNNAMED,
+                                    "/tmp/ui.sock", pid=os.getpid())
+            for alias in (antiphon.peers.UNNAMED, "claude-a3f", "unnamed"):
+                address, detail = antiphon.resolve_target(project, "claude", alias)
+                self.assertIsNone(address, alias)
+
+    def test_an_alias_that_merely_looks_internal_is_still_addressable(self):
+        """Somebody may deliberately call a session `claude-abc`. Refusing it on
+        the shape of the name would take their alias away over a resemblance."""
+        with tempfile.TemporaryDirectory() as project:
+            antiphon.peers.register(project, "claude", "claude-abc",
+                                    "/tmp/abc.sock", pid=os.getpid())
+            self.assertEqual(
+                antiphon.resolve_target(project, "claude", "claude-abc"),
+                ("/tmp/abc.sock", ""))
+
+    def test_a_sole_unnamed_claude_peer_still_takes_a_bare_message(self):
+        """Being unaddressable by name is not being unreachable. One live peer
+        on the Claude side is still one live peer."""
+        with tempfile.TemporaryDirectory() as project:
+            antiphon.peers.register(project, "claude", antiphon.peers.UNNAMED,
+                                    "/tmp/ui.sock", pid=os.getpid())
+            self.assertEqual(antiphon.resolve_target(project, "claude"),
+                             ("/tmp/ui.sock", ""))
+
+    def test_a_named_peer_beside_an_unnamed_one_refuses_and_names_both(self):
+        """And the refusal has to show the unnamed one too, or the reader is
+        told to `address one by name` while looking at a list of one."""
+        with tempfile.TemporaryDirectory() as project:
+            antiphon.peers.register(project, "claude", "ui", "/tmp/ui.sock",
+                                    pid=os.getpid())
+            antiphon.peers.register(project, "claude", antiphon.peers.UNNAMED,
+                                    "/tmp/bare.sock", pid=os.getppid())
+            address, detail = antiphon.resolve_target(project, "claude")
+        self.assertIsNone(address)
+        self.assertIn("ui", detail)
+        self.assertIn(antiphon.peers.UNNAMED, detail)
+
     # ---- one registered Codex peer is not proof of one Codex session ----
 
     def test_a_single_registered_codex_peer_still_refuses_a_bare_message(self):

@@ -170,6 +170,17 @@ class CrossBoundaryContractTest(unittest.TestCase):
             self.assertIsNotNone(example, f"no example event in {where}")
             self.assertIn("sender_alias", example.group(0), where)
 
+    def test_both_sides_reserve_the_same_key_for_a_peer_with_no_name(self):
+        """Node writes the registry entry and Python reads it. Two spellings
+        would leave an unnamed session registered under a key the resolver does
+        not recognise as reserved — and `valid_name` would then be the only
+        thing standing between it and being addressable."""
+        node = capture(r'const UNNAMED_KEY = "([^"]+)"', read("lib", "channel.mjs"))
+        self.assertIsNotNone(node, "channel.mjs no longer declares the key")
+        self.assertEqual(node, peers.UNNAMED)
+        self.assertFalse(peers.valid_name(node),
+                         "and it must stay outside the alias grammar")
+
     def test_no_surface_tells_an_agent_to_pass_a_null_recipient(self):
         """Three sentences that have to agree: `sender_alias` may be null, `to`
         must be a string, and the reader is told when to pass one as the other.

@@ -262,12 +262,13 @@ def delivery_id():
     return str(uuid.uuid4())
 
 
-# What an unaddressable sender renders as. Angle brackets are chosen precisely
-# because `valid_name` cannot produce them: `unnamed` on its own is a perfectly
-# legal `ANTIPHON_NAME`, so a bare `from=unnamed` would mean either "this peer
-# has no name" or "this peer is called unnamed", and the reader could not tell
-# which — one of them is addressable and the other is not.
-NO_ALIAS = "<unnamed>"
+# What an unaddressable sender renders as, and the registry key such a peer
+# occupies: one word for "this peer has no name", wherever that has to be said.
+# Angle brackets are chosen precisely because `valid_name` cannot produce them —
+# `unnamed` on its own is a perfectly legal `ANTIPHON_NAME`, so a bare
+# `from=unnamed` would mean either "this peer has no name" or "this peer is
+# called unnamed", and the reader could not tell which.
+NO_ALIAS = peers.UNNAMED
 
 
 def queue_label(alias, message_id):

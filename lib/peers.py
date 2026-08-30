@@ -4,12 +4,13 @@ A peer is one agent session working in one project directory. Antiphon assumed
 exactly one per side and never said so; this module is the part that lets
 several coexist without taking each other's sockets and cursors.
 
-An explicit name is what buys isolation. A Claude session's hook cannot work out
-which peer it belongs to on its own — `channel.mjs` has no access to the
-transcript UUID, so the two would invent different automatic names for one
-session. When `ANTIPHON_NAME` is set they read the same value from the inherited
-environment and agree. Automatic names identify a session in listings; they do
-not isolate it.
+An explicit name is what buys isolation, and it is the only thing that does. A
+session started without one occupies the reserved `UNNAMED` key below: it is
+counted, it is served, and it cannot be addressed by name — which is exactly
+what having no name means. There is one such peer per side per project, and a
+second session that wants one finds the key taken. Nothing is ever invented on
+a session's behalf; a name it did not choose is a name the other side could
+address without the session having agreed to answer to it.
 
 A Codex peer is written by two processes that never meet. The MCP server owns
 `endpoint.json` and knows the pid; the hook owns `session.json` and knows the
@@ -49,17 +50,39 @@ def explicit_name():
     return (os.environ.get("ANTIPHON_NAME") or "").strip().lower()
 
 
-def auto_name(kind, session_id):
-    """`claude-a3f` — enough to tell two sessions apart in a listing."""
-    short = re.sub(r"[^0-9a-f]", "", (session_id or "").lower())[:3] or "000"
-    return f"{kind}-{short}"
+# The registry key a peer with no name occupies. It is not a name: the angle
+# brackets are outside the alias grammar, so nothing anyone can type or write in
+# an `@claude:` marker can ever be it, and the two can never collide. It is the
+# same spelling the visible label uses, because it is the same idea — one word
+# for "this peer has no name", wherever that has to be said.
+#
+# The check against it is exact, never a prefix or a shape: `claude-abc` is a
+# name somebody may deliberately choose, and inferring from the look of a name
+# would take their alias away over a resemblance. An earlier version generated
+# `claude-<3hex>` for an unnamed session, which was a real name in the registry
+# for a peer that told the other side it had none — and a message addressed to
+# that key resolved.
+UNNAMED = "<unnamed>"
 
 
 def valid_name(name):
-    """Both this and `valid_kind` are handed values that came out of JSON — a
+    """Whether `name` is a public alias: what a person may type, what an
+    `@claude:` marker may carry, what a reply may be addressed to.
+
+    Both this and `valid_kind` are handed values that came out of JSON — a
     tool argument, a marker, a record read off disk — so a non-string is
     refused rather than passed to `fullmatch`, which raises on one."""
     return isinstance(name, str) and bool(NAME_PATTERN.fullmatch(name))
+
+
+def valid_key(name):
+    """Whether `name` may be a peer's place in the registry.
+
+    Every public alias may, and so may the one reserved key that no alias can
+    be. Directory names and record fields are checked with this; addressing is
+    checked with `valid_name`, which is the narrower of the two.
+    """
+    return name == UNNAMED or valid_name(name)
 
 
 def valid_kind(kind):
@@ -209,7 +232,7 @@ def _session_address(cwd, peer):
     comes off disk, and `../..` would read a record from outside the project.
     """
     kind, name = peer.get("kind"), peer.get("name")
-    if not (valid_kind(kind) and valid_name(name)):
+    if not (valid_kind(kind) and valid_key(name)):
         return None
     owner = _owner_of(peer)
     session = _read_record(_session_file(cwd, kind, name))
@@ -264,7 +287,7 @@ def _prune(cwd, kind, name, dead_pid):
     record would leave a live peer invisible. The directory stays, so a peer
     returning under the same name finds its cursor where it left it.
     """
-    if not (valid_kind(kind) and valid_name(name)):
+    if not (valid_kind(kind) and valid_key(name)):
         return
     with _registry_lock(cwd):
         held = _read_record(_peer_file(cwd, kind, name))
@@ -302,7 +325,7 @@ def _scan(cwd):
     records = []
     for entry in entries:
         kind, _, name = entry.partition("-")
-        if not (valid_kind(kind) and valid_name(name)):
+        if not (valid_kind(kind) and valid_key(name)):
             continue
         record = _read_record(os.path.join(peers_dir(cwd), entry, "endpoint.json"))
         if record is None:
@@ -382,7 +405,7 @@ def register(cwd, kind, name, address, pid=None, owner_key=None):
     """
     if not valid_kind(kind):
         return False, f"invalid peer kind {kind!r}: expected 'claude' or 'codex'"
-    if not valid_name(name):
+    if not valid_key(name):
         return False, (f"invalid peer name {name!r}: "
                        "expected [a-z0-9][a-z0-9_-]{0,31}")
     if address is None:
@@ -428,11 +451,13 @@ def register(cwd, kind, name, address, pid=None, owner_key=None):
                     continue
                 return False, f"peer name {name!r} is already held by pid {other_pid}"
             if address is not None and _address_of(other) == address:
-                # The contended resource is the address, not the name. Two
-                # sessions that both found a socket path free would bind it in
-                # turn and register under different automatic names carrying the
-                # same address, and a message addressed to either would reach
-                # whichever actually held the socket.
+                # The contended resource is the address, not the name, and the
+                # two races are different. Two sessions under one alias are
+                # caught above; this catches two *different* aliases carrying
+                # one address — a Codex session registering a second name
+                # against its own rollout, or a hand-written record — where the
+                # registry would show two peers while a message addressed to
+                # either reached whichever actually held it.
                 return False, (f"address {address!r} is already served by peer "
                                f"{other.get('name')!r} (pid {other_pid})")
         path = _peer_file(cwd, kind, name)
@@ -450,7 +475,7 @@ def register(cwd, kind, name, address, pid=None, owner_key=None):
 
 def unregister(cwd, kind, name, pid=None):
     """Releases a name, but only if this owner still holds it."""
-    if not (valid_kind(kind) and valid_name(name)):
+    if not (valid_kind(kind) and valid_key(name)):
         return
     owner = _pid_of({"pid": pid}) if pid is not None else os.getpid()
     if owner is None:
@@ -469,7 +494,7 @@ def unregister(cwd, kind, name, pid=None):
 
 def read_session(cwd, kind, name):
     """The hook's record for an alias as a dict, or None."""
-    if not (valid_kind(kind) and valid_name(name)):
+    if not (valid_kind(kind) and valid_key(name)):
         return None
     return _read_record(_session_file(cwd, kind, name))
 
@@ -493,7 +518,7 @@ def write_session(cwd, kind, name, session_id, transcript, owner):
     No pid is written. The hook has usually exited by the time anyone reads
     this, and a pid it left behind would mark the peer dead on the next read.
     """
-    if not (valid_kind(kind) and valid_name(name)):
+    if not (valid_kind(kind) and valid_key(name)):
         return False, f"invalid peer {kind!r}/{name!r}"
     if not valid_session_id(session_id):
         return False, (f"invalid session id {session_id!r}: expected a canonical "

@@ -27,12 +27,6 @@ class PeerNameTest(unittest.TestCase):
         with patch.dict(os.environ, {}, clear=True):
             self.assertEqual(peers.explicit_name(), "")
 
-    def test_auto_name_uses_three_hex_characters_of_the_session_id(self):
-        self.assertEqual(peers.auto_name("claude", "a3f0b1c2-dead"), "claude-a3f")
-
-    def test_auto_name_survives_a_missing_session_id(self):
-        self.assertEqual(peers.auto_name("codex", ""), "codex-000")
-
     def test_valid_name_accepts_what_the_spec_allows(self):
         for name in ("ui", "api-2", "a", "x" * 32):
             self.assertTrue(peers.valid_name(name), name)
@@ -277,11 +271,10 @@ class PeerRegistryTest(unittest.TestCase):
                              ["claude-ui", "ui"])
 
     def test_one_address_cannot_be_claimed_by_two_live_peers(self):
-        """The socket path is the contended resource, not the name. Two sessions
-        that both found the path free would bind it in turn and register under
-        different automatic names carrying the same address — the registry would
-        then show two peers while a message addressed to either reached whichever
-        actually held the socket."""
+        """The socket path is the contended resource, and it is a different race
+        from the name. Two peers under separate aliases carrying one address
+        would leave the registry showing two peers while a message addressed to
+        either reached whichever actually held the socket."""
         with tempfile.TemporaryDirectory() as project:
             first, _ = peers.register(project, "claude", "ui", "/tmp/shared.sock",
                                       pid=os.getpid())
@@ -352,9 +345,9 @@ class PeerRegistryTest(unittest.TestCase):
         self.assertEqual(live[0]["name"], "ui", "a usable timestamp still sorts first")
 
     def test_two_simultaneous_claims_on_one_address_produce_one_winner(self):
-        """The name race and the address race are different races. This is the one
-        that actually mattered: two sessions with different automatic names both
-        binding the same socket path."""
+        """The name race and the address race are different races. This is the
+        one the name check cannot catch: two peers under different aliases both
+        claiming a single address."""
         with tempfile.TemporaryDirectory() as project:
             barrier = multiprocessing.Barrier(2, timeout=10)
             results = multiprocessing.Manager().list()
@@ -1064,6 +1057,75 @@ class SessionRecordTest(unittest.TestCase):
         for bad in ("", None, 12, self.UUID.upper(), self.UUID + "\n",
                     self.UUID.replace("-", ""), "g" + self.UUID[1:]):
             self.assertFalse(peers.valid_session_id(bad), repr(bad))
+
+
+class UnnamedKeyTest(unittest.TestCase):
+    """The registry key an unnamed peer occupies, which is not a name.
+
+    A peer with no name still needs a place in the registry — it is live, it
+    serves a socket, and it has to be counted. But the key it occupies must not
+    be something anyone can address, or the bridge would hand out a name for a
+    peer that reports having none, and a reply sent to it would be sent to
+    something that never claimed to be reachable that way.
+    """
+
+    def test_the_reserved_key_is_not_a_public_alias(self):
+        """Two grammars, on purpose. The public one is what a person may type
+        and what `@claude:` may carry; the key is only what a directory may be
+        called. Nothing a user can write reaches the second."""
+        self.assertFalse(peers.valid_name(peers.UNNAMED))
+        self.assertTrue(peers.valid_key(peers.UNNAMED))
+        for name in ("ui", "my-build", "claude-abc"):
+            self.assertTrue(peers.valid_name(name), name)
+            self.assertTrue(peers.valid_key(name), name)
+
+    def test_no_alias_a_user_could_choose_can_collide_with_it(self):
+        """The check is exact, never a prefix or a shape. `claude-abc` is a name
+        somebody may deliberately pick, and guessing at it would take their
+        alias away from them."""
+        self.assertNotEqual(peers.UNNAMED, "claude-abc")
+        self.assertFalse(peers.valid_name(peers.UNNAMED))
+
+    def test_an_unnamed_peer_registers_and_reads_back(self):
+        with tempfile.TemporaryDirectory() as project:
+            ok, detail = peers.register(project, "claude", peers.UNNAMED,
+                                        "/tmp/ui.sock", pid=os.getpid())
+            self.assertTrue(ok, detail)
+            live = peers.read_peers(project, "claude")
+        self.assertEqual([(p["name"], p["address"]) for p in live],
+                         [(peers.UNNAMED, "/tmp/ui.sock")])
+
+    def test_two_unnamed_peers_cannot_both_hold_the_key(self):
+        """One unnamed peer per side per project, which is what unnamed means."""
+        with tempfile.TemporaryDirectory() as project:
+            peers.register(project, "claude", peers.UNNAMED, "/tmp/ui.sock",
+                           pid=os.getpid())
+            ok, _ = peers.register(project, "claude", peers.UNNAMED,
+                                   "/tmp/other.sock", pid=os.getppid())
+            self.assertFalse(ok)
+
+    def test_the_key_is_released_and_pruned_like_any_other(self):
+        with tempfile.TemporaryDirectory() as project:
+            peers.register(project, "claude", peers.UNNAMED, "/tmp/ui.sock",
+                           pid=999999)
+            with patch.object(peers, "alive", return_value=False):
+                self.assertEqual(peers.read_peers(project), [])
+            self.assertFalse(os.path.exists(
+                os.path.join(peers.peer_dir(project, "claude", peers.UNNAMED),
+                             "endpoint.json")))
+            peers.register(project, "claude", peers.UNNAMED, "/tmp/ui.sock",
+                           pid=os.getpid())
+            peers.unregister(project, "claude", peers.UNNAMED, pid=os.getpid())
+            self.assertEqual(peers.read_peers(project), [])
+
+    def test_the_key_stays_inside_the_project(self):
+        """It becomes a directory name, so it is checked like every other."""
+        for hostile in ("<unnamed>/../..", "../<unnamed>", "<unnamed> ",
+                        "<UNNAMED>", "unnamed"):
+            self.assertNotEqual(hostile, peers.UNNAMED)
+            if hostile == "unnamed":
+                continue              # a legal alias, and a different peer
+            self.assertFalse(peers.valid_key(hostile), hostile)
 
 
 if __name__ == "__main__":
