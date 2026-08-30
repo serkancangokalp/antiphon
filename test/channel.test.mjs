@@ -332,7 +332,12 @@ async function fourLiveSessionsRouteByName() {
       () => api.client.callTool({
         name: "reply_to_codex", arguments: { text: "to whom?" },
       }),
-      /build|review|discoverable/,
+      (error) => {
+        const refusal = String(error?.message || error);
+        assert.match(refusal, /build/, "the refusal must name build");
+        assert.match(refusal, /review/, "the refusal must name review");
+        return true;
+      },
       "two live Codex peers cannot be chosen between either",
     );
     assert.equal(readFileSync(stub.log, "utf8").split("\n").filter(Boolean).length,
@@ -454,10 +459,9 @@ async function onlyTheSessionThatWonTheNameSignsItsMessages() {
 async function onlyOneUnnamedSessionGetsTheChannel(startTogether) {
   // Started together, both sessions can see the socket path free at the same
   // moment. Nothing after that point may let the loser bind: it would unlink
-  // the winner's live socket, and both would register under different automatic
-  // names carrying the same address, so a message addressed to either would
-  // reach whichever actually held it. The registry claim is atomic, so exactly
-  // one gets through however the two interleave.
+  // the winner's live socket, and the one reserved registry key would no longer
+  // describe a reliably reachable server. The registry claim is atomic, so
+  // exactly one gets through however the two interleave.
   const dir = await mkdtemp(join(tmpdir(), "antiphon-unnamed-"));
   const first = spawnChannel(dir, "");
   if (!startTogether) {
