@@ -862,10 +862,6 @@ def hook(side="claude"):
     key = f"{side}_seen"
     start = cursor_time(cursor, key)
     text, last, _ = build_summary(cwd, side, start)
-    if text and last:
-        cursor[key] = last
-        write_cursor(cwd, cursor, side)
-
     if not text:
         return 0
 
@@ -873,12 +869,18 @@ def hook(side="claude"):
     # "message" but it was counting the other side's transcript events;
     # incoming channel messages already show up via their own notices.
     # Context is injected silently.
-    print(json.dumps({
+    if not _deliver(json.dumps({
         "hookSpecificOutput": {
             "hookEventName": "UserPromptSubmit",
             "additionalContext": text,
         }
-    }, ensure_ascii=False))
+    }, ensure_ascii=False)):
+        # The page never left this process, so it has not been delivered and
+        # the cursor stays where it was. The next turn offers it again.
+        return 1
+    if last:
+        cursor[key] = last
+        write_cursor(cwd, cursor, side)
     return 0
 
 
@@ -1408,10 +1410,29 @@ TOOLS = [{
 }]
 
 
+def _deliver(line):
+    """Write one model-facing line to stdout and get it out of this process.
+
+    Returns whether that succeeded. Neither host acknowledges hook output or a
+    tool result, so nothing here can learn whether the model was actually shown
+    the text; "delivered" means only what is locally observable — the write and
+    the flush both returned. That is the whole reason a cursor is advanced
+    after this and never before, and why the contract is at-least-once: a crash
+    in the window redelivers a page, which both agents can see, where advancing
+    first would drop it in silence.
+    """
+    try:
+        sys.stdout.write(line + "\n")
+        sys.stdout.flush()
+    except (OSError, ValueError):
+        return False
+    return True
+
+
 def _mcp_result(mid, result):
-    sys.stdout.write(json.dumps({"jsonrpc": "2.0", "id": mid, "result": result},
-                                ensure_ascii=False) + "\n")
-    sys.stdout.flush()
+    """Writes one JSON-RPC response; returns whether it left this process."""
+    return _deliver(json.dumps({"jsonrpc": "2.0", "id": mid, "result": result},
+                               ensure_ascii=False))
 
 
 def _send_tool(cwd, text, to=None, sender=None):
@@ -1577,11 +1598,15 @@ def _mcp_serve(cwd, alias=None):
                 cursor = read_cursor(cwd, "codex")
                 start = cursor_time(cursor, "codex_seen")
                 text, last, _ = build_summary(cwd, "codex", start)
-                if text and last:
+                output = text or "Nothing new on the Claude Code side since your last turn."
+                # Answer first, mark seen second — the same order as the hook,
+                # for the same reason: a result that was never written is a
+                # page the model never saw.
+                delivered = _mcp_result(mid,
+                                        {"content": [{"type": "text", "text": output}]})
+                if delivered and text and last:
                     cursor["codex_seen"] = last
                     write_cursor(cwd, cursor, "codex")
-                output = text or "Nothing new on the Claude Code side since your last turn."
-                _mcp_result(mid, {"content": [{"type": "text", "text": output}]})
             elif name == "antiphon_send":
                 arguments = p.get("arguments")
                 arguments = arguments if isinstance(arguments, dict) else {}

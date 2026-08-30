@@ -358,6 +358,42 @@ class AntiphonTest(unittest.TestCase):
         return {"jsonrpc": "2.0", "id": 1, "method": "tools/call",
                 "params": {"name": name, "arguments": arguments}}
 
+    def test_the_read_tool_answers_before_it_marks_anything_seen(self):
+        """`antiphon_read` had the same ordering as the hook: it advanced the
+        cursor and only then wrote the result the model would read."""
+        record = []
+        with tempfile.TemporaryDirectory() as project, \
+             patch.object(antiphon, "project_dir", return_value=project), \
+             patch.object(antiphon.sys, "stdin",
+                          io.StringIO(json.dumps(self._call("antiphon_read")) + "\n")), \
+             patch.object(antiphon, "build_summary",
+                          return_value=("## something happened", 1000.0, 1)), \
+             patch.object(antiphon, "read_cursor", return_value={}), \
+             patch.object(antiphon, "write_cursor",
+                          side_effect=lambda *a, **k: record.append("advance")), \
+             contextlib.redirect_stdout(_Recording(record)):
+            antiphon.mcp()
+        self.assertEqual(record, ["write", "advance"])
+
+    def test_the_read_tool_keeps_the_page_when_the_answer_cannot_be_written(self):
+        class Broken(io.StringIO):
+            def write(self, chunk):
+                raise OSError("stdout is gone")
+
+        record = []
+        with tempfile.TemporaryDirectory() as project, \
+             patch.object(antiphon, "project_dir", return_value=project), \
+             patch.object(antiphon.sys, "stdin",
+                          io.StringIO(json.dumps(self._call("antiphon_read")) + "\n")), \
+             patch.object(antiphon, "build_summary",
+                          return_value=("## something happened", 1000.0, 1)), \
+             patch.object(antiphon, "read_cursor", return_value={}), \
+             patch.object(antiphon, "write_cursor",
+                          side_effect=lambda *a, **k: record.append("advance")), \
+             contextlib.redirect_stdout(Broken()):
+            antiphon.mcp()
+        self.assertEqual(record, [])
+
     def test_mcp_offers_codex_both_a_read_and_a_send_tool(self):
         """Reading was live from the start; sending was not. Codex could only reach
         Claude by ending its turn with `@claude`, so it could never hand over work
@@ -1815,6 +1851,54 @@ class CodexPeerWiringTest(unittest.TestCase):
         fcntl.flock(fd, fcntl.LOCK_EX)
         self.addCleanup(os.close, fd)
         return fd
+
+    def test_the_cursor_moves_only_after_the_page_has_been_written(self):
+        """There is no acknowledgement from either host, so the only safe order
+        is write then advance. Advancing first turns a crash in that window
+        into a page nobody is ever offered again, invisibly on both sides."""
+        record = []
+        with tempfile.TemporaryDirectory() as project:
+            code = self._deliver_hook(project, _Recording(record), record)
+        self.assertEqual(code, 0)
+        self.assertEqual(record, ["write", "advance"])
+
+    def test_a_page_that_could_not_be_written_leaves_the_cursor_alone(self):
+        """The one thing this process can observe about delivery is whether its
+        own write and flush returned. When they did not, the page has not been
+        handed over, and the next turn must offer it again."""
+        class Broken(io.StringIO):
+            def write(self, chunk):
+                raise OSError("stdout is gone")
+
+        record = []
+        with tempfile.TemporaryDirectory() as project:
+            code = self._deliver_hook(project, Broken(), record)
+        self.assertEqual(record, [], "a page nobody received is not seen")
+        self.assertNotEqual(code, 0, "the failure has to be reportable")
+
+    def test_a_flush_that_fails_is_a_failed_delivery(self):
+        """A write that returns and a flush that raises is the same outcome as
+        a failed write: the bytes never left this process. `print` alone does
+        not flush, so a delivery that only writes would satisfy this test while
+        leaving the page inside the process buffer."""
+        class Unflushable(io.StringIO):
+            def flush(self):
+                raise OSError("broken pipe")
+
+        record = []
+        with tempfile.TemporaryDirectory() as project:
+            code = self._deliver_hook(project, Unflushable(), record)
+        self.assertEqual(record, [])
+        self.assertNotEqual(code, 0)
+
+    def test_nothing_is_marked_seen_when_there_was_nothing_to_send(self):
+        """An empty summary is not a delivery, and must not move the cursor."""
+        record = []
+        with tempfile.TemporaryDirectory() as project:
+            code = self._deliver_hook(project, _Recording(record), record,
+                                      summary=("", 0.0, 0))
+        self.assertEqual(record, [])
+        self.assertEqual(code, 0)
 
     @staticmethod
     def _run_mcp(project, *requests, name=None, owner="300:x"):
