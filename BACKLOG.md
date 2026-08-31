@@ -1017,6 +1017,80 @@ reply routing needs a durable design before implementation:
 - fail closed when several unanswered senders remain;
 - define expiry and cleanup without losing a late reply.
 
+## P0 — A named Claude session can identify itself as `<unnamed>`
+
+From a user report on 0.3.3 (macOS 26.3, Node 22.16, Python 3.12.7; one Claude
+and two Codex peers, all named): for 38 minutes every Codex → Claude send
+failed with `Claude MCP Channel is down: No such file or directory` while
+Claude → Codex succeeded throughout. The Claude peer had a `session.json` and
+no `endpoint.json`, so `resolve_target` could not move the address to the
+named socket and returned the project-wide path, where nothing listens — while
+the named socket was bound and serving the whole time. The reporter's own
+words for the shape of it: it presents as "the other agent is ignoring me"
+rather than as a transport fault, because the sender falls back to the passive
+page and the receiver is told nothing at all.
+
+**The report's stated root cause is a false inference, and must not be acted
+on as written.** It observes `grep -c endpoint lib/channel.mjs` → 0 and
+concludes the Node arm never publishes an endpoint record. It does:
+`channel.mjs:235` is `const claimPeer = () => registryCall("register_peer")`,
+which runs `python3 lib/antiphon.py register_peer` with kind, name, address
+and pid on stdin. The word never appears because the file's name belongs to
+the Python half. Adding a second writer there would double-register.
+
+**What was measured here.** Two `channel.mjs` servers started for one project
+under the same `ANTIPHON_NAME`: the second was refused —
+`register_peer: peer name 'mainclaude' is already held by pid 18763` — and
+`endpoint.json` survived intact, still naming the serving process. So the
+atomic claim protects the record in the ordinary duplicate case, and the
+hypothesis that a second server releases the first's registration is
+**disproved**. Why the reporter's first server (pid 6519) held the socket
+without ever registering is **not root-caused from here**; `registryCall`
+writes its failure to stderr, which for an MCP server reaches the host's log
+and never the person. Their `mcp-logs-antiphon/` is where that evidence is.
+
+**What is a real defect, independent of that.** `channel.mjs:462-466` assigns
+`senderAlias = peerName` only in the branch that both won the claim and serves
+the socket. Every other route through startup — claim lost, socket already
+served by another process, `serveSocket()` failed — leaves it null, and the
+session then signs its messages `[from=<unnamed>]` with `ANTIPHON_NAME` set
+and valid. The report saw exactly this: a named peer silently downgraded to
+the one condition the documentation says cannot be routed, which then made the
+Codex side refuse delivery by name. Identity is not the same question as
+channel ownership, and today one answers the other.
+
+**What to change, in the order the evidence supports.**
+
+1. Separate identity from channel ownership: a valid `ANTIPHON_NAME` makes
+   this session that peer for the purpose of signing, whether or not it won
+   the socket. Losing the channel means it cannot be *reached*; it never meant
+   its words come from nobody.
+2. Make a registration failure visible where a person looks. `doctor` can see
+   the shape directly: a live channel socket for this project with no endpoint
+   record naming a live pid is exactly the reported state, and it is
+   diagnosable read-only.
+3. Refuse by the true reason. When a caller asks for `mainclaude` and no live
+   endpoint holds that name, say so instead of falling through to the
+   project-wide path and reporting `ENOENT` on an address the caller never
+   asked for.
+4. Tell the receiver that somebody tried. Nothing on the Claude side learns
+   that a peer attempted a send and was refused; both agents concluded the
+   other was idle. Even a line on the next page would have collapsed a
+   40-minute investigation.
+
+**Also reported, filed rather than fixed here.** A stale pid left in
+`endpoint.json` by a writer that exited without unregistering, which works
+only because the socket path is derived from a hash rather than read from the
+record — `doctor`'s `running:` check now names servers whose code is older
+than the install, but not endpoints whose pid is gone. Orphaned `channel.mjs`
+processes accumulating across reconnects (seen on the maintainer's machine
+too). And the passive fallback's own arithmetic: with a real backlog the
+reader advances roughly one page per turn and iterates dead sources ahead of
+live ones — measured by the reporter at ~940 KB across four sources, two of
+them sessions that had already exited, putting a reply 15-20 turns away.
+`antiphon catch-up` is the blunt escape; deprioritising sources whose session
+is gone is the real answer, and belongs with the source-catalog entry.
+
 ## P1 — Same-vendor bridging: Codex ↔ Codex and Claude ↔ Claude
 
 Asked for on 2026-08-31 after running two Codex terminals and one Claude on a
