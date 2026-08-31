@@ -7797,8 +7797,16 @@ class RefusedSendHonestyTest(unittest.TestCase):
             raise OSError(errno.EACCES, "Permission denied")
 
     class _LiveSocket:
-        def __init__(self):
-            self.answered = False
+        """A channel that connects. What happens after that is the fixture.
+
+        `answer` is what the server sends back; `breaks` is raised once the
+        bytes are already on their way, which is the one failure the sender must
+        never retry.
+        """
+
+        def __init__(self, answer=b'{"ok": true, "message_id": "m1"}', breaks=None):
+            self.answer = answer
+            self.breaks = breaks
 
         def __call__(self, *_a, **_k):
             return self
@@ -7819,16 +7827,15 @@ class RefusedSendHonestyTest(unittest.TestCase):
             pass
 
         def sendall(self, _data):
-            pass
+            if self.breaks is not None:
+                raise self.breaks
 
         def shutdown(self, _how):
             pass
 
         def recv(self, _n):
-            if self.answered:
-                return b""
-            self.answered = True
-            return b'{"ok": true, "message_id": "m1"}'
+            answer, self.answer = self.answer, b""
+            return answer
 
     def _oversized(self):
         return "x" * (antiphon.MAX_CHANNEL_BYTES + 10)
@@ -7845,7 +7852,7 @@ class RefusedSendHonestyTest(unittest.TestCase):
                 code, out, err = self._reply(project, {"text": "hi", "to": "build"})
         self.assertEqual(code, 1)
         self.assertEqual(out, "")
-        self.assertEqual(err, "reply: {} {}\n".format(
+        self.assertEqual(err, "reply: {} — {}\n".format(
             self.HOST_ERROR,
             antiphon.TOOL_GUIDANCE.format(seen="only a tool-name line")))
 
@@ -7860,7 +7867,7 @@ class RefusedSendHonestyTest(unittest.TestCase):
         self.assertIs(result.get("isError"), True)
         self.assertEqual(result["content"][0]["text"],
                          "Not delivered to Claude: Claude MCP Channel is down: "
-                         "Permission denied "
+                         "Permission denied — "
                          + antiphon.TOOL_GUIDANCE.format(seen="nothing"))
 
     def test_a_missing_codex_session_still_gets_the_guidance(self):
@@ -7872,7 +7879,7 @@ class RefusedSendHonestyTest(unittest.TestCase):
              patch.object(antiphon, "codex_session_id", return_value=None):
             code, _, err = self._reply(project, {"text": "hi"})
         self.assertEqual(code, 1)
-        self.assertEqual(err, "reply: {} {}\n".format(
+        self.assertEqual(err, "reply: {} — {}\n".format(
             self.NO_SESSION,
             antiphon.TOOL_GUIDANCE.format(seen="only a tool-name line")))
 
@@ -7890,8 +7897,98 @@ class RefusedSendHonestyTest(unittest.TestCase):
         self.assertIn("the channel accepts at most {}".format(
             antiphon.MAX_CHANNEL_BYTES), text)
         self.assertTrue(
-            text.endswith(" " + antiphon.TOOL_GUIDANCE.format(seen="nothing")),
+            text.endswith(" — " + antiphon.TOOL_GUIDANCE.format(seen="nothing")),
             text)
+
+    def test_every_wrap_site_reaches_its_reader_with_the_guidance(self):
+        """One case per birth site that wraps, driven through the reader.
+
+        The tests above pin a *class*, and several sites share a class — so with
+        only those, a single wrap could be deleted and nothing would notice.
+        Measured: four of the ten could go one at a time with the whole suite
+        still green. A class is not a gate; a site is. A new wrap needs a new
+        case here, which the count assertion below insists on.
+        """
+        replied = antiphon.TOOL_GUIDANCE.format(seen="only a tool-name line")
+        sent = antiphon.TOOL_GUIDANCE.format(seen="nothing")
+
+        def named_reply(*contexts):
+            """`reply()` to a peer that resolves, so the transport is reached."""
+            with tempfile.TemporaryDirectory() as project:
+                self._codex_peer(project, "build", "300:build", self.UUID)
+                with contextlib.ExitStack() as stack:
+                    for context in contexts:
+                        stack.enter_context(context)
+                    return self._reply(project, {"text": "hi", "to": "build"})[2]
+
+        def bare_reply(*contexts):
+            """`reply()` with nothing registered: the unnamed single pair."""
+            with tempfile.TemporaryDirectory() as project, \
+                 contextlib.ExitStack() as stack:
+                for context in contexts:
+                    stack.enter_context(context)
+                return self._reply(project, {"text": "hi"})[2]
+
+        def send(*contexts, text="hi"):
+            with tempfile.TemporaryDirectory() as project:
+                antiphon.peers.register(project, "claude", "ui", "/tmp/ui.sock")
+                with contextlib.ExitStack() as stack:
+                    for context in contexts:
+                        stack.enter_context(context)
+                    result = antiphon._send_tool(project, text, "ui")
+            return result["content"][0]["text"]
+
+        def channel(**how):
+            return patch.object(antiphon.socket, "socket",
+                                self._LiveSocket(**how))
+
+        sites = [
+            ("_queue_codex: the codex command is missing",
+             lambda: named_reply(patch.object(antiphon.subprocess, "run",
+                                              side_effect=FileNotFoundError())),
+             "codex command not found", replied),
+            ("_queue_codex: the subprocess never completed",
+             lambda: named_reply(patch.object(
+                 antiphon.subprocess, "run",
+                 side_effect=subprocess.TimeoutExpired("codex", 15))),
+             "TimeoutExpired", replied),
+            ("_queue_codex: the host refused the queue",
+             lambda: named_reply(patch.object(
+                 antiphon.subprocess, "run",
+                 return_value=self._Refused(self.HOST_ERROR))),
+             self.HOST_ERROR, replied),
+            ("_legacy_target: discovery found no Codex rollout",
+             lambda: bare_reply(patch.object(antiphon, "codex_session_id",
+                                             return_value=None)),
+             self.NO_SESSION, replied),
+            ("send_to_claude: over the channel's byte cap",
+             lambda: send(text=self._oversized()),
+             "the channel accepts at most", sent),
+            ("send_to_claude: the connect was refused",
+             lambda: send(patch.object(antiphon.socket, "socket",
+                                       self._DeadSocket())),
+             "Channel is down: Permission denied", sent),
+            ("send_to_claude: it broke after the bytes went out",
+             lambda: send(channel(breaks=OSError(errno.EPIPE, "Broken pipe"))),
+             "Channel is down: Broken pipe", sent),
+            ("send_to_claude: the answer did not decode",
+             lambda: send(channel(answer=b"not json at all")),
+             "invalid response", sent),
+            ("send_to_claude: the answer decoded to something that is not one",
+             lambda: send(channel(answer=b"[]")),
+             "invalid response", sent),
+            ("send_to_claude: the channel server itself said no",
+             lambda: send(channel(
+                 answer=b'{"ok": false, "error": "channel said no"}')),
+             "channel said no", sent),
+        ]
+        self.assertEqual(len(sites), 10,
+                         "one case per wrap site, and every wrap site has one")
+        for label, refuse, fragment, guidance in sites:
+            with self.subTest(label):
+                said = refuse().rstrip("\n")
+                self.assertIn(fragment, said, "the fixture missed its site")
+                self.assertTrue(said.endswith(" — " + guidance), said)
 
     # ---- everything else holds still ----
 
@@ -7945,7 +8042,8 @@ class RefusedSendHonestyTest(unittest.TestCase):
 
         # The Claude direction. `not yet routable` has no representative here:
         # `read_peers` skips an addressless Claude record, so that shape is
-        # Codex-only, and `unknown peer kind` is unreachable from every caller.
+        # Codex-only, and `unknown peer kind` is unreachable: both callers of
+        # `resolve_target` pass a literal kind.
         # A valid name nobody answers to is retried while the peer might still
         # be registering; the patience is cut to nothing so the suite does not
         # wait out a decision that has already been made.
@@ -8057,7 +8155,7 @@ class RefusedSendHonestyTest(unittest.TestCase):
         Python's whole stderr line, which `reply()` writes as `reply: <detail>`.
         The longest guidance-carrying detail is a host refusal, which
         `_queue_codex` cuts at 200 characters — `no-peer` (54) and `oversize`
-        are both shorter — so 394 of 500 is the worst case, and the 106
+        are both shorter — so 396 of 500 is the worst case, and the 104
         characters of headroom are what let `channel.mjs` stay untouched.
 
         Measured end to end rather than assembled from literals: a host that
@@ -8069,7 +8167,7 @@ class RefusedSendHonestyTest(unittest.TestCase):
                               return_value=self._Refused("h" * 500)):
                 _, _, err = self._reply(project, {"text": "hi", "to": "build"})
         line = err.strip()          # `channel.mjs` trims before it slices
-        self.assertEqual(len(line), 394)
+        self.assertEqual(len(line), 396)
         self.assertLess(len(line), 500)
         self.assertTrue(line.endswith(antiphon.TOOL_GUIDANCE.format(
             seen="only a tool-name line")), line)

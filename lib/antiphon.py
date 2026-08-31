@@ -2040,10 +2040,12 @@ def _guided(detail, seen):
 
     `seen` is the surface's own measurement, not the direction's: the same
     refusal read by two different readers leaves two different things on a page.
+    The join is an em dash because these are two sentences by two authors —
+    a bare space ran the host's last word into this one's first.
     """
     if getattr(detail, "refusal_class", None) is None:
         return detail
-    return f"{detail} {TOOL_GUIDANCE.format(seen=seen)}"
+    return f"{detail} — {TOOL_GUIDANCE.format(seen=seen)}"
 
 
 def _queue_codex(session, message):

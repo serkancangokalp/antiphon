@@ -474,7 +474,7 @@ at 72 red tests; the subclass costs zero and survives every existing unpack.
 `detail.slice(0, 500)` of Python's stderr line, which `reply()` writes as
 `reply: <detail>`; the longest guidance-carrying detail is a host refusal cut
 at 200 characters (`no-peer` is 54 and `oversize` shorter still, so neither
-moves the number), giving 394 of 500 with 106 characters of headroom. A
+moves the number), giving 396 of 500 with 104 characters of headroom. A
 contract test measures that line end to end rather than recomputing it.
 
 ### The entry's open question, answered
