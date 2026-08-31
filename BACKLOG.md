@@ -1120,7 +1120,8 @@ from arbitrary following prose.
 `CLAUDE_HOST_WRAPPERS` and `CODEX_HOST_WRAPPERS` in `lib/antiphon.py` hold
 exactly what a census measured (2026-08-30; re-run 2026-08-31 before 0.3.1,
 which moved `ide_opened_file` into the Codex set on 4 directly inspected
-records), and nothing else. They will go
+records; re-run 2026-08-31 before 0.3.2 — 991 Claude text blocks in 86 files,
+1,060 Codex in 134, nothing outside either set, no change), and nothing else. They will go
 stale as each host adds, renames or drops its own wrapper tags, and the
 obligation to re-measure must not live only in a planning document that ships
 nowhere. Re-run it before every release:

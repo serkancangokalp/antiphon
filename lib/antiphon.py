@@ -357,8 +357,10 @@ def _join_text_blocks(blocks):
 # — measured only on the Claude side — first reached the Codex set.
 # Measured on 2026-08-30 over 1,575 Claude and 445 Codex `role: user`
 # records; re-measured on 2026-08-31 over 4,309 and 872 (one change:
-# `ide_opened_file` joined the Codex set on direct evidence). See BACKLOG.md
-# for when this census has to be re-run.
+# `ide_opened_file` joined the Codex set on direct evidence); re-measured
+# again on 2026-08-31 before 0.3.2 over 991 Claude text blocks in 86 files
+# and 1,060 Codex in 134 (no `<` opening outside either set; no change). See
+# BACKLOG.md for when this census has to be re-run.
 CLAUDE_HOST_WRAPPERS = (
     "channel", "task-notification", "ide_opened_file",
     "command-name", "command-message",
