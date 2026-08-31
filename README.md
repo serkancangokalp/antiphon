@@ -175,9 +175,20 @@ antiphon status            # transcripts, cursors, live peers and channel status
 antiphon doctor            # read-only checkup: why is the bridge quiet?
 antiphon summary [side]    # show the context that would be injected
 antiphon setup             # (re)install the project setup
+antiphon catch-up [side]   # skip undelivered history: page cursors jump to the live edge
 antiphon --version         # the installed version
 npm test                   # Python unit tests + real MCP protocol test
 ```
+
+`catch-up` is for the other quiet: pages that keep arriving but are days old.
+After an upgrade the bridge may re-deliver history from the start of every
+transcript it can see, one page per turn, and a new message waits behind all
+of it. `catch-up` pins each side's page cursor at the live edge — the end of
+the last complete record in every discovered transcript — under the same lock
+the readers take, and says how many bytes it abandoned. What it skips is not
+delivered later; run it when both terminals have already been read by the
+person sitting at them. Unnamed, it moves both sides; a named terminal has its
+own cursor and is told which side to move.
 
 `doctor` answers "why is nothing arriving?" and edits nothing: which copy
 of the package `PATH` resolves and whether the hooks run it, the Node and

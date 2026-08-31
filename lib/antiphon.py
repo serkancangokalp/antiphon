@@ -13,6 +13,7 @@ Usage:
   antiphon reply               # sends a Claude Channel reply to Codex (stdin JSON)
   antiphon channel             # long-lived Node.js MCP Channel server (started by Claude Code)
   antiphon mcp                 # MCP stdio server for Codex (fallback path)
+  antiphon catch-up [side]     # skip undelivered history: page cursors jump to the live edge
   antiphon --version           # the installed version (also -V, version)
 
 Design: NO SHARED LOG IS KEPT. Both CLIs already write transcripts; Antiphon
@@ -4938,6 +4939,112 @@ def doctor():
     return 1 if report.broken else 0
 
 
+def _complete_prefix_end(path):
+    """The byte offset just past the last newline-terminated record.
+
+    A resume that begins inside a line still being written drops that record
+    when the line completes: `read_records` yields the tail, `json.loads`
+    fails, and the parser skips it. So the frontier a catch-up pins is the end
+    of the last complete record, found by walking back from EOF in chunks —
+    a single record can run past 15 KB, so one fixed tail read is not enough.
+    """
+    try:
+        size = os.path.getsize(path)
+        if size == 0:
+            return 0
+        with open(path, "rb") as f:
+            f.seek(size - 1)
+            if f.read(1) == b"\n":
+                return size
+            pos = size - 1
+            while pos > 0:
+                start = max(0, pos - 65536)
+                f.seek(start)
+                newline = f.read(pos - start).rfind(b"\n")
+                if newline >= 0:
+                    return start + newline + 1
+                pos = start
+    except OSError:
+        return 0
+    return 0
+
+
+# What each side's page reader looks at: Claude's page is built from Codex
+# rollouts and Codex's from Claude transcripts. Same window as the readers.
+CATCH_UP_SOURCES = {
+    "claude": lambda cwd: codex_rollout_files(cwd)[:RECENT_FILES],
+    "codex": lambda cwd: claude_transcripts(cwd)[:RECENT_FILES],
+}
+
+
+def catch_up(side=None):
+    """Moves page cursors to the live edge, abandoning undelivered history.
+
+    Measured on the maintainer's own project: the v2→v3 upgrade's byte-zero
+    replay of two days of transcripts was still draining twenty hours later,
+    one page per turn, with every new message queued behind it — the bridge
+    was delivering yesterday. Nothing could skip it. This can: each discovered
+    source is pinned at the end of its last complete record under the same
+    lock every reader takes, and the `replay` marker goes with the history it
+    described. The legacy `_seen` value is left where it is, because a pre-v3
+    process still reads it and the rollback story depends on it.
+
+    Unnamed, it moves both sides — they share one file. A named peer keeps one
+    cursor per side under its own name, so there it needs to be told which
+    side, and run in that side's terminal.
+    """
+    cwd = project_dir()
+    if side is not None and side not in CATCH_UP_SOURCES:
+        print("antiphon: catch-up takes `claude` or `codex`", file=sys.stderr)
+        return 2
+    if side is None:
+        if peers.valid_name(peers.explicit_name()):
+            print("antiphon: this terminal is named, so its cursor is its own — "
+                  "say which side to move: `antiphon catch-up claude|codex`, "
+                  "run in that side's terminal", file=sys.stderr)
+            return 2
+        sides = ("claude", "codex")
+    else:
+        sides = (side,)
+    status = 0
+    for one in sides:
+        key = page_cursor_key(one)
+        frontier, unpinned = {}, []
+        for path in CATCH_UP_SOURCES[one](cwd):
+            gen = source_generation(path)
+            if gen is None:
+                unpinned.append(path)
+                continue
+            frontier[source_id(path)] = {"gen": gen,
+                                         "offset": _complete_prefix_end(path)}
+        skipped = {"bytes": 0}
+
+        def mutate(cursor, key=key, frontier=frontier, skipped=skipped):
+            held = cursor.get(key)
+            old = (held.get("sources") if isinstance(held, dict)
+                   and isinstance(held.get("sources"), dict) else {})
+            for sid, entry in frontier.items():
+                was = old.get(sid)
+                was = (was.get("offset") if isinstance(was, dict)
+                       and isinstance(was.get("offset"), int) else 0)
+                skipped["bytes"] += max(0, entry["offset"] - was)
+            cursor[key] = {"v": PAGE_CURSOR_VERSION, "sources": frontier}
+            return cursor
+
+        if not update_cursor(cwd, one, mutate):
+            print(f"antiphon: {key}: could not take the cursor lock; nothing "
+                  "moved", file=sys.stderr)
+            status = 1
+            continue
+        print(f"{key}: {len(frontier)} source(s) moved to the live edge; "
+              f"{skipped['bytes']:,} bytes of undelivered history will not be "
+              "delivered")
+        for path in unpinned:
+            print(f"{key}: {os.path.basename(path)} has no complete first "
+                  "record yet and was left alone")
+    return status
+
+
 def print_summary(side="claude"):
     cwd = project_dir()
     text, _, _ = build_summary(cwd, side, since=time.time() - LOOKBACK)
@@ -4946,7 +5053,7 @@ def print_summary(side="claude"):
 
 
 COMMANDS = {
-    "setup": setup, "status": status, "doctor": doctor,
+    "setup": setup, "status": status, "doctor": doctor, "catch-up": catch_up,
     "hook": hook, "summary": print_summary,
     "push": push, "reply": reply, "mcp": mcp, "register_peer": register_peer,
     "unregister_peer": unregister_peer,
