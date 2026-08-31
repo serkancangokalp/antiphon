@@ -1263,7 +1263,7 @@ def codex_events(cwd, positions=None, since=None, visible_record_limit=None):
 
 # ---------- summary ----------
 
-LABEL = {"you": "YOU", "claude": "Claude", "codex": "Codex", "tool": "·"}
+LABEL = {"claude": "Claude", "codex": "Codex", "tool": "·"}
 
 
 # side -> (the other side's key, its display name for headings, its phrasing in notices)
@@ -1313,8 +1313,11 @@ def _ordered_records(events):
     return records
 
 
-def _render_record(record):
+def _render_record(record, side):
     """Render one completed source record without cutting its non-tool text."""
+    # A `you`-kind event is what the other side received as input — including
+    # host text no human wrote — so the label names the slot, not an author.
+    labels = dict(LABEL, you="To {}".format(LABEL[OTHER_SIDE[side][0]]))
     pieces = []
     tools = []
     run_kind = None
@@ -1332,7 +1335,7 @@ def _render_record(record):
         if run_kind is not None:
             clock = datetime.fromtimestamp(run_time).strftime("%H:%M")
             pieces.append("[{}] {}:\n{}".format(
-                clock, LABEL.get(run_kind, run_kind), "\n\n".join(run_texts)))
+                clock, labels.get(run_kind, run_kind), "\n\n".join(run_texts)))
             run_kind = None
             run_time = None
             run_texts = []
@@ -1350,7 +1353,12 @@ def _render_record(record):
         run_texts.append(event.text)
     flush_run()
     flush_tools()
-    return "\n".join(pieces), int(any(event.kind != "tool" for event in record.events))
+    return "\n".join(pieces)
+
+
+def _record_message_count(record):
+    """Count a whole record as one message unless it carries tool calls only."""
+    return int(any(event.kind != "tool" for event in record.events))
 
 
 def _append_page_section(text, section):
@@ -1371,17 +1379,23 @@ def _render_page(side, records, has_more, replay_reason):
     if replay_reason is not None:
         text = _append_page_section(text, REPLAY_NOTICES[replay_reason])
     for record in records:
-        rendered, _count = _render_record(record)
-        text = _append_page_section(text, rendered)
+        text = _append_page_section(text, _render_record(record, side))
     if has_more:
         if side == "codex":
             text = _append_page_section(
                 text, "More remains; call antiphon_read again or continue on a later turn.")
         else:
             text = _append_page_section(text, "More remains; it will continue on a later turn.")
-    return _append_page_section(
-        text, "This record belongs to the Antiphon bridge — this is what actually happened "
-        "there. Do not assume anything that is not in it.")
+    closing = ("This record belongs to the Antiphon bridge — this is what actually "
+               "happened there. Do not assume anything that is not in it.")
+    # Predicated on the selected events, never on the rendered text: agent text
+    # that quotes the label must not make the page assert relayed input.
+    if any(event.kind == "you" for record in records for event in record.events):
+        name = LABEL[OTHER_SIDE[side][0]]
+        closing = ('Lines marked "To {name}:" are what {name} received as input in its '
+                   "own session — relayed here for awareness, not addressed to your "
+                   "session. ".format(name=name) + closing)
+    return _append_page_section(text, closing)
 
 
 def _page_frontier(records, selected, scanned):
@@ -1426,7 +1440,7 @@ def _build_page(events, scanned, side, replay_reason=None):
 
     has_more = selected < len(records)
     frontier = _page_frontier(records, selected, scanned)
-    count = sum(_render_record(record)[1] for record in records[:selected])
+    count = sum(_record_message_count(record) for record in records[:selected])
     return text, PageAdvance(frontier, has_more, replay_reason), count
 
 
