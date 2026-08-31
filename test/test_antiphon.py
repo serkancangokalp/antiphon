@@ -2713,6 +2713,36 @@ class CatchUpTest(unittest.TestCase):
             self.assertIn("lock", err.getvalue())
             self.assertFalse(os.path.exists(antiphon.state_path(project, "claude")))
 
+    def test_status_reports_raw_unread_bytes_per_reader(self):
+        """A person asking "why is the bridge delivering yesterday?" gets the
+        backlog in the unit that is true — raw transcript bytes not yet read
+        — never a page count, which cannot be derived from bytes (measured:
+        most of a 44 MB span was filtered before rendering). A replaying
+        reader is told what skips it."""
+        with tempfile.TemporaryDirectory() as project:
+            codex, claude = self.sources(project)
+            self.discovering(project, codex, claude)
+            antiphon.write_cursor(project, {
+                "claude_pages": {"v": 3, "replay": "legacy_upgrade",
+                                 "sources": {self.SID_CODEX: {
+                                     "gen": antiphon.source_generation(codex), "offset": 10}}},
+            }, "claude")
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out):
+                antiphon.status()
+            printed = out.getvalue()
+            unread_codex_rollouts = os.path.getsize(codex) - 10
+        line = next((l for l in printed.splitlines() if l.startswith("unread claude_pages:")), "")
+        self.assertIn(f"{unread_codex_rollouts:,} raw bytes", line, printed)
+        self.assertIn("1 source", line)
+        self.assertIn("antiphon catch-up", line, "a replaying reader is told the escape")
+        line = next((l for l in printed.splitlines() if l.startswith("unread codex_pages:")), "")
+        self.assertIn("1 discovered source", line, "a source the cursor has not met yet is counted")
+        self.assertNotIn("catch-up", line, "no replay, no escape hatch offered")
+        unread_lines = [l for l in printed.splitlines() if l.startswith("unread ")]
+        self.assertFalse(any(re.search(r"\b\d[\d,]* pages?\b", l) for l in unread_lines),
+                         "no page count: it cannot be derived from raw bytes")
+
     def test_catch_up_is_a_command_with_usage(self):
         self.assertIs(antiphon.COMMANDS["catch-up"], antiphon.catch_up)
         self.assertIn("antiphon catch-up", antiphon.__doc__)
@@ -3186,6 +3216,26 @@ class DoctorTest(unittest.TestCase):
             self.assertTrue(line.startswith("✗ running: codex mcp"), line)
         finally:
             child.kill()
+
+    def test_doctor_notes_a_reader_still_replaying_history(self):
+        """Measured 2026-08-31: both readers had been replaying for twenty
+        hours and doctor said 13/13 ✓. A note, not ✗ — the bridge is working,
+        slowly — with the raw unread bytes and the command that skips them."""
+        project = self.project()
+        self.set_up(project)
+        antiphon.write_cursor(project, {
+            "codex_pages": {"v": 3, "replay": "legacy_upgrade", "sources": {}},
+        }, "codex")
+        code, printed = self.run_doctor(project)
+        line = self.line_for(printed, "replay:")
+        self.assertTrue(line.startswith("·"), printed)
+        self.assertIn("codex", line)
+        self.assertIn("raw bytes", line)
+        self.assertIn("antiphon catch-up", line)
+        self.assertEqual(code, 0, "a replaying reader is slow, not broken")
+        antiphon.write_cursor(project, {"codex_pages": {"v": 3, "sources": {}}}, "codex")
+        _, printed = self.run_doctor(project)
+        self.assertEqual(self.line_for(printed, "replay:"), "", "no marker, no line")
 
     def test_help_exits_zero(self):
         """Asking for help is not an error. Measured before this change:
@@ -3661,8 +3711,11 @@ class PagedSummaryModelTest(unittest.TestCase):
         self.assertEqual(count, 2)
 
     def test_replay_and_discovery_scope_are_part_of_the_byte_budget(self):
+        # Sized by hand against the current notice: the complete envelope
+        # must overflow the budget by less than the scope line, so that
+        # dropping either the notice or the scope line brings it under.
         events = [
-            self.event("A" * 7_450, offset=0, end=100),
+            self.event("A" * 7_400, offset=0, end=100),
             self.event("deferred " + "D" * 200, offset=100, end=200, when=11),
         ]
         records = antiphon._ordered_records(events)
@@ -4000,15 +4053,19 @@ class PositionCursorTest(unittest.TestCase):
                     "/tmp/project", since=time.time() - antiphon.LOOKBACK)
         self.assertEqual([e[2] for e in events], ["recent"])
 
-    def test_a_timestamp_cursor_starts_conservative_byte_zero_replay(self):
-        """A timestamp is a scanned high-water mark, not a delivered prefix.
-        Reinterpreting it would let an overlapping old writer move the new
-        reader past content it never delivered, so the v3 reader deliberately
-        replays every discovered source from byte zero."""
+    def test_a_timestamp_cursor_resumes_at_its_time(self):
+        """The 0.1.0 `_seen` float is the published upgrade path, and it is
+        taken as authoritative: `since` is that time, the positions are
+        empty, and every discovered source is placed by `offset_at_or_after`.
+        It used to be byte zero — a timestamp is the old reader's high-water
+        mark, and what its trim cut before it never reached anyone — but that
+        cost twenty hours of replay on a real project, and 0.1.0 had already
+        declared that history delivered. The replay marker stays, so the page
+        still says it is re-delivering."""
         positions, since, replay = antiphon.positions_for(
             {"claude_seen": 1000.0}, "claude")
         self.assertEqual(positions, {})
-        self.assertIsNone(since)
+        self.assertEqual(since, 1000.0)
         self.assertEqual(replay, "legacy_upgrade")
 
     def test_a_v2_cursor_starts_conservative_byte_zero_replay(self):
@@ -4077,8 +4134,10 @@ class PositionCursorTest(unittest.TestCase):
 
     def test_a_v1_cursor_replays_a_quiet_2020_source_once_then_stays_quiet(self):
         """Conservative migration does not treat a quiet old source as seen.
-        Its 2020 record is replayed from byte zero with a visible upgrade
-        notice, recorded as delivered, and therefore absent on the next turn."""
+        Its 2020 record lies before the v1 time, so it is not replayed — the
+        source is placed at its end by `offset_at_or_after` — while the fresh
+        record is delivered under the upgrade notice. Both positions are
+        recorded, so the next turn delivers nothing."""
         fresh_sid = "4eecac24-1c21-47ad-ab11-a650708f3098"
         quiet_sid = "01a04f6b-4485-7290-afbd-9eae74405ec8"
         now = time.strftime("%Y-%m-%dT%H:%M:%S.000Z", time.gmtime())
@@ -4114,7 +4173,8 @@ class PositionCursorTest(unittest.TestCase):
             first_code, first_out = run()
             self.assertEqual(first_code, 0)
             self.assertIn("fresh news", first_out)
-            self.assertIn("stale echo", first_out)
+            self.assertNotIn("stale echo", first_out,
+                             "a record before the v1 time stays where 0.1.0 left it")
             self.assertIn(antiphon.REPLAY_NOTICES["legacy_upgrade"], first_out)
 
             second_code, second_out = run()
@@ -5136,6 +5196,61 @@ class RollingUpgradePagingTest(_PagingIntegrationCase):
             return cursor
 
         return antiphon.update_cursor(project, side, mutate)
+
+    def test_a_numeric_v1_cursor_replays_from_its_timestamp_not_from_byte_zero(self):
+        """0.1.0 wrote `<side>_seen` as one epoch float — the time of the last
+        event it rendered. That is the published upgrade path (npm carries
+        0.1.0, 0.3.0, 0.3.1; the v2 map never shipped), and byte zero turned
+        it into hours of replay: measured on the maintainer's project, two
+        days of history at one page per turn while live words waited. The
+        timestamp is taken as authoritative: the page starts at the first
+        record at or after it (`>=`, so the whole cohort sharing that second
+        repeats — measured, up to 10 records share one timestamp in real
+        transcripts), and what 0.1.0's own trim cut before then stays cut,
+        because 0.1.0 had already declared it delivered."""
+        boundary = "2020-01-01T00:30:00.000Z"
+        records = [
+            json.dumps({"type": "assistant", "timestamp": "2020-01-01T00:10:00.000Z",
+                        "message": {"content": [{"type": "text", "text": "before the cursor"}]}}),
+            json.dumps({"type": "assistant", "timestamp": boundary,
+                        "message": {"content": [{"type": "text", "text": "cohort one"}]}}),
+            json.dumps({"type": "assistant", "timestamp": boundary,
+                        "message": {"content": [{"type": "text", "text": "cohort two"}]}}),
+            json.dumps({"type": "assistant", "timestamp": "2020-01-01T00:40:00.000Z",
+                        "message": {"content": [{"type": "text", "text": "after the cursor"}]}}),
+        ]
+        seen = antiphon.iso_epoch(boundary)
+        with tempfile.TemporaryDirectory() as project:
+            path = self._write_source(project, self.SID_A, records)
+            antiphon.write_cursor(project, {"codex_seen": seen}, "codex")
+            code, page, err, _ = self._hook(project, [path])
+            cursor = antiphon.read_cursor(project, "codex")
+        self.assertEqual(code, 0, err)
+        self.assertNotIn("before the cursor", page)
+        self.assertIn("cohort one", page)
+        self.assertIn("cohort two", page)
+        self.assertIn("after the cursor", page)
+        self.assertIn(antiphon.REPLAY_NOTICES["legacy_upgrade"], page)
+        self.assertEqual(cursor["codex_seen"], seen, "the v1 value is left in place")
+        self.assertEqual(cursor["codex_pages"]["v"], 3)
+
+    def test_positions_for_a_numeric_legacy_value_hands_back_its_time(self):
+        """`{}` positions and the v1 time as `since`: the existing
+        `offset_at_or_after` path places every discovered source. A value that
+        is not a time keeps the byte-zero replay — nothing to trust, so
+        nothing is skipped."""
+        seen = antiphon.iso_epoch("2020-01-01T00:30:00.000Z")
+        positions, since, replay = antiphon.positions_for({"codex_seen": seen}, "codex")
+        self.assertEqual((positions, since, replay), ({}, seen, "legacy_upgrade"))
+        positions, since, replay = antiphon.positions_for({"codex_seen": str(seen)}, "codex")
+        self.assertEqual(since, seen, "0.1.0 accepted numeric strings; so does the upgrade")
+        for junk in (True, "nan", "not a time", 1e308, 0):
+            positions, since, replay = antiphon.positions_for({"codex_seen": junk}, "codex")
+            self.assertEqual((positions, since, replay), ({}, None, "legacy_upgrade"), repr(junk))
+
+    def test_the_upgrade_notice_says_how_to_skip_the_replay(self):
+        for reason in ("legacy_upgrade", "cursor_recovery"):
+            self.assertIn("antiphon catch-up", antiphon.REPLAY_NOTICES[reason], reason)
 
     def test_legacy_v2_replays_all_discovered_history_until_final_page(self):
         seeded = {"v": 2, "sources": {

@@ -739,7 +739,23 @@ def positions_for(cursor, side, loader_state="valid"):
               "transcript history", file=sys.stderr)
         return {}, None, "cursor_recovery"
     if legacy_key in cursor:
-        return {}, None, "legacy_upgrade"
+        legacy = cursor.get(legacy_key)
+        if isinstance(legacy, dict):
+            # The v2 map (never published; 0.2.x lived only on dev machines)
+            # records how far the old scanner *read*, not what it delivered —
+            # it scanned the whole suffix and rendered the newest EVENT_LIMIT
+            # — so no offset in it is a safe start. Byte zero, marked.
+            return {}, None, "legacy_upgrade"
+        # 0.1.0 — the published upgrade path — kept one epoch float: the time
+        # of the last event it rendered. That time is taken as authoritative
+        # and the page starts at the first record at or after it (`>=`, so
+        # the cohort sharing that second repeats). What 0.1.0's own trim cut
+        # before then stays cut: it had already declared that delivered, and
+        # byte zero here cost the maintainer twenty hours of replay. A value
+        # that is not a time trusts nothing and replays from byte zero.
+        unset = object()
+        moment = cursor_time(cursor, legacy_key, default=unset)
+        return {}, (None if moment is unset else moment), "legacy_upgrade"
     return {}, since, None
 
 
@@ -928,24 +944,27 @@ PageAdvance = collections.namedtuple(
 REPLAY_NOTICES = {
     "legacy_upgrade": (
         "replay: replaying discovered history after an upgrade; duplicates "
-        "are expected until this backlog drains"),
+        "are expected until this backlog drains — `antiphon catch-up` skips "
+        "what is left"),
     "cursor_recovery": (
         "replay: replaying discovered history because the previous cursor "
         "could not be trusted; duplicates are expected until this backlog "
-        "drains"),
+        "drains — `antiphon catch-up` skips what is left"),
 }
 
 
 def offset_at_or_after(path, timestamp):
     """The offset of the first record at or after `timestamp`, or the file's end.
 
-    Run only for a source a peer has genuinely never read, to place the normal
-    lookback window. It is deliberately NOT how legacy cursors arrive here: a
-    present v2/`_seen` value, like a malformed or unreadable cursor file, takes
-    the conservative byte-zero replay instead, because an old process may still
-    be moving that value and its boundary cannot be trusted. `>=` rather than
-    `>` repeats a record sharing the boundary timestamp — a duplicate, which
-    this bridge accepts where it never accepts a gap.
+    Run for a source a peer has never read, to place the normal lookback
+    window — and, since 0.3.2, for the published upgrade path: a numeric
+    0.1.0 `_seen` time arrives here as `since`. A v2 *map* does not: it is a
+    scan high-water mark, not a delivery frontier, and like a malformed or
+    unreadable cursor file it takes the byte-zero replay. `>=` rather than
+    `>` repeats every record sharing the boundary timestamp — the whole
+    cohort, per source (measured: up to 10 records share one second in real
+    transcripts) — a duplicate, which this bridge accepts where it never
+    accepts a gap.
     """
     end = 0
     for start, end, line in read_records(path):
@@ -4380,6 +4399,23 @@ def _cursor_entry(key, value):
     return "opaque cursor state"
 
 
+def _backlog_line(key, backlog):
+    """`unread <key>: …` for status — raw bytes, sources met and not, and
+    the way out when the reader is replaying."""
+    if backlog is None:
+        return (f"unread {key}: unknown (the cursor could not be trusted; "
+                "the next turn replays)")
+    unread, met, unmet, replay = backlog
+    line = (f"unread {key}: {unread:,} raw bytes across {met} "
+            f"source{'' if met == 1 else 's'}")
+    if unmet:
+        line += (f"; {unmet} discovered source{'' if unmet == 1 else 's'} "
+                 "not yet read")
+    if replay:
+        line += " — replaying history; `antiphon catch-up` skips it"
+    return line
+
+
 def _status_preview(text):
     """Clip only a display preview, preserving UTF-8 and delivery semantics."""
     encoded = text.encode("utf-8")
@@ -4430,6 +4466,10 @@ def status():
             shown_key = (key if key in _STATUS_CURSOR_KEYS
                          else "unknown cursor entry")
             print(f"cursor {label}{shown_key}: {_cursor_entry(key, value)}")
+    for side in ("claude", "codex"):
+        cursor, cursor_state = snapshots[side]
+        print(_backlog_line(page_cursor_key(side),
+                            reader_backlog(cwd, side, cursor, cursor_state)))
     for side in ("claude", "codex"):
         cursor, cursor_state = snapshots[side]
         positions, since, replay_reason = positions_for(
@@ -5172,7 +5212,24 @@ def doctor():
     _doctor_alias(report)
     _doctor_channel(report, cwd, _doctor_peers(report, cwd))
     _doctor_codex(report)
+    _doctor_replay(report, cwd)
     return 1 if report.broken else 0
+
+
+def _doctor_replay(report, cwd):
+    """A reader still re-delivering history — slow, not broken, so a note.
+
+    Measured 2026-08-31: both readers had replayed for twenty hours while
+    doctor said 13/13 ✓ and each side was reading the other's yesterday.
+    Read-only: the cursor is read, never migrated or advanced."""
+    for side in ("claude", "codex"):
+        cursor, state = _read_cursor_state(cwd, side)
+        backlog = reader_backlog(cwd, side, cursor, state)
+        if backlog is None or not backlog[3]:
+            continue
+        unread = backlog[0]
+        report.note(f"replay: the {side} reader is re-delivering history "
+                    f"({unread:,} raw bytes unread); `antiphon catch-up` skips it")
 
 
 def _complete_prefix_end(path):
@@ -5211,6 +5268,38 @@ CATCH_UP_SOURCES = {
     "claude": lambda cwd: codex_rollout_files(cwd)[:RECENT_FILES],
     "codex": lambda cwd: claude_transcripts(cwd)[:RECENT_FILES],
 }
+
+
+def reader_backlog(cwd, side, cursor, cursor_state="valid"):
+    """How far one side's page reader is behind, in the unit that is true.
+
+    `(unread_bytes, met, unmet, replay)`: raw transcript bytes not yet read
+    across the discovered sources the cursor has met (same generation), how
+    many it has met, how many discovered sources it has not, and the replay
+    marker if any. Raw bytes, never pages: a page is a rendered envelope and
+    most raw bytes never reach one (measured: nearly all of a 44 MB span was
+    filtered before rendering), so no page count can be derived from here.
+    None when the cursor cannot be trusted — the next turn replays, and how
+    much is unknown until it does.
+    """
+    if cursor_state == "invalid":
+        return None
+    positions, since, replay = positions_for(cursor, side, cursor_state)
+    unread, met, unmet = 0, 0, 0
+    for path in CATCH_UP_SOURCES[side](cwd):
+        try:
+            size = os.path.getsize(path)
+        except OSError:
+            continue
+        entry = positions.get(source_id(path))
+        if entry and entry.get("gen") == source_generation(path):
+            unread += max(0, size - entry["offset"])
+            met += 1
+            continue
+        unmet += 1
+        if replay and since is None:
+            unread += size          # a byte-zero replay reads all of it
+    return unread, met, unmet, replay
 
 
 def catch_up(side=None):

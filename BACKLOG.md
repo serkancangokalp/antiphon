@@ -52,15 +52,29 @@ the write-and-flush-before-advance transaction.
 - The durable source catalog and the degraded-discovery marker: discovery
   still reads the newest 3 transcripts per side, and `has_more: false` cannot
   distinguish complete discovery from that window.
-- Backward paging into history an older version already marked seen. Its
-  cost was measured on 2026-08-31: the byte-zero `legacy_upgrade` replay of
-  two days of transcripts (16 MB one way, 44 MB the other) was still draining
-  twenty hours after the upgrade, one page per turn, and every live message
-  waited behind it — the bridge was delivering yesterday. `antiphon catch-up`
-  is the operational escape (page cursors jump to the live edge; the
-  history is abandoned, not delivered later). The upgrade itself still needs
-  to start from the legacy timestamp's position rather than byte zero, and
-  `status`/`doctor` still say nothing about how far behind a reader is.
+- Backward paging into history an older version already marked seen —
+  **settled for the published path, ruled for the rest.** Its cost was
+  measured on 2026-08-31: the byte-zero `legacy_upgrade` replay of two days
+  of transcripts (16 MB one way, 44 MB the other) was still draining twenty
+  hours after the upgrade, one page per turn, and every live message waited
+  behind it. Three things shipped. (1) A numeric 0.1.0 `_seen` — the only
+  legacy shape npm ever carried (0.1.0 → 0.3.x; the v2 map lived on dev
+  machines only) — is taken as authoritative: the page starts at the first
+  record at or after that time, `>=`, so the cohort sharing that second
+  repeats per source (measured: up to 10 records share one second), and what
+  0.1.0's own 2,600-character trim cut before then stays cut — a conscious
+  contract decision, because 0.1.0 had already declared it delivered and
+  resurrecting it cost the maintainer twenty deaf hours. (2) A v2 map still
+  replays from byte zero: it records how far the old scanner *read*, not what
+  it delivered — the old reader scanned the whole suffix and rendered the
+  newest `EVENT_LIMIT` — so no offset in it is a safe start; the four
+  rolling-upgrade tests that pin this stay. (3) The replay notices name
+  `antiphon catch-up`; `status` prints `unread <reader>: N raw bytes …` per
+  reader — raw bytes, never pages, since a page is a rendered envelope and
+  most raw bytes are filtered before one — and `doctor` notes a replaying
+  reader as `·`. Malformed v3 keeps `cursor_recovery` from byte zero and
+  never falls to the v2 sibling; generation mismatch and offset-past-EOF keep
+  byte zero.
 - The last-record content anchor (an in-place rewrite that keeps inode,
   length and first line still resumes silently).
 - Descriptor-safe reading of registry-supplied transcript paths.
