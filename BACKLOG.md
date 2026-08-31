@@ -72,7 +72,11 @@ the write-and-flush-before-advance transaction.
   `antiphon catch-up`; `status` prints `unread <reader>: N raw bytes …` per
   reader — raw bytes, never pages, since a page is a rendered envelope and
   most raw bytes are filtered before one — and `doctor` notes a replaying
-  reader as `·`. Malformed v3 keeps `cursor_recovery` from byte zero and
+  reader as `·`. The count runs through the reader's own start resolver
+  (`_resolve_start`), so a numeric v1 time, an offset past EOF and a replaced
+  generation are counted from where the reader will actually start (review of
+  6089336 caught the re-derived rule saying 0 while the reader would read 126);
+  only an unreadable cursor file is `unknown`. Malformed v3 keeps `cursor_recovery` from byte zero and
   never falls to the v2 sibling; generation mismatch and offset-past-EOF keep
   byte zero.
 - The last-record content anchor (an in-place rewrite that keeps inode,
