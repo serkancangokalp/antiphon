@@ -7697,6 +7697,481 @@ class StatusTest(unittest.TestCase):
         self.assertIn("=== what codex would see ===", text)
         self.assertIn("some news", text)
 
+class RefusedSendHonestyTest(unittest.TestCase):
+    """What a refused send tells its sender about what the peer will still see.
+
+    A refusal born in the transport leaves the words nowhere the peer can read
+    them, and the two directions are not even wrong in the same way: measured
+    on this project's own records, a refused `reply_to_codex` reaches the
+    Codex-side page as a bare tool-name line (123 real records; the `text`
+    argument is unreachable by the parser), while a refused `antiphon_send`
+    reaches Claude's page as nothing at all (0 tool events across 21 rollouts).
+    So those refusals name the road that does carry words — the visible reply,
+    which travels with the passive pages, in order and in full.
+
+    An addressing refusal already names its own fix and says nothing more. That
+    is structural rather than a matter of discipline: only the guidance-carrying
+    birth sites wrap their detail in a class, and a detail carrying none is
+    handed back untouched. `push` reads no class at all — its failure print goes
+    to stderr on an exit-0 hook, which this file records as reaching a debug log
+    and not the agent, so a second-person sentence there is addressed to nobody.
+    """
+
+    UUID = "1d5a03e0-0548-4339-87c3-45c5dbf7e9d7"
+    OTHER = "2e6b14f1-1659-544a-98d4-56d6eca8fa48"
+
+    # The host refusal this work was opened on, observed twice in one session.
+    HOST_ERROR = ("direct app-server input is not allowed for unloaded "
+                  "spawned sub-agents")
+    NO_SESSION = "not delivered: no Codex session found in this directory"
+
+    @staticmethod
+    def _codex_peer(project, alias, owner, session=None):
+        antiphon.peers.register(project, "codex", alias, None,
+                                pid=os.getpid(), owner_key=owner)
+        if session:
+            antiphon.peers.write_session(project, "codex", alias, session,
+                                         f"/t/{alias}.jsonl", owner)
+
+    @staticmethod
+    def _reply(project, payload):
+        out, err = io.StringIO(), io.StringIO()
+        with patch.object(antiphon, "project_dir", return_value=project), \
+             patch.object(antiphon.sys, "stdin", io.StringIO(json.dumps(payload))), \
+             contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            code = antiphon.reply()
+        return code, out.getvalue(), err.getvalue()
+
+    @staticmethod
+    def _push(project, target, turn_text, extra=()):
+        """One Stop-hook push of `turn_text`, with its stderr captured."""
+        payload = {"cwd": project, "transcript_path": "/tmp/transcript"}
+        turn = "_claude_turn" if target == "codex" else "_codex_turn"
+        err = io.StringIO()
+        with contextlib.ExitStack() as stack:
+            enter = stack.enter_context
+            enter(patch.object(antiphon.os.path, "exists", return_value=True))
+            enter(patch.object(antiphon, turn, return_value=(turn_text, "")))
+            enter(patch.object(antiphon, "read_cursor", return_value={}))
+            enter(patch.object(antiphon, "write_cursor", return_value=True))
+            enter(patch.object(antiphon.sys, "stdin",
+                               io.StringIO(json.dumps(payload))))
+            enter(contextlib.redirect_stderr(err))
+            for context in extra:
+                enter(context)
+            code = antiphon.push(target)
+        return code, err.getvalue()
+
+    class _Refused:
+        """`codex queue` answering with a non-zero return and a reason."""
+
+        returncode = 1
+        stdout = ""
+
+        def __init__(self, stderr):
+            self.stderr = stderr
+
+    class _Queued:
+        returncode = 0
+        stderr = ""
+        stdout = ""
+
+    class _DeadSocket:
+        """A connect refused with an errno the sender does not wait out.
+
+        `ENOENT` and `ECONNREFUSED` are retried for `CONNECT_PATIENCE` because a
+        channel about to exist looks exactly like one that never will. This is a
+        real outage instead, and fails at once.
+        """
+
+        def __call__(self, *_a, **_k):
+            return self
+
+        def settimeout(self, _):
+            pass
+
+        def close(self):
+            pass
+
+        def connect(self, _path):
+            raise OSError(errno.EACCES, "Permission denied")
+
+    class _LiveSocket:
+        """A channel that connects. What happens after that is the fixture.
+
+        `answer` is what the server sends back; `breaks` is raised once the
+        bytes are already on their way, which is the one failure the sender must
+        never retry.
+        """
+
+        def __init__(self, answer=b'{"ok": true, "message_id": "m1"}', breaks=None):
+            self.answer = answer
+            self.breaks = breaks
+
+        def __call__(self, *_a, **_k):
+            return self
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_a):
+            return False
+
+        def settimeout(self, _):
+            pass
+
+        def close(self):
+            pass
+
+        def connect(self, _path):
+            pass
+
+        def sendall(self, _data):
+            if self.breaks is not None:
+                raise self.breaks
+
+        def shutdown(self, _how):
+            pass
+
+        def recv(self, _n):
+            answer, self.answer = self.answer, b""
+            return answer
+
+    def _oversized(self):
+        return "x" * (antiphon.MAX_CHANNEL_BYTES + 10)
+
+    # ---- the guidance-carrying classes ----
+
+    def test_a_refused_reply_names_the_passive_page(self):
+        """The host refused the queue: nothing of these words is on the page but
+        the tool's name, and the sender is told where they would travel."""
+        with tempfile.TemporaryDirectory() as project:
+            self._codex_peer(project, "build", "300:build", self.UUID)
+            with patch.object(antiphon.subprocess, "run",
+                              return_value=self._Refused(self.HOST_ERROR)):
+                code, out, err = self._reply(project, {"text": "hi", "to": "build"})
+        self.assertEqual(code, 1)
+        self.assertEqual(out, "")
+        self.assertEqual(err, "reply: {} — {}\n".format(
+            self.HOST_ERROR,
+            antiphon.TOOL_GUIDANCE.format(seen="only a tool-name line")))
+
+    def test_a_refused_send_tool_names_the_passive_page(self):
+        """The other direction says `nothing`, because that is what Claude's page
+        holds of a refused `antiphon_send`: the parser emits a tool event only
+        for `exec_command_begin`, which an MCP call never is."""
+        with tempfile.TemporaryDirectory() as project:
+            antiphon.peers.register(project, "claude", "ui", "/tmp/ui.sock")
+            with patch.object(antiphon.socket, "socket", self._DeadSocket()):
+                result = antiphon._send_tool(project, "hi", "ui")
+        self.assertIs(result.get("isError"), True)
+        self.assertEqual(result["content"][0]["text"],
+                         "Not delivered to Claude: Claude MCP Channel is down: "
+                         "Permission denied — "
+                         + antiphon.TOOL_GUIDANCE.format(seen="nothing"))
+
+    def test_a_missing_codex_session_still_gets_the_guidance(self):
+        """Discovery finding no rollout to address says nothing about a peer's
+        ability to read: the Codex-side page is built from *Claude's*
+        transcripts and carries these words regardless — measured in the same
+        fixture that produces this refusal."""
+        with tempfile.TemporaryDirectory() as project, \
+             patch.object(antiphon, "codex_session_id", return_value=None):
+            code, _, err = self._reply(project, {"text": "hi"})
+        self.assertEqual(code, 1)
+        self.assertEqual(err, "reply: {} — {}\n".format(
+            self.NO_SESSION,
+            antiphon.TOOL_GUIDANCE.format(seen="only a tool-name line")))
+
+    def test_an_oversized_direct_send_names_the_paged_road(self):
+        """Refused before the socket is touched, and the visible reply is
+        exactly where an oversized text still travels whole: the automatic hook
+        hands an oversized record over without splitting it."""
+        with tempfile.TemporaryDirectory() as project:
+            antiphon.peers.register(project, "claude", "ui", "/tmp/ui.sock")
+            with patch.object(antiphon.socket, "socket") as opened:
+                result = antiphon._send_tool(project, self._oversized(), "ui")
+                opened.assert_not_called()
+        text = result["content"][0]["text"]
+        self.assertIs(result.get("isError"), True)
+        self.assertIn("the channel accepts at most {}".format(
+            antiphon.MAX_CHANNEL_BYTES), text)
+        self.assertTrue(
+            text.endswith(" — " + antiphon.TOOL_GUIDANCE.format(seen="nothing")),
+            text)
+
+    def test_every_wrap_site_reaches_its_reader_with_the_guidance(self):
+        """One case per birth site that wraps, driven through the reader.
+
+        The tests above pin a *class*, and several sites share a class — so with
+        only those, a single wrap could be deleted and nothing would notice.
+        Measured: four of the ten could go one at a time with the whole suite
+        still green. A class is not a gate; a site is. A new wrap needs a new
+        case here, which the count assertion below insists on.
+        """
+        replied = antiphon.TOOL_GUIDANCE.format(seen="only a tool-name line")
+        sent = antiphon.TOOL_GUIDANCE.format(seen="nothing")
+
+        def named_reply(*contexts):
+            """`reply()` to a peer that resolves, so the transport is reached."""
+            with tempfile.TemporaryDirectory() as project:
+                self._codex_peer(project, "build", "300:build", self.UUID)
+                with contextlib.ExitStack() as stack:
+                    for context in contexts:
+                        stack.enter_context(context)
+                    return self._reply(project, {"text": "hi", "to": "build"})[2]
+
+        def bare_reply(*contexts):
+            """`reply()` with nothing registered: the unnamed single pair."""
+            with tempfile.TemporaryDirectory() as project, \
+                 contextlib.ExitStack() as stack:
+                for context in contexts:
+                    stack.enter_context(context)
+                return self._reply(project, {"text": "hi"})[2]
+
+        def send(*contexts, text="hi"):
+            with tempfile.TemporaryDirectory() as project:
+                antiphon.peers.register(project, "claude", "ui", "/tmp/ui.sock")
+                with contextlib.ExitStack() as stack:
+                    for context in contexts:
+                        stack.enter_context(context)
+                    result = antiphon._send_tool(project, text, "ui")
+            return result["content"][0]["text"]
+
+        def channel(**how):
+            return patch.object(antiphon.socket, "socket",
+                                self._LiveSocket(**how))
+
+        sites = [
+            ("_queue_codex: the codex command is missing",
+             lambda: named_reply(patch.object(antiphon.subprocess, "run",
+                                              side_effect=FileNotFoundError())),
+             "codex command not found", replied),
+            ("_queue_codex: the subprocess never completed",
+             lambda: named_reply(patch.object(
+                 antiphon.subprocess, "run",
+                 side_effect=subprocess.TimeoutExpired("codex", 15))),
+             "TimeoutExpired", replied),
+            ("_queue_codex: the host refused the queue",
+             lambda: named_reply(patch.object(
+                 antiphon.subprocess, "run",
+                 return_value=self._Refused(self.HOST_ERROR))),
+             self.HOST_ERROR, replied),
+            ("_legacy_target: discovery found no Codex rollout",
+             lambda: bare_reply(patch.object(antiphon, "codex_session_id",
+                                             return_value=None)),
+             self.NO_SESSION, replied),
+            ("send_to_claude: over the channel's byte cap",
+             lambda: send(text=self._oversized()),
+             "the channel accepts at most", sent),
+            ("send_to_claude: the connect was refused",
+             lambda: send(patch.object(antiphon.socket, "socket",
+                                       self._DeadSocket())),
+             "Channel is down: Permission denied", sent),
+            ("send_to_claude: it broke after the bytes went out",
+             lambda: send(channel(breaks=OSError(errno.EPIPE, "Broken pipe"))),
+             "Channel is down: Broken pipe", sent),
+            ("send_to_claude: the answer did not decode",
+             lambda: send(channel(answer=b"not json at all")),
+             "invalid response", sent),
+            ("send_to_claude: the answer decoded to something that is not one",
+             lambda: send(channel(answer=b"[]")),
+             "invalid response", sent),
+            ("send_to_claude: the channel server itself said no",
+             lambda: send(channel(
+                 answer=b'{"ok": false, "error": "channel said no"}')),
+             "channel said no", sent),
+        ]
+        self.assertEqual(len(sites), 10,
+                         "one case per wrap site, and every wrap site has one")
+        for label, refuse, fragment, guidance in sites:
+            with self.subTest(label):
+                said = refuse().rstrip("\n")
+                self.assertIn(fragment, said, "the fixture missed its site")
+                self.assertTrue(said.endswith(" — " + guidance), said)
+
+    # ---- everything else holds still ----
+
+    def test_an_addressing_refusal_stays_byte_identical(self):
+        """One representative per addressing shape per direction, against the
+        recorded dry runs. These messages already name the fix, and the marker
+        advice would be worse than what they say: an unaddressed `@codex` line
+        is refused identically, and `@codex:name` needs exactly the name whose
+        absence caused the refusal."""
+        with tempfile.TemporaryDirectory() as project:
+            self._codex_peer(project, "build", "300:build", self.UUID)
+            self._codex_peer(project, "review", "301:review", self.OTHER)
+            ambiguous = self._reply(project, {"text": "hi"})
+            unknown = self._reply(project, {"text": "hi", "to": "nobody-here"})
+            unusable = self._reply(project, {"text": "hi", "to": "not a name"})
+            # The one route by which caller-supplied text reaches a would-be
+            # classifier's input: `resolve_target` interpolates the alias into
+            # its own message. A classifier reading prose instead of a class
+            # would file this addressing refusal under `no-peer` and append the
+            # guidance to it. The message body cannot do this — on the
+            # `address is None` branch it never reaches the detail at all.
+            impostor = self._reply(project, {
+                "text": "hi", "to": self.NO_SESSION.split(": ", 1)[1]})
+        self.assertEqual(ambiguous, (1, "", (
+            "reply: not delivered: 2 codex peers are live "
+            "(build: ready, review: ready); address one by name\n")))
+        self.assertEqual(unknown, (1, "", (
+            "reply: not delivered: no live codex peer named 'nobody-here'; "
+            "live peers: build, review\n")))
+        self.assertEqual(unusable, (1, "", (
+            "reply: not delivered: 'not a name' is not a usable peer name; "
+            "live codex peers: build, review\n")))
+        self.assertEqual(impostor, (1, "", (
+            "reply: not delivered: 'no Codex session found in this directory' "
+            "is not a usable peer name; live codex peers: build, review\n")))
+
+        with tempfile.TemporaryDirectory() as project:
+            self._codex_peer(project, "build", "300:build")     # no session yet
+            waiting = self._reply(project, {"text": "hi", "to": "build"})
+        self.assertEqual(waiting, (1, "", (
+            "reply: not delivered: 'build' is live but not yet routable — "
+            "it has not run a turn yet\n")))
+
+        with tempfile.TemporaryDirectory() as project:
+            self._codex_peer(project, "build", "300:build", self.UUID)
+            lone = self._reply(project, {"text": "hi"})
+        self.assertEqual(lone, (1, "", (
+            "reply: not delivered: build: ready is the only registered Codex "
+            "peer, but unnamed Codex sessions are not discoverable and cannot "
+            "be ruled out — address a peer by name\n")))
+
+        # The Claude direction. `not yet routable` has no representative here:
+        # `read_peers` skips an addressless Claude record, so that shape is
+        # Codex-only, and `unknown peer kind` is unreachable: both callers of
+        # `resolve_target` pass a literal kind.
+        # A valid name nobody answers to is retried while the peer might still
+        # be registering; the patience is cut to nothing so the suite does not
+        # wait out a decision that has already been made.
+        with tempfile.TemporaryDirectory() as project, \
+             patch.object(antiphon, "CONNECT_PATIENCE", 0):
+            antiphon.peers.register(project, "claude", "ui", "/tmp/ui.sock")
+            antiphon.peers.register(project, "claude", "api", "/tmp/api.sock")
+            said = [antiphon._send_tool(project, "hi"),
+                    antiphon._send_tool(project, "hi", "nobody-here"),
+                    antiphon._send_tool(project, "hi", "not a name")]
+        self.assertEqual([r["content"][0]["text"] for r in said], [
+            "Not delivered to Claude: not delivered: 2 claude peers are live "
+            "(api: ready, ui: ready); address one by name",
+            "Not delivered to Claude: not delivered: no live claude peer named "
+            "'nobody-here'; live peers: api, ui",
+            "Not delivered to Claude: not delivered: 'not a name' is not a "
+            "usable peer name; live claude peers: api, ui",
+        ])
+        self.assertTrue(all(r.get("isError") for r in said))
+
+    def test_a_failed_push_stays_byte_identical(self):
+        """Push renders no guidance, in either direction and for every class —
+        including the classes that are wrapped and flow through it. Its stderr
+        is printed on an exit-0 hook, which this codebase measured as reaching a
+        debug log and nothing else."""
+        with tempfile.TemporaryDirectory() as project:
+            self._codex_peer(project, "build", "300:build", self.UUID)
+            transport = self._push(
+                project, "codex", "@codex:build ship it",
+                [patch.object(antiphon.subprocess, "run",
+                              return_value=self._Refused(self.HOST_ERROR))])
+        self.assertEqual(transport, (0, "antiphon: delivery failed — {}\n".format(
+            self.HOST_ERROR)))
+
+        with tempfile.TemporaryDirectory() as project:
+            no_peer = self._push(
+                project, "codex", "@codex ship it",
+                [patch.object(antiphon, "codex_session_id", return_value=None)])
+        self.assertEqual(no_peer, (0, "antiphon: delivery failed — {}\n".format(
+            self.NO_SESSION)))
+
+        with tempfile.TemporaryDirectory() as project:
+            self._codex_peer(project, "build", "300:build", self.UUID)
+            self._codex_peer(project, "review", "301:review", self.OTHER)
+            addressing = self._push(project, "codex", "@codex ship it")
+        self.assertEqual(addressing, (0, (
+            "antiphon: delivery failed — not delivered: 2 codex peers are live "
+            "(build: ready, review: ready); address one by name\n")))
+
+        with tempfile.TemporaryDirectory() as project:
+            antiphon.peers.register(project, "claude", "ui", "/tmp/ui.sock")
+            down = self._push(project, "claude", "@claude:ui landed",
+                              [patch.object(antiphon.socket, "socket",
+                                            self._DeadSocket())])
+        self.assertEqual(down, (0, (
+            "antiphon: delivery failed — Claude MCP Channel is down: "
+            "Permission denied\n")))
+
+        with tempfile.TemporaryDirectory() as project:
+            antiphon.peers.register(project, "claude", "ui", "/tmp/ui.sock")
+            antiphon.peers.register(project, "claude", "api", "/tmp/api.sock")
+            unaddressed = self._push(project, "claude", "@claude landed")
+        self.assertEqual(unaddressed, (0, (
+            "antiphon: delivery failed — not delivered: 2 claude peers are live "
+            "(api: ready, ui: ready); address one by name\n")))
+
+        # The one class whose byte count depends on the payload envelope, so it
+        # is pinned by both ends of the line rather than by the whole of it.
+        with tempfile.TemporaryDirectory() as project:
+            antiphon.peers.register(project, "claude", "ui", "/tmp/ui.sock")
+            code, oversize = self._push(project, "claude",
+                                        "@claude:ui " + self._oversized())
+        self.assertEqual(code, 0)
+        self.assertTrue(oversize.startswith(
+            "antiphon: delivery failed — message is "), oversize)
+        self.assertTrue(oversize.endswith(
+            "bytes; the channel accepts at most {}\n".format(
+                antiphon.MAX_CHANNEL_BYTES)), oversize)
+
+        for _, printed in (transport, no_peer, addressing, down, unaddressed):
+            self.assertNotIn("passive pages", printed)
+        self.assertNotIn("passive pages", oversize)
+
+    def test_a_successful_send_stays_quiet(self):
+        """A delivered message says what it always said. `reply()` says nothing
+        at all on success — the pin there is on the empty string."""
+        with tempfile.TemporaryDirectory() as project:
+            self._codex_peer(project, "build", "300:build", self.UUID)
+            with patch.object(antiphon.subprocess, "run",
+                              return_value=self._Queued()):
+                delivered = self._reply(project, {"text": "hi", "to": "build"})
+        self.assertEqual(delivered, (0, "", ""))
+
+        with tempfile.TemporaryDirectory() as project:
+            antiphon.peers.register(project, "claude", "ui", "/tmp/ui.sock")
+            with patch.object(antiphon.socket, "socket", self._LiveSocket()):
+                named = antiphon._send_tool(project, "hi", "ui")
+        self.assertEqual(named, {"content": [
+            {"type": "text", "text": "Delivered to the Claude Code peer 'ui'."}]})
+
+        with tempfile.TemporaryDirectory() as project:
+            with patch.object(antiphon.socket, "socket", self._LiveSocket()):
+                bare = antiphon._send_tool(project, "hi")
+        self.assertEqual(bare, {"content": [
+            {"type": "text", "text": "Delivered to the Claude Code channel."}]})
+
+    def test_the_guidance_fits_the_channel_slice(self):
+        """`channel.mjs` hands the calling agent `detail.slice(0, 500)` of
+        Python's whole stderr line, which `reply()` writes as `reply: <detail>`.
+        The longest guidance-carrying detail is a host refusal, which
+        `_queue_codex` cuts at 200 characters — `no-peer` (54) and `oversize`
+        are both shorter — so 396 of 500 is the worst case, and the 104
+        characters of headroom are what let `channel.mjs` stay untouched.
+
+        Measured end to end rather than assembled from literals: a host that
+        answers with far more than the cut still produces this line.
+        """
+        with tempfile.TemporaryDirectory() as project:
+            self._codex_peer(project, "build", "300:build", self.UUID)
+            with patch.object(antiphon.subprocess, "run",
+                              return_value=self._Refused("h" * 500)):
+                _, _, err = self._reply(project, {"text": "hi", "to": "build"})
+        line = err.strip()          # `channel.mjs` trims before it slices
+        self.assertEqual(len(line), 396)
+        self.assertLess(len(line), 500)
+        self.assertTrue(line.endswith(antiphon.TOOL_GUIDANCE.format(
+            seen="only a tool-name line")), line)
+
 
 if __name__ == "__main__":
     unittest.main()

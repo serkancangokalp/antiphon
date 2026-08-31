@@ -1997,6 +1997,57 @@ def push(target="codex"):
     return 0
 
 
+class _ClassifiedRefusal(str):
+    """A refusal detail that also says which kind of refusal it is.
+
+    A `str` subclass and not a wider return: every caller of `send_to_codex` and
+    `send_to_claude` unpacks a pair, and widening that pair was measured at 72
+    red tests against zero for this. Nothing downstream sees the annotation —
+    `json`, printing, slicing and equality all treat this as the plain string it
+    is — which is also why the wrap has to be the outermost call at a birth
+    site: any string operation returns a plain `str` and drops the class.
+
+    An attached class means "the sender needs telling where its words still
+    travel". Its absence means "leave this message alone", so every refusal that
+    already names its own fix stays byte-identical by construction rather than
+    by anybody remembering to exclude it.
+    """
+
+    __slots__ = ("refusal_class",)
+
+    def __new__(cls, detail, refusal_class):
+        refusal = super().__new__(cls, detail)
+        refusal.refusal_class = refusal_class
+        return refusal
+
+
+# Measured, per direction, and both halves are surprises: a refused
+# `reply_to_codex` reaches the Codex-side page as a bare tool-name line (123
+# real records; the `text` argument is unreachable by the parser), and a refused
+# `antiphon_send` reaches Claude's page as nothing at all (0 tool events across
+# 21 rollouts — the parser emits one only for `exec_command_begin`). What does
+# carry the words either way is the visible reply, through the passive pages.
+# No timing is promised: a page is bounded, so under a backlog the words land
+# some turns later, and saying "next turn" would be the same false promise this
+# sentence exists to replace.
+TOOL_GUIDANCE = ("The peer's pull page will show {seen} of this attempt. Words "
+                 "you put in your visible reply travel with the passive pages, "
+                 "in order and in full — no delivery step involved.")
+
+
+def _guided(detail, seen):
+    """The detail as its surface should print it: with the guidance, or as-is.
+
+    `seen` is the surface's own measurement, not the direction's: the same
+    refusal read by two different readers leaves two different things on a page.
+    The join is an em dash because these are two sentences by two authors —
+    a bare space ran the host's last word into this one's first.
+    """
+    if getattr(detail, "refusal_class", None) is None:
+        return detail
+    return f"{detail} — {TOOL_GUIDANCE.format(seen=seen)}"
+
+
 def _queue_codex(session, message):
     """Leaves a message with one Codex session via `codex queue`.
 
@@ -2012,11 +2063,15 @@ def _queue_codex(session, message):
             capture_output=True, text=True, timeout=15, stdin=subprocess.DEVNULL,
         )
     except FileNotFoundError:
-        return False, "codex command not found"
+        return False, _ClassifiedRefusal("codex command not found", "transport")
     except subprocess.SubprocessError as e:
-        return False, f"{type(e).__name__}"
+        return False, _ClassifiedRefusal(f"{type(e).__name__}", "transport")
     if result.returncode != 0:
-        return False, (result.stderr or result.stdout or "unknown error").strip()[:200]
+        # The wrap is outermost: `.strip()[:200]` would hand back a plain `str`
+        # and the class with it.
+        return False, _ClassifiedRefusal(
+            (result.stderr or result.stdout or "unknown error").strip()[:200],
+            "transport")
     return True, ""
 
 
@@ -2039,7 +2094,13 @@ def _legacy_target(cwd, kind):
         return claude_socket_path(cwd), ""
     session = codex_session_id(cwd)
     if not session:
-        return None, "not delivered: no Codex session found in this directory"
+        # Classified where it is born, so nothing downstream has to read the
+        # prose to tell it apart from an addressing refusal. It says discovery
+        # found no rollout to *address* — which is not a statement about a
+        # peer's ability to read: the Codex-side page is built from Claude's
+        # transcripts and carries these words either way, measured.
+        return None, _ClassifiedRefusal(
+            "not delivered: no Codex session found in this directory", "no-peer")
     return session, ""
 
 
@@ -2166,8 +2227,13 @@ def send_to_claude(cwd, text, alias=None, sender_alias=None, message_id=None):
     }
     payload = json.dumps(request, ensure_ascii=False).encode()
     if len(payload) > MAX_CHANNEL_BYTES:
-        return False, (f"message is {len(payload)} bytes; the channel accepts at "
-                       f"most {MAX_CHANNEL_BYTES}")
+        # Refused before any socket is opened, so not a transport failure — but
+        # the visible reply is exactly where an oversized text still travels
+        # whole, since the automatic hook hands an oversized record over without
+        # splitting it.
+        return False, _ClassifiedRefusal(
+            f"message is {len(payload)} bytes; the channel accepts at "
+            f"most {MAX_CHANNEL_BYTES}", "oversize")
 
     deadline = time.monotonic() + CONNECT_PATIENCE
     while True:
@@ -2198,8 +2264,9 @@ def send_to_claude(cwd, text, alias=None, sender_alias=None, message_id=None):
             if error.errno in NOT_LISTENING_YET and time.monotonic() < deadline:
                 time.sleep(CONNECT_RETRY_DELAY)
                 continue
-            return False, ("Claude MCP Channel is down: "
-                           f"{error.strerror or type(error).__name__}")
+            return False, _ClassifiedRefusal(
+                "Claude MCP Channel is down: "
+                f"{error.strerror or type(error).__name__}", "transport")
         break
 
     # Connected. Nothing past this point is retried: the bytes may already have
@@ -2215,19 +2282,24 @@ def send_to_claude(cwd, text, alias=None, sender_alias=None, message_id=None):
                     break
                 reply_bytes += chunk
     except OSError as error:
-        return False, ("Claude MCP Channel is down: "
-                       f"{error.strerror or type(error).__name__}")
+        return False, _ClassifiedRefusal(
+            "Claude MCP Channel is down: "
+            f"{error.strerror or type(error).__name__}", "transport")
     try:
         result = json.loads(reply_bytes.decode())
     except (UnicodeDecodeError, json.JSONDecodeError):
-        return False, "Claude MCP Channel returned an invalid response"
+        return False, _ClassifiedRefusal(
+            "Claude MCP Channel returned an invalid response", "transport")
     if not isinstance(result, dict):
         # Decoded, and not an answer: `[]` and `null` are valid JSON and `.get`
         # on either raises out of a path whose caller is only ever told success
         # or a reason.
-        return False, "Claude MCP Channel returned an invalid response"
+        return False, _ClassifiedRefusal(
+            "Claude MCP Channel returned an invalid response", "transport")
     if not result.get("ok"):
-        return False, str(result.get("error") or "channel delivery failed")[:200]
+        return False, _ClassifiedRefusal(
+            str(result.get("error") or "channel delivery failed")[:200],
+            "transport")
     return True, ""
 
 
@@ -2257,7 +2329,10 @@ def reply(*_):
     label = queue_label(who, delivery_id())
     ok, detail = send_to_codex(cwd, f"{CHANNEL_LABEL} {label} {text}", to)
     if not ok:
-        print(f"reply: {detail}", file=sys.stderr)
+        # `only a tool-name line`: measured on 123 real `reply_to_codex`
+        # records, whose `text` argument no parser path can reach.
+        print(f"reply: {_guided(detail, 'only a tool-name line')}",
+              file=sys.stderr)
         return 1
     _record_delivery(cwd, "codex", text, to)
     return 0
@@ -2455,7 +2530,10 @@ def _send_tool(cwd, text, to=None, sender=None):
     ok, detail = send_to_claude(cwd, text, to, sender_alias=sender_alias(sender),
                                 message_id=delivery_id())
     if not ok:
-        return _tool_error(f"Not delivered to Claude: {detail}")
+        # `nothing`, not a tool-name line: Claude's parser emits a tool event
+        # only for `exec_command_begin`, and an MCP call is never one — measured
+        # at 0 tool events across 21 rollouts.
+        return _tool_error(f"Not delivered to Claude: {_guided(detail, 'nothing')}")
     _record_delivery(cwd, "claude", text, to)
     # Naming the peer back is what lets the sender notice it addressed the wrong
     # one. With a single peer there is nothing to distinguish, so the old

@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
-import { spawn } from "node:child_process";
+import { execFileSync, spawn } from "node:child_process";
 import { existsSync, mkdirSync, readdirSync, readFileSync, symlinkSync, writeFileSync } from "node:fs";
 import { mkdtemp, rm } from "node:fs/promises";
 import { Socket, connect } from "node:net";
@@ -456,6 +456,73 @@ async function onlyTheSessionThatWonTheNameSignsItsMessages() {
   }
 }
 
+// A `codex` that refuses, with more to say than the transport keeps. The
+// success stub above cannot reach this road: what an agent is told when the
+// host itself says no crosses a Python process, a stderr pipe and a
+// 500-character slice before it becomes a tool error, and only the far end of
+// that trip decides whether the sentence arrives whole.
+async function makeRefusingCodexStub(said) {
+  const dir = await mkdtemp(join(tmpdir(), "antiphon-refuse-"));
+  writeFileSync(join(dir, "codex"),
+    `#!/bin/sh\nprintf '%s' ${JSON.stringify(said)} >&2\nexit 1\n`,
+    { mode: 0o755 });
+  return dir;
+}
+
+async function aRefusedTransportTellsTheAgentWhereTheWordsTravel() {
+  // The refusal this work was opened on, padded past the 200-character cut
+  // `_queue_codex` applies: the worst case is a host with plenty to say, and it
+  // is the case where the appended sentence would be the first thing lost.
+  const observed = "direct app-server input is not allowed for unloaded spawned sub-agents";
+  const noisy = `${observed} ${"detail ".repeat(70)}`;
+  // Read out of the module rather than copied: a second hand-maintained literal
+  // in a second language is exactly the drift `TO_DESCRIPTION` needs a contract
+  // test for, and this arm is about the trip, not the wording.
+  const guidance = execFileSync("python3", ["-c",
+    "import sys; sys.path.insert(0, 'lib'); import antiphon; " +
+    "sys.stdout.write(antiphon.TOOL_GUIDANCE.format(seen='only a tool-name line'))",
+  ], { encoding: "utf8" });
+
+  const dir = await mkdtemp(join(tmpdir(), "antiphon-refusal-"));
+  const stubDir = await makeRefusingCodexStub(noisy);
+  const sockets = [socketFor(dir, "")];
+  const clients = [];
+  try {
+    liveCodexPeer(dir, "build", "300:build", CODEX_SESSION);
+    const env = { ...process.env, ANTIPHON_CWD: dir, PATH: `${stubDir}:${process.env.PATH}` };
+    delete env.ANTIPHON_NAME;
+    const transport = new StdioClientTransport({
+      command: "node", args: ["lib/channel.mjs"], env, stderr: "pipe",
+    });
+    const client = new Client({ name: "antiphon-refusal", version: "1.0.0" });
+    await client.connect(transport);
+    clients.push(client);
+
+    await assert.rejects(
+      () => client.callTool({
+        name: "reply_to_codex", arguments: { text: "hi", to: "build" },
+      }),
+      (error) => {
+        const refusal = String(error?.message || error);
+        assert.match(refusal, /Failed to deliver reply to Codex: /);
+        assert.ok(refusal.includes(observed),
+          `the host's own reason must survive: ${refusal}`);
+        assert.ok(refusal.endsWith(guidance),
+          `the guidance must arrive whole, not sliced: ${refusal}`);
+        return true;
+      },
+      "a transport refusal must tell the agent where its words still travel",
+    );
+    console.log("a refused transport names the passive page: ok");
+  } finally {
+    for (const client of clients) await client.close().catch(() => {});
+    for (const path of sockets) await rm(path, { force: true }).catch(() => {});
+    for (const path of [dir, stubDir]) {
+      await rm(path, { recursive: true, force: true }).catch(() => {});
+    }
+  }
+}
+
 async function onlyOneUnnamedSessionGetsTheChannel(startTogether) {
   // Started together, both sessions can see the socket path free at the same
   // moment. Nothing after that point may let the loser bind: it would unlink
@@ -737,6 +804,7 @@ await fourLiveSessionsRouteByName();
 await onlyOneUnnamedSessionGetsTheChannel(false);   // a second terminal, later
 await onlyOneUnnamedSessionGetsTheChannel(true);    // both started together
 console.log("per-peer sockets: ok");
+await aRefusedTransportTellsTheAgentWhereTheWordsTravel();
 
 try {
   await client.connect(transport);
