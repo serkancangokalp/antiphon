@@ -329,13 +329,44 @@ class ShippedContractTest(unittest.TestCase):
                          "the README's Python floor and antiphon.PYTHON_FLOOR "
                          "are one fact")
 
-    def test_the_mcp_server_reports_the_package_version(self):
-        """The MCP handshake names a version, and it sat at 0.1.0 through two
-        releases because nothing tied it to package.json. One number, one
-        fact: the string in the handshake is the version npm installs."""
+    def test_both_mcp_handshakes_name_the_package_version(self):
+        """Two servers, one version. The Python side's handshake sat at 0.1.0
+        through two releases because nothing tied it to package.json; a grep
+        then pinned that one string — and the Node channel's handshake went on
+        announcing 0.1.0 through 0.3.0 and 0.3.1, because the grep never looked
+        at it. So this reads neither source: it runs each server's `initialize`
+        and compares what comes back with the version npm installs."""
         version = json.loads(read("package.json"))["version"]
-        self.assertIn(f'"version": "{version}"', read("lib", "antiphon.py"),
-                      "serverInfo must carry the package version")
+        initialize = json.dumps({"jsonrpc": "2.0", "id": 1, "method": "initialize",
+                                 "params": {"protocolVersion": "2025-06-18",
+                                            "capabilities": {},
+                                            "clientInfo": {"name": "t", "version": "0"}}})
+
+        with self.subTest(server="python mcp"), \
+             tempfile.TemporaryDirectory() as project:
+            out = io.StringIO()
+            with patch.object(antiphon, "project_dir", return_value=project), \
+                 patch.object(antiphon.sys, "stdin", io.StringIO(initialize + "\n")), \
+                 contextlib.redirect_stdout(out):
+                antiphon.mcp()
+            answered = json.loads(out.getvalue().splitlines()[0])
+            self.assertEqual(answered["result"]["serverInfo"]["version"], version)
+
+        with self.subTest(server="node channel"), \
+             tempfile.TemporaryDirectory() as project:
+            # Its own project directory, so the socket key never collides with
+            # a live session's; stdin closing is the channel's own shutdown
+            # signal, and a clean shutdown unlinks the socket it bound.
+            env = {**os.environ, "ANTIPHON_CWD": project}
+            env.pop("ANTIPHON_NAME", None)
+            done = subprocess.run(
+                ["node", os.path.join(ROOT, "lib", "channel.mjs")],
+                input=initialize + "\n", capture_output=True, text=True,
+                env=env, timeout=60)
+            answers = [json.loads(line) for line in done.stdout.splitlines()
+                       if line.strip()]
+            self.assertTrue(answers, f"no handshake answer; stderr: {done.stderr}")
+            self.assertEqual(answers[0]["result"]["serverInfo"]["version"], version)
 
     def test_paged_context_limits_match_code(self):
         """Every number the README states about the pull path is read back off

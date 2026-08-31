@@ -175,6 +175,7 @@ antiphon status            # transcripts, cursors, live peers and channel status
 antiphon doctor            # read-only checkup: why is the bridge quiet?
 antiphon summary [side]    # show the context that would be injected
 antiphon setup             # (re)install the project setup
+antiphon --version         # the installed version
 npm test                   # Python unit tests + real MCP protocol test
 ```
 

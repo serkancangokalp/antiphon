@@ -2797,6 +2797,31 @@ class DoctorTest(unittest.TestCase):
         self.assertEqual(done.returncode, 1,
                          "an unknown command is still an error")
 
+    def test_version_prints_the_package_version_and_exits_zero(self):
+        """Measured before this change: `antiphon --version` fell through the
+        command table like a typo — it printed the usage and exited 1. The
+        number it prints is read from package.json, not spelled again here;
+        one of the two spellings is through the Node wrapper, which is what
+        PATH actually runs."""
+        lib = os.path.dirname(antiphon.__file__)
+        script = os.path.join(lib, "antiphon.py")
+        with open(os.path.join(lib, "..", "package.json"), encoding="utf-8") as f:
+            version = json.load(f)["version"]
+        for spelling in ("--version", "-V", "version"):
+            with self.subTest(spelling=spelling):
+                done = subprocess.run([sys.executable, script, spelling],
+                                      capture_output=True, text=True, timeout=60,
+                                      stdin=subprocess.DEVNULL)
+                self.assertEqual(done.returncode, 0, done.stderr)
+                self.assertEqual(done.stdout, f"antiphon {version}\n")
+        wrapper = os.path.join(lib, "..", "bin", "antiphon.mjs")
+        done = subprocess.run(["node", wrapper, "--version"],
+                              capture_output=True, text=True, timeout=60,
+                              stdin=subprocess.DEVNULL)
+        self.assertEqual(done.returncode, 0, done.stderr)
+        self.assertEqual(done.stdout, f"antiphon {version}\n",
+                         "the wrapper hands --version through unchanged")
+
     # ---- helpers ----
 
     @staticmethod

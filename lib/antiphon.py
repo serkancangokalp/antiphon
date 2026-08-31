@@ -13,6 +13,7 @@ Usage:
   antiphon reply               # sends a Claude Channel reply to Codex (stdin JSON)
   antiphon channel             # long-lived Node.js MCP Channel server (started by Claude Code)
   antiphon mcp                 # MCP stdio server for Codex (fallback path)
+  antiphon --version           # the installed version (also -V, version)
 
 Design: NO SHARED LOG IS KEPT. Both CLIs already write transcripts; Antiphon
 reads and derives from them. That way there's no write race, no stale record,
@@ -3488,7 +3489,9 @@ def _mcp_serve(cwd, alias=None):
             _mcp_result(mid, {
                 "protocolVersion": "2024-11-05",
                 "capabilities": {"tools": {}},
-                "serverInfo": {"name": "antiphon", "version": "0.3.1"},
+                "serverInfo": {"name": "antiphon",
+                               "version": _package_version(_package_root())
+                               or "unknown"},
             })
         elif method == "tools/list":
             _mcp_result(mid, {"tools": TOOLS})
@@ -4969,6 +4972,11 @@ if __name__ == "__main__":
     # command still exits 1.
     if command in ("--help", "-h", "help"):
         print(__doc__)
+        sys.exit(0)
+    # Same shape as help, same reason. The number is the one in package.json
+    # beside this copy — the one npm installed — so a release bumps one file.
+    if command in ("--version", "-V", "version"):
+        print(f"antiphon {_package_version(_package_root()) or 'unknown'}")
         sys.exit(0)
     func = COMMANDS.get(command)
     if not func:
