@@ -889,6 +889,17 @@ Seven checks, in print order:
    three of four realistic pairs, `0.9.0` reading as newer than `0.10.0` — and
    anything that will not parse that way is `·` “cannot compare”, never an
    ordering guess. No `antiphon` on `PATH` while hooks call it is `✗`.
+1b. **Running servers** — `ps -eo pid=,lstart=,args=` behind a third seam
+   (`_process_table`, beside `_which` and `_tool_version`), filtered to the two
+   long-lived servers by the script in their argv; the wrapper only spawns and
+   is not one. A server whose package root's code files (`lib/antiphon.py`,
+   `lib/peers.py`, `lib/channel.mjs`, `package.json`) changed after it started
+   is `✗` with both times and "restart that session" — measured 2026-08-31,
+   four servers were answering with pre-merge code while doctor said 13/13 ✓.
+   A server whose root is gone is `✗` as an orphan (measured: a two-day-old
+   channel under `launchd` from a renamed directory). Machine-wide like the
+   install check; another copy's root is named. The registry lends a pid its
+   alias, scanned without pruning. Nothing running is `·`.
 2. **Interpreters** — this run's Python against a `PYTHON_FLOOR` constant bound
    to the README by contract test; what the wrapper's bare `python3` actually
    resolves to on `PATH`, which is a different question (measured on the

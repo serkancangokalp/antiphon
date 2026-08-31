@@ -2760,14 +2760,17 @@ class DoctorTest(unittest.TestCase):
                         "/usr/bin/node": "v20.11.0"}
 
     @contextlib.contextmanager
-    def hermetic(self, project, tools=None, versions=None):
+    def hermetic(self, project, tools=None, versions=None, processes=()):
         """doctor against a fixed machine: the fixture's project, a stated
-        PATH, stated tool versions."""
+        PATH, stated tool versions, a stated process table (empty unless a
+        test says otherwise — the host running the suite has live bridge
+        servers of its own, and their age is not the fixture's business)."""
         found = self.healthy_tools() if tools is None else dict(tools)
         banners = dict(self.HEALTHY_VERSIONS if versions is None else versions)
         with patch.object(antiphon, "project_dir", return_value=project), \
              patch.object(antiphon, "_which", side_effect=found.get), \
-             patch.object(antiphon, "_tool_version", side_effect=banners.get):
+             patch.object(antiphon, "_tool_version", side_effect=banners.get), \
+             patch.object(antiphon, "_process_table", return_value=list(processes)):
             yield
 
     def run_doctor(self, project, **hermetic):
@@ -3043,6 +3046,146 @@ class DoctorTest(unittest.TestCase):
             _, printed = self.run_doctor(project)
         self.assertEqual(self.line_for(printed, "codex queue:"), "",
                          "no queue database, no line")
+
+    # ---- running servers older than their code ----
+
+    def fake_root(self, changed_at):
+        """A package tree whose code last changed at `changed_at`."""
+        root = tempfile.mkdtemp(prefix="antiphon-pkg-")
+        self.addCleanup(lambda: __import__("shutil").rmtree(root, ignore_errors=True))
+        os.makedirs(os.path.join(root, "lib"))
+        for name in ("lib/antiphon.py", "lib/peers.py", "lib/channel.mjs", "package.json"):
+            path = os.path.join(root, name)
+            with open(path, "w", encoding="utf-8") as f:
+                f.write("{}\n" if name.endswith(".json") else "# code\n")
+            os.utime(path, (changed_at, changed_at))
+        return root
+
+    def test_doctor_flags_a_server_that_started_before_its_code_changed(self):
+        """Measured on 2026-08-31: four bridge servers were running code from
+        before the day's merges, doctor said 13/13 ✓, and the fix the user had
+        just installed was provably not what was answering. A long-lived
+        server loads its code once; the hooks reload every turn, so the two
+        disagree until that session restarts."""
+        project = self.project()
+        self.set_up(project)
+        changed = time.time() - 600
+        root = self.fake_root(changed)
+        stale_start = int(changed - 3600)
+        fresh_start = int(changed + 60)
+        code, printed = self.run_doctor(project, processes=[
+            (4242, stale_start, f"python3 {root}/lib/antiphon.py mcp"),
+            (4243, fresh_start, f"/opt/node/bin/node {root}/lib/channel.mjs"),
+            (4244, stale_start, f"node /opt/homebrew/bin/antiphon mcp"),   # the wrapper: not a server
+        ])
+        self.assertEqual(code, 1)
+        stale = self.line_for(printed, "pid 4242")
+        self.assertTrue(stale.startswith("✗ running:"), stale)
+        self.assertIn("codex mcp", stale)
+        self.assertIn(time.strftime("%H:%M:%S", time.localtime(stale_start)), stale)
+        self.assertIn(time.strftime("%H:%M:%S", time.localtime(changed)), stale)
+        self.assertIn("restart that Codex session", stale)
+        self.assertEqual(self.line_for(printed, "pid 4243"), "",
+                         "a server younger than its code is not named")
+        self.assertEqual(self.line_for(printed, "pid 4244"), "",
+                         "the wrapper only spawns; it is not a server")
+        self.assertTrue(self.line_for(printed, "running: 1 server").startswith("✓"),
+                        printed)
+
+    def test_doctor_names_a_server_whose_tree_is_gone(self):
+        """Measured: a channel from two days earlier, parent `launchd`, running
+        `Documents/claudex/lib/channel.mjs` from a directory that no longer
+        existed. Not stale — orphaned; the repair is different."""
+        project = self.project()
+        self.set_up(project)
+        code, printed = self.run_doctor(project, processes=[
+            (67249, int(time.time() - 86400 * 2),
+             "/opt/node/bin/node /Users/x/Documents/gone/lib/channel.mjs"),
+        ])
+        self.assertEqual(code, 1)
+        line = self.line_for(printed, "pid 67249")
+        self.assertTrue(line.startswith("✗ running:"), line)
+        self.assertIn("claude channel", line)
+        self.assertIn("/Users/x/Documents/gone", line)
+        self.assertIn("no longer exists", line)
+        self.assertIn("orphan", line)
+
+    def test_doctor_is_quiet_about_running_servers_when_there_are_none(self):
+        project = self.project()
+        self.set_up(project)
+        code, printed = self.run_doctor(project)
+        self.assertEqual(code, 0)
+        self.assertTrue(self.line_for(printed, "running:").startswith("·"), printed)
+
+    def test_doctor_names_the_registered_alias_of_a_stale_server(self):
+        """The registry maps a pid to the name the person knows the session
+        by; "pid 4242" alone sends them to `ps`."""
+        project = self.project()
+        self.set_up(project)
+        changed = time.time() - 600
+        root = self.fake_root(changed)
+        antiphon.peers.register(project, "claude", "ui", "/tmp/ui.sock",
+                                pid=4242, owner_key="300:x")
+        _, printed = self.run_doctor(project, processes=[
+            (4242, int(changed - 60), f"node {root}/lib/channel.mjs"),
+        ])
+        line = self.line_for(printed, "pid 4242")
+        self.assertIn('claude channel "ui"', line)
+        self.assertIn("restart that Claude Code session", line)
+
+    def test_the_process_table_seam_parses_what_ps_prints(self):
+        """`LC_ALL=C ps -eo pid=,lstart=,args=` as macOS prints it, including
+        the space-padded day and a command line with its own spaces."""
+        sample = (
+            "10606 Mon Aug 31 12:55:04 2026     /opt/homebrew/Cellar/node/26.7.0/bin/node /Users/x/lib/channel.mjs\n"
+            "  917 Sat Aug  1 09:05:00 2026 python3 /Users/x/lib/antiphon.py mcp\n"
+            "    1 Tue Aug 18 13:50:50 2026 /sbin/launchd\n"
+            "garbage line without a date\n")
+        rows = antiphon._parse_process_table(sample)
+        self.assertEqual([(pid, args) for pid, _, args in rows], [
+            (10606, "/opt/homebrew/Cellar/node/26.7.0/bin/node /Users/x/lib/channel.mjs"),
+            (917, "python3 /Users/x/lib/antiphon.py mcp"),
+            (1, "/sbin/launchd"),
+        ])
+        started = rows[1][1]
+        self.assertEqual(time.localtime(started)[:6], (2026, 8, 1, 9, 5, 0))
+
+    def test_a_real_server_is_seen_through_the_real_process_table(self):
+        """Unpatched `ps`: a real `antiphon.py mcp` started from a package copy
+        whose code is then touched into the future is named by pid."""
+        project = self.project()
+        self.set_up(project)
+        root = self.fake_root(time.time() - 60)
+        real = os.path.join(os.path.dirname(antiphon.__file__), "antiphon.py")
+        __import__("shutil").copy(real, os.path.join(root, "lib", "antiphon.py"))
+        __import__("shutil").copy(os.path.join(os.path.dirname(antiphon.__file__), "peers.py"),
+                                  os.path.join(root, "lib", "peers.py"))
+        env = {**os.environ, "ANTIPHON_CWD": project}
+        env.pop("ANTIPHON_NAME", None)
+        child = subprocess.Popen([sys.executable, os.path.join(root, "lib", "antiphon.py"), "mcp"],
+                                 stdin=subprocess.PIPE, stdout=subprocess.DEVNULL,
+                                 stderr=subprocess.DEVNULL, env=env)
+        self.addCleanup(child.wait)
+        self.addCleanup(child.kill)
+        try:
+            deadline = time.time() + 5
+            while time.time() < deadline:
+                table = antiphon._process_table()
+                if table and any(pid == child.pid for pid, _, _ in table):
+                    break
+                time.sleep(0.1)
+            future = time.time() + 5
+            os.utime(os.path.join(root, "lib", "antiphon.py"), (future, future))
+            with patch.object(antiphon, "project_dir", return_value=project), \
+                 patch.object(antiphon, "_which", side_effect=self.healthy_tools().get), \
+                 patch.object(antiphon, "_tool_version", side_effect=self.HEALTHY_VERSIONS.get):
+                out = io.StringIO()
+                with contextlib.redirect_stdout(out):
+                    antiphon.doctor()
+            line = self.line_for(out.getvalue(), f"pid {child.pid}")
+            self.assertTrue(line.startswith("✗ running: codex mcp"), line)
+        finally:
+            child.kill()
 
     def test_help_exits_zero(self):
         """Asking for help is not an error. Measured before this change:
