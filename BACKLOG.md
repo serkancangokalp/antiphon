@@ -403,25 +403,105 @@ never printed before — a diagnosis, not a behaviour change.
   wording, which describes keyless→keyless suppression, while this residual is
   **keyless-write → keyed-identical-push** through the migration branch.
 
-## P2 — A refused active send does not say the message will still arrive
+## Shipped — a refused send says what the peer will and will not see
 
-When the direct channel refuses a send, the tools report the host's error and
-stop there. Observed twice in one session: the Codex host answered
-`direct app-server input is not allowed for unloaded spawned sub-agents`, so
-`reply_to_codex` failed. `antiphon status` then showed the same text waiting in
-the other side's pull queue — the passive path had it, and it was delivered on
-the peer's next prompt.
+The problem was real and the recorded premise was false. Observed twice in one
+session: the Codex host answered `direct app-server input is not allowed for
+unloaded spawned sub-agents`, `reply_to_codex` failed, and the tool reported
+that error and stopped there. The reasonable reading of a failed send is that
+the message was lost — which invites repeating it, or proceeding as though the
+peer was never told. But the fix this entry prescribed was to promise a delay:
+*"passive pull carries everything either side wrote, and a refused active send
+changes only the timing."* Measured, what a refused send leaves on the peer's
+page is neither everything nor the same thing in both directions.
 
-The sender could not know that from the error. The reasonable reading of a
-failed send is that the message was lost, which invites repeating it, or
-proceeding as though the peer was never told. Both are worse than waiting.
+- **Claude → Codex: a tool-name line, and nothing of the message.**
+  `claude_events` (`lib/antiphon.py:1077`) draws a tool event's detail from
+  `file_path`, `command` or `pattern`. `reply_to_codex` carries none of them,
+  so across 123 real `tool_use` records in this project's own transcripts the
+  whole page entry is `· 1 tool calls: mcp__antiphon__reply_to_codex`, and the
+  `text` argument is unreachable by any parser path. That sample covers refused
+  calls by mechanism: a `tool_use` block is part of the assistant message and
+  is written when the call is *emitted*, before any result exists.
+- **Codex → Claude: nothing at all.** `codex_events`
+  (`lib/antiphon.py:1205`) emits a tool event from exactly one record shape,
+  `payload.type == "exec_command_begin"`. Across 21 discovered rollouts there
+  were 0 tool events, and a census of all 129 rollout files on the maintainer's
+  machine found no `exec_command_begin` record of any kind — this Codex writes
+  tool calls as `custom_tool_call` (3,879) and `function_call` (282). A refused
+  `antiphon_send` leaves no trace on Claude's page whatsoever.
+- **What does survive is the visible reply.** `build_summary` carries assistant
+  text verbatim, marker line included, and `_build_page`
+  (`lib/antiphon.py:1415`) never splits a record. So the guidance points there
+  and claims order and completeness only — never timing. A page is bounded by
+  `PAGE_BUDGET` and `EVENT_LIMIT` and filled oldest-first, so under a backlog
+  the words land on the peer's third or fourth turn; "on its next turn" would
+  have been the same species of false promise as the one being removed.
+- **The Stop hook is not a second transport.** `push()` → `deliver()`
+  (`lib/antiphon.py:1806`, `1879`) calls the same `send_to_codex` /
+  `send_to_claude` the tool just called, so a refusal repeats byte-identically
+  after the prefix. Advising a sender to re-address the line would be advising
+  it to reproduce the failure. (A failed push does not record its fingerprint,
+  so the line is genuinely re-offered every turn until it succeeds — that is
+  the true guarantee, and it is not one about the refused send.)
+- **The no-session refusal is about addressing, not about readership.**
+  `not delivered: no Codex session found in this directory` means
+  `codex_rollout_files(cwd)[:1]` was empty (`codex_session_id`,
+  `lib/antiphon.py:1762`). The Codex-side page is built from **Claude's**
+  transcripts and never consults a Codex rollout, so it is fully readable
+  exactly where that refusal fires — measured in the same fixture that produces
+  it. This is the class where naming the passive page matters most, not least.
 
-The bridge already knows the answer: passive pull carries everything either
-side wrote, and a refused *active* send changes only the timing. Say so in the
-failure — name the fallback and what it costs, which is a delay until the peer's
-next turn rather than a loss. Worth checking first whether any refusal exists
-that the pull path genuinely cannot cover; if one does, it needs a different
-message from the ones that merely arrive late.
+### What the surfaces say now
+
+`TOOL_GUIDANCE` (`lib/antiphon.py:2033`) with a `{seen}` slot the reading
+surface fills from its own measurement: `only a tool-name line` from `reply()`,
+`nothing` from `_send_tool`. It is appended only when the detail was born
+carrying a class — a `str` subclass with `refusal_class`
+(`_ClassifiedRefusal`, `lib/antiphon.py:2000`), wrapped at the birth sites
+below. Widening the `(ok, detail)` pair to carry the class instead was measured
+at 72 red tests; the subclass costs zero and survives every existing unpack.
+
+| class | born at | guidance |
+|---|---|---|
+| `transport` | `_queue_codex` ×3, `send_to_claude`'s five socket/response failures | yes — the words are nowhere on the page |
+| `no-peer` | `_legacy_target`'s no-session message | yes — the page carries them regardless |
+| `oversize` | `send_to_claude`'s 128 KiB pre-transport refusal | yes — an oversized record still travels whole through the automatic hook |
+| `addressing` | `resolve_target`'s six sites | **no**, byte-identical: they already name the fix, and those sites are never wrapped, so there is nothing to append |
+| **push**, every class | — | **no**, byte-identical: its failure print is exit-0 hook stderr, which reaches a debug log and not the agent |
+
+`lib/channel.mjs` is untouched. It hands the calling agent
+`detail.slice(0, 500)` of Python's stderr line, which `reply()` writes as
+`reply: <detail>`; the longest guidance-carrying detail is a host refusal cut
+at 200 characters (`no-peer` is 54 and `oversize` shorter still, so neither
+moves the number), giving 394 of 500 with 106 characters of headroom. A
+contract test measures that line end to end rather than recomputing it.
+
+### The entry's open question, answered
+
+It asked whether any refusal exists that the pull path genuinely cannot cover.
+Pull covers every *refusal*. What it cannot carry is text that exists only
+inside a tool call's arguments — in both directions, and that is precisely the
+text a refused send consists of. Which is why every guidance points at the
+visible reply rather than at the send being retried. The route that would
+change that answer is the tool-call retrieval item under P0's *Still open, by
+name*; until it exists, a tool argument is unreadable to the other side whether
+its call succeeded or not.
+
+### What "in full" is bounded by
+
+- `antiphon_read` refuses a record over `PAGE_BUDGET` without advancing (the
+  measured Codex-MCP-result caveat above). It cannot bite the `oversize` class,
+  whose reader is always Claude and whose channel exposes no `antiphon_read`,
+  and the automatic hook delivers the record whole either way.
+- Discovery reads the newest `RECENT_FILES = 3` transcripts per side
+  (`lib/antiphon.py:60`): a sender whose session is not among them contributes
+  nothing to the peer's page. Filed under the durable source catalog in *Still
+  open, by name*.
+- A peer with no cursor positions starts its window at `LOOKBACK` —
+  **six hours** (`lib/antiphon.py:61`, applied in `positions_for` at `708`). A
+  Codex session that starts more than six hours after the words were written
+  begins past them, which bounds the `no-peer` case's future reader.
 
 ## Shipped — `antiphon doctor`
 
