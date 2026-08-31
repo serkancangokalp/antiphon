@@ -56,7 +56,6 @@ the write-and-flush-before-advance transaction.
 - The last-record content anchor (an in-place rewrite that keeps inode,
   length and first line still resumes silently).
 - Descriptor-safe reading of registry-supplied transcript paths.
-- Direct-channel spill for the 128 KiB `antiphon_send` cap.
 - Retirement of the preserved v2 sibling key once pre-v3 processes and
   rollback support are no longer needed.
 
@@ -294,21 +293,189 @@ The boundary, stated straight: a reading agent can still choose to act on
 relayed words. What shipped makes their provenance impossible to misread, which
 is all a label can do.
 
-## P1 — Large direct-message attachments
+## P1 — Large direct-message attachments (shipped, minus acknowledgement and retry)
 
-The direct channel has a separate, honest 128 KiB byte cap. Keep it until an
-oversized message has a recoverable path:
+The direct channel has a separate, honest 128 KiB byte cap, and it stays. What
+changed is what happens above it: an oversized direct message is no longer a
+dead end. The sender parks the full text and delivers a small envelope naming
+where it went.
 
-- atomically write mode-0600 content under `.antiphon/messages/`;
-- send a size, SHA-256 hash and local reference instead of truncating;
-- validate every reference beneath the project state directory;
-- define acknowledgement, retry, TTL and total-quota behavior;
-- show pending storage in `antiphon status` and clean it without deleting an
-  unread message silently.
+The entry asked for five things. Three shipped, one shipped in a form the entry
+did not ask for and this close names as a deviation, and two — acknowledgement
+and retry — are **not delivered and remain open below**.
 
-This is separate from passive pull, whose old 2,600-character trim is retired
-— pull now pages complete records. Ordinary long SQL and code already fit
-under 128 KiB when sent through a channel tool.
+### What shipped — the decisions
+
+**The spill lives in the tools, not in the transports.** `reply` and
+`_send_tool` decide; `send_to_claude`, `send_to_codex` and `_queue_codex`'s
+transport body are untouched. Measured: a spill inside a transport strips the
+`[Antiphon bridge] Claude:` / `[Antiphon channel] Claude:` prefix that anchors
+the echo guard, so the bridge's own delivery is read back as new traffic and
+delivered again — `queue_label`'s docstring names that failure exactly — and it
+leaves the mid-turn park holding the original. At the caller layer the envelope
+replaces only the outgoing text, and the prefixes, the `[from= id=]` reply
+address, the park and the dedupe all see an ordinary message.
+
+**Each direction's predicate mirrors what actually refuses.** The composition
+comes first — the full outgoing message, prefix and label included — and that
+is what is measured.
+
+- `_oversized_for_claude` reproduces `send_to_claude`'s own JSON
+  serialization. `len(text)` and the payload length are different numbers and
+  not by a constant: measured, `"` costs two bytes and every control character
+  six, so 22,000 control characters serialize to 132,091 against a 131,072-byte
+  cap while their raw length is a sixth of it, and the whole 130,982–131,072
+  ASCII band is over the cap while reading as under it. A raw-length trigger
+  would have left exactly that band refusing.
+- `_oversized_for_queue` computes its bound at call time:
+  `SC_ARG_MAX` − a 502-byte per-exec overhead − the live environment − the
+  fixed argv (the session id included) − a one-page margin. No constant could
+  be correct: measured on one machine, one binary, only the environment block
+  grown, the largest message that execs fell **1,044,820 → 844,759 → 444,759**,
+  byte for byte with the environment. `ARG_MAX` is one budget argv and environ
+  share. The single-argument limit is not separately binding on Darwin — a
+  1,047,587-byte argument execs against an `ARG_MAX` of 1,048,576 — so the
+  formula carries no term for it.
+
+**The file carries its own provenance.** One header line —
+`[Antiphon attachment from=… id=… sha256=… bytes=…]` — then a blank line, then
+the exact content. Megabytes of the other agent's words must not enter a
+context as anonymous `Read` output, and the header says whose they are in the
+same read. The hash covers the **content only**, so the rule is one a person
+can perform: everything after the first blank line, `tail -n +3 <path> |
+shasum -a 256`. The envelope repeats the author, redundantly on purpose.
+
+**The envelope carries an absolute path.** The receiving agent's `Read` tool
+requires one, and a session started in a subdirectory cannot rebuild it from a
+relative form. Measured on the live install: `setup` writes the same absolute
+`ANTIPHON_CWD` into `.mcp.json` and `.codex/config.toml`, so both sides agree
+on the root, and `project_dir()` returns it from any working directory. The
+path is local, and the envelope and both RULEs say so: same machine, same user,
+same project. That bound was previously stated nowhere.
+
+**No orphan ever charges the store.** The order is write → send → on any
+non-delivery unlink at once, with one line on stderr. Refusals are the common
+case, not crashes: an agent retrying an oversized send against a channel that
+is down would otherwise write one full-size orphan per attempt and turn a
+transport outage into a seven-day storage refusal.
+
+**Above `ATTACHMENT_MAX` the old refusal returns, unchanged.** No store will
+take those words, and the guidance naming the visible-reply road is still the
+right message. It falls through to the existing `oversize` wrap rather than
+refusing in the tool, which is why no new refusal class was born there.
+
+**The quota refusal is unclassed.** `_ClassifiedRefusal`'s own invariant is
+that a class means "the sender needs telling where its words still travel", and
+its absence means "leave this message alone, it already names its fix". The
+quota refusal names its fix — wait for the TTL, or clear the directory — so it
+joins the `addressing` family. Nothing is ever evicted to make room: an
+unexpired attachment is somebody's undelivered words.
+
+**The sweep runs on the bridge's own heartbeat.** In `hook`, immediately after
+`cwd` is resolved and before the page is built. Both halves matter: before the
+resolution there is no store path, and after the page build the ordinary quiet
+turn — `hook` has five exits and `if not text` is the common one — would never
+sweep. Outside every lock (a hold across `cursor_lock` was measured at 5,008 ms
+against a concurrent reader's 2,038 ms of patience), in its own `try/except` (a
+non-zero exit suppresses the page), tolerating a concurrent unlink, and never
+on the `project_dir()` fallback root this code distrusts everywhere else. The
+cost was measured at 1.32 µs against a missing store — the overwhelming case —
+and 93.9 µs across 50 files.
+
+**The store is a directory this bridge owns outright, or it is not used.**
+Measured before the check existed: with `.antiphon/messages` symlinked at a
+directory outside the project, the words landed there and were counted as
+though they were here. Every write, count and unlink now runs against a store
+whose parent and leaf are checked without following a link, with the leaf
+opened `O_NOFOLLOW` so a symlink fails the open rather than being examined and
+then followed. A pre-existing loose mode is tightened to 0700 rather than
+trusted — `makedirs(..., exist_ok=True)` leaves a 0755 directory exactly as it
+found it — and a mode that cannot be tightened fails closed. `drop_attachment`
+runs on a failure path against a path a caller supplied, so it goes through the
+same validated helper the sweep uses: a uuid-shaped name in somebody else's
+directory is not this bridge's file to delete, and before the fix it was
+deleting it.
+
+Named limitation, ruled at the review gate: a hair of TOCTOU remains — the
+store is proved sound with `O_NOFOLLOW` and then re-opened by path for the
+write, so a same-user process racing its OWN store between the two steps could
+redirect it. Under this project's stated threat model (one person, one
+machine; the envelope itself teaches "same machine, same user") that race is
+self-sabotage, not an attack surface, and the reviewer's verdict was PASS on
+exactly that condition. The absolute closure is known and named: dir-fd-based
+creation (`open(..., O_NOFOLLOW, dir_fd=…)` + `os.replace(..., dst_dir_fd=…)`),
+which would replace the `mkstemp` idiom — future work if the threat model ever
+widens, not a silent gap.
+
+**The quota is one transaction.** A usage read and the write it authorizes are
+not two operations. Measured before the lock: two processes released from one
+barrier, a 1,000-byte quota and two 700-byte messages — both passed the check,
+five rounds out of five, and the store held 1,400. A flock beside the store
+(never inside it, where only `{uuid4}.txt` names may appear) covers the read,
+the decision and the write, and is released before the caller sends. `push`
+already records what a lock held across a transport costs: a 5,008 ms hold
+against a concurrent reader's own 2,038 ms of patience.
+
+**Only `{uuid4}.txt` is ever counted, swept or unlinked**, checked without
+following symlinks. The one foreign entry this feature can create is a
+`mkstemp` leftover from a write that died mid-flight, and the naming rule
+refuses it, so it is reported and left rather than swept as an attachment.
+
+### The bounds
+
+`ATTACHMENT_MAX` 8 MiB per message, `ATTACHMENT_QUOTA` 64 MiB for the store,
+`ATTACHMENT_TTL` 7 days. All three count **content** bytes, header excluded —
+the cap, the quota and the status line alike — and all three are pinned in
+README §Limits by the contract technique this project already uses for
+`PAGE_BUDGET` and `MAX_CHANNEL_BYTES`, so drift is loud. A contract test reads
+this file too, but only for the names of open gaps — never for a number, which
+is why the numbers live in the README.
+
+The TTL makes a file *eligible* for removal; it does not remove it. There is no
+timer. The next hook either side runs does the deleting, so a project where
+neither side takes a turn keeps its files until one does. The envelope, both
+RULE sentences, the quota refusal and README §Limits all say that, rather than
+promising a deletion nothing schedules.
+
+The queue's own bound is deliberately unpinnable. It is not a constant, and a
+number written down here would be a promise about somebody else's shell.
+
+### The two roads are not the same, and both surfaces say so
+
+The direct tools spill. The `@claude` / `@codex` marker road does not: a marker
+line over the cap is still refused, and that refusal prints on an exit-0 Stop
+hook, which this file already records as reaching a debug log and not the
+agent. That is a decision, not an omission — a marker line's words are already
+in the visible reply, and the passive pull pages carry that reply whole, so an
+attachment there would duplicate for nobody what pull already delivers. An
+agent that learned "oversized direct sends work now" and then lost a `@claude`
+line would have been told something untrue, so `AGENTS_RULE`, `CLAUDE_RULE` and
+README §Limits each state the asymmetry, with contract tests on all three.
+
+### The deviation, named
+
+The entry asked to clean the store "without deleting an unread message
+silently". Unread is not tracked and this does not track it. What ships is
+time-based and announced: a file older than the TTL is deleted with a line
+naming it, on the next hook either side runs. The party that announcement
+reaches is whoever is looking at that terminal — **not** the reader who never
+read the message. That is a real gap against the words of the bullet, and
+closing it needs the acknowledgement protocol below.
+
+### Still open, by name
+
+- **Acknowledgement.** Nothing signals that the parked file was read. The
+  envelope rides the same at-least-once delivery every message does, and its
+  ack story is every message's: none beyond transport success. This is also
+  what would make the TTL's deletion provably safe rather than merely
+  announced.
+- **Retry.** A resent message parks a second file under a second uuid; nothing
+  reuses or supersedes the first. The first is then an ordinary attachment with
+  an ordinary TTL, so nothing leaks, but a retry is not a retry of anything —
+  it is a new attachment.
+
+Both need pending-delivery state this release does not have, which is the same
+state the `reply correlation` entry below wants. They belong together.
 
 ## P1 — A marker in anything but the turn's last message is dropped (fixed)
 
@@ -596,7 +763,7 @@ at 72 red tests; the subclass costs zero and survives every existing unpack.
 
 | class | born at | guidance |
 |---|---|---|
-| `transport` | `_queue_codex` ×3, `send_to_claude`'s five socket/response failures | yes — the words are nowhere on the page |
+| `transport` | `_queue_codex` ×4 (one of them the crash-belt: an exec the kernel refuses, measured at 1.1 MB of message), `send_to_claude`'s five socket/response failures | yes — the words are nowhere on the page |
 | `no-peer` | `_legacy_target`'s no-session message | yes — the page carries them regardless |
 | `oversize` | `send_to_claude`'s 128 KiB pre-transport refusal | yes — an oversized record still travels whole through the automatic hook |
 | `addressing` | `resolve_target`'s six sites | **no**, byte-identical: they already name the fix, and those sites are never wrapped, so there is nothing to append |

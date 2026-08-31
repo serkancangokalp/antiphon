@@ -44,6 +44,7 @@ import shutil
 import socket
 import subprocess
 import sys
+import tempfile
 import time
 import uuid
 
@@ -1611,8 +1612,32 @@ def hook(side="claude"):
         # `[]` and `"x"` are valid JSON. `.get` on either raises, and out of a
         # Stop hook that is a traceback in somebody's terminal.
         input_data = {}
-    cwd = os.path.abspath(input_data.get("cwd") or project_dir())
+    stated_cwd = input_data.get("cwd")
+    cwd = os.path.abspath(stated_cwd or project_dir())
     event = input_data.get("hook_event_name") or "UserPromptSubmit"
+
+    # The sweep's moment: immediately after `cwd` is resolved, because there is
+    # no store path before that, and before the page is built, because a sweep
+    # at a successful tail never runs on the ordinary quiet turn — this
+    # function has five exits and `if not text` is the common one. Outside
+    # every lock: at 1.32 µs against a missing store and 93.9 µs across 50
+    # files the cost is nothing, but a hold across `cursor_lock` was measured
+    # at 5,008 ms against a concurrent reader's 2,038 ms of patience.
+    #
+    # Only on a `cwd` the payload stated. `project_dir()` is the fallback this
+    # code deliberately does not trust for anything else, and deleting a
+    # person's files off a guess about which project this is would be worse
+    # than an unswept store.
+    #
+    # Its own `try/except` because a non-zero exit suppresses the page: this
+    # function spends a paragraph below on why that costs the reader more than
+    # any error it could report.
+    if stated_cwd:
+        try:
+            sweep_attachments(cwd)
+        except OSError as error:
+            print(f"antiphon: the attachment sweep failed: {error}",
+                  file=sys.stderr)
 
     if side == "codex":
         # On every event, not only `SessionStart`. A missed one then costs a
@@ -2197,6 +2222,21 @@ def _queue_codex(session, message):
         )
     except FileNotFoundError:
         return False, _ClassifiedRefusal("codex command not found", "transport")
+    except OSError as e:
+        # The crash-belt, and it must sit AFTER the arm above: a
+        # `FileNotFoundError` is an `OSError` too, and catching the wider one
+        # first would swallow "codex command not found".
+        #
+        # The exec itself was refused. Measured on this machine at a 1.1 MB
+        # message: `PermissionError [Errno 13]`, which is neither a
+        # `FileNotFoundError` nor a `SubprocessError` — and an uncaught one
+        # propagates out of a Stop hook as a traceback in somebody's terminal.
+        # The predicate above this transport keeps it from firing on size; the
+        # belt is here for every other way an exec can be refused, and for the
+        # platform whose errno is not this one.
+        return False, _ClassifiedRefusal(
+            f"codex queue could not be started: "
+            f"{e.strerror or type(e).__name__}", "transport")
     except subprocess.SubprocessError as e:
         return False, _ClassifiedRefusal(f"{type(e).__name__}", "transport")
     if result.returncode != 0:
@@ -2436,6 +2476,564 @@ def send_to_claude(cwd, text, alias=None, sender_alias=None, message_id=None):
     return True, ""
 
 
+# ---------- large direct-message attachments ----------
+
+# Content bytes in all three, header excluded: the cap, the quota and the
+# status line count the words a peer actually sent, never the provenance line
+# written above them.
+ATTACHMENT_MAX = 8 * 1024 * 1024          # bytes one parked message may hold
+ATTACHMENT_QUOTA = 64 * 1024 * 1024       # bytes the whole store may hold
+ATTACHMENT_TTL = 7 * 24 * 3600            # seconds a parked message survives
+
+# The envelope's opening words. Deliberately not part of the self-injection
+# family: `_SELF_INJECTION_PREFIXES` exists so `PUSH_LABEL` and `CHANNEL_LABEL`
+# cannot drift apart, and an envelope is not a bridge delivery of its own — on
+# the queue road it travels *inside* one, behind the prefix that anchors the
+# echo guard.
+ATTACHMENT_LABEL = "[Antiphon attachment]"
+
+# The only shape ever counted, swept or unlinked. A `mkstemp` leftover from a
+# write that died mid-flight is `.tmpXXXXXX.tmp`, which this refuses — so the
+# one foreign entry this feature can create is never swept as though it were an
+# attachment, and neither is anything a person drops in the directory.
+ATTACHMENT_NAME = re.compile(
+    r"\A[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\.txt\Z")
+
+# What one parked file's own header says its content weighs. The header is one
+# line, so reading it is one short read rather than arithmetic on a size nobody
+# can check.
+ATTACHMENT_BYTES = re.compile(r"\bbytes=(\d+)\]")
+
+
+def attachment_dir(cwd):
+    """Where this project parks words that would not fit a transport."""
+    return os.path.join(cwd, ".antiphon", "messages")
+
+
+def _sound_store(cwd, create=False):
+    """The store as a directory this code owns outright, or None with a word.
+
+    Checked without following a symlink, at the parent and at the leaf, before
+    anything is written, counted or unlinked. Measured: with
+    `.antiphon/messages` pointed at a directory outside the project,
+    `write_attachment` put the words there and `attachment_usage` counted them
+    as though they were here. This store's whole premise is that everything
+    inside it belongs to this bridge, and a link is somebody else's claim.
+
+    A loose mode found here is tightened rather than trusted:
+    `makedirs(..., exist_ok=True)` leaves a pre-existing 0755 directory exactly
+    as it found it, and this one holds one side's words for the other. It is
+    tightened rather than refused because refusing would take the feature down
+    over a mode a `mkdir -p` could have set; a mode that cannot be tightened
+    fails closed instead, because the alternative is parking private words
+    somewhere the machine can read.
+    """
+    path = attachment_dir(cwd)
+    parent = os.path.dirname(path)
+    if os.path.islink(parent) or (os.path.exists(parent)
+                                  and not os.path.isdir(parent)):
+        print(f"antiphon: the attachment store's parent {parent} is not a "
+              "plain directory; nothing was touched", file=sys.stderr)
+        return None
+    if create:
+        try:
+            os.makedirs(parent, exist_ok=True)
+            if not os.path.exists(path):
+                os.mkdir(path, 0o700)
+        except FileExistsError:
+            # Another peer created it between the test and the call, or the
+            # name is a dangling link. The open below decides which.
+            pass
+        except OSError as error:
+            print(f"antiphon: the attachment store could not be created: "
+                  f"{error}", file=sys.stderr)
+            return None
+    try:
+        # `O_NOFOLLOW` is the atomic half of the check: a symlink here fails
+        # the open rather than being examined and then followed.
+        fd = os.open(path, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    except FileNotFoundError:
+        # No store at all is the overwhelming case and not a problem.
+        return None
+    except OSError as error:
+        print(f"antiphon: the attachment store at {path} is not a plain "
+              f"directory and was left alone: {error}", file=sys.stderr)
+        return None
+    try:
+        mode = os.fstat(fd).st_mode & 0o777
+        if mode & 0o077:
+            try:
+                os.fchmod(fd, 0o700)
+            except OSError as error:
+                print(f"antiphon: the attachment store is {mode:04o} and could "
+                      f"not be tightened to 0700 ({error}); nothing was parked",
+                      file=sys.stderr)
+                return None
+            print(f"antiphon: the attachment store was {mode:04o}; tightened "
+                  "to 0700", file=sys.stderr)
+    finally:
+        os.close(fd)
+    return path
+
+
+# Beside the store, never inside it: only `{uuid4}.txt` names may appear in the
+# directory, and a lock file there would be a foreign entry this code reported
+# at itself on every hook.
+ATTACHMENT_LOCK_PATIENCE = 2.0        # seconds, as the cursor lock allows
+
+
+@contextlib.contextmanager
+def attachment_lock(cwd):
+    """Serializes read-usage → decide → write, and nothing else.
+
+    Yields True when the lock was taken, having already said why not when it
+    was not. Measured without it: two processes released from one barrier, a
+    1,000-byte quota and two 700-byte messages — both passed the check, five
+    rounds out of five, and the store held 1,400. A quota read and the write it
+    authorizes are one transaction or they are not a quota.
+
+    Never held across a transport. `push` records the ruling this follows: a
+    lock held across a send was measured at a 5,008 ms hold against a
+    concurrent reader's own 2,038 ms of patience, and that reader gave up
+    having delivered no context at all. The send happens after this block, with
+    the lock already released.
+    """
+    path = os.path.join(cwd, ".antiphon", "messages.lock")
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        fd = os.open(path, os.O_CREAT | os.O_RDWR, 0o600)
+    except OSError as error:
+        print(f"antiphon: no attachment lock at {path}: {error}",
+              file=sys.stderr)
+        yield False
+        return
+    held = False
+    deadline = time.monotonic() + ATTACHMENT_LOCK_PATIENCE
+    try:
+        while True:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                held = True
+                break
+            except BlockingIOError:
+                if time.monotonic() >= deadline:
+                    break
+                time.sleep(CURSOR_LOCK_RETRY_DELAY)
+        yield held
+    finally:
+        if held:
+            fcntl.flock(fd, fcntl.LOCK_UN)
+        os.close(fd)
+
+
+def _unlink_attachment(store, path):
+    """Removes one file, and only an attachment of this project's.
+
+    Returns `(removed, error)`. The name has to be the final form and the
+    directory has to be the validated store: a path arriving from a caller is
+    an argument, not authority, and a uuid-shaped name somewhere else is not
+    this bridge's file to delete. A symlink is refused for the same reason the
+    store root is.
+    """
+    name = os.path.basename(path)
+    if (not ATTACHMENT_NAME.match(name)
+            or os.path.abspath(path) != os.path.join(store, name)):
+        print(f"antiphon: refusing to delete {path}: it is not one of this "
+              "project's attachments", file=sys.stderr)
+        return False, None
+    if os.path.islink(path):
+        print(f"antiphon: refusing to delete {path}: it is a link, not an "
+              "attachment", file=sys.stderr)
+        return False, None
+    try:
+        os.unlink(path)
+    except FileNotFoundError:
+        # Both sides' hooks sweep this directory; the loser of that race has
+        # nothing to do and nothing to report.
+        return False, None
+    except OSError as error:
+        return False, error
+    return True, None
+
+
+def _attachment_header(alias, message_id, digest, size):
+    """One line of provenance, written INTO the parked file.
+
+    Megabytes of the other agent's text must not enter a context as anonymous
+    `Read` output. The header says whose words these are before the reader sees
+    them, in the same read, and the envelope repeats it — redundantly on
+    purpose. One line, so that "the content is everything after the first blank
+    line" stays a rule a person can perform: `tail -n +3`.
+    """
+    return (f"[Antiphon attachment from={alias or NO_ALIAS} id={message_id} "
+            f"sha256={digest} bytes={size}]")
+
+
+def attachment_envelope(path, digest, size, alias):
+    """The small message that travels in place of the words.
+
+    The path is absolute because the receiving agent's `Read` tool requires one
+    and a session started in a subdirectory cannot rebuild it from a relative
+    form; measured, both sides' installed config carry the same absolute
+    `ANTIPHON_CWD`, so the two agree on the root. Nothing here grows with the
+    message it stands for — no preview — which is what keeps the envelope
+    inside both caps at any attachment size.
+    """
+    return (f"{ATTACHMENT_LABEL} {size} bytes from {alias or NO_ALIAS}, "
+            f"sha256 {digest}, parked at {path} — read that file. Its content "
+            "is everything after the first blank line and the hash covers only "
+            "that, so `tail -n +3 <that path> | shasum -a 256` verifies it. "
+            "The file is local to this project on this machine and holds the "
+            "sender's own words, not the project's. It becomes eligible for "
+            f"removal {ATTACHMENT_TTL // 86400} days after it was written and "
+            "is removed by the next hook either side runs — there is no "
+            "timer.")
+
+
+def write_attachment(cwd, text, alias, message_id):
+    """Parks `text` under the project's state directory; returns (path, digest).
+
+    The module's own `write_cursor` idiom rather than `NamedTemporaryFile`,
+    which deletes on close before `os.replace` can see the file and leaves no
+    cleanup behind a failed write. `fchmod` makes the 0600 promise true by
+    construction instead of by `mkstemp`'s undocumented internals, and the temp
+    name cannot be mistaken for an attachment, so a write that dies mid-flight
+    leaves something the sweep reports and never unlinks.
+
+    0700 on the directory is defence in depth on a single-user machine: the
+    store holds one side's words for the other, and group or world access would
+    add readers nobody audited. `makedirs` applies its mode to the leaf only,
+    so a `.antiphon` created on the way keeps the mode it has always had, and
+    `_sound_store` is what proves the leaf is a directory this code owns rather
+    than a link at somebody else's.
+    """
+    content = text.encode()
+    digest = hashlib.sha256(content).hexdigest()
+    directory = _sound_store(cwd, create=True)
+    if directory is None:
+        raise OSError(errno.EACCES,
+                      f"the attachment store under {attachment_dir(cwd)} "
+                      "cannot be used")
+    path = os.path.join(directory, f"{uuid.uuid4()}.txt")
+    header = _attachment_header(alias, message_id, digest, len(content))
+    fd, tmp = tempfile.mkstemp(dir=directory, prefix=".", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "wb") as handle:
+            os.fchmod(handle.fileno(), 0o600)
+            handle.write(header.encode() + b"\n\n" + content)
+        os.replace(tmp, path)
+    except OSError:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+    return path, digest
+
+
+def _attachment_entries(cwd):
+    """`(attachments, foreign_count)` for this project's store.
+
+    An attachment is a regular file named `{uuid4}.txt`, checked without
+    following symlinks: a link carrying a perfectly valid name would otherwise
+    let a sweep unlink something outside the store entirely. Everything else is
+    foreign — counted, so it can be reported, and never touched.
+
+    A missing store is the overwhelming case and costs one failed `scandir`.
+    """
+    attachments, foreign = [], 0
+    store = _sound_store(cwd)
+    if store is None:
+        return [], 0
+    try:
+        with os.scandir(store) as entries:
+            for entry in entries:
+                if not ATTACHMENT_NAME.match(entry.name):
+                    foreign += 1
+                    continue
+                try:
+                    if not entry.is_file(follow_symlinks=False):
+                        foreign += 1
+                        continue
+                    attachments.append(
+                        (entry.path, entry.stat(follow_symlinks=False)))
+                except FileNotFoundError:
+                    # The other side's sweep won the race. Nothing to report:
+                    # this store is per-project, and both hooks sweep it.
+                    continue
+                except OSError:
+                    foreign += 1
+    except (FileNotFoundError, NotADirectoryError):
+        return [], 0
+    except OSError as error:
+        print(f"antiphon: the attachment store could not be read: {error}",
+              file=sys.stderr)
+        return [], 0
+    return attachments, foreign
+
+
+def _attachment_content_bytes(path, size):
+    """What one parked file's own header says its content weighs.
+
+    The header is excluded from every count this feature makes, and its length
+    varies with the sender's alias, so the number is read back rather than
+    derived. A file whose header will not parse is charged its whole size:
+    over-charging something nobody can explain is the safe direction.
+    """
+    try:
+        with open(path, "rb") as handle:
+            first = handle.readline()
+    except OSError:
+        return size
+    match = ATTACHMENT_BYTES.search(first.decode("utf-8", "replace"))
+    if not match:
+        return size
+    stated = int(match.group(1))
+    return stated if 0 <= stated <= size else size
+
+
+def _mib(size):
+    """Bytes as MiB, for the one refusal a person has to act on."""
+    return f"{size / (1024 * 1024):.1f} MiB"
+
+
+def attachment_usage(cwd, now=None):
+    """`(count, content bytes, oldest age in seconds, foreign count)`.
+
+    Unexpired files only: a store whose whole content is past its TTL is not
+    full, it is unswept, and refusing a send against it would be a lie the next
+    hook erases.
+    """
+    now = time.time() if now is None else now
+    attachments, foreign = _attachment_entries(cwd)
+    count, size, oldest = 0, 0, 0.0
+    for path, info in attachments:
+        age = now - info.st_mtime
+        if age > ATTACHMENT_TTL:
+            continue
+        count += 1
+        size += _attachment_content_bytes(path, info.st_size)
+        oldest = max(oldest, age)
+    return count, size, oldest, foreign
+
+
+def sweep_attachments(cwd, now=None):
+    """Deletes every parked attachment past its TTL, naming each one.
+
+    Cheap enough to run on every hook — measured at 1.32 µs against a store
+    that does not exist, which is the overwhelming case, and 93.9 µs across 50
+    files. Nothing here may raise into a hook's exit code, so every unlink is
+    guarded and a file that vanished under a concurrent sweep is simply gone.
+    """
+    now = time.time() if now is None else now
+    store = _sound_store(cwd)
+    attachments, foreign = _attachment_entries(cwd)
+    for path, info in attachments:
+        age = now - info.st_mtime
+        if age <= ATTACHMENT_TTL:
+            continue
+        removed, error = _unlink_attachment(store, path)
+        if error is not None:
+            print(f"antiphon: an expired attachment could not be deleted: "
+                  f"{path}: {error}", file=sys.stderr)
+        elif removed:
+            print(f"antiphon: attachment expired after {int(age // 86400)} "
+                  f"days and was deleted: {path}", file=sys.stderr)
+    if foreign:
+        # Reported and left. This directory is not a namespace this code owns
+        # outright, and a count says enough: a report is not a directory
+        # listing, and this line repeats on every hook until somebody looks.
+        noun = "entry" if foreign == 1 else "entries"
+        print(f"antiphon: {foreign} {noun} in {attachment_dir(cwd)} left "
+              "alone — not attachments", file=sys.stderr)
+
+
+def drop_attachment(cwd, path):
+    """Removes a parked file whose message never left, and says so.
+
+    Write, send, and on any non-delivery unlink at once. Without this an agent
+    retrying an oversized send against a channel that is down writes one
+    full-size orphan per attempt, and a transport outage becomes a permanent
+    storage refusal seven days long.
+
+    Through the same validated helper the sweep uses. This runs on a failure
+    path, on a path a caller handed over, so it removes an attachment of this
+    project's or it removes nothing at all.
+    """
+    store = _sound_store(cwd)
+    if store is None:
+        print(f"antiphon: a send failed and its attachment at {path} could not "
+              "be removed: this project has no usable attachment store",
+              file=sys.stderr)
+        return
+    removed, error = _unlink_attachment(store, path)
+    if error is not None:
+        print(f"antiphon: a send failed and its attachment could not be "
+              f"removed: {path}: {error}", file=sys.stderr)
+    elif removed:
+        print(f"antiphon: the send failed, so its attachment was removed: "
+              f"{path}", file=sys.stderr)
+
+
+def attachment_report(cwd, now=None):
+    """The `status` line for the parked store. A reader, never a sweeper.
+
+    Never a filename: `status` prints no path, address or session id anywhere
+    else either, and a parked file's name is the one thing in this feature a
+    person cannot be shown by accident. The oldest age renders in whole days
+    because two consecutive `status` runs are pinned equal, and a duration
+    derived from `now` at any finer grain would make that pin flake.
+    """
+    parked, held, oldest, foreign = attachment_usage(cwd, now)
+    if not parked:
+        line = "Attachments:        none parked"
+    else:
+        days = int(oldest // 86400)
+        aged = "today" if days == 0 else f"{days} day{'' if days == 1 else 's'} old"
+        line = (f"Attachments:        {parked} parked, {held:,} bytes, "
+                f"oldest {aged}")
+    if foreign:
+        noun = "entry" if foreign == 1 else "entries"
+        line += f"; {foreign} other {noun} left alone"
+    return line
+
+
+def _oversized_for_claude(text, alias=None, message_id=None):
+    """Whether `send_to_claude`'s cap would refuse `text`.
+
+    The cap's own arithmetic over the cap's own dict. `len(text.encode())` and
+    the serialized length are different numbers and not by a constant —
+    measured, `"` costs two bytes and every control character six, so 22,000
+    control characters serialize past a 131,072-byte cap while their raw length
+    is one sixth of it, and the whole 130,982-131,072 ASCII band is over the
+    cap while reading as under it. A predicate on the raw length would leave
+    exactly that band refusing with the message this feature exists to replace.
+
+    Callers hand over the very alias and `message_id` they will hand the
+    transport, so the two cannot disagree by a byte.
+    """
+    request = {"content": text, "message_id": message_id or delivery_id(),
+               "sender_alias": alias}
+    payload = json.dumps(request, ensure_ascii=False).encode()
+    return len(payload) > MAX_CHANNEL_BYTES
+
+
+# `codex queue --thread <session> --message <message>` at exec time. Measured
+# on this machine: `SC_ARG_MAX` (1,048,576) is one budget shared by argv and
+# the environment, and the largest message that execs falls byte for byte as
+# the environment grows — 1,044,820 at a 3,191-byte environment, 844,759 at
+# 203,244, 444,759 at 603,244 — so no constant bound can be correct. What is
+# stable is the per-exec overhead: 496 bytes over three session-id lengths, and
+# 504 once the environment is large, the 8-byte spread being alignment.
+QUEUE_EXEC_OVERHEAD = 502
+# The session id `send_to_codex` will resolve is not known here — this runs
+# before the target is picked — and it is a 36-byte uuid in practice. The
+# margin covers a longer one many times over.
+QUEUE_SESSION_BYTES = 36
+# One page. The measured error in the accounting above is 8 bytes; this also
+# absorbs a longer session id and any argument the transport gains later. The
+# single-argument limit needs no term: measured on Darwin, a 1,047,587-byte
+# single argument execs against an ARG_MAX of 1,048,576, so it is not
+# separately binding here.
+QUEUE_MARGIN = 4096
+
+
+def _queue_message_limit():
+    """The largest message `codex queue` could exec right now, or None.
+
+    Computed at call time and never stored, because the bound moves with this
+    process's own environment. None where the budget cannot be read at all,
+    which leaves the decision to the crash-belt rather than to a guess.
+    """
+    try:
+        budget = os.sysconf("SC_ARG_MAX")
+    except (ValueError, OSError):
+        return None
+    if not isinstance(budget, int) or budget <= 0:
+        return None
+    # `key=value\0` per entry and `arg\0` per argument, which is what the
+    # kernel copies. `surrogateescape` because that is how the environment was
+    # decoded, and a bound that raised on an odd variable would be worse than
+    # one that counted it.
+    environ = sum(len(key.encode("utf-8", "surrogateescape"))
+                  + len(value.encode("utf-8", "surrogateescape")) + 2
+                  for key, value in os.environ.items())
+    argv = sum(len(part) + 1 for part in
+               ("codex", "queue", "--thread", "--message"))
+    # The session id, and the message's own trailing NUL.
+    return (budget - QUEUE_EXEC_OVERHEAD - QUEUE_MARGIN - environ - argv
+            - QUEUE_SESSION_BYTES - 1 - 1)
+
+
+def _oversized_for_queue(message):
+    """Whether `codex queue` could not exec `message` as one argument."""
+    limit = _queue_message_limit()
+    if limit is None:
+        return False
+    return len(message.encode()) > limit
+
+
+def _attachable(text):
+    """Whether the store may hold `text` at all.
+
+    Above `ATTACHMENT_MAX` the spill does not happen and the send proceeds to
+    the refusal it always made: the guidance naming the visible-reply road is
+    still the right message for words no store will take, and letting that path
+    stand is why no new refusal class is born here.
+    """
+    return len(text.encode()) <= ATTACHMENT_MAX
+
+
+_Attachment = collections.namedtuple("_Attachment", "envelope path size")
+
+
+def _spill(cwd, text, alias, message_id):
+    """Parks `text`; returns `(attachment, refusal)` with exactly one filled.
+
+    A refusal here is a plain string, never a `_ClassifiedRefusal`: an attached
+    class means "the sender needs telling where its words still travel", and
+    these refusals name their own fix instead.
+
+    The lock covers the usage read, the decision and the write, and is released
+    before the caller sends: measured, without it two peers released from one
+    barrier both passed a quota neither of them had invalidated.
+    """
+    size = len(text.encode())
+    with attachment_lock(cwd) as locked:
+        if not locked:
+            return None, ("another peer in this project is parking an "
+                          "attachment and did not finish within "
+                          f"{ATTACHMENT_LOCK_PATIENCE:.0f} seconds; nothing "
+                          "was written. Sending again is safe.")
+        return _spill_locked(cwd, text, alias, message_id, size)
+
+
+def _spill_locked(cwd, text, alias, message_id, size):
+    """The half of `_spill` that must not interleave with another peer's."""
+    parked, held, oldest, _foreign = attachment_usage(cwd)
+    if held + size > ATTACHMENT_QUOTA:
+        # Nothing is evicted to make room. An unexpired attachment is somebody
+        # else's undelivered words, and deleting them to fit these would be
+        # exactly the silent loss this store exists to remove. So the refusal
+        # reports the state and names the two ways out of it: wait, or clear
+        # the directory by hand.
+        return None, (
+            f"the attachment store is full: {parked} parked attachments hold "
+            f"{_mib(held)} of the {_mib(ATTACHMENT_QUOTA)} it may hold, and "
+            f"this message needs {_mib(size)} more. Attachments become "
+            f"eligible for removal {ATTACHMENT_TTL // 86400} days after they "
+            "are written and go on the next hook either side runs — there is "
+            f"no timer; the oldest here is {int(oldest // 86400)} days old, "
+            f"and {attachment_dir(cwd)} can also be cleared by hand.")
+    try:
+        path, digest = write_attachment(cwd, text, alias, message_id)
+    except OSError as error:
+        return None, (f"the message could not be parked in "
+                      f"{attachment_dir(cwd)}: {error}")
+    return _Attachment(attachment_envelope(path, digest, size, alias), path,
+                       size), None
+
+
 def reply(*_):
     """Sends the reply from the Claude channel reply tool to the running Codex session."""
     try:
@@ -2459,15 +3057,36 @@ def reply(*_):
     text = text.strip()
     # `channel.mjs` passes the peer name it validated for itself.
     who = sender_alias(input_data.get("sender_alias"))
-    label = queue_label(who, delivery_id())
-    ok, detail = send_to_codex(cwd, f"{CHANNEL_LABEL} {label} {text}", to)
+    message_id = delivery_id()
+    label = queue_label(who, message_id)
+    # The FULL outgoing message is composed first and that is what the
+    # predicate measures: the prefix and label are 84 bytes the kernel counts
+    # too, and a predicate on the bare text would let them straddle the
+    # decision. The spill re-composes through the same path, so the envelope
+    # keeps the prefix that anchors the echo guard and the `[from= id=]` a
+    # reply is addressed by.
+    outgoing, parked = text, None
+    composed = f"{CHANNEL_LABEL} {label} {text}"
+    if _oversized_for_queue(composed) and _attachable(text):
+        attachment, refusal = _spill(cwd, text, who, message_id)
+        if refusal is not None:
+            print(f"reply: {refusal}", file=sys.stderr)
+            return 1
+        outgoing, parked = attachment.envelope, attachment
+        composed = f"{CHANNEL_LABEL} {label} {outgoing}"
+    ok, detail = send_to_codex(cwd, composed, to)
     if not ok:
+        if parked is not None:
+            drop_attachment(cwd, parked.path)
         # `only a tool-name line`: measured on 123 real `reply_to_codex`
         # records, whose `text` argument no parser path can reach.
         print(f"reply: {_guided(detail, 'only a tool-name line')}",
               file=sys.stderr)
         return 1
-    _record_delivery(cwd, "codex", text, to)
+    # The BARE text, which is the shape `deliver_batches` compares: push
+    # fingerprints bare marker lines, never composed ones, so parking the
+    # composed string would leave the park matching nothing.
+    _record_delivery(cwd, "codex", outgoing, to)
     return 0
 
 
@@ -2660,18 +3279,40 @@ def _send_tool(cwd, text, to=None, sender=None):
     if to is not None and not isinstance(to, str):
         return _tool_error("to must be a string naming one live Claude peer")
     text = text.strip()
-    ok, detail = send_to_claude(cwd, text, to, sender_alias=sender_alias(sender),
-                                message_id=delivery_id())
+    who = sender_alias(sender)
+    # Decided here rather than inside the transport, so the predicate can
+    # mirror the cap over the very bytes the cap will measure. There is no
+    # prefix on this road: the composition the cap sees is its own JSON
+    # serialization, which `_oversized_for_claude` reproduces.
+    message_id = delivery_id()
+    outgoing, parked = text, None
+    if _oversized_for_claude(text, who, message_id) and _attachable(text):
+        attachment, refusal = _spill(cwd, text, who, message_id)
+        if refusal is not None:
+            return _tool_error(f"Not delivered to Claude: {refusal}")
+        outgoing, parked = attachment.envelope, attachment
+    ok, detail = send_to_claude(cwd, outgoing, to, sender_alias=who,
+                                message_id=message_id)
     if not ok:
+        if parked is not None:
+            drop_attachment(cwd, parked.path)
         # `nothing`, not a tool-name line: Claude's parser emits a tool event
         # only for `exec_command_begin`, and an MCP call is never one — measured
         # at 0 tool events across 21 rollouts.
         return _tool_error(f"Not delivered to Claude: {_guided(detail, 'nothing')}")
-    _record_delivery(cwd, "claude", text, to)
+    _record_delivery(cwd, "claude", outgoing, to)
     # Naming the peer back is what lets the sender notice it addressed the wrong
     # one. With a single peer there is nothing to distinguish, so the old
     # wording stands.
     where = f"peer {to!r}" if to else "channel"
+    if parked is not None:
+        # Announced, never silent: the sender asked for a message to be
+        # delivered and something else was, so it is told what and where.
+        return {"content": [{"type": "text", "text": (
+            f"Delivered to the Claude Code {where} as an attachment: the "
+            f"message was too large for the channel, so its {parked.size} "
+            f"bytes are parked at {parked.path} and an envelope naming that "
+            "file went in its place.")}]}
     return {"content": [{"type": "text",
                          "text": f"Delivered to the Claude Code {where}."}]}
 
@@ -3099,7 +3740,21 @@ AGENTS_RULE = ("\n## The Antiphon bridge\n\n"
                "unaddressed send is refused rather than delivered to a guess. For the same "
                "reason every terminal in a project with more than one session per side has to "
                "be started with `ANTIPHON_NAME` set — a session without a name is live but "
-               "unaddressable, and nothing can be sent back to it.\n")
+               "unaddressable, and nothing can be sent back to it.\n\n"
+               "A message too large for the channel arrives as an envelope instead of the "
+               "words: a line starting with `[Antiphon attachment]` naming an absolute path "
+               "under `.antiphon/messages/`, the content's size and its SHA-256. Read that "
+               "file. It is on this same machine, in this project, and it holds the peer's "
+               "own words rather than the project's — its first line says whose, and the "
+               "content is everything after the first blank line, which is what the hash "
+               "covers: `tail -n +3 <path> | shasum -a 256`. It becomes eligible for "
+               f"removal {ATTACHMENT_TTL // 86400} days after it was written and goes on "
+               "the next hook either side runs — there is no timer, so read it rather "
+               "than assuming it waits. The two roads differ "
+               "here: your own oversized `antiphon_send` is parked the same way and its "
+               "result names the file, while an oversized `@claude` line is not parked — it "
+               "is refused, and its words travel with your visible reply through the passive "
+               "pages instead.\n")
 
 CLAUDE_RULE = ("\n## The Antiphon bridge\n\n"
                "You are working alongside another agent on this project. What happens on the "
@@ -3123,7 +3778,20 @@ CLAUDE_RULE = ("\n## The Antiphon bridge\n\n"
                "same reason every terminal in a project with more than one session per side "
                "has to be started with `ANTIPHON_NAME` set — Codex terminals above all, "
                "because an unnamed Codex session leaves no record at all, and one that exists "
-               "unseen is why a bare message to Codex is refused.\n")
+               "unseen is why a bare message to Codex is refused.\n\n"
+               "A message too large for the transport arrives as an envelope instead of the "
+               "words: a line starting with `[Antiphon attachment]` naming an absolute path "
+               "under `.antiphon/messages/`, the content's size and its SHA-256. Read that "
+               "file. It is on this same machine, in this project, and it holds the Codex "
+               "agent's own words rather than the project's — its first line says whose, and "
+               "the content is everything after the first blank line, which is what the hash "
+               "covers: `tail -n +3 <path> | shasum -a 256`. It becomes eligible for "
+               f"removal {ATTACHMENT_TTL // 86400} days after it was written and goes on "
+               "the next hook either side runs — there is no timer, so read it rather "
+               "than assuming it waits. The two roads differ "
+               "here: an oversized `reply_to_codex` is parked the same way, while an "
+               "oversized `@codex` line is not parked — it is refused, and its words travel "
+               "with your visible reply through the passive pages instead.\n")
 
 
 class ConfigFileError(Exception):
@@ -3667,6 +4335,7 @@ def status():
     channel = ("live" if live["claude"]
                else "live" if os.path.exists(claude_socket_path(cwd)) else "down")
     print(f"Claude channel:     {channel}")
+    print(attachment_report(cwd))
     for line in _peer_report(live):
         print(line)
     snapshots = {}

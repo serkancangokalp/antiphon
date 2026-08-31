@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
 import { execFileSync, spawn } from "node:child_process";
-import { existsSync, mkdirSync, readdirSync, readFileSync, symlinkSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readdirSync, readFileSync, statSync, symlinkSync, writeFileSync } from "node:fs";
 import { mkdtemp, rm } from "node:fs/promises";
 import { Socket, connect } from "node:net";
 import { once } from "node:events";
@@ -908,6 +908,116 @@ try {
     assert.equal(seen.params.meta.sender_alias, null,
       `an unusable alias must not reach the agent: ${JSON.stringify(claimed)}`);
   }
+
+  // ---- large attachments, end to end -------------------------------------
+  // The one place the whole road is real at once: the real Python tool, the
+  // real Unix socket, the real channel server, a real MCP notification — and a
+  // file on disk this test verifies exactly as the envelope tells its reader
+  // to, by hashing everything after the first blank line.
+  const libDir = join(process.cwd(), "lib");
+
+  function sendTool(text) {
+    return JSON.parse(execFileSync("python3", [
+      "-c",
+      "import json, os, sys\n" +
+      "sys.path.insert(0, sys.argv[1])\n" +
+      "import antiphon\n" +
+      "print(json.dumps(antiphon._send_tool(os.environ['ANTIPHON_CWD'],\n" +
+      "                                     sys.stdin.read())))\n",
+      libDir,
+    ], { env: mainEnv, input: text, encoding: "utf8",
+         maxBuffer: 64 * 1024 * 1024 }));
+  }
+
+  function parkedContent(path) {
+    const raw = readFileSync(path);
+    const blank = raw.indexOf("\n\n");
+    assert.ok(blank > 0, "one header line, then a blank line");
+    return { header: raw.subarray(0, blank).toString(),
+             content: raw.subarray(blank + 2) };
+  }
+
+  const words = "x".repeat(400_000);          // over the cap, far under 8 MiB
+  const pendingEnvelope = nextNotification();
+  const parkedSend = sendTool(words);
+  assert.match(parkedSend.content[0].text, /parked at/,
+    "the sender is told its words were parked");
+  const envelope = (await pendingEnvelope).params.content;
+  assert.match(envelope, /^\[Antiphon attachment\] 400000 bytes from /,
+    "the envelope names the size and the author");
+  assert.ok(envelope.length < 2_000,
+    "the transport carried the envelope, not the words");
+  assert.ok(!envelope.includes("xxxxxxxxxx"), "and none of the words");
+
+  const parkedPath = /parked at (\S+) —/.exec(envelope)[1];
+  const parked = parkedContent(parkedPath);
+  assert.equal(parked.content.toString(), words, "the file holds them exactly");
+  assert.match(parked.header, /^\[Antiphon attachment from=<unnamed> id=/,
+    "and says whose they are, in the file itself");
+  const digest = createHash("sha256").update(parked.content).digest("hex");
+  assert.ok(envelope.includes(`sha256 ${digest}`),
+    "the envelope's hash verifies against the content, as its own rule says");
+  assert.equal(statSync(parkedPath).mode & 0o777, 0o600, "0600");
+  assert.equal(statSync(join(projectDir, ".antiphon", "messages")).mode & 0o777,
+    0o700, "0700");
+
+  // And the bridge keeps working: a small message straight after flows the way
+  // it always did, through the same tool and the same socket.
+  const pendingSmall = nextNotification();
+  const smallSend = sendTool("and here is the short version");
+  assert.match(smallSend.content[0].text, /^Delivered to the Claude Code/);
+  assert.doesNotMatch(smallSend.content[0].text, /parked/);
+  assert.equal((await pendingSmall).params.content,
+    "and here is the short version");
+
+  // The queue direction, through the real `reply_to_codex` tool and the stub
+  // recorder. The size comes from the live bound rather than a constant: it is
+  // `ARG_MAX` minus this shell's own environment, so a number written here
+  // would be a claim about somebody else's machine.
+  const queueLimit = Number(execFileSync("python3", [
+    "-c",
+    "import sys\n" +
+    "sys.path.insert(0, sys.argv[1])\n" +
+    "import antiphon\n" +
+    "print(antiphon._queue_message_limit())\n",
+    libDir,
+  ], { env: mainEnv, encoding: "utf8" }).trim());
+  assert.ok(queueLimit > 0 && queueLimit < 8 * 1024 * 1024,
+    `a usable queue bound: ${queueLimit}`);
+
+  const tooLongToExec = "y".repeat(queueLimit + 4_096);
+  const replied = await client.callTool({
+    name: "reply_to_codex", arguments: { text: tooLongToExec, to: "review" },
+  });
+  assert.match(replied.content[0].text, /review/);
+  const queuedNow = readFileSync(queueLog, "utf8");
+  assert.match(queuedNow,
+    /\[Antiphon channel\] Claude: \[from=<unnamed> id=[0-9a-f-]{36}\] \[Antiphon attachment\]/,
+    "the envelope keeps the prefix and the reply address in front of it");
+  assert.ok(!queuedNow.includes("yyyyyyyyyy"),
+    "and the words themselves never reached the argv");
+  const queuedEnvelope =
+    /(\[Antiphon attachment\][^\n]*)/.exec(queuedNow)[1];
+  const queuedPath = /parked at (\S+) —/.exec(queuedEnvelope)[1];
+  const queuedFile = parkedContent(queuedPath);
+  assert.equal(queuedFile.content.length, tooLongToExec.length);
+  assert.ok(queuedEnvelope.includes(
+    `sha256 ${createHash("sha256").update(queuedFile.content).digest("hex")}`),
+    "this direction's hash verifies the same way");
+
+  // Two parked files, one per direction, and `status` sees exactly those.
+  const store = readdirSync(join(projectDir, ".antiphon", "messages"));
+  assert.equal(store.length, 2, `one per direction: ${store.join(", ")}`);
+  const reported = execFileSync("python3", [
+    join(libDir, "antiphon.py"), "status",
+  ], { env: mainEnv, encoding: "utf8" });
+  assert.match(reported, /Attachments:\s+2 parked, [\d,]+ bytes, oldest today/);
+  for (const name of store) {
+    assert.ok(!reported.includes(name), "status names no parked file");
+  }
+  assert.equal(readdirSync(join(projectDir, ".antiphon", "messages")).length, 2,
+    "and status deleted nothing");
+  console.log("large attachments end to end: ok");
 
   console.log("MCP channel integration: ok");
 } finally {
