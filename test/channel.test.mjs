@@ -378,11 +378,12 @@ async function fourLiveSessionsRouteByName() {
   }
 }
 
-async function onlyTheSessionThatWonTheNameSignsItsMessages() {
-  // Two sessions started as `ui`; exactly one wins the registry. The winner
-  // must sign its messages `ui` and the loser must not, because a reply
-  // addressed to `ui` reaches the winner — and a message the loser signed `ui`
-  // would send that reply to a session that never spoke.
+async function everySessionSignsTheValidNameItWasGiven() {
+  // Two sessions started as `ui`; exactly one wins the registry and owns the
+  // channel. That decides reachability, not identity: both sessions were
+  // explicitly named `ui`, so both must sign their own words `ui`. The losing
+  // session is warned that it cannot receive there; silently renaming its words
+  // `<unnamed>` would describe a configuration it does not have.
   //
   // Both branches, in one real race, through two live MCP clients. With only
   // the loser exercised, deleting the success assignment outright changed no
@@ -433,19 +434,19 @@ async function onlyTheSessionThatWonTheNameSignsItsMessages() {
     });
 
     assert.match(readFileSync(stubs[0].log, "utf8"), /\[from=ui id=/,
-      "the session that holds `ui` must sign itself `ui`");
+      "the session that holds `ui` signs itself `ui`");
     const loserQueue = readFileSync(stubs[1].log, "utf8");
-    assert.match(loserQueue, /\[from=<unnamed> id=/,
-      "and the session that does not hold it must not");
-    assert.ok(!loserQueue.includes("[from=ui "),
-      `the loser signed itself with a name it does not hold: ${loserQueue}`);
+    assert.match(loserQueue, /\[from=ui id=/,
+      "the session that cannot receive there still signs its configured identity");
+    assert.ok(!loserQueue.includes("[from=<unnamed> "),
+      `a named session silently denied its own identity: ${loserQueue}`);
 
     await clients.pop().close();      // the loser leaves
     const held = registeredPeers(dir).filter((peer) => peer.name === "ui");
     assert.equal(held.length, 1, "the winner's record survives the loser's exit");
     assert.equal(held[0].address, sockets[0]);
     assert.ok(existsSync(sockets[0]), "and its socket still serves");
-    console.log("only the winner signs its name: ok");
+    console.log("identity is independent of channel ownership: ok");
   } finally {
     for (const client of clients) await client.close().catch(() => {});
     for (const path of sockets) await rm(path, { force: true }).catch(() => {});
@@ -799,7 +800,7 @@ await anOversizedMessageIsRefusedWithoutKillingTheSession();
 await aRefusedClientCannotKeepStreaming();
 await aStalledClientDoesNotBlockShutdown();
 await aSocketPathItCannotClearDoesNotKillTheSession();
-await onlyTheSessionThatWonTheNameSignsItsMessages();
+await everySessionSignsTheValidNameItWasGiven();
 await fourLiveSessionsRouteByName();
 await onlyOneUnnamedSessionGetsTheChannel(false);   // a second terminal, later
 await onlyOneUnnamedSessionGetsTheChannel(true);    // both started together

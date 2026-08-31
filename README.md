@@ -54,6 +54,10 @@ A Claude → Codex message reaches Codex tagged either `[Antiphon bridge] Claude
 
 The tag is followed by `[from=<alias> id=<uuid>]`, naming which Claude peer spoke so a reply can be addressed back to it. A session started without `ANTIPHON_NAME` shows `from=<unnamed>`: it has no name to be addressed by, and the angle brackets keep that apart from a peer actually called `unnamed`. The id names one delivery attempt — it is not a correlation id, and nothing routes replies by it.
 
+A valid Claude `ANTIPHON_NAME` is the session's configured identity, not proof that its named return channel is reachable. If startup says the channel was not acquired, the name still identifies that session's outgoing words, but the label alone does not establish that a reply will reach the same process. `antiphon doctor` makes the broken return path visible; restart the Claude session after correcting the duplicate name or registration failure.
+
+An `Antiphon delivery notice:` event is a bridge-authored diagnostic: it carries no original message content and does not turn the sender's refusal into delivery. Antiphon sends one only when an explicitly requested alias has no live endpoint record but that alias's deterministic socket still answers; the notice names the alias and attempt time, while the original send remains refused.
+
 A Codex → Claude message never pastes text into the terminal and never impersonates user input. The local MCP server sends Claude Code a `notifications/claude/channel` event. Its metadata looks like:
 
 ```xml
@@ -73,6 +77,10 @@ command:
     ANTIPHON_NAME=api claude --dangerously-load-development-channels server:antiphon
     ANTIPHON_NAME=build codex
     ANTIPHON_NAME=review codex
+
+Names must be unique per side within a project. Two Claude sessions configured
+with the same name both identify their own outgoing words by that name, but
+only the one that owns the named channel can receive a reply there.
 
 Once named, a peer is addressed explicitly — by marker at the start of a line,
 or by the `to` argument of the tool that sends without ending the turn:

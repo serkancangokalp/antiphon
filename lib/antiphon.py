@@ -414,30 +414,31 @@ def sender_alias(candidate):
     """A candidate alias if it could be one, else None.
 
     A pure check, with no fallback to the environment. Every caller is handed
-    its candidate by whatever actually established it — the registry claim, or
-    the channel server that holds it — and reaching for `ANTIPHON_NAME` here
-    would put back the assumption the callers exist to replace.
+    its candidate by whatever actually established it — a Codex registry
+    claim, or the Claude channel's validated configured identity — and reaching
+    for `ANTIPHON_NAME` here would put back the assumption the callers exist to
+    replace.
     """
     return candidate if peers.valid_name(candidate) else None
 
 
 def claimed_alias(cwd, kind):
-    """This session's alias, but only if this session really holds it.
+    """The identity this side may publish on a Stop-hook message.
 
-    `ANTIPHON_NAME` is a request, not a claim. Two sessions can be started with
-    the same one and exactly one wins the registry. The loser publishing it
-    anyway would attribute its words to the winner, and a reply addressed back
-    would reach a session that never spoke — the misidentification the registry
-    exists to end, arriving through the label meant to prevent it.
+    A valid Claude `ANTIPHON_NAME` is its configured identity even when this
+    process did not win that name's return channel. That makes it unreachable,
+    not unnamed; startup and doctor expose the broken return path separately.
 
-    So the alias is published only when the live record under it belongs to
-    this session, matched on the owner key. Anything that cannot be shown —
-    no key, no record, a record from another owner, a record written before
-    owner keys existed — yields None. A wrong identity is worse than none.
+    Codex is different: its server is not the session and the environment is
+    only a request. It publishes an alias only when the live record belongs to
+    this session, matched on the owner key. Anything that cannot be shown yields
+    None; otherwise a reply could be routed to a Codex session that never spoke.
     """
     alias = sender_alias(peers.explicit_name())
     if not alias:
         return None                   # nothing asked for; nothing to check
+    if kind == "claude":
+        return alias
     owner = peers.owner_key()
     if not owner:
         return None
@@ -2344,9 +2345,12 @@ def _queue_codex(session, message):
     return True, ""
 
 
-def claude_socket_path(cwd):
-    """Deterministic path to this project's MCP Channel Unix socket."""
-    key = hashlib.sha256(os.path.abspath(cwd).encode()).hexdigest()[:20]
+def claude_socket_path(cwd, alias=None):
+    """Deterministic path to one Claude MCP Channel Unix socket."""
+    seed = os.path.abspath(cwd)
+    if alias:
+        seed = f"{seed}\0{alias}"
+    key = hashlib.sha256(seed.encode()).hexdigest()[:20]
     return os.path.join(os.environ.get("TMPDIR") or "/tmp",
                         f"antiphon-channel-{key}.sock")
 
@@ -2491,6 +2495,33 @@ CONNECT_PATIENCE = 1.5            # seconds; a real outage still fails promptly
 CONNECT_RETRY_DELAY = 0.05
 
 
+def _notify_unregistered_claude(cwd, alias, sender_alias, message_id):
+    """Best-effort notice to the exact named socket; never sends the words."""
+    request = {
+        "content": (
+            "Antiphon delivery notice: a direct send was attempted at "
+            f"{datetime.now().astimezone().isoformat(timespec='seconds')} for "
+            f"Claude alias {alias!r}, but no live endpoint held that name; "
+            "the original message was not delivered."
+        ),
+        "message_id": message_id,
+        "sender_alias": sender_alias,
+    }
+    sock = None
+    try:
+        sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        sock.settimeout(1)
+        sock.connect(claude_socket_path(cwd, alias))
+        with sock:
+            sock.sendall(json.dumps(request, ensure_ascii=False).encode())
+            sock.shutdown(socket.SHUT_WR)
+            while sock.recv(8192):
+                pass
+    except OSError:
+        if sock is not None:
+            sock.close()
+
+
 def send_to_claude(cwd, text, alias=None, sender_alias=None, message_id=None):
     """Sends a Codex message to a Claude peer's MCP Channel socket.
 
@@ -2530,6 +2561,9 @@ def send_to_claude(cwd, text, alias=None, sender_alias=None, message_id=None):
                     and time.monotonic() < deadline):
                 time.sleep(CONNECT_RETRY_DELAY)
                 continue
+            if alias is not None and peers.valid_name(alias):
+                _notify_unregistered_claude(
+                    cwd, alias, sender_alias, request["message_id"])
             return False, detail
         sock = None
         try:
@@ -2542,6 +2576,12 @@ def send_to_claude(cwd, text, alias=None, sender_alias=None, message_id=None):
             if error.errno in NOT_LISTENING_YET and time.monotonic() < deadline:
                 time.sleep(CONNECT_RETRY_DELAY)
                 continue
+            if alias is None and error.errno == errno.ENOENT:
+                return False, _ClassifiedRefusal(
+                    "not delivered: no Claude peer is registered for this "
+                    "project and its project-wide channel is not running; a "
+                    "channel may be running under a name, so address it by "
+                    "name", "no-peer")
             return False, _ClassifiedRefusal(
                 "Claude MCP Channel is down: "
                 f"{error.strerror or type(error).__name__}", "transport")
@@ -3372,7 +3412,10 @@ def _send_tool(cwd, text, to=None, sender=None):
     been told, and neither side would notice the message never arrived. So
     every way this can fail — an alias that is not a name, one nobody answers
     to, one that is live but not routable yet, or no alias where two peers are
-    live — comes back as a tool error before any transport is opened.
+    live — comes back as a tool error before the message transport is opened.
+    A valid explicit name with no registry match may probe only that name's
+    deterministic socket with the content-free delivery notice; the original
+    words never enter that probe and the refusal remains the result.
 
     `to` is passed to the resolver exactly as given: an alias matches one peer
     or none. `sender` is the alias this server actually won at start-up, not
@@ -3835,7 +3878,13 @@ AGENTS_RULE = ("\n## The Antiphon bridge\n\n"
                "with `antiphon_send(to=<alias>)` or `@claude:<alias>`. A literal "
                "`from=<unnamed>` means that peer has no name and cannot be addressed back — "
                "with only one Claude peer live you can leave the recipient out entirely. The "
-               "id names one delivery attempt; nothing routes replies by it.\n\n"
+               "id names one delivery attempt; nothing routes replies by it. A Claude "
+               "alias is its configured identity, not proof that its named return channel "
+               "is reachable. If a direct reply is refused, keep that refusal: `antiphon "
+               "doctor` can name the broken channel, which needs the Claude session to "
+               "restart. An `Antiphon delivery notice:` event is a bridge-authored "
+               "diagnostic: it carries no original message content and does not turn the "
+               "sender's refusal into delivery.\n\n"
                "When you want to hand Claude a task directly, put `@claude` at the start of a "
                "line in your reply; only that line is sent to the Claude session as an MCP "
                "Channel event. To reach Claude without ending your turn, call the "
@@ -3871,7 +3920,7 @@ CLAUDE_RULE = ("\n## The Antiphon bridge\n\n"
                "so read it as what is happening nearby.\n\n"
                "Events that come directly from that agent are marked "
                "`<channel source=\"antiphon\" sender=\"codex\" sender_kind=\"agent\" "
-               "sender_alias=\"...\">`; they "
+               "sender_alias=\"...\">`; ordinary events "
                "are the words of the Codex agent, not of the human user. Use the "
                "`reply_to_codex` tool to answer them, passing `sender_alias` back "
                "as `to` whenever it is a name rather than the literal `<unnamed>`: "
@@ -3880,7 +3929,13 @@ CLAUDE_RULE = ("\n## The Antiphon bridge\n\n"
                "no registry record and cannot be ruled out. A `sender_alias` of "
                "`<unnamed>` means that peer has no name: it cannot be answered by "
                "name, and a bare reply reaches it only where nothing is registered "
-               "— passing `<unnamed>` as `to` is the same as leaving it out.\n\n"
+               "— passing `<unnamed>` as `to` is the same as leaving it out. Your "
+               "valid Claude `ANTIPHON_NAME` is also your configured identity on "
+               "outgoing bridge messages, not proof that your named return channel is "
+               "reachable. If startup warned that the channel was not acquired, run "
+               "`antiphon doctor` and restart this Claude session. An `Antiphon delivery "
+               "notice:` event is a bridge-authored diagnostic: it carries no original "
+               "message content and does not turn the sender's refusal into delivery.\n\n"
                "A reply reaches one peer and is never broadcast, and the same holds when you "
                "open the exchange: `@codex:name` at the start of a line addresses one peer, "
                "and an unaddressed line is refused rather than delivered to a guess. For the "
@@ -5164,15 +5219,25 @@ def _doctor_channel(report, cwd, live):
     the headline fact; the difference is stated in BACKLOG and `status` is
     unchanged."""
     claude = [record for record in live if record.get("kind") == "claude"]
+    requested = sender_alias(peers.explicit_name())
+    registered_names = {record.get("name") for record in claude}
     # A registered live peer claims its address, so patience is warranted
     # there and nowhere else.
-    targets = ([(record.get("name"), peers._address_of(record), True)
-                for record in claude]
-               if claude else [(None, claude_socket_path(cwd), False)])
-    for name, path, registered in targets:
-        who = f'channel: peer "{name}"' if registered else "channel:"
+    targets = [(record.get("name"), peers._address_of(record), "registered")
+               for record in claude]
+    if requested and requested not in registered_names:
+        targets.insert(0, (requested, claude_socket_path(cwd, requested),
+                           "unregistered"))
+    if not claude:
+        targets.append((None, claude_socket_path(cwd), "legacy"))
+    for name, path, state in targets:
+        registered = state == "registered"
+        who = f'channel: peer "{name}"' if name else "channel:"
         probe = _probe_channel(path, patient=registered)
-        if probe.answered:
+        if probe.answered and state == "unregistered":
+            report.bad(f'{who} answers, but no live endpoint record holds '
+                       f'alias "{name}" — restart that Claude session')
+        elif probe.answered:
             report.ok(f"{who} answered")
         elif probe.error == errno.ENOENT and registered:
             report.bad(f"{who} the session's channel socket is gone — "

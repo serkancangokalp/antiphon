@@ -1017,7 +1017,7 @@ reply routing needs a durable design before implementation:
 - fail closed when several unanswered senders remain;
 - define expiry and cleanup without losing a late reply.
 
-## P0 — A named Claude session can identify itself as `<unnamed>`
+## P0 — A named Claude session can identify itself as `<unnamed>` (fixed)
 
 From a user report on 0.3.3 (macOS 26.3, Node 22.16, Python 3.12.7; one Claude
 and two Codex peers, all named): for 38 minutes every Codex → Claude send
@@ -1077,6 +1077,32 @@ channel ownership, and today one answers the other.
    that a peer attempted a send and was refused; both agents concluded the
    other was idle. Even a line on the next page would have collapsed a
    40-minute investigation.
+
+**What landed.** A valid Claude `ANTIPHON_NAME` now signs both of its outgoing
+roads — the channel's `reply_to_codex` subprocess and the Stop-hook push —
+without treating ownership of the return socket as identity. Codex keeps the
+stricter owner-key rule because its MCP server is not the session it names.
+The duplicate-name loser is still refused the channel and the startup warning
+now asks for a *unique* name; `identitySettled` still resolves after every
+startup route.
+
+`doctor` derives the current named socket and reports a live listener with no
+live endpoint holding that alias as broken, without writing the registry or
+socket. A bare send with neither a registry record nor a live legacy socket is
+now a classified `no-peer` refusal that says no Claude peer is registered and
+suggests addressing a named channel, rather than exposing `ENOENT` for the
+implementation path. The already-honest explicit-name refusal remains
+byte-identical.
+
+On that explicit-name refusal only, Antiphon makes one best-effort connection
+to `sha256(project\0alias)`'s socket. If it answers, the existing channel
+payload carries a bridge-authored notice with the attempt time and requested
+alias, no original message content and no new metadata field. The sender's
+refusal remains the result; an absent socket receives no bytes; no pending
+delivery state is created. README, both generated agent rules and the live
+channel instructions state the same identity/reachability and notice contract.
+Why the reporter's original serving process had no registration remains
+unexplained, exactly as above.
 
 **Also reported, filed rather than fixed here.** A stale pid left in
 `endpoint.json` by a writer that exited without unregistering, which works

@@ -1009,17 +1009,13 @@ class AntiphonTest(unittest.TestCase):
                 self.assertEqual(antiphon.push("claude"), 0)
         self.assertIn("@claude:api line carried no message", err.getvalue())
 
-    # A mock that stands in for a transport nobody should touch must raise, not
-    # record. A bare MagicMock socket answers `recv` with a truthy object for
-    # ever, so a wrong turn does not fail the test — it hangs the suite.
-    # Measured twice while mutating this very code.
-    UNTOUCHABLE = AssertionError("this message must touch no transport")
-
     def test_a_named_marker_that_reaches_nobody_is_reported_not_redirected(self):
         """A name that does not resolve is refused out loud. Delivering it to
         whoever is around instead would be the silent misroute wearing a
-        recipient's name."""
+        recipient's name. The exact named socket may hear only the refusal
+        notice; an absent socket receives no bytes and changes no cursor."""
         err = io.StringIO()
+        chan = self._Channel(missing=1)
         with tempfile.TemporaryDirectory() as project:
             input_data = {"cwd": project, "transcript_path": "/tmp/rollout"}
             with patch.object(antiphon.os.path, "exists", return_value=True), \
@@ -1027,14 +1023,15 @@ class AntiphonTest(unittest.TestCase):
                               return_value=("@claude:api run", "")), \
                  patch.object(antiphon, "read_cursor", return_value={}), \
                  patch.object(antiphon, "write_cursor") as write, \
-                 patch.object(antiphon.socket, "socket",
-                              side_effect=self.UNTOUCHABLE) as sock, \
+                 patch.object(antiphon, "CONNECT_PATIENCE", 0), \
+                 patch.object(antiphon.socket, "socket", chan), \
                  patch.object(antiphon.sys, "stdin",
                               io.StringIO(json.dumps(input_data))), \
                  contextlib.redirect_stderr(err):
                 self.assertEqual(antiphon.push("claude"), 0)
-                sock.assert_not_called()
                 write.assert_not_called()
+        self.assertEqual(chan.connects, 1)
+        self.assertEqual(chan.sent, b"")
         self.assertIn("api", err.getvalue())
         self.assertIn("not delivered", err.getvalue())
 
@@ -1231,6 +1228,22 @@ class AntiphonTest(unittest.TestCase):
         self.assertIn("ui", detail)
         self.assertIn("not delivered", detail.lower())
 
+    def test_a_missing_bare_channel_is_a_no_peer_refusal_not_an_errno(self):
+        """With no registry records the legacy path is still tried for old
+        installs. Once its startup patience is spent, ENOENT describes an
+        implementation path nobody selected; the actionable fact is that no
+        peer is registered and a named channel may need an address."""
+        missing = FileNotFoundError(errno.ENOENT, "No such file or directory")
+        with tempfile.TemporaryDirectory() as project, \
+             patch.object(antiphon, "CONNECT_PATIENCE", 0), \
+             patch.object(antiphon.socket, "socket", side_effect=missing):
+            ok, detail = antiphon.send_to_claude(project, "hello")
+        self.assertFalse(ok)
+        self.assertEqual(detail.refusal_class, "no-peer")
+        self.assertIn("no Claude peer is registered", detail)
+        self.assertIn("address", detail)
+        self.assertNotIn("No such file", detail)
+
     def test_an_oversized_message_never_reaches_the_socket(self):
         """The server refuses on arrival, but a sender should not have to learn
         that from a dropped connection. The limit is in bytes, so a multi-byte
@@ -1274,6 +1287,7 @@ class AntiphonTest(unittest.TestCase):
             self.missing = missing
             self.reply = reply
             self.connects = 0
+            self.paths = []
             self.sent = b""
 
         def __call__(self, *_a, **_k):
@@ -1291,8 +1305,9 @@ class AntiphonTest(unittest.TestCase):
         def close(self):
             pass
 
-        def connect(self, _path):
+        def connect(self, path):
             self.connects += 1
+            self.paths.append(path)
             if self.connects <= self.missing:
                 raise FileNotFoundError(2, "No such file or directory")
 
@@ -1324,6 +1339,55 @@ class AntiphonTest(unittest.TestCase):
         self.assertEqual(chan.connects, 1,
                          "the socket is touched only after the alias exists")
 
+    def test_a_live_unregistered_named_socket_hears_an_attempt_without_the_words(self):
+        """The registry cannot authorize the original delivery, but the socket
+        derived from the requested alias can safely hear a diagnostic: it says
+        when and where somebody tried while disclosing none of the message."""
+        chan = self._Channel()
+        attempt = "1d5a03e0-0548-4339-87c3-45c5dbf7e9d7"
+        secret = "do not disclose this message"
+        absent = "not delivered: no live claude peer named 'ui'"
+        with tempfile.TemporaryDirectory() as project, \
+             patch.object(antiphon, "CONNECT_PATIENCE", 0), \
+             patch.object(antiphon.socket, "socket", chan), \
+             patch.object(antiphon, "resolve_target", return_value=(None, absent)):
+            ok, detail = antiphon.send_to_claude(
+                project, secret, alias="ui", sender_alias="build",
+                message_id=attempt)
+        self.assertFalse(ok)
+        self.assertEqual(detail, absent, "the sender's refusal still stands")
+        key = hashlib.sha256(f"{os.path.abspath(project)}\0ui".encode()).hexdigest()[:20]
+        self.assertEqual(chan.paths,
+                         [os.path.join(os.environ.get("TMPDIR") or "/tmp",
+                                       f"antiphon-channel-{key}.sock")])
+        self.assertTrue(chan.sent, "the live named socket heard no diagnostic")
+        notice = json.loads(chan.sent.decode())
+        self.assertEqual(set(notice), {"content", "message_id", "sender_alias"},
+                         "the existing channel payload shape is unchanged")
+        self.assertEqual(notice["message_id"], attempt)
+        self.assertEqual(notice["sender_alias"], "build")
+        self.assertIn("ui", notice["content"])
+        self.assertRegex(notice["content"], r"\d{4}-\d{2}-\d{2}T")
+        self.assertIn("not delivered", notice["content"])
+        self.assertNotIn(secret, notice["content"])
+
+    def test_an_absent_named_socket_leaves_the_refusal_and_sends_no_bytes(self):
+        """The diagnostic is best effort, never a second delivery promise. It
+        probes only the requested alias's path; when nobody listens, the caller
+        receives the registry refusal and no content is written anywhere."""
+        chan = self._Channel(missing=1)
+        absent = "not delivered: no live claude peer named 'ui'"
+        with tempfile.TemporaryDirectory() as project, \
+             patch.object(antiphon, "CONNECT_PATIENCE", 0), \
+             patch.object(antiphon.socket, "socket", chan), \
+             patch.object(antiphon, "resolve_target", return_value=(None, absent)):
+            ok, detail = antiphon.send_to_claude(
+                project, "still secret", alias="ui", sender_alias="build")
+        self.assertFalse(ok)
+        self.assertEqual(detail, absent)
+        self.assertEqual(chan.connects, 1, "the requested alias socket is probed once")
+        self.assertEqual(chan.sent, b"", "no diagnostic or message reached a dead socket")
+
     def test_a_message_sent_before_the_socket_exists_still_arrives(self):
         """Measured: the MCP handshake completes 27-41ms before the channel socket
         is bound, so a message sent the moment the channel looked ready was
@@ -1342,7 +1406,7 @@ class AntiphonTest(unittest.TestCase):
                          "each attempt must re-resolve: a named peer can register "
                          "between them and move the address")
 
-    def test_a_channel_that_never_appears_fails_within_a_bounded_time(self):
+    def test_a_bare_channel_that_never_appears_refuses_within_a_bounded_time(self):
         chan = self._Channel(missing=10_000)
         with tempfile.TemporaryDirectory() as project, \
              patch.object(antiphon.socket, "socket", chan), \
@@ -1353,7 +1417,8 @@ class AntiphonTest(unittest.TestCase):
             ok, detail = antiphon.send_to_claude(project, "hello")
             elapsed = time.monotonic() - started
         self.assertFalse(ok)
-        self.assertIn("down", detail)
+        self.assertEqual(detail.refusal_class, "no-peer")
+        self.assertIn("not delivered", detail)
         self.assertLess(elapsed, 3.0, "retrying must stay bounded")
 
     def test_an_ambiguous_target_is_not_retried(self):
@@ -3083,6 +3148,25 @@ class DoctorTest(unittest.TestCase):
             self.assertEqual(code, 1)
             self.assertFalse(self.line_for(printed, "channel:").startswith("✓"),
                              "an arbitrary listener is not an Antiphon channel")
+
+    def test_doctor_reports_a_named_channel_with_no_live_endpoint_record(self):
+        """The user-report shape: the named listener answers while the registry
+        says nobody owns it. Looking only at the bare socket calls this healthy
+        project idle and hides the fault a person ran doctor to find."""
+        project = self.project()
+        self.set_up(project)
+        base = self.socket_dir()
+        key = hashlib.sha256(f"{project}\0ui".encode()).hexdigest()[:20]
+        named = os.path.join(base, f"antiphon-channel-{key}.sock")
+        with patch.dict(os.environ, {"TMPDIR": base, "ANTIPHON_NAME": "ui"}), \
+             self.listener(named, b'{"ok":false,"error":"empty"}'):
+            code, printed = self.run_doctor(project)
+        self.assertEqual(code, 1, printed)
+        line = self.line_for(printed, "channel:")
+        self.assertTrue(line.startswith("✗"), line)
+        self.assertIn("ui", line)
+        self.assertIn("no live endpoint", line)
+        self.assertIn("restart", line)
 
     def test_doctor_reports_a_broken_alias(self):
         """Through `peers.explicit_name()` — the exact function production
@@ -7344,14 +7428,16 @@ class RoutingTest(unittest.TestCase):
         """The legacy address is for the case where nothing is registered at
         all. Reaching for it because a *named* recipient was not found would
         deliver to a session nobody asked for, and report success."""
-        # The transports raise rather than record. A bare mock socket answers
-        # `recv` with a truthy object for ever, so a wrong fallback here hangs
-        # the suite instead of failing it — measured, once.
+        # The delivery transports raise rather than record. The exact named
+        # socket gets the new content-free diagnostic probe, represented by
+        # `notice`; it is not a fallback and cannot carry the message.
         touched = AssertionError("a refused recipient must touch no transport")
         with tempfile.TemporaryDirectory() as project, \
              patch.object(antiphon, "codex_session_id",
                           return_value="sess-legacy") as rollout, \
              patch.object(antiphon.socket, "socket", side_effect=touched) as sock, \
+             patch.object(antiphon, "_notify_unregistered_claude") as notice, \
+             patch.object(antiphon, "CONNECT_PATIENCE", 0), \
              patch.object(antiphon.subprocess, "run",
                           side_effect=only_the_process_table(touched)) as run:
             for kind in ("claude", "codex"):
@@ -7360,6 +7446,8 @@ class RoutingTest(unittest.TestCase):
                 self.assertIn("ghost", detail)
             self.assertFalse(antiphon.send_to_codex(project, "hi", "ghost")[0])
             self.assertFalse(antiphon.send_to_claude(project, "hi", "ghost")[0])
+            self.assertEqual(notice.call_count, 1)
+            self.assertEqual(notice.call_args.args[:2], (project, "ghost"))
             rollout.assert_not_called()
             sock.assert_not_called()
             run.assert_not_called()
@@ -7823,19 +7911,24 @@ class ToolRecipientTest(unittest.TestCase):
 
     def test_the_send_tool_reports_an_unroutable_recipient_as_an_error(self):
         """Invalid, unknown, waiting and ambiguous all reach the caller as tool
-        errors. A silent success would be the worst outcome: Codex would believe
-        Claude had been told."""
+        errors. A valid unknown alias gets only the content-free diagnostic;
+        invalid and ambiguous requests touch no socket. A silent success would
+        be the worst outcome: Codex would believe Claude had been told."""
         touched = AssertionError("a refused send must touch no transport")
         cases = [("ghost", "no live claude peer"), ("API!", "usable peer name"),
                  (None, "address one by name")]
         with tempfile.TemporaryDirectory() as project:
             antiphon.peers.register(project, "claude", "ui", "/tmp/ui.sock")
             antiphon.peers.register(project, "claude", "api", "/tmp/api.sock")
-            with patch.object(antiphon.socket, "socket", side_effect=touched):
+            with patch.object(antiphon.socket, "socket", side_effect=touched), \
+                 patch.object(antiphon, "_notify_unregistered_claude") as notice, \
+                 patch.object(antiphon, "CONNECT_PATIENCE", 0):
                 for alias, expected in cases:
                     result = antiphon._send_tool(project, "hello", alias)
                     self.assertTrue(result.get("isError"), repr(alias))
                     self.assertIn(expected, result["content"][0]["text"])
+        self.assertEqual(notice.call_count, 1)
+        self.assertEqual(notice.call_args.args[1], "ghost")
 
     def test_a_recipient_that_is_not_a_string_is_refused_before_anything_else(self):
         """`to` arrives from JSON, so it can be any type at all."""
@@ -8370,6 +8463,50 @@ class SenderIdentityTest(unittest.TestCase):
     UUID = "1d5a03e0-0548-4339-87c3-45c5dbf7e9d7"
     OWNER = "300:mine"
 
+    def test_every_agent_facing_surface_separates_claude_identity_from_reachability(self):
+        """A labelled message must not make either agent infer that its reply
+        path works. README, generated rules and live channel instructions are
+        the four places that teach that contract, so none may retain the old
+        implication on its own."""
+        node = read_source("lib", "channel.mjs")
+        start = node.index("    instructions:")
+        end = node.index("\n  },\n);", start)
+        channel = re.sub(r'"\s*\+\s*\n\s*"', "", node[start:end])
+        surfaces = {
+            "AGENTS.md rule": antiphon.AGENTS_RULE,
+            "CLAUDE.md rule": antiphon.CLAUDE_RULE,
+            "channel instructions": channel,
+            "README": read_source("README.md"),
+        }
+        for name, surface in surfaces.items():
+            with self.subTest(surface=name):
+                words = surface.lower()
+                self.assertIn("configured identity", words)
+                self.assertIn("not proof", words)
+                self.assertIn("return channel", words)
+                self.assertIn("restart", words)
+
+    def test_every_agent_facing_surface_explains_the_refused_send_notice(self):
+        """The diagnostic uses the existing channel event shape, so prose is
+        what prevents the receiver from mistaking it for the sender's words or
+        for a late successful delivery."""
+        node = read_source("lib", "channel.mjs")
+        start = node.index("    instructions:")
+        end = node.index("\n  },\n);", start)
+        channel = re.sub(r'"\s*\+\s*\n\s*"', "", node[start:end])
+        surfaces = {
+            "AGENTS.md rule": antiphon.AGENTS_RULE,
+            "CLAUDE.md rule": antiphon.CLAUDE_RULE,
+            "channel instructions": channel,
+            "README": read_source("README.md"),
+        }
+        for name, surface in surfaces.items():
+            with self.subTest(surface=name):
+                words = surface.lower()
+                self.assertIn("bridge-authored diagnostic", words)
+                self.assertIn("no original message content", words)
+                self.assertIn("sender's refusal", words)
+
     @staticmethod
     @contextlib.contextmanager
     def _named(name):
@@ -8381,9 +8518,11 @@ class SenderIdentityTest(unittest.TestCase):
 
     @contextlib.contextmanager
     def _holding(self, project, kind, name):
-        """The sender's own claim. An alias is published only by the session
-        the registry says holds it, so a label test has to establish that the
-        same way the real paths do."""
+        """The ordinary reachable fixture behind a sender identity.
+
+        Codex needs this claim to publish the alias. Claude now needs only the
+        valid configured name, but keeping its endpoint here makes these label
+        tests describe the healthy, reachable case rather than the P0 fault."""
         if name and antiphon.peers.valid_name(name):
             if kind == "codex":
                 self._codex_peer(project, name, self.OWNER, self.UUID)
@@ -8573,8 +8712,9 @@ class SenderIdentityTest(unittest.TestCase):
                       self._reply_text("ui", {"sender_alias": "api"}))
 
     def test_an_explicit_null_from_the_channel_is_not_second_guessed(self):
-        """A channel server that lost its claim sends null on purpose. Reading
-        the environment instead would put its name straight back on."""
+        """The subprocess trusts the identity field the channel validated.
+        Reading the environment again would turn an explicit unnamed identity
+        from this or an older server into a name that was never sent."""
         with self._named("ui"):
             self.assertIn("[from=<unnamed> id=",
                           self._reply_text("ui", {"sender_alias": None}))
@@ -8587,14 +8727,13 @@ class SenderIdentityTest(unittest.TestCase):
 
 
 class ClaimedAliasTest(unittest.TestCase):
-    """An alias may be published only by the session that actually holds it.
+    """Codex proves an alias claim; Claude separates identity from reachability.
 
-    A valid `ANTIPHON_NAME` is a request, not a claim. Two sessions can be
-    started with the same one and exactly one wins the registry. The loser
-    publishing it anyway would attribute its words to the winner, and a reply
-    addressed back would reach a session that never spoke — the silent
-    misidentification this whole registry exists to end, arriving through the
-    label that was meant to prevent it.
+    A Codex MCP server is not the session it names, so `ANTIPHON_NAME` remains a
+    request until the registry owner matches. A Claude process is the session:
+    its valid configured name identifies its outgoing words even when another
+    process owns the return channel, and the startup warning plus doctor expose
+    that reachability fault instead of silently renaming the speaker.
     """
 
     UUID = "1d5a03e0-0548-4339-87c3-45c5dbf7e9d7"
@@ -8667,16 +8806,18 @@ class ClaimedAliasTest(unittest.TestCase):
                 self.assertEqual(self._stop_to_claude(project), "ui")
                 self.assertIn("[from=ui id=", self._stop_to_codex(project))
 
-    def test_a_session_that_lost_the_alias_does_not_publish_it(self):
-        """Both directions. The words are still delivered — only the claim to
-        be `ui` is withheld, because it is not this session's to make."""
+    def test_identity_and_channel_ownership_are_separate_for_claude(self):
+        """A Codex sender still needs its registry claim, but a Claude sender
+        signs the valid name it was configured with even when another process
+        owns that name's return channel. The latter is unreachable, not
+        unnamed; its startup warning and doctor make that distinction visible."""
         with tempfile.TemporaryDirectory() as project:
             self._codex_endpoint(project, self.THEIRS)
             self._claude_endpoint(project, self.THEIRS)
             with self._named("ui"), \
                  patch.object(antiphon.peers, "owner_key", return_value=self.MINE):
                 self.assertIsNone(self._stop_to_claude(project))
-                self.assertIn("[from=<unnamed> id=", self._stop_to_codex(project))
+                self.assertIn("[from=ui id=", self._stop_to_codex(project))
 
     def test_one_turn_settles_who_is_speaking_exactly_once(self):
         """Three recipients, one sender. Deciding again per recipient would walk
@@ -8688,9 +8829,8 @@ class ClaimedAliasTest(unittest.TestCase):
                 antiphon.peers.register(project, "codex", alias, f"sess-{alias}",
                                         pid=os.getpid(), owner_key=self.MINE)
             payload = {"cwd": project, "transcript_path": "/tmp/transcript"}
-            with self._named("ui"), \
-                 patch.object(antiphon.peers, "owner_key",
-                              return_value=self.MINE) as walk, \
+            with patch.object(antiphon, "claimed_alias",
+                              return_value="ui") as identify, \
                  patch.object(antiphon.os.path, "exists", return_value=True), \
                  patch.object(antiphon, "_claude_turn",
                               return_value=("@codex:a one\n@codex:b two\n"
@@ -8704,7 +8844,8 @@ class ClaimedAliasTest(unittest.TestCase):
                  contextlib.redirect_stderr(io.StringIO()):
                 self.assertEqual(antiphon.push("codex"), 0)
         self.assertEqual(queued.call_count, 3, "all three still went")
-        self.assertEqual(walk.call_count, 1, "and the sender was settled once")
+        self.assertEqual(identify.call_count, 1,
+                         "and the sender was settled once")
         labels = {m.split("id=")[0] for _, m in
                   (c.args for c in queued.call_args_list)}
         self.assertEqual(len(labels), 1, "one turn, one sender identity")
@@ -8765,14 +8906,12 @@ class ClaimedAliasTest(unittest.TestCase):
             self.assertEqual(sent, [expected], repr(claim))
 
     def test_the_reply_path_takes_no_alias_from_the_environment(self):
-        """`channel.mjs` publishes its name only once it holds the claim and
-        serves the socket. Falling back to the environment here would undo that
-        in the one process that cannot check.
+        """`channel.mjs` passes the identity it already validated. Falling back
+        to the environment here would second-guess the one process that knows.
 
-        Both wire forms: an explicit null is what a channel server that lost the
-        claim actually sends, and an absent field is what an older one sends.
-        The environment says `ui` throughout, and neither is allowed to become
-        it."""
+        Both wire forms: an explicit null is an unnamed identity and an absent
+        field is what an older server sends. The environment says `ui`
+        throughout, and neither is allowed to become it."""
         for body in ({"text": "hi", "sender_alias": None, "to": "ui"},
                      {"text": "hi", "to": "ui"}):
             queued = []
@@ -8790,8 +8929,8 @@ class ClaimedAliasTest(unittest.TestCase):
             self.assertIn("[from=<unnamed> id=", queued[0], repr(body))
 
     def test_register_peer_records_the_owner_key_it_can_see(self):
-        """The Stop hook checks the endpoint's owner against its own. Without
-        one written here, a Claude session could never publish its alias."""
+        """The owner still joins a live endpoint to its session record for
+        source labels, even though Claude identity no longer depends on it."""
         with tempfile.TemporaryDirectory() as project, \
              patch.object(antiphon, "project_dir", return_value=project), \
              patch.object(antiphon.peers, "owner_key", return_value=self.MINE), \
@@ -9356,6 +9495,15 @@ class RefusedSendHonestyTest(unittest.TestCase):
                     result = antiphon._send_tool(project, text, "ui")
             return result["content"][0]["text"]
 
+        def bare_send(*contexts):
+            with tempfile.TemporaryDirectory() as project, \
+                 contextlib.ExitStack() as stack:
+                stack.enter_context(patch.object(antiphon, "CONNECT_PATIENCE", 0))
+                for context in contexts:
+                    stack.enter_context(context)
+                result = antiphon._send_tool(project, "hi")
+            return result["content"][0]["text"]
+
         def channel(**how):
             return patch.object(antiphon.socket, "socket",
                                 self._LiveSocket(**how))
@@ -9391,6 +9539,12 @@ class RefusedSendHonestyTest(unittest.TestCase):
              lambda: send(patch.object(antiphon.socket, "socket",
                                        self._DeadSocket())),
              "Channel is down: Permission denied", sent),
+            ("send_to_claude: no registry and no legacy channel",
+             lambda: bare_send(patch.object(
+                 antiphon.socket, "socket",
+                 side_effect=FileNotFoundError(errno.ENOENT,
+                                               "No such file or directory"))),
+             "no Claude peer is registered", sent),
             ("send_to_claude: it broke after the bytes went out",
              lambda: send(channel(breaks=OSError(errno.EPIPE, "Broken pipe"))),
              "Channel is down: Broken pipe", sent),
@@ -9405,12 +9559,13 @@ class RefusedSendHonestyTest(unittest.TestCase):
                  answer=b'{"ok": false, "error": "channel said no"}')),
              "channel said no", sent),
         ]
-        # 10 existing rows plus one: `_queue_codex`'s crash-belt, which turns
+        # 10 original rows plus `_queue_codex`'s crash-belt and the bare
+        # channel's honest `no-peer` refusal. The former turns
         # an exec the kernel refuses — measured at 1.1 MB of message on this
         # machine — into a classified refusal instead of a traceback out of a
         # Stop hook. The quota refusal born in the spill branch adds no row: it
         # is unclassed, and an unwrapped refusal is not a census site.
-        self.assertEqual(len(sites), 11,
+        self.assertEqual(len(sites), 12,
                          "one case per wrap site, and every wrap site has one")
         for label, refuse, fragment, guidance in sites:
             with self.subTest(label):
