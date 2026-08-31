@@ -22,8 +22,18 @@
 #   * The window where a Codex thread is open but has written no rollout yet.
 #     `codex exec` writes one immediately; only an interactive terminal waits.
 #   * `codex exec` fires SessionStart but never UserPromptSubmit, so the page
-#     is produced by running the command `.codex/hooks.json` declares, with the
-#     payload the host sends. The wiring itself is what `antiphon doctor` checks.
+#     is produced by running `antiphon hook codex` with the payload the host
+#     sends, after asserting that is exactly what `.codex/hooks.json` declares.
+#     The declared command is compared, never executed: running whatever the
+#     code under test wrote would hand it a shell. The wiring itself is what
+#     `antiphon doctor` checks.
+#   * T2 proves a push against a real Claude transcript, not that Claude's own
+#     Stop hook invoked it — `.antiphon/` appears from the UserPromptSubmit
+#     hook too, so the automatic Stop wiring could regress with all of this
+#     green. Only doctor's reading of `.claude/settings.json` covers that.
+#   * The Codex rollout this run creates is left in place and named, never
+#     deleted: choosing a file to delete from a person's session store on the
+#     word of the code under test is a risk no test script may take.
 #
 # Usage:  test/e2e/fresh-user.sh [--version <npm-version>] [--keep]
 #   default: packs this working tree.  --version: installs that release instead.
@@ -56,6 +66,30 @@ lacks() {
   case "$2" in *"$3"*) fail "$1 — olmamalıydı: $3" ;; *) pass "$1" ;; esac
 }
 
+# One helper, two legacy shapes. A v2 map is a scan high-water mark, so it
+# replays from byte zero by design; a 0.1.0 float is a delivered boundary and
+# must not. Comparing the two pages on the same transcripts measures the rule
+# without guessing which timestamps happen to render.
+seed() { python3 -c "import json,sys; json.dump(json.loads(sys.argv[1]), open('$PROJECT/.antiphon/cursor.json','w'))" "$1"; }
+# A hook that crashes prints nothing, and a check reading "nothing is left to
+# deliver" would call that success. The status of every stage is kept, and a
+# failure answers with a word no assertion accepts.
+page_now() {
+  local raw decoded
+  raw="$(printf '{"cwd":"%s","hook_event_name":"UserPromptSubmit","transcript_path":"%s","session_id":"%s"}' \
+    "$PROJECT" "$ROLLOUT" "$(basename "$ROLLOUT" .jsonl | grep -o '[0-9a-f-]\{36\}')" \
+    | (cd "$PROJECT" && antiphon hook codex))" || { echo "HOOK-FAILED"; return 1; }
+  [ -z "$raw" ] && return 0                      # nothing to deliver is empty, legitimately
+  decoded="$(printf '%s' "$raw" | python3 -c "
+import sys, json
+try:
+    print(json.loads(sys.stdin.read())['hookSpecificOutput']['additionalContext'])
+except Exception as error:
+    print('HOOK-UNDECODABLE: %s' % error); raise SystemExit(1)")" || { echo "$decoded"; return 1; }
+  printf '%s' "$decoded"
+}
+events_in() { printf '%s' "$1" | grep -cE '^\[[0-9][0-9]:[0-9][0-9]\]'; }
+
 for tool in claude codex node npm python3 sqlite3; do
   command -v "$tool" >/dev/null || { echo "gerekli araç yok: $tool" >&2; exit 2; }
 done
@@ -64,13 +98,22 @@ done
 # record the resolved path: an unresolved one names a transcript directory that
 # never fills and a project Codex discovery cannot match.
 TMP="$(cd "$(mktemp -d "${TMPDIR:-/tmp}/antiphon-e2e.XXXXXX")" && pwd -P)"
+# Unique per run: a constant marker meets an earlier run's leftovers in a
+# store neither run owns, and an assertion about "this run's rows" would be
+# answering about someone else's.
+NONCE="e2e-$(basename "$TMP" | tr -dc 'A-Za-z0-9')"
 PREFIX="$TMP/prefix"; PROJECT="$TMP/project"
 SLUG="$(printf '%s' "$PROJECT" | sed 's|[^A-Za-z0-9]|-|g')"
 CLAUDE_DIR="$HOME/.claude/projects/$SLUG"
 QUEUE="$HOME/.codex/queue_1.sqlite"
 CODEX_CONFIG_BEFORE="$(shasum -a 256 "$HOME/.codex/config.toml" 2>/dev/null | cut -d' ' -f1)"
-# A queue that cannot be read must not answer 0 twice and call that proof.
-queued() { sqlite3 "$QUEUE" 'SELECT count(*) FROM queued_items;' 2>/dev/null || echo unreadable; }
+# Read-only, and absent is its own answer: a plain `sqlite3` call creates the
+# file it was asked to read, so a first-ever run would leave a database behind
+# and call the machine unchanged.
+queued() {
+  [ -f "$QUEUE" ] || { echo absent; return; }
+  sqlite3 -readonly "$QUEUE" 'SELECT count(*) FROM queued_items;' 2>/dev/null || echo unreadable
+}
 
 cleanup() {
   if [ "$KEEP" = "1" ]; then
@@ -131,27 +174,36 @@ lacks "doctor finds nothing broken" "$DOCTOR" "✗"
 
 step "T2 — Claude writes to a Codex that does not exist yet"
 BEFORE_QUEUE="$(queued)"
-case "$BEFORE_QUEUE" in ''|*[!0-9]*) fail "Codex's queue could not be read; the stranding check would prove nothing" ;; esac
+case "$BEFORE_QUEUE" in
+  absent) echo "  ---- Codex has no queue database yet; the stranding check compares against none" ;;
+  ''|*[!0-9]*) fail "Codex's queue could not be read; the stranding check would prove nothing" ;;
+esac
 # Two turns, so T5 has two distinct moments to place a cursor between. One
 # turn renders both of its lines in the same second, and the `>=` boundary
 # rule repeats the whole cohort sharing it — nothing to bound.
-(cd "$PROJECT" && claude -p 'Respond with exactly one line and nothing else, no preamble: @codex e2e-probe-one' >/dev/null 2>&1) \
+(cd "$PROJECT" && claude -p "Respond with exactly one line and nothing else, no preamble: @codex $NONCE-one" >/dev/null 2>&1) \
   && pass "the first claude -p turn exits 0" || fail "the first claude -p turn failed"
 sleep 2
-(cd "$PROJECT" && claude -p 'Respond with exactly one line and nothing else, no preamble: @codex e2e-probe-two' >/dev/null 2>&1) \
+(cd "$PROJECT" && claude -p "Respond with exactly one line and nothing else, no preamble: @codex $NONCE-two" >/dev/null 2>&1) \
   && pass "the second claude -p turn exits 0" || fail "the second claude -p turn failed"
 TRANSCRIPT="$(ls -t "$CLAUDE_DIR"/*.jsonl 2>/dev/null | head -1)"
 [ -n "$TRANSCRIPT" ] && pass "claude -p wrote a transcript" || fail "claude -p wrote no transcript"
-grep -qr '@codex e2e-probe-two' "$CLAUDE_DIR" 2>/dev/null && pass "the marker is in the transcript" || fail "the marker never reached the transcript"
+grep -qr "@codex $NONCE-two" "$CLAUDE_DIR" 2>/dev/null && pass "the marker is in the transcript" || fail "the marker never reached the transcript"
 [ -d "$PROJECT/.antiphon" ] && pass "the hooks ran (.antiphon exists)" || fail "the hooks never ran"
 PUSH="$(printf '{"cwd":"%s","hook_event_name":"Stop","transcript_path":"%s","session_id":"%s"}' \
         "$PROJECT" "$TRANSCRIPT" "$(basename "$TRANSCRIPT" .jsonl)" | (cd "$PROJECT" && antiphon push codex 2>&1))"
 contains "the push refuses instead of guessing" "$PUSH" "no Codex session found"
 AFTER_QUEUE="$(queued)"
-case "$AFTER_QUEUE" in ''|*[!0-9]*) fail "Codex's queue could not be read after the push" ;; esac
-STRANDED="$(sqlite3 -readonly "$QUEUE" "SELECT count(*) FROM queued_items WHERE payload_json LIKE '%e2e-probe%';" 2>&1)"
-check "this run stranded nothing of its own" "$STRANDED" "0"
-check "and left the queue as it found it" "$AFTER_QUEUE" "$BEFORE_QUEUE"
+if [ "$AFTER_QUEUE" = "absent" ]; then
+  pass "this run stranded nothing of its own (Codex has no queue)"
+else
+  case "$AFTER_QUEUE" in ''|*[!0-9]*) fail "Codex's queue could not be read after the push" ;; esac
+  # This run's own rows, by its own nonce: a constant marker would collide
+  # with an earlier run's residue, and a machine-wide total moves under any
+  # other session enqueueing or draining while this one runs.
+  STRANDED="$(sqlite3 -readonly "$QUEUE" "SELECT count(*) FROM queued_items WHERE payload_json LIKE '%$NONCE%';" 2>&1)"
+  check "this run stranded nothing of its own" "$STRANDED" "0"
+fi
 
 step "T3 — Codex's first turn reads what the refused push could not carry"
 BEFORE_ROLLOUTS="$(mktemp)"; find "$HOME/.codex/sessions" -name 'rollout-*.jsonl' 2>/dev/null | sort > "$BEFORE_ROLLOUTS"
@@ -179,15 +231,15 @@ else
 fi
 check "discovery returns the rollout this run created" "$FOUND" "$NEW_ROLLOUT"
 ROLLOUT="$FOUND"
+# Read, compared, and never executed. Running whatever `setup` happened to
+# write would hand the code under test a shell — the assertion would record
+# the surprise and the script would run it anyway.
 HOOK_CMD="$(python3 -c "import json; print(json.load(open('$PROJECT/.codex/hooks.json'))['hooks']['UserPromptSubmit'][0]['hooks'][0]['command'])")"
 check "hooks.json declares the hook command" "$HOOK_CMD" "antiphon hook codex"
-PAGE="$(printf '{"cwd":"%s","hook_event_name":"UserPromptSubmit","transcript_path":"%s","session_id":"%s"}' \
-        "$PROJECT" "$ROLLOUT" "$(basename "$ROLLOUT" .jsonl | grep -o '[0-9a-f-]\{36\}')" \
-        | (cd "$PROJECT" && eval "$HOOK_CMD") \
-        | python3 -c "import sys,json; raw=sys.stdin.read().strip(); print(json.loads(raw)['hookSpecificOutput']['additionalContext'] if raw else '')")"
+PAGE="$(page_now)" && pass "the first page was produced" || fail "the first page — hook failed"
 # The relayed prompt carries the same words, so the label decides: this must
 # be Claude's own line, which is what the refused push could not carry.
-SAID="$(printf '%s' "$PAGE" | grep -A1 '^\[[0-9][0-9]:[0-9][0-9]\] Claude:$' | grep '@codex e2e-probe-two' || true)"
+SAID="$(printf '%s' "$PAGE" | grep -A1 '^\[[0-9][0-9]:[0-9][0-9]\] Claude:$' | grep -- "@codex $NONCE-two" || true)"
 [ -n "$SAID" ] && pass "the refused words arrive as Claude's own line" \
                 || fail "the page has no Claude: line carrying the marker"
 contains "and the prompt that asked for them is relayed, not claimed" "$PAGE" "To Claude:"
@@ -209,30 +261,6 @@ for path in glob.glob(os.path.join(sys.argv[1], "*.jsonl")):
 print("%.3f" % (max(stamps) if stamps else 0))
 PY
 )"
-# One helper, two legacy shapes. A v2 map is a scan high-water mark, so it
-# replays from byte zero by design; a 0.1.0 float is a delivered boundary and
-# must not. Comparing the two pages on the same transcripts measures the rule
-# without guessing which timestamps happen to render.
-seed() { python3 -c "import json,sys; json.dump(json.loads(sys.argv[1]), open('$PROJECT/.antiphon/cursor.json','w'))" "$1"; }
-# A hook that crashes prints nothing, and a check reading "nothing is left to
-# deliver" would call that success. The status of every stage is kept, and a
-# failure answers with a word no assertion accepts.
-page_now() {
-  local raw decoded
-  raw="$(printf '{"cwd":"%s","hook_event_name":"UserPromptSubmit","transcript_path":"%s","session_id":"%s"}' \
-    "$PROJECT" "$ROLLOUT" "$(basename "$ROLLOUT" .jsonl | grep -o '[0-9a-f-]\{36\}')" \
-    | (cd "$PROJECT" && eval "$HOOK_CMD"))" || { echo "HOOK-FAILED"; return 1; }
-  [ -z "$raw" ] && return 0                      # nothing to deliver is empty, legitimately
-  decoded="$(printf '%s' "$raw" | python3 -c "
-import sys, json
-try:
-    print(json.loads(sys.stdin.read())['hookSpecificOutput']['additionalContext'])
-except Exception as error:
-    print('HOOK-UNDECODABLE: %s' % error); raise SystemExit(1)")" || { echo "$decoded"; return 1; }
-  printf '%s' "$decoded"
-}
-events_in() { printf '%s' "$1" | grep -cE '^\[[0-9][0-9]:[0-9][0-9]\]'; }
-
 seed '{"codex_seen": {"v": 2, "sources": {}}}'
 FULL_PAGE="$(page_now)" && pass "the byte-zero page was produced" || fail "the byte-zero page was produced — hook failed"; FULL="$(events_in "$FULL_PAGE")"
 
@@ -251,10 +279,10 @@ contains "and how to skip it" "$UPGRADE_PAGE" "antiphon catch-up"
 # Both turns come back from byte zero, and only the second from the 0.1.0
 # time: named, not counted, so a boundary that wrongly skipped everything
 # could not pass as "fewer".
-contains "the v2 map replays the first turn" "$FULL_PAGE" "e2e-probe-one"
-contains "and the second" "$FULL_PAGE" "e2e-probe-two"
-lacks "the 0.1.0 time leaves the first turn where it was" "$UPGRADE_PAGE" "e2e-probe-one"
-contains "and replays the turn it recorded" "$UPGRADE_PAGE" "e2e-probe-two"
+contains "the v2 map replays the first turn" "$FULL_PAGE" "$NONCE-one"
+contains "and the second" "$FULL_PAGE" "$NONCE-two"
+lacks "the 0.1.0 time leaves the first turn where it was" "$UPGRADE_PAGE" "$NONCE-one"
+contains "and replays the turn it recorded" "$UPGRADE_PAGE" "$NONCE-two"
 if [ "$FULL" -lt 2 ]; then
   # Never a silent skip: a summary reading "failed 0" while the central
   # assertion never ran is the wrong-reason pass this script exists to avoid.
@@ -269,7 +297,11 @@ contains "catch-up says what it abandons" "$CATCHUP" "will not be delivered"
 AFTER_PAGE="$(page_now)" && pass "the post-catch-up page was produced" || fail "the post-catch-up page was produced — hook failed"
 check "nothing is left to deliver after catch-up" "$(printf '%s' "$AFTER_PAGE" | tr -d '[:space:]')" ""
 
-step "the machine is as it was"
+step "what the run changed outside its own temp tree"
+# Not "the machine is as it was": this run leaves a Codex rollout behind on
+# purpose — deleting from that store on a discovery result is a risk no test
+# may take — and Claude Code records every directory it runs in. What must
+# not change is configuration and trust.
 check "~/.codex/config.toml untouched" "$(shasum -a 256 "$HOME/.codex/config.toml" 2>/dev/null | cut -d' ' -f1)" "$CODEX_CONFIG_BEFORE"
 # Claude Code records every directory it runs in, so this file legitimately
 # changes. What must not change is trust: the script never grants it, and a
