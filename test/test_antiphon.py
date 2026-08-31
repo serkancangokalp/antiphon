@@ -8,8 +8,10 @@ import fcntl
 import io
 import json
 import shutil
+import socket
 import subprocess
 import tempfile
+import threading
 import time
 try:
     import tomllib          # Python 3.11+
@@ -2489,6 +2491,316 @@ class AntiphonTest(unittest.TestCase):
                     "codex_seen": 12.0,
                     "last_pushed_claude": {"": "fingerprint"},
                 }, "the next write persists the translation")
+
+
+class DoctorTest(unittest.TestCase):
+    """`antiphon doctor` explains a quiet bridge without touching it.
+
+    Every test that asserts an exit code patches the two seams doctor routes
+    external lookups through — `_which` and `_tool_version` — never the stdlib
+    underneath them. Measured trap this exists for: patching `shutil.which`
+    alone leaves the `node --version` subprocess reading the host, so a Node 18
+    contributor reds two tests that have nothing to do with Node."""
+
+    def project(self):
+        project = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, project, ignore_errors=True)
+        return project
+
+    def socket_dir(self):
+        """A short base for AF_UNIX fixtures.
+
+        Measured: the bindable ceiling is 103 bytes and the platform default
+        TMPDIR alone spends 49 of them, so a socket under a nested
+        TemporaryDirectory lands exactly on the limit with no margin.
+        `dir="/tmp"` spends five."""
+        base = tempfile.mkdtemp(dir="/tmp", prefix="a")
+        self.addCleanup(shutil.rmtree, base, ignore_errors=True)
+        return base
+
+    def set_up(self, project):
+        with patch.object(antiphon, "project_dir", return_value=project), \
+             contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(antiphon.setup(), 0)
+
+    def healthy_tools(self):
+        """A machine where everything the bridge needs is installed, and the
+        `antiphon` on PATH is the copy under test."""
+        root = os.path.dirname(os.path.dirname(os.path.realpath(antiphon.__file__)))
+        return {"antiphon": os.path.join(root, "bin", "antiphon.mjs"),
+                "python3": "/usr/bin/python3", "node": "/usr/bin/node",
+                "codex": "/usr/bin/codex"}
+
+    HEALTHY_VERSIONS = {"/usr/bin/python3": "Python 3.9.6",
+                        "/usr/bin/node": "v20.11.0"}
+
+    @contextlib.contextmanager
+    def hermetic(self, project, tools=None, versions=None):
+        """doctor against a fixed machine: the fixture's project, a stated
+        PATH, stated tool versions."""
+        found = self.healthy_tools() if tools is None else dict(tools)
+        banners = dict(self.HEALTHY_VERSIONS if versions is None else versions)
+        with patch.object(antiphon, "project_dir", return_value=project), \
+             patch.object(antiphon, "_which", side_effect=found.get), \
+             patch.object(antiphon, "_tool_version", side_effect=banners.get):
+            yield
+
+    def run_doctor(self, project, **hermetic):
+        out = io.StringIO()
+        with self.hermetic(project, **hermetic), \
+             contextlib.redirect_stdout(out):
+            code = antiphon.doctor()
+        return code, out.getvalue()
+
+    @staticmethod
+    def snapshot(*roots):
+        """Every file under each root, by bytes, size and mtime.
+
+        Two roots because the channel socket cannot live in the project: it is
+        named from a hash under TMPDIR, so a test watching only the project
+        could not see doctor create, touch or remove one."""
+        seen = {}
+        for root in roots:
+            for base, _dirs, files in os.walk(root):
+                for name in sorted(files):
+                    path = os.path.join(base, name)
+                    info = os.lstat(path)
+                    try:
+                        with open(path, "rb") as f:
+                            body = f.read()
+                    except OSError:
+                        body = None       # a socket has no readable contents
+                    seen[path] = (body, info.st_mtime, info.st_size)
+        return seen
+
+    # ---- the checks ----
+
+    def test_doctor_reports_an_unconfigured_project(self):
+        """An empty directory: every configuration file is missing, each says
+        so with the same repair, and the command exits 1."""
+        project = self.project()
+        code, printed = self.run_doctor(project)
+        self.assertEqual(code, 1)
+        for name in (antiphon.CLAUDE_SETTINGS_FILE,
+                     antiphon.CLAUDE_LOCAL_SETTINGS_FILE,
+                     antiphon.CODEX_HOOKS_FILE, antiphon.CODEX_CONFIG_FILE,
+                     antiphon.MCP_CONFIG_FILE):
+            line = self.line_for(printed, name)
+            self.assertTrue(line.startswith("✗"), f"{name}: {line!r}")
+            self.assertIn("antiphon setup", line, name)
+
+    def test_doctor_passes_on_a_set_up_project(self):
+        """`setup` writes; doctor reads back. Every configuration check is ✓.
+
+        This is the agreement test the drift gate turns on: setup and doctor
+        run in one process against one set of shapes, so mutating a shared
+        shape moves both and this test stays green. A doctor holding its own
+        copy of a string would not move, and it would red."""
+        project = self.project()
+        self.set_up(project)
+        code, printed = self.run_doctor(project)
+        for name in (antiphon.CLAUDE_SETTINGS_FILE,
+                     antiphon.CLAUDE_LOCAL_SETTINGS_FILE,
+                     antiphon.CODEX_HOOKS_FILE, antiphon.CODEX_CONFIG_FILE,
+                     antiphon.MCP_CONFIG_FILE):
+            self.assertTrue(self.line_for(printed, name).startswith("✓"),
+                            f"{name}: {self.line_for(printed, name)!r}")
+        self.assertEqual(code, 0, printed)
+
+    def test_a_healthy_idle_project_prints_no_x(self):
+        """A set-up project with no session running is not broken. No socket,
+        no peers, no ✗, exit 0 — a diagnostic that warns about the normal
+        resting state is one people learn to ignore."""
+        project = self.project()
+        self.set_up(project)
+        code, printed = self.run_doctor(project)
+        self.assertEqual(code, 0, printed)
+        self.assertEqual([line for line in printed.splitlines()
+                          if line.startswith("✗")], [])
+        self.assertTrue(any(line.startswith("·") for line in printed.splitlines()),
+                        "an idle project still has something to say calmly")
+
+    def test_doctor_never_writes(self):
+        """Bytes, sizes and mtimes under both roots, before and after, on a
+        broken fixture and a healthy one, each with a dead peer record armed.
+
+        The corpse is the point. `read_peers`, `_live_by_kind` and
+        `resolve_target` all delete one on the way past, so a doctor built on
+        any of them changes the tree it was asked to describe — and deletes
+        exactly the stale record the person ran it to ask about."""
+        for set_up in (False, True):
+            with self.subTest(set_up=set_up):
+                project = self.project()
+                sockets = self.socket_dir()
+                if set_up:
+                    self.set_up(project)
+                antiphon.peers.register(project, "claude", "gone",
+                                        "/nowhere/gone.sock", pid=os.getpid())
+                record = antiphon.peers._peer_file(project, "claude", "gone")
+                with patch.dict(os.environ, {"TMPDIR": sockets}), \
+                     patch.object(antiphon.peers, "alive", return_value=False):
+                    before = self.snapshot(project, sockets)
+                    self.run_doctor(project)
+                    after = self.snapshot(project, sockets)
+                self.assertEqual(before, after)
+                self.assertTrue(os.path.exists(record),
+                                "the stale record doctor was asked about is "
+                                "still there to be explained")
+
+    def test_doctor_survives_a_malformed_config(self):
+        """The canonical quiet bridge: a hand-edited settings file with a
+        trailing comma. The reader raises; doctor must explain instead of
+        crashing, and must not borrow the writer's voice — it never intended to
+        overwrite anything, so it cannot have refused to."""
+        project = self.project()
+        self.set_up(project)
+        with open(os.path.join(project, antiphon.CLAUDE_SETTINGS_FILE), "w",
+                  encoding="utf-8") as f:
+            f.write('{\n  "permissions": {"allow": ["Bash(ls:*)"]},\n}\n')
+        code, printed = self.run_doctor(project)
+        self.assertEqual(code, 1)
+        line = self.line_for(printed, antiphon.CLAUDE_SETTINGS_FILE)
+        self.assertTrue(line.startswith("✗"), line)
+        self.assertIn("not valid JSON", line)
+        self.assertNotIn("refusing to overwrite", line)
+        # One broken file is not the end of a diagnostic; it is the reason
+        # somebody started one. Everything after it still runs.
+        self.assertTrue(
+            self.line_for(printed, antiphon.MCP_CONFIG_FILE).startswith("✓"))
+        self.assertTrue(self.line_for(printed, "alias").startswith(("✓", "·")),
+                        printed)
+
+    def test_doctor_probes_the_socket_not_the_file(self):
+        """Four states one `os.path.exists` cannot tell apart."""
+        project = self.project()
+        self.set_up(project)
+        base = self.socket_dir()
+        with patch.dict(os.environ, {"TMPDIR": base}):
+            path = antiphon.claude_socket_path(project)
+
+            # (a) a listener answering the shape the channel server answers
+            with self.listener(path, b'{"ok":false,"error":"empty"}'):
+                code, printed = self.run_doctor(project)
+            self.assertEqual(code, 0, printed)
+            self.assertTrue(self.line_for(printed, "channel:").startswith("✓"),
+                            printed)
+
+            # (b) a plain file where the socket should be
+            with open(path, "w", encoding="utf-8") as f:
+                f.write("not a socket")
+            code, printed = self.run_doctor(project)
+            self.assertEqual(code, 1)
+            self.assertIn("not a socket", self.line_for(printed, "channel:"))
+            os.unlink(path)
+
+            # (c) bound, listened, then closed without unlinking — what a
+            # SIGKILLed channel server leaves behind
+            dead = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            dead.bind(path)
+            dead.listen(1)
+            dead.close()
+            code, printed = self.run_doctor(project)
+            self.assertEqual(code, 1)
+            line = self.line_for(printed, "channel:")
+            self.assertIn("nothing listening", line)
+            self.assertIn(path, line, "the repair line names the file to remove")
+            self.assertNotIn("not a socket", line,
+                             "(b) and (c) are different diagnoses")
+            os.unlink(path)
+
+            # (d) a listener that accepts and answers something else. The ✓ is
+            # falsifiable or it is nothing: any process can bind that path.
+            with self.listener(path, b"hello there"):
+                code, printed = self.run_doctor(project)
+            self.assertEqual(code, 1)
+            self.assertFalse(self.line_for(printed, "channel:").startswith("✓"),
+                             "an arbitrary listener is not an Antiphon channel")
+
+    def test_doctor_reports_a_broken_alias(self):
+        """Through `peers.explicit_name()` — the exact function production
+        routing uses — never the raw environment variable."""
+        project = self.project()
+        self.set_up(project)
+
+        with patch.dict(os.environ, {"ANTIPHON_NAME": "bad name"}):
+            code, printed = self.run_doctor(project)
+        self.assertEqual(code, 1)
+        line = self.line_for(printed, "alias")
+        self.assertTrue(line.startswith("✗"), line)
+        self.assertIn("lower-case", line, "the accepted shape is named")
+
+        with patch.dict(os.environ, {"ANTIPHON_NAME": "ui"}):
+            code, printed = self.run_doctor(project)
+        self.assertEqual(code, 0, printed)
+        self.assertEqual(self.line_for(printed, "alias"), '✓ alias: named "ui"')
+
+        # Measured: `explicit_name()` lower-cases, so production accepts "UI"
+        # while `NAME_PATTERN` refuses the raw value — a doctor reading the
+        # environment directly calls a working session broken. And the name it
+        # prints is the one the bridge can address: `@claude:UI` reaches nobody.
+        with patch.dict(os.environ, {"ANTIPHON_NAME": "UI"}):
+            code, printed = self.run_doctor(project)
+        self.assertEqual(code, 0, printed)
+        self.assertEqual(self.line_for(printed, "alias"), '✓ alias: named "ui"')
+
+    def test_help_exits_zero(self):
+        """Asking for help is not an error. Measured before this change:
+        `--help`, `-h` and `help` each printed the usage and exited 1."""
+        script = os.path.join(os.path.dirname(antiphon.__file__), "antiphon.py")
+        for spelling in ("--help", "-h", "help"):
+            with self.subTest(spelling=spelling):
+                done = subprocess.run([sys.executable, script, spelling],
+                                      capture_output=True, text=True, timeout=60,
+                                      stdin=subprocess.DEVNULL)
+                self.assertEqual(done.returncode, 0, done.stderr)
+                self.assertIn("Usage:", done.stdout)
+                self.assertIn("antiphon doctor", done.stdout)
+        done = subprocess.run([sys.executable, script, "nonsense"],
+                              capture_output=True, text=True, timeout=60,
+                              stdin=subprocess.DEVNULL)
+        self.assertEqual(done.returncode, 1,
+                         "an unknown command is still an error")
+
+    # ---- helpers ----
+
+    @staticmethod
+    def line_for(printed, needle):
+        for line in printed.splitlines():
+            if needle in line:
+                return line
+        return ""
+
+    @contextlib.contextmanager
+    def listener(self, path, reply):
+        """A server that accepts one connection, waits for FIN, answers `reply`.
+
+        The wait is what the real server does: `lib/channel.mjs` answers from
+        its `end` handler, so a probe that never half-closes is never answered
+        — measured, 0 ms with the half-close and a 2 s timeout without it."""
+        server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        server.bind(path)
+        server.listen(1)
+
+        def serve():
+            try:
+                conn, _ = server.accept()
+            except OSError:
+                return
+            with conn:
+                while conn.recv(4096):
+                    pass
+                with contextlib.suppress(OSError):
+                    conn.sendall(reply)
+
+        thread = threading.Thread(target=serve, daemon=True)
+        thread.start()
+        try:
+            yield
+        finally:
+            server.close()
+            thread.join(timeout=5)
+            with contextlib.suppress(OSError):
+                os.unlink(path)
 
 
 class SetupShapeCharacterizationTest(unittest.TestCase):

@@ -172,10 +172,21 @@ versions in place; it never creates duplicates.
 
 ```bash
 antiphon status            # transcripts, cursors, live peers and channel status
+antiphon doctor            # read-only checkup: why is the bridge quiet?
 antiphon summary [side]    # show the context that would be injected
 antiphon setup             # (re)install the project setup
 npm test                   # Python unit tests + real MCP protocol test
 ```
+
+`doctor` answers "why is nothing arriving?" and edits nothing: which copy
+of the package `PATH` resolves and whether the hooks run it, the Node and
+Python the bridge actually gets, every file `setup` writes read back
+through the shapes `setup` wrote, the current alias, the registered peers,
+and whether the Claude channel *answers* — a connect and a one-line reply,
+not a file that exists. `✓` fine, `·` nothing to do here, `✗` broken; only
+a `✗` makes it exit non-zero, so a set-up project with no session running
+exits 0. It never takes a lock, never writes, and never removes the stale
+record it is explaining.
 
 `setup` registers Codex's MCP tools — `antiphon_read` and `antiphon_send`
 — in this project's `.codex/config.toml`, so there is nothing to add by

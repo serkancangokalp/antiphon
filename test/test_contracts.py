@@ -315,6 +315,20 @@ class ShippedContractTest(unittest.TestCase):
                          "the README must name the Python floor it was tested "
                          "at, not a bare `Python 3`")
 
+    def test_the_python_floor_doctor_enforces_is_the_one_the_readme_promises(self):
+        """`doctor` fails a Python older than the floor, and the README tells a
+        reader which floor that is. Two places, one number — and the number is
+        read back, not merely looked for: `assertRegex(readme, r"Python 3\\.\\d+\\+")`
+        passes against any floor at all, including one doctor stopped
+        enforcing."""
+        readme = read("README.md")
+        stated = re.findall(r"Python (\d+)\.(\d+)\+", readme)
+        self.assertTrue(stated, "the README must name the Python floor")
+        self.assertEqual({tuple(int(part) for part in pair) for pair in stated},
+                         {antiphon.PYTHON_FLOOR},
+                         "the README's Python floor and antiphon.PYTHON_FLOOR "
+                         "are one fact")
+
     def test_the_mcp_server_reports_the_package_version(self):
         """The MCP handshake names a version, and it sat at 0.1.0 through two
         releases because nothing tied it to package.json. One number, one
