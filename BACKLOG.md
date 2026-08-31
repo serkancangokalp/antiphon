@@ -152,9 +152,13 @@ the real budget loop — rendered **byte-identical** old against new, with no
 crash on either side. It could not have been otherwise today, and the reason is
 recorded rather than assumed: across the 31 distinct project directories those
 corpora name, the registries hold exactly **one** endpoint record, and it
-carries no owner key, so `_session_address` refuses it. The same sweep against a
-registry that does claim a real rollout's session produces 22 labelled lines on
-that page, so the differing bucket is reachable and simply empty.
+carries no owner key, so `_session_address` refuses it. The one-file sweep itself can
+never label under the two-source rule, so reachability was proved the way the
+rule requires: two real rollouts of one project drained together produce 199
+pages of which exactly one differs — four labelled lines and the informational
+sentence, no remedy (correctly: no unnamed endpoint was live). The differing
+bucket is reachable, its measured frequency on real data is 1 in 199, and the
+sweep's zero is the rule working, not the feature idle.
 
 **Capacity.** A label can only be added as a prefix grows, never removed, so
 candidate size stays monotone and the budget loop cannot oscillate — `selected`
