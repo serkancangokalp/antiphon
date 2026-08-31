@@ -191,7 +191,9 @@ person sitting at them. Unnamed, it moves both sides; a named terminal has its
 own cursor and is told which side to move.
 
 `doctor` answers "why is nothing arriving?" and edits nothing: which copy
-of the package `PATH` resolves and whether the hooks run it, the Node and
+of the package `PATH` resolves and whether the hooks run it, which bridge servers are running and whether any of
+them started before its own code last changed (a server loads its code once;
+the hooks reload every turn), the Node and
 Python the bridge actually gets, every file `setup` writes read back
 through the shapes `setup` wrote, the current alias, the registered peers,
 and whether the Claude channel *answers* — a connect and a one-line reply,

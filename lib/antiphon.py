@@ -4757,6 +4757,142 @@ def _doctor_install(report, hooks_configured):
                     f"diagnostic is the older copy {mine}")
 
 
+# The two long-lived servers this package runs, by the script in their argv.
+# The wrapper (`node …/bin/antiphon mcp`) only spawns and is not matched.
+_PY_SERVER = re.compile(r"(\S+/lib/antiphon\.py)\s+mcp(?:\s|$)")
+_NODE_SERVER = re.compile(r"(\S+/lib/channel\.mjs)(?:\s|$)")
+# What a server loads once at start. A change to any of these after that
+# start is code the process is provably not running.
+CODE_FILES = ("lib/antiphon.py", "lib/peers.py", "lib/channel.mjs", "package.json")
+
+
+def _parse_process_table(text):
+    """`(pid, started, args)` rows from `ps -eo pid=,lstart=,args=` output.
+
+    `lstart` is five whitespace-separated tokens (`Sat Aug  1 09:05:00 2026`,
+    day space-padded), so the line splits on at most six gaps and the seventh
+    field is the command line with its own spaces intact. Lines that do not
+    parse are skipped, never guessed at."""
+    rows = []
+    for line in text.splitlines():
+        parts = line.split(None, 6)
+        if len(parts) < 7:
+            continue
+        try:
+            started = int(time.mktime(time.strptime(" ".join(parts[1:6]),
+                                                    "%a %b %d %H:%M:%S %Y")))
+            rows.append((int(parts[0]), started, parts[6]))
+        except (ValueError, OverflowError):
+            continue
+    return rows
+
+
+def _process_table():
+    """Every process, as `(pid, started, args)`, or None if `ps` cannot say.
+
+    Doctor's third seam, beside `_which` and `_tool_version`: the suite runs
+    on a machine with live bridge servers of its own, and their age must not
+    redden a fixture's diagnosis. `LC_ALL=C` pins the month names the parser
+    reads; the flags are the ones macOS and procps share."""
+    try:
+        done = subprocess.run(["ps", "-eo", "pid=,lstart=,args="],
+                              capture_output=True, text=True, timeout=5,
+                              stdin=subprocess.DEVNULL,
+                              env={**os.environ, "LC_ALL": "C"})
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if done.returncode != 0:
+        return None
+    return _parse_process_table(done.stdout)
+
+
+def _bridge_servers(table):
+    """The bridge servers in a process table: `(pid, started, side, script)`."""
+    servers = []
+    for pid, started, args in table:
+        match = _PY_SERVER.search(args)
+        if match:
+            servers.append((pid, started, "codex mcp", match.group(1)))
+            continue
+        match = _NODE_SERVER.search(args)
+        if match:
+            servers.append((pid, started, "claude channel", match.group(1)))
+    return servers
+
+
+def _code_changed_at(root):
+    """The newest mtime among a package root's code files, or None if none
+    can be read — a tree that is gone, or never was one."""
+    latest = None
+    for name in CODE_FILES:
+        try:
+            changed = os.stat(os.path.join(root, name)).st_mtime
+        except OSError:
+            continue
+        latest = changed if latest is None else max(latest, changed)
+    return latest
+
+
+def _when(stamp):
+    local = time.localtime(stamp)
+    if local[:3] == time.localtime()[:3]:
+        return time.strftime("%H:%M:%S", local)
+    return time.strftime("%Y-%m-%d %H:%M:%S", local)
+
+
+def _doctor_running(report, cwd):
+    """Servers running code older than the code on disk.
+
+    A hook reloads every turn; a server loads once. Measured on 2026-08-31:
+    four bridge servers were running code from before the day's merges,
+    doctor said 13/13 ✓, and the fix the person had just installed was
+    provably not what was answering. Machine-wide on purpose, like the
+    install check: staleness belongs to the install, not to a project, and a
+    server started from another copy names that copy. The registry, scanned
+    without pruning, lends a pid its alias so the line names the session the
+    person knows. An ✗, because the installed code is not the running code,
+    and the repair is theirs: restart that session.
+    """
+    table = _process_table()
+    if table is None:
+        report.note("running: the process table could not be read (`ps`)")
+        return
+    servers = _bridge_servers(table)
+    if not servers:
+        report.note("running: no bridge server of this package is running — "
+                    "a session starts one")
+        return
+    names = {}
+    for record in peers._scan(cwd):
+        pid, name = record.get("pid"), record.get("name")
+        if isinstance(pid, int) and isinstance(name, str) and peers.valid_name(name):
+            names[pid] = name
+    here = _package_root()
+    fresh = 0
+    for pid, started, side, script in sorted(servers):
+        root = os.path.dirname(os.path.dirname(script))
+        who = (f'{side} "{names[pid]}" pid {pid}' if pid in names
+               else f"{side} pid {pid}")
+        changed = _code_changed_at(root)
+        if changed is None:
+            where = ("which no longer exists" if not os.path.isdir(root)
+                     else "whose code files cannot be read")
+            report.bad(f"running: {who} runs from {root}, {where} — an orphan; "
+                       "stop it")
+            continue
+        if int(changed) > started:
+            origin = "" if os.path.realpath(root) == here else f" (from {root})"
+            restart = ("restart that Claude Code session, or reconnect the "
+                       "antiphon MCP server" if side == "claude channel"
+                       else "restart that Codex session")
+            report.bad(f"running: {who} started {_when(started)}, its code "
+                       f"changed {_when(changed)}{origin} — {restart}")
+            continue
+        fresh += 1
+    if fresh:
+        report.ok(f"running: {fresh} server(s) on their current code")
+
+
 def _doctor_interpreters(report):
     """The two interpreters the bridge runs on, and the one the hooks get."""
     running = sys.version_info[:3]
@@ -5028,6 +5164,7 @@ def doctor():
     report = _Report()
     states = _config_state(cwd)
     _doctor_install(report, _hooks_configured(states))
+    _doctor_running(report, cwd)
     _doctor_interpreters(report)
     _doctor_config(report, cwd, states)
     _doctor_alias(report)
