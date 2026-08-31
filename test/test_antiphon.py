@@ -3380,6 +3380,37 @@ class DoctorTest(unittest.TestCase):
         self.assertEqual(code, 1)
         self.assertTrue(self.line_for(printed, "pid 5160").startswith("✗ running:"), printed)
 
+    def test_an_unnamed_peer_registered_here_is_still_in_scope(self):
+        """Review of 032472d: the scoping rule says a peer registered here is
+        judged wherever it runs from, but the pid table was built only from
+        names `valid_name` accepts — and the unnamed peer, which is the whole
+        default install, registers under the reserved `<unnamed>` key that
+        `valid_name` deliberately rejects. Reproduced: a stale server for this
+        project, from another root, dropped to the `·` count and doctor exited
+        0. Being registered is what puts a pid in scope; the name only decides
+        how the line reads."""
+        project = self.project()
+        self.set_up(project)
+        changed = time.time() - 600
+        mine, theirs = self.fake_root(changed), self.fake_root(changed)
+        self.assertTrue(
+            antiphon.peers.register(project, "claude", antiphon.peers.UNNAMED,
+                                    "/tmp/u.sock", pid=5159, owner_key="300:x"),
+            "the premise: an unnamed peer really is registered")
+        self.assertFalse(antiphon.peers.valid_name(antiphon.peers.UNNAMED),
+                         "and its key really is outside the alias grammar")
+        code, printed = self.run_doctor(project, tools=self.tools_at(mine), processes=[
+            (5159, int(changed - 3600), f"node {theirs}/lib/channel.mjs"),
+        ])
+        self.assertEqual(code, 1, printed)
+        line = self.line_for(printed, "pid 5159")
+        self.assertTrue(line.startswith("✗ running:"), printed)
+        self.assertIn("claude channel pid 5159", line,
+                      "an unnamed peer is named by kind and pid, never by the reserved key")
+        self.assertNotIn(antiphon.peers.UNNAMED, line)
+        self.assertEqual(self.line_for(printed, "another install"), "",
+                         "it was judged, so it is not counted as somebody else's")
+
     def test_the_queue_note_names_only_this_project_s_threads(self):
         """Same fresh-project measurement: the note named threads queued from
         another project, which the reader cannot act on from here. A thread is

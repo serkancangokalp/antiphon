@@ -103,8 +103,13 @@ else
   TARBALL="$(cd "$TMP" && npm pack "$REPO" --silent 2>/dev/null | tail -1)"
   TARBALL="$TMP/$TARBALL"
 fi
-npm install -g --prefix "$PREFIX" "$TARBALL" --silent >/dev/null 2>&1
+npm install -g --prefix "$PREFIX" "$TARBALL" --silent >/dev/null 2>&1 \
+  && pass "the tarball installs" || fail "npm install of the tarball failed"
 export PATH="$PREFIX/bin:$PATH"
+case "$(command -v antiphon)" in
+  "$PREFIX/bin/antiphon") pass "PATH resolves to the copy under test" ;;
+  *) fail "PATH resolves to $(command -v antiphon), not $PREFIX/bin/antiphon" ;;
+esac
 EXPECTED_VERSION="$(python3 -c "import json,sys; print(json.load(open('$REPO/package.json'))['version'])")"
 [ -n "$VERSION" ] && EXPECTED_VERSION="$VERSION"
 check "antiphon --version" "$(antiphon --version 2>&1)" "antiphon $EXPECTED_VERSION"
@@ -114,7 +119,8 @@ check "mcp handshake version" "$HANDSHAKE" "$EXPECTED_VERSION"
 step "T1 — setup, then a clean bill of health"
 mkdir -p "$PROJECT"; (cd "$PROJECT" && git init -q)
 export ANTIPHON_CWD="$PROJECT"
-(cd "$PROJECT" && antiphon setup >/dev/null 2>&1)
+(cd "$PROJECT" && antiphon setup >/dev/null 2>&1) \
+  && pass "setup exits 0" || fail "setup exited non-zero"
 for f in .claude/settings.json .claude/settings.local.json .codex/hooks.json .codex/config.toml .mcp.json CLAUDE.md AGENTS.md; do
   [ -f "$PROJECT/$f" ] && pass "setup wrote $f" || fail "setup did not write $f"
 done
@@ -129,9 +135,11 @@ case "$BEFORE_QUEUE" in ''|*[!0-9]*) fail "Codex's queue could not be read; the 
 # Two turns, so T5 has two distinct moments to place a cursor between. One
 # turn renders both of its lines in the same second, and the `>=` boundary
 # rule repeats the whole cohort sharing it — nothing to bound.
-(cd "$PROJECT" && claude -p 'Respond with exactly one line and nothing else, no preamble: @codex e2e-probe-one' >/dev/null 2>&1)
+(cd "$PROJECT" && claude -p 'Respond with exactly one line and nothing else, no preamble: @codex e2e-probe-one' >/dev/null 2>&1) \
+  && pass "the first claude -p turn exits 0" || fail "the first claude -p turn failed"
 sleep 2
-(cd "$PROJECT" && claude -p 'Respond with exactly one line and nothing else, no preamble: @codex e2e-probe-two' >/dev/null 2>&1)
+(cd "$PROJECT" && claude -p 'Respond with exactly one line and nothing else, no preamble: @codex e2e-probe-two' >/dev/null 2>&1) \
+  && pass "the second claude -p turn exits 0" || fail "the second claude -p turn failed"
 TRANSCRIPT="$(ls -t "$CLAUDE_DIR"/*.jsonl 2>/dev/null | head -1)"
 [ -n "$TRANSCRIPT" ] && pass "claude -p wrote a transcript" || fail "claude -p wrote no transcript"
 grep -qr '@codex e2e-probe-two' "$CLAUDE_DIR" 2>/dev/null && pass "the marker is in the transcript" || fail "the marker never reached the transcript"
@@ -139,24 +147,50 @@ grep -qr '@codex e2e-probe-two' "$CLAUDE_DIR" 2>/dev/null && pass "the marker is
 PUSH="$(printf '{"cwd":"%s","hook_event_name":"Stop","transcript_path":"%s","session_id":"%s"}' \
         "$PROJECT" "$TRANSCRIPT" "$(basename "$TRANSCRIPT" .jsonl)" | (cd "$PROJECT" && antiphon push codex 2>&1))"
 contains "the push refuses instead of guessing" "$PUSH" "no Codex session found"
-check "nothing is stranded in another thread" "$(queued)" "$BEFORE_QUEUE"
+AFTER_QUEUE="$(queued)"
+case "$AFTER_QUEUE" in ''|*[!0-9]*) fail "Codex's queue could not be read after the push" ;; esac
+STRANDED="$(sqlite3 -readonly "$QUEUE" "SELECT count(*) FROM queued_items WHERE payload_json LIKE '%e2e-probe%';" 2>&1)"
+check "this run stranded nothing of its own" "$STRANDED" "0"
+check "and left the queue as it found it" "$AFTER_QUEUE" "$BEFORE_QUEUE"
 
 step "T3 — Codex's first turn reads what the refused push could not carry"
-CODEX_OUT="$(cd "$PROJECT" && codex exec -s read-only --color never 'Reply with exactly: E2E-OK' 2>&1)"
+BEFORE_ROLLOUTS="$(mktemp)"; find "$HOME/.codex/sessions" -name 'rollout-*.jsonl' 2>/dev/null | sort > "$BEFORE_ROLLOUTS"
+CODEX_OUT="$(cd "$PROJECT" && codex exec -s read-only --color never 'Reply with exactly: E2E-OK' 2>&1)" \
+  && pass "codex exec exits 0" || fail "codex exec failed"
 contains "codex exec ran the SessionStart hook" "$CODEX_OUT" "hook: SessionStart"
-# Through the package's own discovery, so a change to it fails here too.
-ROLLOUT="$(PYTHONPATH="$PREFIX/lib/node_modules/antiphon/lib" python3 -c "
+# Two answers, deliberately: what the package's own discovery returns, and
+# what this run provably created. They must agree — that is the assertion —
+# and only the proven-new one is ever a deletion target. Trusting the code
+# under test to choose a file to delete is how a review finds a harness that
+# can destroy a real session's history.
+FOUND="$(PYTHONPATH="$PREFIX/lib/node_modules/antiphon/lib" python3 -c "
 import antiphon
 found = antiphon.codex_rollout_files('$PROJECT')
 print(found[0] if found else '')")"
-[ -n "$ROLLOUT" ] && pass "discovery finds this project's rollout" || fail "discovery found no rollout for this project"
+NEW_ROLLOUT="$(find "$HOME/.codex/sessions" -name 'rollout-*.jsonl' 2>/dev/null | sort | comm -13 "$BEFORE_ROLLOUTS" - | head -1)"
+rm -f "$BEFORE_ROLLOUTS"
+if [ -n "$NEW_ROLLOUT" ] && python3 -c "
+import json, sys
+head = open('$NEW_ROLLOUT', encoding='utf-8', errors='replace').readline()
+sys.exit(0 if json.loads(head).get('payload', {}).get('cwd') == '$PROJECT' else 1)" 2>/dev/null; then
+  pass "codex wrote one new rollout, recorded for this project"
+else
+  fail "no new rollout recording this project"
+fi
+check "discovery returns the rollout this run created" "$FOUND" "$NEW_ROLLOUT"
+ROLLOUT="$FOUND"
 HOOK_CMD="$(python3 -c "import json; print(json.load(open('$PROJECT/.codex/hooks.json'))['hooks']['UserPromptSubmit'][0]['hooks'][0]['command'])")"
 check "hooks.json declares the hook command" "$HOOK_CMD" "antiphon hook codex"
 PAGE="$(printf '{"cwd":"%s","hook_event_name":"UserPromptSubmit","transcript_path":"%s","session_id":"%s"}' \
         "$PROJECT" "$ROLLOUT" "$(basename "$ROLLOUT" .jsonl | grep -o '[0-9a-f-]\{36\}')" \
         | (cd "$PROJECT" && eval "$HOOK_CMD") \
         | python3 -c "import sys,json; raw=sys.stdin.read().strip(); print(json.loads(raw)['hookSpecificOutput']['additionalContext'] if raw else '')")"
-contains "the refused words arrive through the page" "$PAGE" "@codex e2e-probe-two"
+# The relayed prompt carries the same words, so the label decides: this must
+# be Claude's own line, which is what the refused push could not carry.
+SAID="$(printf '%s' "$PAGE" | grep -A1 '^\[[0-9][0-9]:[0-9][0-9]\] Claude:$' | grep '@codex e2e-probe-two' || true)"
+[ -n "$SAID" ] && pass "the refused words arrive as Claude's own line" \
+                || fail "the page has no Claude: line carrying the marker"
+contains "and the prompt that asked for them is relayed, not claimed" "$PAGE" "To Claude:"
 lacks "a new project does not replay history" "$PAGE" "replay:"
 
 step "T5 — upgrading from the published 0.1.0 cursor"
@@ -180,16 +214,27 @@ PY
 # must not. Comparing the two pages on the same transcripts measures the rule
 # without guessing which timestamps happen to render.
 seed() { python3 -c "import json,sys; json.dump(json.loads(sys.argv[1]), open('$PROJECT/.antiphon/cursor.json','w'))" "$1"; }
+# A hook that crashes prints nothing, and a check reading "nothing is left to
+# deliver" would call that success. The status of every stage is kept, and a
+# failure answers with a word no assertion accepts.
 page_now() {
-  printf '{"cwd":"%s","hook_event_name":"UserPromptSubmit","transcript_path":"%s","session_id":"%s"}' \
+  local raw decoded
+  raw="$(printf '{"cwd":"%s","hook_event_name":"UserPromptSubmit","transcript_path":"%s","session_id":"%s"}' \
     "$PROJECT" "$ROLLOUT" "$(basename "$ROLLOUT" .jsonl | grep -o '[0-9a-f-]\{36\}')" \
-    | (cd "$PROJECT" && eval "$HOOK_CMD") \
-    | python3 -c "import sys,json; raw=sys.stdin.read().strip(); print(json.loads(raw)['hookSpecificOutput']['additionalContext'] if raw else '')"
+    | (cd "$PROJECT" && eval "$HOOK_CMD"))" || { echo "HOOK-FAILED"; return 1; }
+  [ -z "$raw" ] && return 0                      # nothing to deliver is empty, legitimately
+  decoded="$(printf '%s' "$raw" | python3 -c "
+import sys, json
+try:
+    print(json.loads(sys.stdin.read())['hookSpecificOutput']['additionalContext'])
+except Exception as error:
+    print('HOOK-UNDECODABLE: %s' % error); raise SystemExit(1)")" || { echo "$decoded"; return 1; }
+  printf '%s' "$decoded"
 }
 events_in() { printf '%s' "$1" | grep -cE '^\[[0-9][0-9]:[0-9][0-9]\]'; }
 
 seed '{"codex_seen": {"v": 2, "sources": {}}}'
-FULL_PAGE="$(page_now)"; FULL="$(events_in "$FULL_PAGE")"
+FULL_PAGE="$(page_now)" && pass "the byte-zero page was produced" || fail "the byte-zero page was produced — hook failed"; FULL="$(events_in "$FULL_PAGE")"
 
 seed "{\"codex_seen\": $BOUNDARY}"
 STATUS="$(cd "$PROJECT" && antiphon status 2>&1 | grep '^unread codex_pages')"
@@ -200,21 +245,28 @@ if printf '%s' "$STATUS" | grep -qE '[0-9]+ ~?pages?\b'; then
 else
   pass "status never guesses a page count"
 fi
-UPGRADE_PAGE="$(page_now)"; BOUNDED="$(events_in "$UPGRADE_PAGE")"
+UPGRADE_PAGE="$(page_now)" && pass "the upgrade page was produced" || fail "the upgrade page was produced — hook failed"; BOUNDED="$(events_in "$UPGRADE_PAGE")"
 contains "the upgrade page says it is replaying" "$UPGRADE_PAGE" "replay:"
 contains "and how to skip it" "$UPGRADE_PAGE" "antiphon catch-up"
+# Both turns come back from byte zero, and only the second from the 0.1.0
+# time: named, not counted, so a boundary that wrongly skipped everything
+# could not pass as "fewer".
+contains "the v2 map replays the first turn" "$FULL_PAGE" "e2e-probe-one"
+contains "and the second" "$FULL_PAGE" "e2e-probe-two"
+lacks "the 0.1.0 time leaves the first turn where it was" "$UPGRADE_PAGE" "e2e-probe-one"
+contains "and replays the turn it recorded" "$UPGRADE_PAGE" "e2e-probe-two"
 if [ "$FULL" -lt 2 ]; then
   # Never a silent skip: a summary reading "failed 0" while the central
   # assertion never ran is the wrong-reason pass this script exists to avoid.
   fail "the fixture holds $FULL visible event(s); the two legacy shapes cannot be compared"
-elif [ "$BOUNDED" -lt "$FULL" ]; then
+elif [ "$BOUNDED" -ge 1 ] && [ "$BOUNDED" -lt "$FULL" ]; then
   pass "a 0.1.0 time bounds the replay ($BOUNDED of $FULL events, v2 map replays all $FULL)"
 else
   fail "a 0.1.0 time did not bound the replay ($BOUNDED of $FULL events)"
 fi
 CATCHUP="$(cd "$PROJECT" && antiphon catch-up 2>&1)"
 contains "catch-up says what it abandons" "$CATCHUP" "will not be delivered"
-AFTER_PAGE="$(page_now)"
+AFTER_PAGE="$(page_now)" && pass "the post-catch-up page was produced" || fail "the post-catch-up page was produced — hook failed"
 check "nothing is left to deliver after catch-up" "$(printf '%s' "$AFTER_PAGE" | tr -d '[:space:]')" ""
 
 step "the machine is as it was"
