@@ -1133,6 +1133,51 @@ Stop blocks, add an explicit delimited syntax with tests for fenced code,
 embedded marker text, empty blocks and deduplication; never guess continuation
 from arbitrary following prose.
 
+## Shipped — a fresh-user end-to-end run, and doctor scoped to this project
+
+`npm test` drives the servers with an SDK client and fixtures. It was green on
+2026-08-31 while three faults were live at once — a null `sender_alias` the
+host rejected, a push queued into a thread nobody would read, an upgrade
+replaying from byte zero — because each needed a real host, a real CLI or real
+transcripts to see. `test/e2e/fresh-user.sh` is the run that sees them: it
+packs this tree, installs it into a throwaway prefix, sets up a throwaway
+project, drives `claude -p` and `codex exec`, and asserts on what the person
+would actually get. It is not part of `npm test` (it needs both CLIs logged
+in, the network, and two small model calls) and belongs in the release ritual
+between the wrapper census and `npm version`.
+
+What the first run measured, in order of what it changed:
+
+- **doctor judged other projects.** On a correctly set up fresh project it
+  printed four ✗ about another project's servers and exited 1, so a healthy
+  project could not be told from a broken one. `running:` is now scoped to the
+  copy this project's hooks run (PATH's `antiphon`, `realpath`) plus any pid
+  registered here; the rest are one `·` count with no paths and no verdict.
+  The `codex queue:` note is scoped the same way — only threads one of this
+  project's own rollouts records — because Codex's queue is one database for
+  every project on the machine. A thread whose rollout has aged out of
+  discovery drops out of the note with it.
+- **`claude -p` runs hooks in an untrusted workspace; only `permissions.allow`
+  is ignored.** Measured: `.antiphon/` appears, the peer registers, `push`
+  runs. The first reading of the warning ("this workspace has not been
+  trusted") suggested otherwise and was wrong. `--dangerously-skip-permissions`
+  does not change it, and `CLAUDE_CONFIG_DIR` isolates the login too, so the
+  script grants no trust and asserts it granted none.
+- **`codex exec` fires `SessionStart` and never `UserPromptSubmit`**, so a
+  non-interactive Codex is never injected with a page. The script therefore
+  runs the command `.codex/hooks.json` declares, with the payload the host
+  sends; the wiring itself is what `doctor` checks. It also runs the project's
+  hooks with no trust prompt and writes nothing to `~/.codex/config.toml`.
+- **macOS `$TMPDIR` is a symlink** and both hosts record the resolved path, so
+  a harness that does not `pwd -P` watches a transcript directory that never
+  fills. Two of the first run's failures were this, not the product.
+
+Named limitations, checked by hand instead: `-p` mode never loads the channel,
+so the host's notification schema — the fault that cost the most today — is
+still only visible in an interactive session's MCP log; and `codex exec` writes
+its rollout at once, so the window where a live thread has no transcript yet
+does not reproduce.
+
 ## P1 — Re-run the host wrapper census before release
 
 `CLAUDE_HOST_WRAPPERS` and `CODEX_HOST_WRAPPERS` in `lib/antiphon.py` hold

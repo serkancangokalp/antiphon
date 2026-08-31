@@ -4927,10 +4927,22 @@ def _doctor_running(report, cwd):
         pid, name = record.get("pid"), record.get("name")
         if isinstance(pid, int) and isinstance(name, str) and peers.valid_name(name):
             names[pid] = name
+    # The copy this project's hooks run, which is the one whose staleness this
+    # project can act on. Measured on a fresh temp project: judging every
+    # bridge server on the machine printed four ✗ about another project's
+    # sessions and exited 1, so a correctly set up project could not be told
+    # apart from a broken one. A peer registered here stays in scope wherever
+    # it runs from — it is serving this project.
+    found = _which("antiphon")
+    install = (os.path.dirname(os.path.dirname(os.path.realpath(found)))
+               if found else _package_root())
     here = _package_root()
-    fresh = 0
+    fresh, elsewhere = 0, 0
     for pid, started, side, script in sorted(servers):
         root = os.path.dirname(os.path.dirname(script))
+        if pid not in names and os.path.realpath(root) != os.path.realpath(install):
+            elsewhere += 1
+            continue
         who = (f'{side} "{names[pid]}" pid {pid}' if pid in names
                else f"{side} pid {pid}")
         changed = _code_changed_at(root)
@@ -4951,6 +4963,13 @@ def _doctor_running(report, cwd):
         fresh += 1
     if fresh:
         report.ok(f"running: {fresh} server(s) on their current code")
+    if elsewhere:
+        # Counted, never judged, and never by path: another install's servers
+        # are another project's diagnosis, and its directories are not this
+        # report's to print.
+        report.note(f"running: {elsewhere} bridge server(s) from another "
+                    "install are running; run doctor in their project to "
+                    "judge them")
 
 
 def _doctor_interpreters(report):
@@ -5164,7 +5183,7 @@ def _doctor_channel(report, cwd, live):
                        "whatever holds it")
 
 
-def _doctor_codex(report):
+def _doctor_codex(report, cwd):
     """Presence only. Executing `codex` from a diagnostic can block on auth or
     spawn a session; the boundary is stated in BACKLOG."""
     found = _which("codex")
@@ -5173,10 +5192,10 @@ def _doctor_codex(report):
     else:
         report.note("codex CLI: not on PATH — push-to-Codex needs it (fine on "
                     "a Claude-only install)")
-    _doctor_codex_queue(report)
+    _doctor_codex_queue(report, cwd)
 
 
-def _doctor_codex_queue(report):
+def _doctor_codex_queue(report, cwd):
     """Messages `codex queue` accepted for a thread that is no longer running.
 
     Measured: two bridge messages sat in Codex's queue for closed threads —
@@ -5191,6 +5210,19 @@ def _doctor_codex_queue(report):
     paths = sorted(glob.glob(CODEX_QUEUE_DBS))
     if not paths:
         return
+    # Only threads this project could have queued to. Codex's queue is one
+    # database for every project on the machine, and a message stranded in
+    # another project's thread is not this reader's to act on — measured on a
+    # fresh temp project, where the note named two threads belonging to a
+    # different directory entirely. A thread whose rollout has aged out of
+    # discovery drops out of this note with it.
+    ours = set()
+    for path in codex_rollout_files(cwd):
+        sid = SESSION_ID.search(os.path.basename(path))
+        if sid:
+            ours.add(sid.group(1))
+    if not ours:
+        return
     try:
         con = sqlite3.connect(f"file:{paths[-1]}?mode=ro", uri=True)
         try:
@@ -5201,7 +5233,8 @@ def _doctor_codex_queue(report):
     except (sqlite3.Error, OSError):
         return
     stranded = [(tid, n) for tid, n in rows
-                if isinstance(tid, str) and codex_thread_alive(tid) is False]
+                if isinstance(tid, str) and tid in ours
+                and codex_thread_alive(tid) is False]
     for tid, n in stranded:
         report.note(f"codex queue: {n} message(s) wait in Codex thread "
                     f"{tid[:8]}…, which is not running — they are read only if "
@@ -5229,7 +5262,7 @@ def doctor():
     _doctor_config(report, cwd, states)
     _doctor_alias(report)
     _doctor_channel(report, cwd, _doctor_peers(report, cwd))
-    _doctor_codex(report)
+    _doctor_codex(report, cwd)
     _doctor_replay(report, cwd)
     return 1 if report.broken else 0
 

@@ -2889,6 +2889,13 @@ class DoctorTest(unittest.TestCase):
                 "python3": "/usr/bin/python3", "node": "/usr/bin/node",
                 "codex": "/usr/bin/codex"}
 
+    def tools_at(self, root):
+        """A machine whose `antiphon` on PATH lives in `root` — the copy this
+        project's hooks would run."""
+        tools = self.healthy_tools()
+        tools["antiphon"] = os.path.join(root, "bin", "antiphon.mjs")
+        return tools
+
     HEALTHY_VERSIONS = {"/usr/bin/python3": "Python 3.9.6",
                         "/usr/bin/node": "v20.11.0"}
 
@@ -3165,8 +3172,18 @@ class DoctorTest(unittest.TestCase):
         fd = os.open(os.path.join(locks, live + ".lock"), os.O_CREAT | os.O_RDWR, 0o600)
         fcntl.flock(fd, fcntl.LOCK_EX)
         self.addCleanup(os.close, fd)
+        # Both threads belong to this project, so the scoping rule lets both
+        # through and the verdict is about liveness alone.
+        rollouts = []
+        for tid in (dead, live):
+            path = os.path.join(project, f"rollout-2026-08-31T00-00-00-{tid}.jsonl")
+            with open(path, "w", encoding="utf-8") as f:
+                f.write(json.dumps({"type": "session_meta",
+                                    "payload": {"session_id": tid, "cwd": project}}) + "\n")
+            rollouts.append(path)
         with patch.object(antiphon, "CODEX_THREAD_LOCKS", locks), \
-             patch.object(antiphon, "CODEX_QUEUE_DBS", os.path.join(home, "queue_*.sqlite")):
+             patch.object(antiphon, "CODEX_QUEUE_DBS", os.path.join(home, "queue_*.sqlite")), \
+             patch.object(antiphon, "codex_rollout_files", return_value=rollouts):
             _, printed = self.run_doctor(project)
         line = self.line_for(printed, "codex queue:")
         self.assertTrue(line.startswith("·"), line)
@@ -3175,7 +3192,8 @@ class DoctorTest(unittest.TestCase):
         self.assertNotIn(live[:8], line, "the running thread's queue is normal")
         self.assertNotIn(project, line)
         with patch.object(antiphon, "CODEX_THREAD_LOCKS", locks), \
-             patch.object(antiphon, "CODEX_QUEUE_DBS", os.path.join(home, "nothing_*.sqlite")):
+             patch.object(antiphon, "CODEX_QUEUE_DBS", os.path.join(home, "nothing_*.sqlite")), \
+             patch.object(antiphon, "codex_rollout_files", return_value=rollouts):
             _, printed = self.run_doctor(project)
         self.assertEqual(self.line_for(printed, "codex queue:"), "",
                          "no queue database, no line")
@@ -3187,10 +3205,15 @@ class DoctorTest(unittest.TestCase):
         root = tempfile.mkdtemp(prefix="antiphon-pkg-")
         self.addCleanup(lambda: __import__("shutil").rmtree(root, ignore_errors=True))
         os.makedirs(os.path.join(root, "lib"))
+        # The same version this copy is: a package.json without one makes the
+        # install check call the copy on PATH broken, which is a different
+        # diagnosis than the one under test.
+        version = antiphon._package_version(antiphon._package_root())
         for name in ("lib/antiphon.py", "lib/peers.py", "lib/channel.mjs", "package.json"):
             path = os.path.join(root, name)
             with open(path, "w", encoding="utf-8") as f:
-                f.write("{}\n" if name.endswith(".json") else "# code\n")
+                f.write(json.dumps({"version": version}) + "\n"
+                        if name.endswith(".json") else "# code\n")
             os.utime(path, (changed_at, changed_at))
         return root
 
@@ -3206,7 +3229,7 @@ class DoctorTest(unittest.TestCase):
         root = self.fake_root(changed)
         stale_start = int(changed - 3600)
         fresh_start = int(changed + 60)
-        code, printed = self.run_doctor(project, processes=[
+        code, printed = self.run_doctor(project, tools=self.tools_at(root), processes=[
             (4242, stale_start, f"python3 {root}/lib/antiphon.py mcp"),
             (4243, fresh_start, f"/opt/node/bin/node {root}/lib/channel.mjs"),
             (4244, stale_start, f"node /opt/homebrew/bin/antiphon mcp"),   # the wrapper: not a server
@@ -3231,9 +3254,10 @@ class DoctorTest(unittest.TestCase):
         existed. Not stale — orphaned; the repair is different."""
         project = self.project()
         self.set_up(project)
-        code, printed = self.run_doctor(project, processes=[
+        gone = "/Users/x/Documents/gone"
+        code, printed = self.run_doctor(project, tools=self.tools_at(gone), processes=[
             (67249, int(time.time() - 86400 * 2),
-             "/opt/node/bin/node /Users/x/Documents/gone/lib/channel.mjs"),
+             f"/opt/node/bin/node {gone}/lib/channel.mjs"),
         ])
         self.assertEqual(code, 1)
         line = self.line_for(printed, "pid 67249")
@@ -3259,6 +3283,8 @@ class DoctorTest(unittest.TestCase):
         root = self.fake_root(changed)
         antiphon.peers.register(project, "claude", "ui", "/tmp/ui.sock",
                                 pid=4242, owner_key="300:x")
+        # Deliberately NOT this project's install: a peer registered here is in
+        # scope wherever it runs from, because it is serving this project.
         _, printed = self.run_doctor(project, processes=[
             (4242, int(changed - 60), f"node {root}/lib/channel.mjs"),
         ])
@@ -3310,7 +3336,7 @@ class DoctorTest(unittest.TestCase):
             future = time.time() + 5
             os.utime(os.path.join(root, "lib", "antiphon.py"), (future, future))
             with patch.object(antiphon, "project_dir", return_value=project), \
-                 patch.object(antiphon, "_which", side_effect=self.healthy_tools().get), \
+                 patch.object(antiphon, "_which", side_effect=self.tools_at(root).get), \
                  patch.object(antiphon, "_tool_version", side_effect=self.HEALTHY_VERSIONS.get):
                 out = io.StringIO()
                 with contextlib.redirect_stdout(out):
@@ -3319,6 +3345,75 @@ class DoctorTest(unittest.TestCase):
             self.assertTrue(line.startswith("✗ running: codex mcp"), line)
         finally:
             child.kill()
+
+    def test_a_server_from_another_install_is_not_this_project_s_verdict(self):
+        """Measured on a fresh temp project (first e2e run, 2026-08-31): the
+        machine-wide check printed four ✗ about another project's servers and
+        exited 1, so a brand-new, correctly set up project could not be told
+        apart from a broken one. A server is this project's business when it
+        runs the copy this project's hooks run, or when it is registered here.
+        The rest are counted, not judged."""
+        project = self.project()
+        self.set_up(project)
+        changed = time.time() - 600
+        mine, theirs = self.fake_root(changed), self.fake_root(changed)
+        code, printed = self.run_doctor(project, tools=self.tools_at(mine), processes=[
+            (5150, int(changed - 3600), f"python3 {theirs}/lib/antiphon.py mcp"),
+            (5151, int(changed - 3600), f"node {theirs}/lib/channel.mjs"),
+        ])
+        self.assertEqual(code, 0, printed)
+        self.assertEqual(self.line_for(printed, "pid 5150"), "", printed)
+        elsewhere = self.line_for(printed, "another install")
+        self.assertTrue(elsewhere.startswith("·"), printed)
+        self.assertIn("2", elsewhere)
+        self.assertNotIn(theirs, elsewhere, "no other project's paths in this report")
+
+    def test_a_stale_server_of_this_install_is_still_this_project_s_verdict(self):
+        """The scoping must not silence the case it was built for."""
+        project = self.project()
+        self.set_up(project)
+        changed = time.time() - 600
+        mine = self.fake_root(changed)
+        code, printed = self.run_doctor(project, tools=self.tools_at(mine), processes=[
+            (5160, int(changed - 3600), f"python3 {mine}/lib/antiphon.py mcp"),
+        ])
+        self.assertEqual(code, 1)
+        self.assertTrue(self.line_for(printed, "pid 5160").startswith("✗ running:"), printed)
+
+    def test_the_queue_note_names_only_this_project_s_threads(self):
+        """Same fresh-project measurement: the note named threads queued from
+        another project, which the reader cannot act on from here. A thread is
+        this project's when one of this project's rollouts records it."""
+        project = self.project()
+        self.set_up(project)
+        home = tempfile.mkdtemp(prefix="antiphon-codexhome-")
+        self.addCleanup(lambda: __import__("shutil").rmtree(home, ignore_errors=True))
+        db = os.path.join(home, "queue_1.sqlite")
+        con = __import__("sqlite3").connect(db)
+        con.execute("CREATE TABLE queued_items (id TEXT PRIMARY KEY, thread_id TEXT, "
+                    "payload_json TEXT, queue_order INTEGER, created_at_ms INTEGER, "
+                    "updated_at_ms INTEGER)")
+        ours = "01a05745-bc86-73d3-b95d-41754c16fd0f"
+        theirs = "01a0573e-8a71-7fc3-830f-fbf0b0b5dc22"
+        for i, tid in enumerate((ours, theirs)):
+            con.execute("INSERT INTO queued_items VALUES (?,?,?,?,?,?)",
+                        (f"q{i}", tid, "{}", i, 1, 1))
+        con.commit(); con.close()
+        rollout = os.path.join(project, f"rollout-2026-08-31T13-03-03-{ours}.jsonl")
+        with open(rollout, "w", encoding="utf-8") as f:
+            f.write(json.dumps({"type": "session_meta",
+                                "payload": {"session_id": ours, "cwd": project}}) + "\n")
+        locks = tempfile.mkdtemp(prefix="antiphon-locks-")
+        self.addCleanup(lambda: __import__("shutil").rmtree(locks, ignore_errors=True))
+        with patch.object(antiphon, "CODEX_THREAD_LOCKS", locks), \
+             patch.object(antiphon, "CODEX_QUEUE_DBS", os.path.join(home, "queue_*.sqlite")), \
+             patch.object(antiphon, "codex_rollout_files", return_value=[rollout]):
+            _, printed = self.run_doctor(project)
+        queue_lines = [l for l in printed.splitlines() if "codex queue:" in l]
+        self.assertEqual(len(queue_lines), 1, queue_lines)
+        self.assertIn(ours[:8], queue_lines[0])
+        self.assertNotIn(theirs[:8], printed,
+                         "a thread this project never queued to is not its business")
 
     def test_doctor_notes_a_reader_still_replaying_history(self):
         """Measured 2026-08-31: both readers had been replaying for twenty

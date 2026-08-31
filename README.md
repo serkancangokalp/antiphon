@@ -178,6 +178,7 @@ antiphon setup             # (re)install the project setup
 antiphon catch-up [side]   # skip undelivered history: page cursors jump to the live edge
 antiphon --version         # the installed version
 npm test                   # Python unit tests + real MCP protocol test
+test/e2e/fresh-user.sh     # what a new user gets, with the real CLIs (not in npm test)
 ```
 
 `catch-up` is for the other quiet: pages that keep arriving but are days old.
