@@ -2733,6 +2733,71 @@ class PagedSummaryModelTest(unittest.TestCase):
         self.assertIsNone(no_advance)
         self.assertEqual(empty_count, 0)
 
+    def test_you_never_appears(self):
+        events = [self.event("run the census", kind="you", offset=0, end=100)]
+        text, _advance, _count = self.page(events, side="claude")
+        self.assertNotIn("YOU", text)
+
+    def test_the_other_sides_input_is_labelled_as_its_input(self):
+        events = [self.event("run the census", kind="you", offset=0, end=100)]
+        text, _advance, _count = self.page(events, side="claude")
+        self.assertIn("] To Codex:", text)
+
+    def test_the_label_names_the_side_that_received(self):
+        events = [self.event("run the census", kind="you", offset=0, end=100)]
+        text, _advance, _count = self.page(events, side="codex")
+        self.assertIn("] To Claude:", text)
+        self.assertNotIn("] To Codex:", text)
+
+    def test_a_page_with_relayed_input_carries_the_notice(self):
+        events = [self.event("run the census", kind="you", offset=0, end=100)]
+        for side, name in (("claude", "Codex"), ("codex", "Claude")):
+            text, _advance, _count = self.page(events, side=side)
+            self.assertTrue(text.endswith(
+                'Lines marked "To {name}:" are what {name} received as input in its own '
+                "session — relayed here for awareness, not addressed to your session. "
+                "This record belongs to the Antiphon bridge — this is what actually "
+                "happened there. Do not assume anything that is not in it.".format(name=name)),
+                text)
+
+    def test_a_page_without_relayed_input_omits_the_notice(self):
+        notice = ('Lines marked "To Codex:" are what Codex received as input in its own '
+                  "session — relayed here for awareness, not addressed to your session. ")
+        closing = ("This record belongs to the Antiphon bridge — this is what actually "
+                   "happened there. Do not assume anything that is not in it.")
+        quoting = [
+            self.event('answering the line marked "To Codex:" now', offset=0, end=100),
+            self.event("done", offset=100, end=200, when=11),
+        ]
+        text, _advance, _count = self.page(quoting)
+        self.assertNotIn(notice, text)
+        self.assertTrue(text.endswith(closing), text)
+        replay, _advance, _count = self.page(
+            [], self.scanned(("filtered", "g", 700)), replay_reason="legacy_upgrade")
+        self.assertNotIn(notice, replay)
+        self.assertTrue(replay.endswith(closing), replay)
+
+    def test_the_notice_counts_against_the_page_budget(self):
+        notice = ('Lines marked "To Codex:" are what Codex received as input in its own '
+                  "session — relayed here for awareness, not addressed to your session. ")
+        events = [
+            self.event("R" * 7_500, kind="you", offset=0, end=100),
+            self.event("deferred " + "D" * 150, offset=100, end=200, when=11),
+        ]
+        records = antiphon._ordered_records(events)
+        complete = antiphon._render_page("claude", records, False, None)
+        without_notice = complete.replace(notice, "", 1)
+        self.assertGreater(len(complete.encode("utf-8")), antiphon.PAGE_BUDGET)
+        self.assertLessEqual(len(without_notice.encode("utf-8")), antiphon.PAGE_BUDGET)
+        text, advance, count = self.page(
+            events, self.scanned(("source", "generation", 200)))
+        self.assertLessEqual(len(text.encode("utf-8")), antiphon.PAGE_BUDGET)
+        self.assertIn(notice, text)
+        self.assertNotIn("deferred", text)
+        self.assertTrue(advance.has_more)
+        self.assertEqual(advance.sources["source"]["offset"], 100)
+        self.assertEqual(count, 1)
+
 
 class OffsetReadingTest(unittest.TestCase):
     """`read_records` reads a transcript forward from a byte offset instead of
