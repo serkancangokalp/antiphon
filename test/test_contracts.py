@@ -182,10 +182,13 @@ class CrossBoundaryContractTest(unittest.TestCase):
                          "and it must stay outside the alias grammar")
 
     def test_no_surface_tells_an_agent_to_pass_a_null_recipient(self):
-        """Three sentences that have to agree: `sender_alias` may be null, `to`
-        must be a string, and the reader is told when to pass one as the other.
-        "Always" made those three incompatible, and an agent following it would
-        send `to: null` and be refused for doing as it was told."""
+        """Three sentences that have to agree: `sender_alias` is always a string
+        (`<unnamed>` when the peer has no name — measured, Claude Code 2.1.251
+        rejects a null there and the event never arrives), `to` must be a
+        string, and the reader is told when to pass one as the other. "Always"
+        made those incompatible, and an agent following it would send the
+        sentinel as `to` and be refused for doing as it was told; "non-null"
+        described a wire that no longer carries null at all."""
         surfaces = {
             "channel.mjs instructions": re.sub(r'"\s*\+\s*\n\s*"', "",
                                                read("lib", "channel.mjs")),
@@ -203,7 +206,10 @@ class CrossBoundaryContractTest(unittest.TestCase):
                                  f"{where} does not say when to pass it at all")
             said = instruction.group(0)
             self.assertNotIn("always", said.lower(), where)
-            self.assertIn("non-null", said, where)
+            self.assertNotIn("null", said.lower(),
+                             f"{where} still describes a null the wire no longer carries")
+            self.assertIn(peers.UNNAMED, said,
+                          f"{where} must name the sentinel the reader will actually see")
 
     def test_the_codex_side_is_told_the_same_thing_in_its_own_form(self):
         """The two directions carry identity differently — metadata one way, a

@@ -702,6 +702,39 @@ never printed before — a diagnosis, not a behaviour change.
   wording, which describes keyless→keyless suppression, while this residual is
   **keyless-write → keyed-identical-push** through the migration branch.
 
+## Shipped — the channel never hands Claude Code a null sender
+
+Measured on Claude Code 2.1.251, in the host's own MCP log: every
+`notifications/claude/channel` carrying `meta.sender_alias: null` was refused
+with `ProtocolError: Invalid params … expected string, received null`, and the
+event never reached the agent — while `channel.mjs` had already answered the
+sender `{ok:true}` and Codex read "Delivered". An unnamed Codex is the default
+install, so the whole Codex→Claude direct road was dark for it; the passive
+pull masked this until the upgrade replay (below) starved that road too. The
+same day's log shows string aliases going through untouched, and the previous
+day's log shows no refusal at all: every live send until then had come from a
+named session, so the null branch had never been exercised against the host —
+the Node suite drives the server with the SDK client, which does not enforce
+the host's schema.
+
+What shipped: `meta.sender_alias` is always a string. A peer with no usable
+name arrives as the reserved registry key `<unnamed>` — the one both writers
+already share and the alias grammar already refuses — and `reply_to_codex`
+reads that key handed back as `to` as "nobody in particular", the bare reply,
+never as a peer called `<unnamed>`. The three Claude-side surfaces (channel
+instructions, CLAUDE.md rule, README) say "a name rather than the literal
+`<unnamed>`" where they said "non-null", and the contract test now rejects the
+word "null" on any of them. The Node test pins the wire: nine unusable claims,
+including `null` and `"<unnamed>"` itself, all reach the agent as the string
+sentinel; the sentinel as `to` produces word-for-word the bare outcome.
+
+Named limitation: this is the host's schema as measured on one version. If a
+later Claude Code accepts null, nothing breaks; if it ever rejects the
+sentinel string, the same measurement (the MCP log under
+`~/Library/Caches/claude-cli-nodejs/<project>/mcp-logs-antiphon/`) finds it.
+The fresh-user end-to-end run that would have caught this before release is
+filed under the release checklist entry below.
+
 ## Shipped — a refused send says what the peer will and will not see
 
 The problem was real and the recorded premise was false. Observed twice in one
