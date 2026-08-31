@@ -1764,6 +1764,11 @@ def _retire_park(cwd, side, key, observed):
     Nothing observed means no lock at all — the markerless Stop is the hottest
     path on the bridge, and this must not put a write on it for the ordinary
     case where no tool spoke this turn.
+
+    A lost lock exits 1 by `cursor_lock`'s own rule: on exit 0 the host sends
+    stderr to a debug log and shows the person nothing, and the notice below
+    exists precisely to be seen. `push` injects no context, so its non-zero
+    costs nobody a page.
     """
     if not observed:
         return 0

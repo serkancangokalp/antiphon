@@ -295,8 +295,8 @@ notice beside it, so the two costs are reported separately rather than under
 one blanket sentence.
 
 **The trade, stated straight.** In the ordinary flow the park lives exactly
-one Stop. In the crash window (a turn whose Stop never runs) and the
-lost-lock window, a stale park survives into the next push, whose consume can
+one Stop. In the crash window (a turn whose Stop never runs — or a push that dies
+between its unlocked read and its retire) and the lost-lock window, a stale park survives into the next push, whose consume can
 then suppress **one** next-turn marker repeating the parked wording — a
 bounded, one-turn loss; the turn after sends. It is diagnosed on stderr in the
 lost-lock case and **silent in the crash case**, where no push ran to say
@@ -307,15 +307,18 @@ the slot.
 
 **Cost.** The markerless Stop did zero cursor I/O before (measured). It now
 does one unlocked read per markerless Stop, and takes the lock only when that
-read actually found a park.
+read actually found a park. One visible side effect of that read: a corrupt
+cursor file is now diagnosed ("could not be read safely") on a path that
+never printed before — a diagnosis, not a behaviour change.
 
 ### Named limitations
 
-- Two mid-turn replies to the **same recipient in one turn** still echo the
-  second line. The park holds one digest per slot, the Stop batch hashes both
-  lines together, so nothing matches — unchanged from before this work, not a
-  regression, but it bounds "the mid-turn duplicate stays prevented" to the
-  single-line case.
+- Two mid-turn replies to the **same recipient in one turn** still echo —
+  and the echo is the **whole batch** (measured: `line one\nline two`, so the
+  first line is redelivered too). The park holds one digest per slot, the
+  Stop batch hashes both lines together, so nothing matches — unchanged from
+  before this work, not a regression, but it bounds "the mid-turn duplicate
+  stays prevented" to the single-line case.
 - The legacy supersede stays where it was moved to: at park-write time, on an
   unaddressed delivery.
 - The flat→scoped migration branch inside `deliver_batches` stays live. It is
