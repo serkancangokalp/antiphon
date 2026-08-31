@@ -5297,14 +5297,19 @@ CATCH_UP_SOURCES = {
 def reader_backlog(cwd, side, cursor, cursor_state="valid"):
     """How far one side's page reader is behind, in the unit that is true.
 
-    `(unread_bytes, met, unmet, replay)`: raw transcript bytes not yet read
-    across the discovered sources the cursor has met (same generation), how
-    many it has met, how many discovered sources it has not, and the replay
-    marker if any. Raw bytes, never pages: a page is a rendered envelope and
-    most raw bytes never reach one (measured: nearly all of a 44 MB span was
-    filtered before rendering), so no page count can be derived from here.
-    None when the cursor cannot be trusted — the next turn replays, and how
-    much is unknown until it does.
+    `(unread, positioned, unpositioned, replay)`: raw transcript bytes the
+    reader has still to read across the discovered sources — each counted
+    from where `_resolve_start` says the reader will actually start, the
+    same rule the reader runs — how many of those sources start from a
+    trusted recorded position, how many do not (placed by time, restarted at
+    byte zero for a replaced generation or an offset past EOF, or never
+    positioned), and the replay marker if any. Raw bytes, never pages: a
+    page is a rendered envelope and most raw bytes never reach one (measured:
+    nearly all of a 44 MB span was filtered before rendering), so no page
+    count can be derived from here. None only when the cursor file itself
+    cannot be read — then the next turn recovers, and how much it will read
+    is unknown until it does; a malformed page key is recovery from byte
+    zero and counts the whole file.
     """
     if cursor_state == "invalid":
         return None
