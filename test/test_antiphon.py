@@ -6097,6 +6097,29 @@ class SourceAwarePullTest(unittest.TestCase):
         self.assertEqual(self._page(project, events), bare)
         self.assertNotIn("(build)", bare)
 
+    def test_a_single_source_live_claimed_page_is_byte_identical(self):
+        """The other half of the rule. A label answers "which of these said
+        it", so it needs a "these": on a page with one source there is nothing
+        to tell apart, and the suffix would prevent no confusion that could
+        arise there.
+
+        The cost is what settles it. Naming terminals is the recommended
+        practice, so a claim-only rule would put a permanent suffix on every
+        page of every named session — including every page of the ordinary
+        single-pair install, which is the shape the Goal promises stays
+        byte-identical."""
+        project = self.project()
+        events = (self._record(self.A, 0, ("codex", "worked on the parser"),
+                               ("you", "carry on"),
+                               ("tool", "rg source_id"))
+                  + self._record(self.A, 100, ("codex", "done")))
+        bare = self._page(project, events)
+        self._codex_claim(project, "build", self.A)
+        page = self._page(project, events)
+        self.assertEqual(page, bare, "a live claim alone changes nothing")
+        self.assertNotIn("(build)", page)
+        self.assertNotIn("interleaves", page)
+
     def test_a_dead_multi_source_page_is_byte_identical(self):
         """The measured 8% shape on a single-pair install: two sources on the
         page, both of them one terminal's earlier sessions. Neither a label nor
@@ -6315,7 +6338,9 @@ class SourceAwarePullTest(unittest.TestCase):
         its own contract: names and readiness, never an address, never a
         session id."""
         project = self.project()
-        events = self._record(self.A, 0, ("codex", "read the plan"))
+        events = (self._record(self.A, 0, ("codex", "read the plan"))
+                  + self._record(self.B, 0, ("codex", "an older session"),
+                                 when=50))
         self._codex_claim(project, "build", self.A)
         out = io.StringIO()
         with patch.object(antiphon, "project_dir", return_value=project), \
@@ -6343,6 +6368,7 @@ class SourceAwarePullTest(unittest.TestCase):
         for index in range(6):
             events += self._record(self.A, index * 100,
                                    ("codex", "block %d" % index), when=index)
+        events += self._record(self.B, 0, ("codex", "an older session"), when=50)
         self._codex_claim(project, "build", self.A)
         real = antiphon._session_join
         with patch.object(antiphon, "_session_join",
@@ -6357,7 +6383,9 @@ class SourceAwarePullTest(unittest.TestCase):
         the registry by changing it — and the stale record is exactly what the
         next `doctor` is for."""
         project = self.project()
-        events = self._record(self.A, 0, ("codex", "read the plan"))
+        events = (self._record(self.A, 0, ("codex", "read the plan"))
+                  + self._record(self.C, 0, ("codex", "an older session"),
+                                 when=50))
         self._codex_claim(project, "build", self.A)
         self._codex_claim(project, "gone", self.B, owner=self.OTHER_KEY,
                           pid=999999)

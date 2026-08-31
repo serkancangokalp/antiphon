@@ -93,16 +93,21 @@ env-settable identity is the one thing `owner_key` refuses, because a key anyone
 can set lets one session claim another's. The hook route needs no `channel.mjs`
 change, no endpoint-schema change, and refreshes every turn.
 
-**2. A label requires a live claim, joined the way the registry already
-joins.** `peers._session_address(cwd, endpoint)` is the join: liveness on the
-**endpoint**, session identity from the hook's half, and the owner key between
-them. A missing record, one with no owner, one from a different owner and one
-whose id is not a canonical UUID all read the same way — no claim. Liveness on
-the session record itself would have joined nothing at all: `write_session`
-deliberately writes no pid. A session two live endpoints claim under different
-aliases is dropped rather than decided; `sorted(os.listdir(...))` order is not
-an answer. The reserved `<unnamed>` key is filtered by `valid_name`: it is a
-place in the registry, not a name anything may print.
+**2. A label needs both halves — two or more sessions sharing the page, and a
+live claim on that source — joined the way the registry already joins.** One
+source is not a "which of these": there is no ambiguity for a label to prevent,
+and since naming terminals is the recommended practice, a claim-only rule would
+put a permanent suffix on every page of every named session, the ordinary
+single-pair install included. `peers._session_address(cwd, endpoint)` is the
+join: liveness on the **endpoint**, session identity from the hook's half, and
+the owner key between them. A missing record, one with no owner, one from a
+different owner and one whose id is not a canonical UUID all read the same way
+— no claim. Liveness on the session record itself would have joined nothing at
+all: `write_session` deliberately writes no pid. A session two live endpoints
+claim under different aliases is dropped rather than decided;
+`sorted(os.listdir(...))` order is not an answer. The reserved `<unnamed>` key
+is filtered by `valid_name`: it is a place in the registry, not a name anything
+may print.
 
 The join is built **once per `build_summary`** and threaded down. `_render_page`
 runs once per prefix length inside the budget loop — up to `EVENT_LIMIT` times —

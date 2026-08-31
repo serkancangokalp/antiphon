@@ -1440,7 +1440,28 @@ def _append_page_section(text, section):
 
 def _render_page(side, records, has_more, replay_reason, join=None):
     """Render the exact visible envelope whose UTF-8 size is page-bounded."""
+    # Over the SELECTED records, never the candidates. The measured shape of a
+    # real page is two sources discovered and one delivered — 55 of 60 — and a
+    # count taken over the candidates would relabel every one of them for a
+    # session whose words are not on the page.
+    #
+    # A page carries exactly one peer kind (`build_summary` reads the other
+    # side's transcripts and nothing else), so "sources on the page" is the
+    # whole count; there is no per-kind split to make.
+    sources = {record.source for record in records}
+    # A label takes BOTH halves: a live claim on the source, and a second
+    # source to tell it from. One source is not a "which of these" — there is
+    # no ambiguity there for a label to prevent, and naming terminals is the
+    # recommended practice, so a claim-only rule would put a permanent suffix
+    # on every page of every named session, the ordinary single-pair install
+    # included. Dropped here rather than at each decision below, so nothing
+    # downstream can label what the count refuses.
     join = join or NO_SESSION_JOIN
+    if len(sources) < 2:
+        join = NO_SESSION_JOIN
+    labelled = {source for source in sources if source in join.aliases}
+    name = LABEL[OTHER_SIDE[side][0]]
+
     other = OTHER_SIDE[side][1]
     text = "## What happened on the {} side (since your last turn)".format(other)
     text = _append_page_section(text, "has_more: {}".format(str(has_more).lower()))
@@ -1456,22 +1477,13 @@ def _render_page(side, records, has_more, replay_reason, join=None):
         else:
             text = _append_page_section(text, "More remains; it will continue on a later turn.")
 
-    # Over the SELECTED records, never the candidates. The measured shape of a
-    # real page is two sources discovered and one delivered — 55 of 60 — and a
-    # count taken over the candidates would annotate every one of them about a
-    # session whose words are not on the page.
-    #
-    # A page carries exactly one peer kind (`build_summary` reads the other
-    # side's transcripts and nothing else), so "sources on the page" is the
-    # whole count; there is no per-kind split to make.
-    sources = {record.source for record in records}
-    labelled = {source for source in sources if source in join.aliases}
-    name = LABEL[OTHER_SIDE[side][0]]
-    if labelled and len(sources) > 1:
-        # Anchored on a live claim. Sources with none are one terminal's
-        # earlier sessions — measured, that is 8% of this install's pages — and
-        # telling their reader that "some of this is old" is noise they learn
-        # to skip past.
+    if labelled:
+        # `labelled` is non-empty only when the count above let a claim
+        # through, so this is the same two-source condition and there is only
+        # one of it to drift. Anchored on a live claim: sources with none are
+        # one terminal's earlier sessions — measured, 8% of this install's
+        # pages — and telling their reader that "some of this is old" is noise
+        # they learn to skip past.
         text = _append_page_section(text, (
             "This page interleaves {count} {name} sessions; unlabelled blocks "
             "are earlier or unnamed sessions.".format(count=len(sources),
