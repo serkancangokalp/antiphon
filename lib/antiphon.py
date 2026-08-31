@@ -4906,12 +4906,17 @@ def _doctor_running(report, cwd):
     A hook reloads every turn; a server loads once. Measured on 2026-08-31:
     four bridge servers were running code from before the day's merges,
     doctor said 13/13 ✓, and the fix the person had just installed was
-    provably not what was answering. Machine-wide on purpose, like the
-    install check: staleness belongs to the install, not to a project, and a
-    server started from another copy names that copy. The registry, scanned
-    without pruning, lends a pid its alias so the line names the session the
-    person knows. An ✗, because the installed code is not the running code,
-    and the repair is theirs: restart that session.
+    provably not what was answering.
+
+    Scoped to what this project can act on: a server running the copy this
+    project's hooks run — `PATH`'s `antiphon`, realpath — or one registered in
+    this project's registry, wherever it runs from. Judging every bridge
+    server on the machine printed four ✗ about another project's sessions on a
+    correctly set up fresh project, so a healthy project could not be told
+    from a broken one; the rest are one `·` count, without paths or a verdict.
+    The registry, scanned without pruning, also lends a pid its alias so the
+    line names the session the person knows. An ✗, because the installed code
+    is not the running code, and the repair is theirs: restart that session.
     """
     table = _process_table()
     if table is None:
@@ -4922,10 +4927,18 @@ def _doctor_running(report, cwd):
         report.note("running: no bridge server of this package is running — "
                     "a session starts one")
         return
-    names = {}
+    # Two different questions, and conflating them cost the default install:
+    # being registered here is what puts a pid in scope, while a name is only
+    # how the line reads. The unnamed peer registers under the reserved
+    # `<unnamed>` key, which `valid_name` rejects on purpose — built from names
+    # alone, the pid table excluded exactly the single-pair default.
+    registered, names = set(), {}
     for record in peers._scan(cwd):
         pid, name = record.get("pid"), record.get("name")
-        if isinstance(pid, int) and isinstance(name, str) and peers.valid_name(name):
+        if not isinstance(pid, int):
+            continue
+        registered.add(pid)
+        if isinstance(name, str) and peers.valid_name(name):
             names[pid] = name
     # The copy this project's hooks run, which is the one whose staleness this
     # project can act on. Measured on a fresh temp project: judging every
@@ -4940,7 +4953,7 @@ def _doctor_running(report, cwd):
     fresh, elsewhere = 0, 0
     for pid, started, side, script in sorted(servers):
         root = os.path.dirname(os.path.dirname(script))
-        if pid not in names and os.path.realpath(root) != os.path.realpath(install):
+        if pid not in registered and os.path.realpath(root) != os.path.realpath(install):
             elsewhere += 1
             continue
         who = (f'{side} "{names[pid]}" pid {pid}' if pid in names
