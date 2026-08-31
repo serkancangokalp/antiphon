@@ -60,20 +60,152 @@ the write-and-flush-before-advance transaction.
 - Retirement of the preserved v2 sibling key once pre-v3 processes and
   rollback support are no longer needed.
 
-## P1 — Source-aware multi-peer pull context
+## P1 — Source-aware multi-peer pull context (fixed)
 
 Live push is explicitly addressed and never broadcast. Passive pull context is
-project-wide awareness, which is useful, but today it merges transcripts under
+project-wide awareness, which is useful, but it merged transcripts under
 generic `Claude`/`Codex` labels. With several terminals that can look like one
 agent said another agent's words.
 
-- Record and validate the source peer for every transcript used by pull.
-- Label each event with the source alias (or honestly `unnamed`) and stable
-  session identity.
-- Keep project-wide awareness separate from task dispatch: an event addressed
-  to `api` may be visible to `ui`, but must remain visibly addressed to `api`.
-- Add an explicit filtering policy only if users ask for it; do not silently
-  infer Claude↔Codex pairs from matching aliases.
+The entry asked for the source alias on every event. What shipped is narrower
+and, measured, more honest: a *source* is a **session**, not a peer. `Event.source`
+is `source_id(path)` — the session UUID in the transcript's own filename, which
+both hosts write and which survives a move or a rename — and `RECENT_FILES = 3`
+means the sources on an ordinary page are usually one terminal's *consecutive*
+sessions. Measured on this machine over a real drain: 5 of 60 Claude-read pages
+and 1 of 60 Codex-read pages carry more than one source, and every one of those
+is one person's Codex session restarted, not two terminals. Labelling all of
+them, and advising their reader to "name each terminal", would have been advice
+that is wrong wherever it fires most.
+
+### What shipped — four decisions
+
+**1. The Claude hook records its own session, mirroring the Codex one.** The
+hook has always been handed `session_id` and always threw it away;
+`record_claude_session` now writes the same `session.json` half through the same
+`peers.write_session`, gated on `explicit_name()` and `owner_key()` exactly as
+the Codex arm is. The alternative — a `session` field on `endpoint.json`, filled
+from `CLAUDE_CODE_SESSION_ID` when the channel server registers — was measured
+and dropped: `claimPeer()` runs exactly once (the live server on this machine
+had been up 20h59m on one claim), so a resume or a fork would leave the record
+naming the old session and put the live alias on a dead transcript; and an
+env-settable identity is the one thing `owner_key` refuses, because a key anyone
+can set lets one session claim another's. The hook route needs no `channel.mjs`
+change, no endpoint-schema change, and refreshes every turn.
+
+**2. A label needs both halves — two or more sessions sharing the page, and a
+live claim on that source — joined the way the registry already joins.** One
+source is not a "which of these": there is no ambiguity for a label to prevent,
+and since naming terminals is the recommended practice, a claim-only rule would
+put a permanent suffix on every page of every named session, the ordinary
+single-pair install included. `peers._session_address(cwd, endpoint)` is the
+join: liveness on the **endpoint**, session identity from the hook's half, and
+the owner key between them. A missing record, one with no owner, one from a
+different owner and one whose id is not a canonical UUID all read the same way
+— no claim. Liveness on the session record itself would have joined nothing at
+all: `write_session` deliberately writes no pid. A session two live endpoints
+claim under different aliases is dropped rather than decided;
+`sorted(os.listdir(...))` order is not an answer. The reserved `<unnamed>` key
+is filtered by `valid_name`: it is a place in the registry, not a name anything
+may print.
+
+The join is built **once per `build_summary`** and threaded down. `_render_page`
+runs once per prefix length inside the budget loop — up to `EVENT_LIMIT` times —
+and the join walks the registry with a `ps` per record: measured, 343 ms per
+turn if it were built there, against a 46 ms whole-page build.
+
+**3. Labels are per record block, not per kind of line.** Every line a record
+renders comes from one source, so the agent line, the relayed line and the tool
+line take the suffix together: `Codex (build):`, `To Codex (build):`,
+`  · (build) 3 tool calls: …`. The tool line matters most — measured, 26 of the
+first 40 records a Codex reader sees render *only* a tool line, so it is the
+only place their label can go. A per-kind rule would have labelled the agent
+lines and left the relayed line of the *same rollout* bare: measured on real
+page 52, where the per-kind source counts are `{'codex': 2, 'you': 1}`.
+
+**4. The notice is two-tier and anchored on live claims; the relayed sentence
+is additive.** A page says `This page interleaves {n} {Label} sessions;
+unlabelled blocks are earlier or unnamed sessions.` only when at least one
+selected source is live-claimed **and** two or more sources are selected. It
+adds `A {Label} session is running now with no name; name each terminal
+(ANTIPHON_NAME) to tell them apart.` only when a block is unlabelled **and** the
+registry holds a live endpoint under the reserved key. That last condition is a
+kind fact: `valid_key("codex", UNNAMED)` is False, so an unnamed Codex endpoint
+cannot exist and the remedy can only ever appear on a page **Codex** reads.
+A dead-only multi-source page gets neither line and stays byte-identical.
+
+Today's relayed closing sentence keeps its bytes exactly. On a page where
+labelling is active *and* a `you` event is selected, one sentence follows it:
+`A parenthesised session label after the recipient names which live session's
+line it is.` The trigger is conjunctive because the two conditions come apart —
+measured, 4 of the 6 real labellable pages carry no `you` event at all, and a
+sentence about what follows a recipient, on a page with no recipient line,
+is the defect the relayed-words entry above exists to close. An earlier revision
+made the reword unconditional and moved the closing bytes on 22% of real
+Claude-read pages and 37% of Codex-read ones; that is why it is additive.
+
+### Measured, so it is not re-derived
+
+**The real-data gate.** Every file of both corpora — 85 Claude transcripts and
+130 Codex rollouts, 215 files, 1,656 pages drained from a zero cursor through
+the real budget loop — rendered **byte-identical** old against new, with no
+crash on either side. It could not have been otherwise today, and the reason is
+recorded rather than assumed: across the 31 distinct project directories those
+corpora name, the registries hold exactly **one** endpoint record, and it
+carries no owner key, so `_session_address` refuses it. The one-file sweep itself can
+never label under the two-source rule, so reachability was proved the way the
+rule requires: two real rollouts of one project drained together produce 199
+pages of which exactly one differs — four labelled lines and the informational
+sentence, no remedy (correctly: no unnamed endpoint was live). The differing
+bucket is reachable, its measured frequency on real data is 1 in 199, and the
+sweep's zero is the rule working, not the feature idle.
+
+**Capacity.** A label can only be added as a prefix grows, never removed, so
+candidate size stays monotone and the budget loop cannot oscillate — `selected`
+is still the largest length that fits. It is not free: on a near-budget page
+(200-byte bodies, 30 records from one source and 5 from another, interleaved,
+the first claimed) the same corpus that was delivered complete at 35 records now
+delivers 34 and reports `has_more: true`. That flip holds at 20-20 and does not
+at 5-30, because the split decides how many blocks carry a suffix; the fixture
+parameters are part of the test's assertion.
+
+**`status` shows labels on purpose.** `build_summary` has four call sites, and
+the what-X-would-see preview is the page — so it shows exactly what is
+delivered. The `Peers:` block is a different thing and is untouched: names and
+readiness, never an address, never a session id.
+
+### The bounds, by name
+
+- **Unnamed Codex concurrency is undetectable.** A Codex session that was given
+  no alias registers nothing at all, so two of them interleaved on one page
+  leave no evidence anywhere. The page says nothing rather than guessing; this
+  is why the remedy tier can only appear on a page Codex reads.
+- **A hook that carries no `session_id` stays unjoinable.** Nothing is inferred
+  from a transcript's contents or its mtime.
+- **A started-but-unprompted Claude session is an honestly unlabelled source.**
+  `hook_shapes()` installs the Codex pull hook on both `SessionStart` and
+  `UserPromptSubmit`; the Claude side has only `UserPromptSubmit`, so
+  `record_claude_session` cannot run before that session's first prompt. The
+  extra `HookShape` row is declined as out of scope here — both `setup` and
+  `doctor` read that table — and nothing false ships: the label is absent, not
+  wrong.
+- **An endpoint that records no owner key can never be joined.** Two causes and
+  no way to tell them apart from a record: one written before the field existed
+  (which is what this machine's one live record is), or an `owner_key()` that
+  returned nothing at registration. `doctor` names the observable and offers the
+  common cause as a cause; the hook stays silent, because saying it once per
+  prompt forever is not a diagnosis.
+- **Discovery is unchanged.** `RECENT_FILES = 3` still bounds which transcripts
+  pull reads at all, and the label work neither widens it nor claims to — see
+  the durable source catalog under P0's "Still open, by name".
+
+### The guardrails, kept verbatim
+
+Awareness never becomes dispatch: a label names a session on a page and changes
+nothing about who a message can be sent to. There is no filtering — a page
+carries every source it carried before. And no Claude↔Codex pair is inferred
+from matching aliases: the join is built for one kind, the kind the reading side
+does not own.
 
 ## P1 — Relayed human words are not the reader's own user (fixed)
 

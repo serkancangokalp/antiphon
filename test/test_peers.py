@@ -1151,6 +1151,43 @@ class SessionRecordTest(unittest.TestCase):
             self.assertEqual(peers.read_peers(project, "codex")[0]["address"],
                              self.UUID, "the first session still becomes routable")
 
+    def test_an_endpoint_that_records_no_owner_is_refused_without_an_accusation(self):
+        """An absent owner key is evidence of nothing, and the record is most
+        often the writer's own — registered before the field existed, or by a
+        tree `owner_key` could not walk. `_owner_of` returns None there, so the
+        comparison reads it as *a different owner* and the old wording named the
+        reader's own pid as somebody else's live session, once per turn.
+
+        The write is still refused: an endpoint whose owner cannot be read
+        cannot be shown to be this session's, and guessing is what this registry
+        exists to end. Only the sentence changes."""
+        with tempfile.TemporaryDirectory() as project:
+            ok, detail = peers.register(project, "codex", "build", "/t/b.sock",
+                                        pid=os.getpid())
+            self.assertTrue(ok, detail)
+            ok, detail = peers.write_session(project, "codex", "build", self.UUID,
+                                             "/t/r.jsonl", self.KEY)
+            self.assertFalse(ok)
+            self.assertFalse(os.path.exists(self._session_path(project)))
+        self.assertEqual(detail,
+                         "alias 'build' is held by a live codex endpoint that "
+                         f"records no owner (pid {os.getpid()}); its record was "
+                         "not touched")
+        self.assertNotIn("another live", detail,
+                         "nobody has been shown to be another session")
+
+    def test_a_known_different_owner_is_still_named_as_another_session(self):
+        """The accusation is true exactly where an owner key was readable and
+        differed, so that sentence stays."""
+        with tempfile.TemporaryDirectory() as project:
+            self._endpoint(project)
+            ok, detail = peers.write_session(project, "codex", "build", self.OTHER,
+                                             "/t/second.jsonl", self.OTHER_KEY)
+        self.assertFalse(ok)
+        self.assertEqual(detail,
+                         "alias 'build' is held by another live codex session "
+                         f"(pid {os.getpid()}); its record was not touched")
+
     def test_the_same_owner_overwrites_its_own_record(self):
         """One session's next turn, not a clash with itself."""
         with tempfile.TemporaryDirectory() as project:

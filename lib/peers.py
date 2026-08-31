@@ -227,7 +227,14 @@ def _addressless(record):
 
 
 def _session_address(cwd, peer):
-    """The session id an addressless Codex endpoint answers to, or None.
+    """The session id this endpoint's own hook has claimed for it, or None.
+
+    Kind-neutral, and used both ways. For a Codex endpoint the id is also the
+    address: a Codex peer registers before it has one and this is what it comes
+    to answer to. For a Claude endpoint it is not an address at all — the
+    socket is — and the id says only which transcript that peer is writing,
+    which is what a pull page joins a session label on. Same halves, same
+    owner, same refusal either way.
 
     The two halves are joined on the owner key and nothing else. A missing
     session record, one with no owner, one from a different owner, and one whose
@@ -601,6 +608,16 @@ def write_session(cwd, kind, name, session_id, transcript, owner):
     with _registry_lock(cwd):
         endpoint = _read_record(_peer_file(cwd, kind, name))
         if endpoint and _owner_of(endpoint) != owner and _record_alive(endpoint):
+            if _owner_of(endpoint) is None:
+                # An unreadable owner is not a different owner. The write is
+                # still refused — an endpoint that names nobody cannot be shown
+                # to be this session's — but the endpoint is most often the
+                # caller's own, from before the field existed or from a tree
+                # `owner_key` could not walk, and calling it another live
+                # session names the reader's own pid as somebody else.
+                return False, (f"alias {name!r} is held by a live {kind} endpoint "
+                               f"that records no owner (pid {_pid_of(endpoint)}); "
+                               "its record was not touched")
             return False, (f"alias {name!r} is held by another live {kind} session "
                            f"(pid {_pid_of(endpoint)}); its record was not touched")
         record = {"kind": kind, "name": name, "owner": owner,

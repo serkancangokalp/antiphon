@@ -2743,6 +2743,38 @@ class DoctorTest(unittest.TestCase):
         self.assertEqual(code, 0, printed)
         self.assertEqual(self.line_for(printed, "alias"), '✓ alias: named "ui"')
 
+    def test_doctor_names_an_endpoint_that_records_no_owner_key(self):
+        """The one place an operator finds out why their named session is never
+        labelled on a pull page. The hook is silent about it on purpose — once
+        per prompt forever is not a diagnosis — so doctor has to say it.
+
+        It states the observable and offers the common cause as a cause: the
+        two origins (a record from before the field, and an `owner_key()` that
+        returned nothing at registration) are indistinguishable here, and
+        naming one of them would be the guess this module refuses everywhere
+        else."""
+        project = self.project()
+        self.set_up(project)
+        antiphon.peers.register(project, "claude", "ui", "/nowhere/ui.sock",
+                                pid=os.getpid())
+        _, printed = self.run_doctor(project)
+        notes = [line for line in printed.splitlines()
+                 if line.startswith("·") and "claude/ui" in line]
+        self.assertEqual(len(notes), 1, printed)
+        self.assertEqual(notes[0],
+                         "· peer claude/ui: this endpoint has no owner key, so "
+                         "sessions cannot be joined to it; restarting that "
+                         "session usually records one")
+
+    def test_an_endpoint_with_an_owner_key_gets_no_such_note(self):
+        """The ordinary case stays as quiet as it was."""
+        project = self.project()
+        self.set_up(project)
+        antiphon.peers.register(project, "claude", "ui", "/nowhere/ui.sock",
+                                pid=os.getpid(), owner_key="300:x")
+        _, printed = self.run_doctor(project)
+        self.assertNotIn("no owner key", printed)
+
     def test_help_exits_zero(self):
         """Asking for help is not an error. Measured before this change:
         `--help`, `-h` and `help` each printed the usage and exited 1."""
@@ -5695,11 +5727,12 @@ class CodexPeerWiringTest(unittest.TestCase):
                                           "gen": "g", "offset": 5}}), 1))
         self.assertIn("news", out)
 
-    def test_the_claude_hook_touches_no_part_of_the_codex_registry(self):
-        """Claude's alias is settled by its socket, and `ANTIPHON_NAME` is
-        shared by both sides of one terminal. A Claude hook that walked the
-        process tree or wrote a session record would be describing a peer it is
-        not."""
+    def test_the_claude_hook_writes_nothing_under_the_codex_kind(self):
+        """`ANTIPHON_NAME` is shared by both sides of one terminal, so a Claude
+        hook that wrote a codex record would be describing a peer it is not.
+
+        It does walk the process tree now — that is how its own two halves join
+        — and what it records is pinned in `ClaudeSessionWiringTest`."""
         # `hook` takes a real lock beside the (named) cursor for
         # UserPromptSubmit — a fixed cwd would leave a lock file on a real
         # developer's machine.
@@ -5708,15 +5741,15 @@ class CodexPeerWiringTest(unittest.TestCase):
                        "session_id": self.UUID}
             with self._named("build"), \
                  patch.object(antiphon.sys, "stdin", io.StringIO(json.dumps(payload))), \
-                 patch.object(antiphon.peers, "owner_key") as walk, \
-                 patch.object(antiphon.peers, "write_session") as write_session, \
+                 patch.object(antiphon.peers, "owner_key", return_value="300:x"), \
                  patch.object(antiphon, "build_summary", return_value=("", None, 0)), \
                  patch.object(antiphon, "read_cursor", return_value={}), \
                  patch.object(antiphon, "write_cursor"), \
                  contextlib.redirect_stdout(io.StringIO()):
                 self.assertEqual(antiphon.hook("claude"), 0)
-        walk.assert_not_called()
-        write_session.assert_not_called()
+            self.assertIsNone(antiphon.peers.read_session(project, "codex", "build"))
+            self.assertFalse(os.path.exists(
+                antiphon.peers.peer_dir(project, "codex", "build")))
 
     def test_the_hook_still_injects_context_when_the_registry_is_broken(self):
         with tempfile.TemporaryDirectory() as project, \
@@ -5818,6 +5851,600 @@ class CodexPeerWiringTest(unittest.TestCase):
         self.assertEqual(
             [entry["command"] for group in hooks["UserPromptSubmit"]
              for entry in group["hooks"]].count("antiphon hook codex"), 1)
+
+
+class ClaudeSessionWiringTest(unittest.TestCase):
+    """The Claude hook's half of a Claude peer: which session is behind an alias.
+
+    The mirror of the Codex pair. The channel server owns `endpoint.json` and
+    knows the socket; the hook owns `session.json` and knows the session id,
+    and it writes it on every turn it sees. Neither reads, modifies and writes
+    the other's file, so the join between them is the owner key and never a
+    guess.
+    """
+
+    UUID = "1d5a03e0-0548-4339-87c3-45c5dbf7e9d7"
+    OTHER = "2e6b14f1-1659-544a-98d4-56d6eca8fa48"
+
+    @staticmethod
+    @contextlib.contextmanager
+    def _named(name):
+        """`ANTIPHON_NAME` as this session would really see it — set, or absent."""
+        with patch.dict(os.environ, {}):
+            os.environ.pop("ANTIPHON_NAME", None)
+            if name:
+                os.environ["ANTIPHON_NAME"] = name
+            yield
+
+    def _hook(self, project, session_id=None, name="ui", owner="300:x",
+              transcript="/t/c.jsonl", event="UserPromptSubmit"):
+        payload = {"cwd": project, "hook_event_name": event,
+                   "transcript_path": transcript}
+        if session_id is not None:
+            payload["session_id"] = session_id
+        out, err, written = io.StringIO(), io.StringIO(), []
+        with self._named(name), \
+             patch.object(antiphon.sys, "stdin", io.StringIO(json.dumps(payload))), \
+             patch.object(antiphon.peers, "owner_key", return_value=owner), \
+             patch.object(antiphon, "build_summary", return_value=("", None, 0)), \
+             patch.object(antiphon, "read_cursor", return_value={}), \
+             patch.object(antiphon, "write_cursor",
+                          side_effect=lambda cwd, data, kind: written.append(kind) or True), \
+             contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            code = antiphon.hook("claude")
+        return code, out.getvalue(), err.getvalue(), written
+
+    def test_a_named_claude_turn_records_its_session(self):
+        """The whole point: a live alias can be joined to the transcript it is
+        writing, through the same `write_session` the Codex hook uses."""
+        with tempfile.TemporaryDirectory() as project:
+            code, _, err, _ = self._hook(project, session_id=self.UUID)
+            record = antiphon.peers.read_session(project, "claude", "ui")
+            self.assertTrue(os.path.exists(os.path.join(
+                antiphon.peers.peer_dir(project, "claude", "ui"), "session.json")))
+        self.assertEqual(code, 0, err)
+        self.assertEqual(record["kind"], "claude")
+        self.assertEqual(record["name"], "ui")
+        self.assertEqual(record["session_id"], self.UUID)
+        self.assertEqual(record["transcript"], "/t/c.jsonl")
+        self.assertEqual(record["owner"], "300:x")
+
+    def test_an_unnamed_claude_turn_records_nothing(self):
+        """Measured before this change and pinned after it: an unnamed session
+        asked for nothing, so there is nothing to record and nothing to say."""
+        with tempfile.TemporaryDirectory() as project:
+            _, _, err, _ = self._hook(project, name="", session_id=self.UUID)
+            self.assertFalse(os.path.exists(antiphon.peers.peers_dir(project)))
+        self.assertEqual(err, "")
+
+    def test_the_reserved_key_never_gains_a_session_record(self):
+        """`<unnamed>` is where a channel server without a name puts its socket,
+        because a socket has to be findable. It is not a name, so no session may
+        be recorded under it: a page that printed it would show angle brackets
+        for a peer the registry says has no name at all."""
+        with tempfile.TemporaryDirectory() as project:
+            antiphon.peers.register(project, "claude", antiphon.peers.UNNAMED,
+                                    "/t/u.sock", pid=os.getpid(),
+                                    owner_key="300:x")
+            self._hook(project, name="", session_id=self.UUID)
+            self.assertIsNone(antiphon.peers.read_session(
+                project, "claude", antiphon.peers.UNNAMED))
+
+    def test_a_later_turn_replaces_the_session_id_it_recorded(self):
+        """Every turn, not once at start-up. A claim taken once would keep
+        naming the session that started the channel, and a resume or a fork
+        would then put the live alias on a transcript nobody is writing."""
+        with tempfile.TemporaryDirectory() as project:
+            self._hook(project, session_id=self.UUID)
+            self._hook(project, session_id=self.OTHER)
+            record = antiphon.peers.read_session(project, "claude", "ui")
+        self.assertEqual(record["session_id"], self.OTHER)
+
+    def test_a_second_owners_claude_hook_cannot_repoint_a_live_alias(self):
+        """The two-writer law, extended to this side: the session that got there
+        first keeps working and the second one is told. The owner offered here
+        is this session's own, never the one the endpoint already claims."""
+        with tempfile.TemporaryDirectory() as project:
+            antiphon.peers.register(project, "claude", "ui", "/t/ui.sock",
+                                    pid=os.getppid(), owner_key="300:first")
+            antiphon.peers.write_session(project, "claude", "ui", self.UUID,
+                                         "/t/first.jsonl", "300:first")
+            _, _, err, _ = self._hook(project, session_id=self.OTHER,
+                                      owner="301:second")
+            record = antiphon.peers.read_session(project, "claude", "ui")
+        self.assertEqual(record["session_id"], self.UUID,
+                         "the first session is untouched")
+        self.assertEqual(record["transcript"], "/t/first.jsonl")
+        self.assertIn("ui", err, "the second session is told whose alias it is")
+
+    def test_an_ownerless_endpoint_stays_silent(self):
+        """An endpoint with no owner key refuses the write and names nobody:
+        the record is most often this very session's own, registered before the
+        field existed or by a tree `owner_key` could not walk. Saying "another
+        live session (pid <your own>)" once per prompt, forever, would be a
+        false accusation nobody can act on. `doctor` says it once, calmly,
+        where somebody is asking."""
+        with tempfile.TemporaryDirectory() as project:
+            antiphon.peers.register(project, "claude", "ui", "/t/ui.sock",
+                                    pid=os.getpid())
+            code, _, err, _ = self._hook(project, session_id=self.UUID)
+            self.assertIsNone(antiphon.peers.read_session(project, "claude", "ui"))
+        self.assertEqual(code, 0)
+        self.assertEqual(err, "", "not a word, not once per turn")
+
+    def test_the_claude_hook_records_only_its_own_side(self):
+        """`ANTIPHON_NAME` is shared by both sides of one terminal, so a Claude
+        hook that wrote a codex record would be describing a peer it is not.
+        It walks the process tree now — that is how the two halves join — but
+        only ever to write under its own kind."""
+        with tempfile.TemporaryDirectory() as project:
+            self._hook(project, name="build", session_id=self.UUID)
+            mine = antiphon.peers.read_session(project, "claude", "build")
+            self.assertIsNone(antiphon.peers.read_session(project, "codex", "build"))
+            self.assertFalse(os.path.exists(
+                antiphon.peers.peer_dir(project, "codex", "build")))
+        self.assertEqual(mine["session_id"], self.UUID)
+
+
+
+class SourceAwarePullTest(unittest.TestCase):
+    """Which live session said what, on a page that interleaves several.
+
+    A source is a session, not a peer: `RECENT_FILES` means the sources on an
+    ordinary page are usually one agent's consecutive sessions, of which the
+    registry holds at most the current one. So a label is not "which agent" —
+    it is "which session, of the ones running right now", and a source with no
+    live claim is honestly left bare rather than named after a neighbour.
+
+    Every fixture builds its registry through the real `peers` writers, and the
+    pages come out of the real `build_summary` with only the parser stubbed.
+    """
+
+    A = "1d5a03e0-0548-4339-87c3-45c5dbf7e9d7"
+    B = "2e6b14f1-1659-544a-98d4-56d6eca8fa48"
+    C = "3f7c25a2-2760-655b-a9e5-67e7fdb90b59"
+    KEY = "300:first"
+    OTHER_KEY = "301:second"
+
+    CLOSING = ("This record belongs to the Antiphon bridge — this is what "
+               "actually happened there. Do not assume anything that is not "
+               "in it.")
+    RELAYED = ('Lines marked "To Codex:" are what Codex received as input in '
+               "its own session — relayed here for awareness, not addressed to "
+               "your session. ")
+    ADDITIVE = ("A parenthesised session label after the recipient names which "
+                "live session's line it is. ")
+
+    def project(self):
+        project = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, project, ignore_errors=True)
+        return project
+
+    # ---- fixtures ----
+
+    @staticmethod
+    def _record(source, offset, *pairs, **kwargs):
+        """One completed source record: `(kind, text)` blocks sharing an offset."""
+        when = kwargs.get("when", offset)
+        return [antiphon.Event(float(when) + index, kind, text, source, "g",
+                               offset, offset + 100)
+                for index, (kind, text) in enumerate(pairs)]
+
+    @staticmethod
+    def _summary(project, events, side="claude"):
+        reader = "codex_events" if side == "claude" else "claude_events"
+        with patch.object(antiphon, reader, return_value=(events, {})):
+            return antiphon.build_summary(project, side)
+
+    def _page(self, project, events, side="claude"):
+        return self._summary(project, events, side)[0]
+
+    def _codex_endpoint(self, project, alias, owner=None, pid=None):
+        owner = owner or self.KEY
+        ok, detail = antiphon.peers.register(
+            project, "codex", alias, None,
+            pid=os.getpid() if pid is None else pid, owner_key=owner)
+        self.assertTrue(ok, detail)
+
+    def _codex_claim(self, project, alias, session, owner=None, pid=None):
+        """A Codex endpoint and the session record its hook would leave."""
+        owner = owner or self.KEY
+        self._codex_endpoint(project, alias, owner=owner, pid=pid)
+        ok, detail = antiphon.peers.write_session(
+            project, "codex", alias, session, "/t/%s.jsonl" % alias, owner)
+        self.assertTrue(ok, detail)
+
+    def _claude_endpoint(self, project, alias, owner=None, pid=None):
+        owner = owner or self.KEY
+        ok, detail = antiphon.peers.register(
+            project, "claude", alias, "/t/%s.sock" % alias.strip("<>"),
+            pid=os.getpid() if pid is None else pid, owner_key=owner)
+        self.assertTrue(ok, detail)
+
+    def _claude_claim(self, project, alias, session, owner=None):
+        """The whole of Task 2, end to end: the endpoint, then a real hook turn
+        that records which session is behind the alias."""
+        owner = owner or self.KEY
+        self._claude_endpoint(project, alias, owner=owner)
+        payload = {"cwd": project, "hook_event_name": "UserPromptSubmit",
+                   "session_id": session,
+                   "transcript_path": "/t/%s.jsonl" % alias}
+        with patch.dict(os.environ, {"ANTIPHON_NAME": alias}), \
+             patch.object(antiphon.sys, "stdin", io.StringIO(json.dumps(payload))), \
+             patch.object(antiphon.peers, "owner_key", return_value=owner), \
+             patch.object(antiphon, "build_summary", return_value=("", None, 0)), \
+             patch.object(antiphon, "read_cursor", return_value={}), \
+             patch.object(antiphon, "write_cursor", return_value=True), \
+             contextlib.redirect_stdout(io.StringIO()), \
+             contextlib.redirect_stderr(io.StringIO()):
+            self.assertEqual(antiphon.hook("claude"), 0)
+        self.assertEqual(
+            antiphon.peers.read_session(project, "claude", alias)["session_id"],
+            session, "Task 2 wrote the record this page is about to read")
+
+    # ---- byte identity: everything without a live claim ----
+
+    def test_a_single_source_page_is_byte_identical(self):
+        """One source, and a claim on it that names a session nobody is
+        running. A dead session's words are history, not a speaker anyone can
+        be confused with."""
+        project = self.project()
+        events = (self._record(self.A, 0, ("codex", "worked on the parser"),
+                               ("you", "carry on"))
+                  + self._record(self.A, 100, ("codex", "done")))
+        bare = self._page(project, events)
+        self._codex_claim(project, "build", self.A, pid=999999)
+        self.assertEqual(self._page(project, events), bare)
+        self.assertNotIn("(build)", bare)
+
+    def test_a_single_source_live_claimed_page_is_byte_identical(self):
+        """The other half of the rule. A label answers "which of these said
+        it", so it needs a "these": on a page with one source there is nothing
+        to tell apart, and the suffix would prevent no confusion that could
+        arise there.
+
+        The cost is what settles it. Naming terminals is the recommended
+        practice, so a claim-only rule would put a permanent suffix on every
+        page of every named session — including every page of the ordinary
+        single-pair install, which is the shape the Goal promises stays
+        byte-identical."""
+        project = self.project()
+        events = (self._record(self.A, 0, ("codex", "worked on the parser"),
+                               ("you", "carry on"),
+                               ("tool", "rg source_id"))
+                  + self._record(self.A, 100, ("codex", "done")))
+        bare = self._page(project, events)
+        self._codex_claim(project, "build", self.A)
+        page = self._page(project, events)
+        self.assertEqual(page, bare, "a live claim alone changes nothing")
+        self.assertNotIn("(build)", page)
+        self.assertNotIn("interleaves", page)
+
+    def test_a_dead_multi_source_page_is_byte_identical(self):
+        """The measured 8% shape on a single-pair install: two sources on the
+        page, both of them one terminal's earlier sessions. Neither a label nor
+        a notice, and not one byte moved."""
+        project = self.project()
+        events = (self._record(self.A, 0, ("codex", "yesterday"))
+                  + self._record(self.B, 0, ("codex", "this morning"), when=5))
+        bare = self._page(project, events)
+        self._codex_claim(project, "build", self.A, pid=999999)
+        self._codex_claim(project, "review", self.B, owner=self.OTHER_KEY,
+                          pid=999999)
+        page = self._page(project, events)
+        self.assertEqual(page, bare)
+        self.assertNotIn("interleaves", page)
+
+    def test_two_sources_one_selected_is_byte_identical(self):
+        """The 55-of-60 shape: two sources exist, one lands in the selected
+        prefix. The label decision reads the selected records, never the
+        candidates — counting over the whole list is the simpler, likelier code
+        and it would relabel every one of those pages."""
+        project = self.project()
+        events = (self._record(self.A, 0, ("codex", "selected"))
+                  + self._record(self.B, 0, ("codex", "not selected"), when=5))
+        with patch.object(antiphon, "EVENT_LIMIT", 1):
+            bare = self._page(project, events)
+            self._codex_claim(project, "build", self.B)
+            page = self._page(project, events)
+        self.assertEqual(page, bare)
+        self.assertNotIn("interleaves", page)
+        self.assertNotIn("(build)", page)
+
+    # ---- the label ----
+
+    def test_a_live_claimed_source_is_labelled(self):
+        """One block, one suffix, everywhere the block speaks. A page that
+        labelled the agent line and left the relayed line bare would show two
+        speakers where the rollout has one."""
+        project = self.project()
+        events = (self._record(self.A, 0,
+                               ("codex", "read the plan"),
+                               ("you", "carry on"),
+                               ("tool", "rg source_id"), ("tool", "sed -n 1,20p"))
+                  + self._record(self.B, 0, ("codex", "an older session"), when=50))
+        self._codex_claim(project, "build", self.A)
+        page = self._page(project, events)
+        self.assertIn("] Codex (build):", page)
+        self.assertIn("] To Codex (build):", page)
+        self.assertIn("  · (build) 2 tool calls:", page)
+        self.assertIn("] Codex:\nan older session", page)
+        self.assertNotIn("] Codex (build):\nan older session", page)
+        self.assertIn("This page interleaves 2 Codex sessions; unlabelled "
+                      "blocks are earlier or unnamed sessions.", page)
+
+    def test_a_claude_page_labels_the_same_way(self):
+        """The mirror, off the record Task 2's hook really wrote.
+
+        The heading above it says "the Claude Code side" while the label and
+        the notice say "Claude": `OTHER_SIDE` names the host, `LABEL` names the
+        peer, and the notice is a label. Deliberate, not drift."""
+        project = self.project()
+        events = (self._record(self.A, 0, ("claude", "wrote the join"),
+                               ("you", "go on"))
+                  + self._record(self.B, 0, ("claude", "an older session"),
+                                 when=50))
+        self._claude_claim(project, "ui", self.A)
+        page = self._page(project, events, side="codex")
+        self.assertIn("] Claude (ui):", page)
+        self.assertIn("] To Claude (ui):", page)
+        self.assertIn("] Claude:\nan older session", page)
+        self.assertIn("This page interleaves 2 Claude sessions; unlabelled "
+                      "blocks are earlier or unnamed sessions.", page)
+        self.assertIn("## What happened on the Claude Code side", page)
+
+    def test_a_twice_claimed_session_labels_nothing(self):
+        """Two live records, different aliases, one session id — `claude
+        --resume` in a second terminal. Whichever `sorted(os.listdir(...))`
+        happened to write last is not an answer, so the session is labelled by
+        neither. The other source, claimed once, is unaffected."""
+        project = self.project()
+        events = (self._record(self.A, 0, ("codex", "contested"))
+                  + self._record(self.B, 0, ("codex", "uncontested"), when=50))
+        self._codex_claim(project, "build", self.A)
+        self._codex_claim(project, "review", self.A, owner=self.OTHER_KEY)
+        self._codex_claim(project, "solo", self.B, owner="302:third")
+        page = self._page(project, events)
+        self.assertNotIn("(build)", page)
+        self.assertNotIn("(review)", page)
+        self.assertIn("] Codex:\ncontested", page)
+        self.assertIn("] Codex (solo):\nuncontested", page)
+
+    def test_the_reserved_key_never_labels(self):
+        """`<unnamed>` is where a nameless channel server puts its socket. It is
+        outside the alias grammar on purpose, so nothing a marker can carry is
+        ever it — and nothing on a page may print it as though it were a name."""
+        project = self.project()
+        events = (self._record(self.A, 0, ("claude", "the unnamed session"))
+                  + self._record(self.B, 0, ("claude", "another"), when=50))
+        bare = self._page(project, events, side="codex")
+        self._claude_endpoint(project, antiphon.peers.UNNAMED)
+        ok, detail = antiphon.peers.write_session(
+            project, "claude", antiphon.peers.UNNAMED, self.A, "/t/u.jsonl",
+            self.KEY)
+        self.assertTrue(ok, detail)
+        page = self._page(project, events, side="codex")
+        self.assertNotIn("unnamed>", page)
+        self.assertEqual(page, bare)
+
+    # ---- the two-tier notice ----
+
+    def test_the_remedy_needs_a_live_unnamed_endpoint(self):
+        """The remedy is a kind fact, not a reader-side one.
+        `valid_key("codex", UNNAMED)` is False — an unnamed Codex session leaves
+        no record at all — so the only nameless endpoint that can exist is a
+        Claude one, and the only page that can raise the remedy is one Codex
+        reads."""
+        events = (self._record(self.A, 0, ("claude", "named"))
+                  + self._record(self.B, 0, ("claude", "nameless"), when=50))
+
+        project = self.project()
+        self._claude_claim(project, "ui", self.A)
+        page = self._page(project, events, side="codex")
+        self.assertIn("interleaves 2 Claude sessions", page)
+        self.assertNotIn("ANTIPHON_NAME", page,
+                         "every endpoint is named; there is nothing to advise")
+
+        self._claude_endpoint(project, antiphon.peers.UNNAMED,
+                              owner=self.OTHER_KEY)
+        page = self._page(project, events, side="codex")
+        self.assertIn("A Claude session is running now with no name; name each "
+                      "terminal (ANTIPHON_NAME) to tell them apart.", page)
+
+        self._claude_claim(project, "api", self.B, owner="302:third")
+        page = self._page(project, events, side="codex")
+        self.assertIn("interleaves 2 Claude sessions", page)
+        self.assertNotIn("ANTIPHON_NAME", page,
+                         "no block is unlabelled, so nothing is being confused")
+
+        # The mirror: a Codex-source page can never raise it. The registry will
+        # not hold the record the trigger asks for.
+        other = self.project()
+        codex_events = (self._record(self.A, 0, ("codex", "named"))
+                        + self._record(self.B, 0, ("codex", "nameless"), when=50))
+        self._codex_claim(other, "build", self.A)
+        refused, detail = antiphon.peers.register(
+            other, "codex", antiphon.peers.UNNAMED, None, pid=os.getpid(),
+            owner_key=self.OTHER_KEY)
+        self.assertFalse(refused, detail)
+        page = self._page(other, codex_events)
+        self.assertIn("interleaves 2 Codex sessions", page)
+        self.assertNotIn("ANTIPHON_NAME", page)
+
+    def test_a_dead_unnamed_endpoint_raises_nothing(self):
+        """A corpse cannot be renamed, and telling somebody to name a terminal
+        that is not running is the advice C6 measured as wrong."""
+        project = self.project()
+        events = (self._record(self.A, 0, ("claude", "named"))
+                  + self._record(self.B, 0, ("claude", "nameless"), when=50))
+        self._claude_claim(project, "ui", self.A)
+        self._claude_endpoint(project, antiphon.peers.UNNAMED,
+                              owner=self.OTHER_KEY, pid=999999)
+        page = self._page(project, events, side="codex")
+        self.assertIn("interleaves 2 Claude sessions", page)
+        self.assertNotIn("ANTIPHON_NAME", page)
+
+    # ---- the closing sentence ----
+
+    def test_the_relayed_notice_is_additive(self):
+        """Today's sentence is true and stays byte-for-byte; the label gets one
+        sentence of its own, and only where the page has a relayed line for it
+        to be about. An unconditional reword moves the closing bytes on 22-37%
+        of real pages — which is what the last revision of this sentence did."""
+        project = self.project()
+        relayed = self._record(self.A, 0, ("codex", "worked"), ("you", "carry on"))
+        quiet = self._record(self.A, 0, ("codex", "worked"))
+        second = self._record(self.B, 0, ("codex", "an older session"), when=50)
+
+        # (a) no label: today's closing, exactly.
+        page = self._page(project, relayed + second)
+        self.assertTrue(page.endswith(self.RELAYED + self.CLOSING), page[-400:])
+
+        self._codex_claim(project, "build", self.A)
+
+        # (b) labelled, with a relayed line: today's sentence, then the label's.
+        page = self._page(project, relayed + second)
+        self.assertIn("(build)", page)
+        self.assertTrue(page.endswith(self.RELAYED + self.ADDITIVE + self.CLOSING),
+                        page[-400:])
+
+        # (c) labelled, with no relayed line: today's closing line exactly. The
+        # added sentence rides the relayed one; 4 of the 6 real labellable
+        # pages carry no `you` event at all.
+        page = self._page(project, quiet + second)
+        self.assertIn("(build)", page)
+        self.assertTrue(page.endswith(self.CLOSING), page[-400:])
+        self.assertNotIn("parenthesised", page)
+
+    # ---- what the label is not ----
+
+    def test_a_label_never_makes_a_peer_deliverable(self):
+        """Awareness never becomes dispatch. The page may name a session; that
+        changes nothing about who a message can be sent to."""
+        project = self.project()
+        events = (self._record(self.A, 0, ("codex", "read the plan"))
+                  + self._record(self.B, 0, ("codex", "older"), when=50))
+        self._codex_claim(project, "build", self.A)
+        page = self._page(project, events)
+        self.assertIn("(build)", page)
+        address, detail = antiphon.resolve_target(project, "codex", "build")
+        self.assertEqual(address, self.A, detail)
+        self.assertIsNone(antiphon.resolve_target(project, "codex", "review")[0])
+        self.assertIsNone(antiphon.resolve_target(project, "claude", "build")[0])
+
+    def test_status_shows_the_page_as_delivered_and_names_no_session(self):
+        """The preview is the page, so labels appear in it exactly as they are
+        delivered — deliberate. The Peers block is a different thing and keeps
+        its own contract: names and readiness, never an address, never a
+        session id."""
+        project = self.project()
+        events = (self._record(self.A, 0, ("codex", "read the plan"))
+                  + self._record(self.B, 0, ("codex", "an older session"),
+                                 when=50))
+        self._codex_claim(project, "build", self.A)
+        out = io.StringIO()
+        with patch.object(antiphon, "project_dir", return_value=project), \
+             patch.object(antiphon, "codex_events", return_value=(events, {})), \
+             patch.object(antiphon, "claude_events", return_value=([], {})), \
+             contextlib.redirect_stdout(out):
+            self.assertEqual(antiphon.status(), 0)
+        printed = out.getvalue()
+        self.assertIn("] Codex (build):", printed)
+        peers_block = [line for line in printed.splitlines()
+                       if line.startswith("  Codex ")]
+        self.assertEqual(peers_block, ["  Codex build — ready"])
+        self.assertNotIn(self.A, printed.split("=== what")[0],
+                         "the Peers block names no session id")
+
+    # ---- the join itself ----
+
+    def test_the_join_is_built_once(self):
+        """`_render_page` runs once per prefix length inside the budget loop —
+        up to `EVENT_LIMIT` times. Measured, a join built there costs 343 ms per
+        turn against a 46 ms page build, so it is built in `build_summary` and
+        threaded down."""
+        project = self.project()
+        events = []
+        for index in range(6):
+            events += self._record(self.A, index * 100,
+                                   ("codex", "block %d" % index), when=index)
+        events += self._record(self.B, 0, ("codex", "an older session"), when=50)
+        self._codex_claim(project, "build", self.A)
+        real = antiphon._session_join
+        with patch.object(antiphon, "_session_join",
+                          side_effect=real) as spy:
+            page = self._page(project, events)
+        self.assertEqual(spy.call_count, 1)
+        self.assertIn("(build)", page, "the join it built was the one used")
+
+    def test_the_join_writes_nothing_and_prunes_nothing(self):
+        """`read_peers`, `_live_by_kind` and `resolve_target` all prune. A page
+        build that deleted a stale record would be answering a question about
+        the registry by changing it — and the stale record is exactly what the
+        next `doctor` is for."""
+        project = self.project()
+        events = (self._record(self.A, 0, ("codex", "read the plan"))
+                  + self._record(self.C, 0, ("codex", "an older session"),
+                                 when=50))
+        self._codex_claim(project, "build", self.A)
+        self._codex_claim(project, "gone", self.B, owner=self.OTHER_KEY,
+                          pid=999999)
+        stale = antiphon.peers._peer_file(project, "codex", "gone")
+        before = DoctorTest.snapshot(project)
+        page = self._page(project, events)
+        after = DoctorTest.snapshot(project)
+        self.assertEqual(before, after)
+        self.assertTrue(os.path.exists(stale),
+                        "the stale record is still there to be explained")
+        self.assertIn("(build)", page)
+
+    # ---- the budget ----
+
+    def _budget_events(self, n_a, n_b, body=200):
+        """`n_a` records from the first source and `n_b` from the second,
+        interleaved by time, each one block of `body` bytes."""
+        events = []
+        for index in range(max(n_a, n_b)):
+            if index < n_a:
+                events += self._record(self.A, index * 1000,
+                                       ("codex", "a" * body), when=index * 2)
+            if index < n_b:
+                events += self._record(self.B, index * 1000,
+                                       ("codex", "b" * body), when=index * 2 + 1)
+        return events
+
+    def test_labelling_keeps_the_budget_monotone(self):
+        """The fixture's parameters are part of the assertion: 200-byte bodies,
+        30 records from the first source and 5 from the second, interleaved,
+        the first source claimed. Measured, the 35→34 flip holds there and at
+        20-20 and not at 5-30, because the split decides how many blocks carry
+        a suffix.
+
+        The property is what matters and it holds everywhere: a label can only
+        be added as the prefix grows, never removed, so candidate size stays
+        monotone, the budget loop cannot oscillate, and `selected` is still the
+        largest length that fits."""
+        project = self.project()
+        events = self._budget_events(30, 5, body=200)
+        base_text, base_advance, _ = self._summary(project, events)
+        self._codex_claim(project, "build", self.A)
+        text, advance, _ = self._summary(project, events)
+
+        self.assertLessEqual(len(text.encode("utf-8")), antiphon.PAGE_BUDGET)
+        self.assertEqual(base_text.count("] Codex"), 35)
+        self.assertFalse(base_advance.has_more)
+        self.assertEqual(text.count("] Codex"), 34)
+        self.assertTrue(advance.has_more, "the page defers one record instead")
+
+        records = antiphon._ordered_records(events)
+        join = antiphon._session_join(project, "codex")
+        sizes = [len(antiphon._render_page("claude", records[:length],
+                                           length < len(records), None, join)
+                     .encode("utf-8"))
+                 for length in range(1, len(records) + 1)]
+        self.assertEqual([index for index in range(1, len(sizes))
+                          if sizes[index] < sizes[index - 1]], [],
+                         "a label is never removed as the prefix grows")
 
 
 class RoutingTest(unittest.TestCase):
