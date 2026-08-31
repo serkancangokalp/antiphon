@@ -562,10 +562,22 @@ class ShippedContractTest(unittest.TestCase):
                 ("backward paging", r"(?i)backward\s+paging"),
                 ("last-record anchor", r"(?i)anchor"),
                 ("descriptor-safe reading", r"(?i)descriptor-safe"),
-                ("direct-channel spill", r"(?i)direct-channel\s+spill"),
                 ("v2 retirement", r"(?i)retirement")):
             self.assertRegex(backlog, pattern,
                              f"BACKLOG's ledger must keep naming {gap}")
+        # The direct-channel spill left this ledger by being closed in writing,
+        # which is the only way a gap may leave it. Its entry says what it did
+        # not deliver, so the two halves cannot drift into "it shipped" with
+        # nothing recording what shipping meant.
+        still_open = section(backlog, "P0 — Lossless, paged context transfer")
+        self.assertIsNotNone(still_open, "the P0 ledger is gone")
+        self.assertNotRegex(still_open, r"(?i)direct-channel\s+spill",
+                            "the spill is no longer an open P0 loss")
+        self.assertRegex(
+            backlog,
+            r"## P1 — Large direct-message attachments[^\n]*"
+            r"minus acknowledgement and retry",
+            "and the entry that closed it names what it left open")
         self.assertNotRegex(limits, r"(?i)\blossless\b(?![^.]*\bBACKLOG)",
                             "Limits calls the pull path lossless while tool "
                             "detail, discovery and backward paging still lose")
