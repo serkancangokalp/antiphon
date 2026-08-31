@@ -75,24 +75,92 @@ agent said another agent's words.
 - Add an explicit filtering policy only if users ask for it; do not silently
   infer Claude↔Codex pairs from matching aliases.
 
-## P1 — Relayed human words are not the reader's own user
+## P1 — Relayed human words are not the reader's own user (fixed)
 
-`build_summary` labels the other side's human as `YOU`. The block header says
-which side it came from, but the line itself reads `[11:04] YOU: rewrite the
-migration`, and nothing tells the reading agent that this is a person talking
-to *somebody else*. An agent that treats it as its own user's instruction has
+`build_summary` labelled the other side's human as `YOU`. The block header said
+which side it came from, but the line itself read `[11:04] YOU: rewrite the
+migration`, and nothing told the reading agent that this was a person talking
+to *somebody else*. An agent that treated it as its own user's instruction had
 been handed authority nobody gave it — in a bridge whose whole invariant is
 preserving who said something.
 
-Provenance and authority are different questions, and this label answers only
-the first. The fix is to say both: relay the words under a label that names them
-as relayed, and state once, where the reader cannot miss it, that they are
-context rather than a direct instruction. The existing header and footer already
-carry that tone; the per-line label is the part that lies.
+Provenance and authority are different questions, and that label answered only
+the first. The fix had to say both: relay the words under a label that names
+them as relayed, and state once, where the reader cannot miss it, that they are
+context rather than a direct instruction. The header and closing line already
+carried that tone; the per-line label was the part that lied.
 
-Worth settling with it: whether the relayed label should also carry the speaking
-peer's alias when one is set, and whether an agent should ever act on a relayed
-instruction without its own user confirming.
+### What shipped
+
+**The label.** A `you`-kind event no longer renders as `YOU`. It renders as
+`To Codex:` in a page Claude reads and `To Claude:` in a page Codex reads —
+what entered the other side's context as input, which is true of a user prompt
+and of a host injection alike and claims authorship of neither. The neutrality
+is not taste. Measured over this project's live transcripts, **5 of 79 `you`
+events are not human text at all**: 3 of the 25 records Claude reads off the
+Codex side are the Codex host's own `# AGENTS.md instructions…` block, and 2 of
+the 54 Codex reads are Claude Code's compact-continuation preamble. They pass
+`_is_host_record`, which only refuses a complete opening wrapper tag at the
+start of the text, so any `X's user:` label would have shipped a false
+attribution on every one of them — the exact failure this entry exists to
+prevent, re-entered from the other end. The name comes from `LABEL["codex"]` /
+`LABEL["claude"]`, the same strings the agent lines already use, so
+`[10:00] Codex:` and `[10:02] To Codex:` sit on one page in one spelling.
+
+**The notice.** A page that carries at least one relayed line closes with the
+sentence in front of the existing closing line:
+
+> Lines marked "To Codex:" are what Codex received as input in its own session
+> — relayed here for awareness, not addressed to your session. This record
+> belongs to the Antiphon bridge — this is what actually happened there. Do not
+> assume anything that is not in it.
+
+It is provenance only: no authorship claim, no ruling on whose instructions
+they are. "Not addressed to your session" is true by construction of the
+parser, where "nothing in them was said in your session" would not be — the
+same human demonstrably repeats an instruction across both terminals.
+
+It is also conditional, and the predicate is over the selected records'
+`you`-kind **events**, never over the rendered page text: an agent-only page
+whose text merely quotes `"To Codex:"` must not assert that it carries relayed
+input, and measured, a string predicate does exactly that. A page with no
+relayed line — including the replay-notice page, which carries no records at
+all — closes exactly as it did before, so no page asserts words it does not
+contain. The sentence costs 143 bytes for a Claude reader and 146 for a Codex
+reader, inside the ordinary `PAGE_BUDGET` arithmetic: on a tuned fixture it is
+what defers a second record to the next page.
+
+Two facts from the gate rounds, recorded so they are not re-derived. Because
+the notice is conditional, every existing page stays byte-identical and **no
+existing test broke** (519 tests before, 525 after — six new ones). And the
+rendering/counting split — `_render_record(record, side)` renders and returns a
+bare string, `_record_message_count(record)` counts — has **no runtime
+observable**: with the split fully undone the suite stays green, because the
+count never reads a label. It is kept as a structural invariant instead,
+recorded by grep: `_render_record` has exactly one caller (`_render_page`,
+which knows the reading side) and the counter takes no side argument, so no
+unobservable side parameter can drift back in.
+
+### The two open questions, settled
+
+**Whether the relayed label should carry the speaking peer's alias — deferred**
+to the source-aware multi-peer P1 above. An alias↔session-UUID join exists
+today **only for named Codex sessions**: `peers.write_session` records that
+UUID under the alias and `Event.source` carries it, but there is no Claude-side
+writer and `read_session` has no production caller at all. A label that named
+aliases now would cover one side of one shape and guess the rest — which is
+misattribution again, wearing a more specific name.
+
+**Whether an agent should act on a relayed instruction — the bridge answers
+provenance and stops.** The shipped sentence says where the words ran and that
+they did not run here; whether the reading agent acts on them belongs to that
+agent and its own user. The single human who often *is* both sides' user can of
+course repeat an instruction in the reader's own session — that is exactly the
+confirmation loop working, not a gap in the bridge.
+
+The boundary, stated straight: a reading agent can still choose to act on
+relayed words. What shipped makes their provenance impossible to misread, which
+is all a label can do.
 
 ## P1 — Large direct-message attachments
 
