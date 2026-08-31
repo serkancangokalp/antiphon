@@ -1492,6 +1492,12 @@ def hook(side="claude"):
         # turn of routability rather than the whole session's.
         record_codex_session(cwd, input_data.get("session_id"),
                              input_data.get("transcript_path"))
+    else:
+        # The same field, off the same payload, on the side that used to throw
+        # it away. Claude Code installs this hook under `UserPromptSubmit`
+        # only, so this is every event this side gets.
+        record_claude_session(cwd, input_data.get("session_id"),
+                              input_data.get("transcript_path"))
 
     if event != "UserPromptSubmit":
         # Only a prompt has something for context to attach to. Anything else —
@@ -2614,6 +2620,61 @@ def record_codex_session(cwd, session_id, transcript):
               "turn. The bare single-peer fallback still works.", file=sys.stderr)
         return False
     if not ok:
+        print(f"antiphon: {detail}", file=sys.stderr)
+    return ok
+
+
+def _endpoint_owner(cwd, kind, name):
+    """The owner key on the endpoint holding an alias, or None if it names none.
+
+    `_scan`, never `read_peers`: this runs on a hook turn's refusal path, and a
+    pruning read there would delete a record on the strength of a liveness
+    lookup nobody asked for.
+    """
+    for record in peers._scan(cwd):
+        if record.get("kind") == kind and record.get("name") == name:
+            return peers._owner_of(record)
+    return None
+
+
+def record_claude_session(cwd, session_id, transcript):
+    """Writes the Claude hook's half: which session is behind this alias.
+
+    The mirror of `record_codex_session`, through the same `peers.write_session`
+    and the same owner key. Two writers, one peer: the channel server owns
+    `endpoint.json` and knows the socket, the hook owns `session.json` and knows
+    the session id the host hands it.
+
+    Every turn, on purpose. The id belongs to the transcript being written right
+    now, and a claim taken once when the channel started would go on naming that
+    session through a resume or a fork — putting the live alias on a transcript
+    nobody is writing, which is the exact misattribution this join exists to
+    end.
+
+    Silent when this session has no usable alias or cannot identify itself, for
+    the reason `record_codex_session` gives. Silent too when the endpoint
+    holding the alias records no owner: `_owner_of` returns None there and the
+    refusal reads as a different owner, but an unreadable owner is evidence of
+    nothing — the record is usually this very session's own. Accusing the reader
+    of being somebody else, once per prompt, forever, would be worse than saying
+    nothing; `doctor` says it once, where somebody is asking.
+    """
+    alias = peers.explicit_name()
+    if not (peers.valid_name(alias) and session_id):
+        return False
+    try:
+        owner = peers.owner_key()
+        if not owner:
+            return False
+        ok, detail = peers.write_session(cwd, "claude", alias, session_id,
+                                         transcript, owner)
+    except Exception as error:
+        # Named routing is a layer over a bridge that already works without it.
+        print(f"antiphon: {alias!r} could not be recorded "
+              f"({type(error).__name__}: {error}); its session cannot be named "
+              "on the other side's pages this turn.", file=sys.stderr)
+        return False
+    if not ok and _endpoint_owner(cwd, "claude", alias) is not None:
         print(f"antiphon: {detail}", file=sys.stderr)
     return ok
 
@@ -3984,7 +4045,16 @@ def _doctor_peers(report, cwd):
         if not peers._record_alive(record):
             report.note(f"peer {who}: stale record; a live session cleans this "
                         "up on its next pass")
-        elif peers._address_of(record) is None:
+            continue
+        if peers._owner_of(record) is None:
+            # Two origins and no way to tell them apart from here: a record
+            # written before the field existed, or an `owner_key()` that
+            # returned nothing at registration. The note states what is
+            # observable and offers the common one as a cause, not a diagnosis.
+            report.note(f"peer {who}: this endpoint has no owner key, so "
+                        "sessions cannot be joined to it; restarting that "
+                        "session usually records one")
+        if peers._address_of(record) is None:
             report.note(f"peer {who}: live, waiting for its first turn")
         else:
             live.append(record)

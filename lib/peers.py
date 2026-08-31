@@ -601,6 +601,16 @@ def write_session(cwd, kind, name, session_id, transcript, owner):
     with _registry_lock(cwd):
         endpoint = _read_record(_peer_file(cwd, kind, name))
         if endpoint and _owner_of(endpoint) != owner and _record_alive(endpoint):
+            if _owner_of(endpoint) is None:
+                # An unreadable owner is not a different owner. The write is
+                # still refused — an endpoint that names nobody cannot be shown
+                # to be this session's — but the endpoint is most often the
+                # caller's own, from before the field existed or from a tree
+                # `owner_key` could not walk, and calling it another live
+                # session names the reader's own pid as somebody else.
+                return False, (f"alias {name!r} is held by a live {kind} endpoint "
+                               f"that records no owner (pid {_pid_of(endpoint)}); "
+                               "its record was not touched")
             return False, (f"alias {name!r} is held by another live {kind} session "
                            f"(pid {_pid_of(endpoint)}); its record was not touched")
         record = {"kind": kind, "name": name, "owner": owner,

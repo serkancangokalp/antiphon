@@ -2743,6 +2743,38 @@ class DoctorTest(unittest.TestCase):
         self.assertEqual(code, 0, printed)
         self.assertEqual(self.line_for(printed, "alias"), '✓ alias: named "ui"')
 
+    def test_doctor_names_an_endpoint_that_records_no_owner_key(self):
+        """The one place an operator finds out why their named session is never
+        labelled on a pull page. The hook is silent about it on purpose — once
+        per prompt forever is not a diagnosis — so doctor has to say it.
+
+        It states the observable and offers the common cause as a cause: the
+        two origins (a record from before the field, and an `owner_key()` that
+        returned nothing at registration) are indistinguishable here, and
+        naming one of them would be the guess this module refuses everywhere
+        else."""
+        project = self.project()
+        self.set_up(project)
+        antiphon.peers.register(project, "claude", "ui", "/nowhere/ui.sock",
+                                pid=os.getpid())
+        _, printed = self.run_doctor(project)
+        notes = [line for line in printed.splitlines()
+                 if line.startswith("·") and "claude/ui" in line]
+        self.assertEqual(len(notes), 1, printed)
+        self.assertEqual(notes[0],
+                         "· peer claude/ui: this endpoint has no owner key, so "
+                         "sessions cannot be joined to it; restarting that "
+                         "session usually records one")
+
+    def test_an_endpoint_with_an_owner_key_gets_no_such_note(self):
+        """The ordinary case stays as quiet as it was."""
+        project = self.project()
+        self.set_up(project)
+        antiphon.peers.register(project, "claude", "ui", "/nowhere/ui.sock",
+                                pid=os.getpid(), owner_key="300:x")
+        _, printed = self.run_doctor(project)
+        self.assertNotIn("no owner key", printed)
+
     def test_help_exits_zero(self):
         """Asking for help is not an error. Measured before this change:
         `--help`, `-h` and `help` each printed the usage and exited 1."""
@@ -5695,11 +5727,12 @@ class CodexPeerWiringTest(unittest.TestCase):
                                           "gen": "g", "offset": 5}}), 1))
         self.assertIn("news", out)
 
-    def test_the_claude_hook_touches_no_part_of_the_codex_registry(self):
-        """Claude's alias is settled by its socket, and `ANTIPHON_NAME` is
-        shared by both sides of one terminal. A Claude hook that walked the
-        process tree or wrote a session record would be describing a peer it is
-        not."""
+    def test_the_claude_hook_writes_nothing_under_the_codex_kind(self):
+        """`ANTIPHON_NAME` is shared by both sides of one terminal, so a Claude
+        hook that wrote a codex record would be describing a peer it is not.
+
+        It does walk the process tree now — that is how its own two halves join
+        — and what it records is pinned in `ClaudeSessionWiringTest`."""
         # `hook` takes a real lock beside the (named) cursor for
         # UserPromptSubmit — a fixed cwd would leave a lock file on a real
         # developer's machine.
@@ -5708,15 +5741,15 @@ class CodexPeerWiringTest(unittest.TestCase):
                        "session_id": self.UUID}
             with self._named("build"), \
                  patch.object(antiphon.sys, "stdin", io.StringIO(json.dumps(payload))), \
-                 patch.object(antiphon.peers, "owner_key") as walk, \
-                 patch.object(antiphon.peers, "write_session") as write_session, \
+                 patch.object(antiphon.peers, "owner_key", return_value="300:x"), \
                  patch.object(antiphon, "build_summary", return_value=("", None, 0)), \
                  patch.object(antiphon, "read_cursor", return_value={}), \
                  patch.object(antiphon, "write_cursor"), \
                  contextlib.redirect_stdout(io.StringIO()):
                 self.assertEqual(antiphon.hook("claude"), 0)
-        walk.assert_not_called()
-        write_session.assert_not_called()
+            self.assertIsNone(antiphon.peers.read_session(project, "codex", "build"))
+            self.assertFalse(os.path.exists(
+                antiphon.peers.peer_dir(project, "codex", "build")))
 
     def test_the_hook_still_injects_context_when_the_registry_is_broken(self):
         with tempfile.TemporaryDirectory() as project, \
@@ -5818,6 +5851,139 @@ class CodexPeerWiringTest(unittest.TestCase):
         self.assertEqual(
             [entry["command"] for group in hooks["UserPromptSubmit"]
              for entry in group["hooks"]].count("antiphon hook codex"), 1)
+
+
+class ClaudeSessionWiringTest(unittest.TestCase):
+    """The Claude hook's half of a Claude peer: which session is behind an alias.
+
+    The mirror of the Codex pair. The channel server owns `endpoint.json` and
+    knows the socket; the hook owns `session.json` and knows the session id,
+    and it writes it on every turn it sees. Neither reads, modifies and writes
+    the other's file, so the join between them is the owner key and never a
+    guess.
+    """
+
+    UUID = "1d5a03e0-0548-4339-87c3-45c5dbf7e9d7"
+    OTHER = "2e6b14f1-1659-544a-98d4-56d6eca8fa48"
+
+    @staticmethod
+    @contextlib.contextmanager
+    def _named(name):
+        """`ANTIPHON_NAME` as this session would really see it — set, or absent."""
+        with patch.dict(os.environ, {}):
+            os.environ.pop("ANTIPHON_NAME", None)
+            if name:
+                os.environ["ANTIPHON_NAME"] = name
+            yield
+
+    def _hook(self, project, session_id=None, name="ui", owner="300:x",
+              transcript="/t/c.jsonl", event="UserPromptSubmit"):
+        payload = {"cwd": project, "hook_event_name": event,
+                   "transcript_path": transcript}
+        if session_id is not None:
+            payload["session_id"] = session_id
+        out, err, written = io.StringIO(), io.StringIO(), []
+        with self._named(name), \
+             patch.object(antiphon.sys, "stdin", io.StringIO(json.dumps(payload))), \
+             patch.object(antiphon.peers, "owner_key", return_value=owner), \
+             patch.object(antiphon, "build_summary", return_value=("", None, 0)), \
+             patch.object(antiphon, "read_cursor", return_value={}), \
+             patch.object(antiphon, "write_cursor",
+                          side_effect=lambda cwd, data, kind: written.append(kind) or True), \
+             contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            code = antiphon.hook("claude")
+        return code, out.getvalue(), err.getvalue(), written
+
+    def test_a_named_claude_turn_records_its_session(self):
+        """The whole point: a live alias can be joined to the transcript it is
+        writing, through the same `write_session` the Codex hook uses."""
+        with tempfile.TemporaryDirectory() as project:
+            code, _, err, _ = self._hook(project, session_id=self.UUID)
+            record = antiphon.peers.read_session(project, "claude", "ui")
+            self.assertTrue(os.path.exists(os.path.join(
+                antiphon.peers.peer_dir(project, "claude", "ui"), "session.json")))
+        self.assertEqual(code, 0, err)
+        self.assertEqual(record["kind"], "claude")
+        self.assertEqual(record["name"], "ui")
+        self.assertEqual(record["session_id"], self.UUID)
+        self.assertEqual(record["transcript"], "/t/c.jsonl")
+        self.assertEqual(record["owner"], "300:x")
+
+    def test_an_unnamed_claude_turn_records_nothing(self):
+        """Measured before this change and pinned after it: an unnamed session
+        asked for nothing, so there is nothing to record and nothing to say."""
+        with tempfile.TemporaryDirectory() as project:
+            _, _, err, _ = self._hook(project, name="", session_id=self.UUID)
+            self.assertFalse(os.path.exists(antiphon.peers.peers_dir(project)))
+        self.assertEqual(err, "")
+
+    def test_the_reserved_key_never_gains_a_session_record(self):
+        """`<unnamed>` is where a channel server without a name puts its socket,
+        because a socket has to be findable. It is not a name, so no session may
+        be recorded under it: a page that printed it would show angle brackets
+        for a peer the registry says has no name at all."""
+        with tempfile.TemporaryDirectory() as project:
+            antiphon.peers.register(project, "claude", antiphon.peers.UNNAMED,
+                                    "/t/u.sock", pid=os.getpid(),
+                                    owner_key="300:x")
+            self._hook(project, name="", session_id=self.UUID)
+            self.assertIsNone(antiphon.peers.read_session(
+                project, "claude", antiphon.peers.UNNAMED))
+
+    def test_a_later_turn_replaces_the_session_id_it_recorded(self):
+        """Every turn, not once at start-up. A claim taken once would keep
+        naming the session that started the channel, and a resume or a fork
+        would then put the live alias on a transcript nobody is writing."""
+        with tempfile.TemporaryDirectory() as project:
+            self._hook(project, session_id=self.UUID)
+            self._hook(project, session_id=self.OTHER)
+            record = antiphon.peers.read_session(project, "claude", "ui")
+        self.assertEqual(record["session_id"], self.OTHER)
+
+    def test_a_second_owners_claude_hook_cannot_repoint_a_live_alias(self):
+        """The two-writer law, extended to this side: the session that got there
+        first keeps working and the second one is told. The owner offered here
+        is this session's own, never the one the endpoint already claims."""
+        with tempfile.TemporaryDirectory() as project:
+            antiphon.peers.register(project, "claude", "ui", "/t/ui.sock",
+                                    pid=os.getppid(), owner_key="300:first")
+            antiphon.peers.write_session(project, "claude", "ui", self.UUID,
+                                         "/t/first.jsonl", "300:first")
+            _, _, err, _ = self._hook(project, session_id=self.OTHER,
+                                      owner="301:second")
+            record = antiphon.peers.read_session(project, "claude", "ui")
+        self.assertEqual(record["session_id"], self.UUID,
+                         "the first session is untouched")
+        self.assertEqual(record["transcript"], "/t/first.jsonl")
+        self.assertIn("ui", err, "the second session is told whose alias it is")
+
+    def test_an_ownerless_endpoint_stays_silent(self):
+        """An endpoint with no owner key refuses the write and names nobody:
+        the record is most often this very session's own, registered before the
+        field existed or by a tree `owner_key` could not walk. Saying "another
+        live session (pid <your own>)" once per prompt, forever, would be a
+        false accusation nobody can act on. `doctor` says it once, calmly,
+        where somebody is asking."""
+        with tempfile.TemporaryDirectory() as project:
+            antiphon.peers.register(project, "claude", "ui", "/t/ui.sock",
+                                    pid=os.getpid())
+            code, _, err, _ = self._hook(project, session_id=self.UUID)
+            self.assertIsNone(antiphon.peers.read_session(project, "claude", "ui"))
+        self.assertEqual(code, 0)
+        self.assertEqual(err, "", "not a word, not once per turn")
+
+    def test_the_claude_hook_records_only_its_own_side(self):
+        """`ANTIPHON_NAME` is shared by both sides of one terminal, so a Claude
+        hook that wrote a codex record would be describing a peer it is not.
+        It walks the process tree now — that is how the two halves join — but
+        only ever to write under its own kind."""
+        with tempfile.TemporaryDirectory() as project:
+            self._hook(project, name="build", session_id=self.UUID)
+            mine = antiphon.peers.read_session(project, "claude", "build")
+            self.assertIsNone(antiphon.peers.read_session(project, "codex", "build"))
+            self.assertFalse(os.path.exists(
+                antiphon.peers.peer_dir(project, "codex", "build")))
+        self.assertEqual(mine["session_id"], self.UUID)
 
 
 class RoutingTest(unittest.TestCase):
