@@ -2666,8 +2666,132 @@ def _mcp_serve(cwd, alias=None):
 
 # ---------- setup ----------
 
+# --- what setup writes, as data ---
+#
+# Every shape below used to be a literal inside one of `setup`'s closures,
+# reachable from nothing else. `doctor` has to read back exactly what `setup`
+# wrote, and a diagnostic holding its own spelling of a string the writer may
+# change is a bridge that reports itself healthy while one direction is silent.
+# So the shapes are module data with one spelling each, and both the writer and
+# the reader consume them.
+#
+# Measured before the split: `mcp__antiphon__reply_to_codex` and
+# `default_tools_approval_mode` were asserted by no test in the suite, so an
+# extraction that dropped either passed all 525 tests.
+
 HOOK_COMMAND = "antiphon hook {side}"
 PUSH_COMMAND = "antiphon push {target}"
+
+# What a Codex user reads at the "New hook - review required" prompt.
+CODEX_HOOK_LABEL = "Antiphon bridge"
+
+# Without this in `permissions.allow`, Claude is asked to approve the reply tool
+# on every single use, and the Claude → Codex direction goes quiet in practice.
+REPLY_TOOL_PERMISSION = "mcp__antiphon__reply_to_codex"
+
+# The `.mcp.json` server key. `.claude/settings.local.json` allow-lists the same
+# name — it is one server, so it is one fact and one spelling.
+CHANNEL_SERVER_NAME = "antiphon"
+
+# Paths relative to the project directory, so the writer and the reader cannot
+# disagree about which file holds which shape.
+CLAUDE_SETTINGS_FILE = os.path.join(".claude", "settings.json")
+CLAUDE_LOCAL_SETTINGS_FILE = os.path.join(".claude", "settings.local.json")
+CODEX_HOOKS_FILE = os.path.join(".codex", "hooks.json")
+CODEX_CONFIG_FILE = os.path.join(".codex", "config.toml")
+MCP_CONFIG_FILE = ".mcp.json"
+
+CODEX_MCP_TABLE = "mcp_servers.antiphon"
+CODEX_MCP_ENV_TABLE = CODEX_MCP_TABLE + ".env"
+
+# Each assignment in `[mcp_servers.antiphon]` with the comment that precedes it
+# in the written file. The comments belong to the writer alone: `doctor` looks
+# up the assignments and never the prose, so re-wording a comment is not drift.
+CODEX_TABLE_ASSIGNMENTS = (
+    ('command = "antiphon"', ""),
+    ('args = ["mcp"]', ""),
+    ('default_tools_approval_mode = "approve"',
+     "# read-only local bridge; no need to ask on every turn\n"),
+    ('env_vars = ["ANTIPHON_NAME"]',
+     "# forwarded, not set: the peer name comes from the terminal that\n"
+     "# started this session, and Codex does not pass it down otherwise\n"),
+)
+
+HookShape = collections.namedtuple("HookShape", "path event command label")
+
+
+def hook_shapes():
+    """Every hook `setup` installs: which file, which event, which command.
+
+    One table, two readers — `setup` installs each row and `doctor` looks each
+    row back up in the file it finds. Two enumerations would be two spellings
+    of one fact, and the one that drifts is the one nothing runs.
+
+    The Codex pull hook appears twice on purpose. The session id arrives at
+    `SessionStart`; `UserPromptSubmit` is the fallback for a CLI that never
+    sends one, which makes a peer routable one turn later rather than never.
+    """
+    return (
+        HookShape(CLAUDE_SETTINGS_FILE, "UserPromptSubmit",
+                  HOOK_COMMAND.format(side="claude"), None),
+        HookShape(CLAUDE_SETTINGS_FILE, "Stop",
+                  PUSH_COMMAND.format(target="codex"), None),
+        HookShape(CODEX_HOOKS_FILE, "UserPromptSubmit",
+                  HOOK_COMMAND.format(side="codex"), CODEX_HOOK_LABEL),
+        HookShape(CODEX_HOOKS_FILE, "SessionStart",
+                  HOOK_COMMAND.format(side="codex"), CODEX_HOOK_LABEL),
+        HookShape(CODEX_HOOKS_FILE, "Stop",
+                  PUSH_COMMAND.format(target="claude"), None),
+    )
+
+
+def channel_server_entry(cwd):
+    """The `.mcp.json` entry that starts Claude's MCP Channel server.
+
+    `args = ["channel"]`, never `["mcp"]`: the `mcp` server is Codex's side and
+    hands out `antiphon_read`. `env` carries the absolute project directory
+    because the server is invoked as a bare `antiphon` with no path argument,
+    and has no other way to know which project it serves."""
+    return {"command": "antiphon", "args": ["channel"],
+            "env": {"ANTIPHON_CWD": cwd}}
+
+
+def codex_env_assignments(cwd):
+    """The `[mcp_servers.antiphon.env]` assignments, in written order.
+
+    The value, not just the key: a table left pointing at a renamed directory
+    reads another project's registry and delivers nothing, which is a quiet
+    bridge with every key present."""
+    return [f'ANTIPHON_CWD = "{cwd}"']
+
+
+def hook_installed(data, shape):
+    """Whether one hook row is already present in a parsed settings file.
+
+    The reading `_add_hook` performs when it decides there is nothing to add,
+    without the mutation that makes that answer unusable to a read-only caller.
+    A shape naming a label demands that label too: a stale one is what a Codex
+    user is asked to approve.
+
+    Everything here comes off disk, so every level is type-checked rather than
+    indexed — a hand-edited file may hold any shape at all and a diagnostic
+    must not raise on one."""
+    events = data.get("hooks") if isinstance(data, dict) else None
+    groups = events.get(shape.event) if isinstance(events, dict) else None
+    if not isinstance(groups, list):
+        return False
+    for group in groups:
+        entries = group.get("hooks") if isinstance(group, dict) else None
+        for entry in entries if isinstance(entries, list) else []:
+            if not isinstance(entry, dict):
+                continue
+            if entry.get("command") != shape.command:
+                continue
+            if shape.label is not None and entry.get("statusMessage") != shape.label:
+                continue
+            return True
+    return False
+
 
 SECTION_HEADING = "## The Antiphon bridge"
 
@@ -2895,7 +3019,6 @@ def _update_instructions(current, rule):
     return current[:start].rstrip("\n") + rule + tail, "updated"
 
 
-CODEX_MCP_TABLE = "mcp_servers.antiphon"
 # Matches `[table]` and `[[table]]` headers, capturing the name between them.
 TOML_HEADER = re.compile(r"^\s*\[\[?\s*([^\[\]]+?)\s*\]\]?\s*$")
 
@@ -2913,16 +3036,11 @@ def _codex_config_block(cwd):
     a curated set plus whatever `env` declares. Without this line `ANTIPHON_NAME`
     never reaches `antiphon mcp` however the terminal was started, so the server
     and the hook could not agree on which peer they belong to."""
-    return (f'[{CODEX_MCP_TABLE}]\n'
-            'command = "antiphon"\n'
-            'args = ["mcp"]\n'
-            '# read-only local bridge; no need to ask on every turn\n'
-            'default_tools_approval_mode = "approve"\n'
-            '# forwarded, not set: the peer name comes from the terminal that\n'
-            "# started this session, and Codex does not pass it down otherwise\n"
-            'env_vars = ["ANTIPHON_NAME"]\n'
-            f'\n[{CODEX_MCP_TABLE}.env]\n'
-            f'ANTIPHON_CWD = "{cwd}"\n')
+    table = "".join(f"{comment}{line}\n"
+                    for line, comment in CODEX_TABLE_ASSIGNMENTS)
+    env = "".join(f"{line}\n" for line in codex_env_assignments(cwd))
+    return (f'[{CODEX_MCP_TABLE}]\n{table}'
+            f'\n[{CODEX_MCP_ENV_TABLE}]\n{env}')
 
 
 def _strip_toml_table(text, table):
@@ -2976,18 +3094,20 @@ def setup():
             return
         print(f"{'✓' if changed else '·'} {done if changed else already}: {target}")
 
+    # Every command, event and label comes from the shared table; only the
+    # legacy spellings to upgrade and the lines to print belong to the writer.
+    claude_pull, claude_push, codex_pull, codex_session, codex_push = hook_shapes()
+
     # --- Claude Code side: .claude/settings.json ---
-    claude_target = os.path.join(cwd, ".claude", "settings.json")
-    claude_command = HOOK_COMMAND.format(side="claude")
+    claude_target = os.path.join(cwd, CLAUDE_SETTINGS_FILE)
     legacy_commands = _legacy_commands(script, "kanca", "claude")
 
     def claude_mutate(data):
-        hooks = data.setdefault("hooks", {}).setdefault("UserPromptSubmit", [])
-        changed = _add_hook(hooks, claude_command, legacy_commands)
+        hooks = data.setdefault("hooks", {}).setdefault(claude_pull.event, [])
+        changed = _add_hook(hooks, claude_pull.command, legacy_commands)
         allowed = data.setdefault("permissions", {}).setdefault("allow", [])
-        reply_tool = "mcp__antiphon__reply_to_codex"
-        if reply_tool not in allowed:
-            allowed.append(reply_tool)
+        if REPLY_TOOL_PERMISSION not in allowed:
+            allowed.append(REPLY_TOOL_PERMISSION)
             changed = True
         return changed
 
@@ -2995,88 +3115,82 @@ def setup():
             "Claude hook installed", "Claude hook already installed")
 
     # --- Claude side: push to Codex (Stop hook) ---
-    push_command = PUSH_COMMAND.format(target="codex")
     legacy_push_commands = _legacy_commands(script, "it", "codex")
 
     def push_mutate(data):
-        hooks = data.setdefault("hooks", {}).setdefault("Stop", [])
-        return _add_hook(hooks, push_command, legacy_push_commands)
+        hooks = data.setdefault("hooks", {}).setdefault(claude_push.event, [])
+        return _add_hook(hooks, claude_push.command, legacy_push_commands)
 
     install(claude_target, push_mutate,
             "Push-to-Codex hook installed (Stop)",
             "Push-to-Codex hook already installed")
 
     # --- Codex side: .codex/hooks.json (same contract, same body) ---
-    codex_target = os.path.join(cwd, ".codex", "hooks.json")
-    codex_command = HOOK_COMMAND.format(side="codex")
+    codex_target = os.path.join(cwd, CODEX_HOOKS_FILE)
     legacy_codex_commands = _legacy_commands(script, "kanca", "codex")
 
     def codex_mutate(data):
-        hooks = data.setdefault("hooks", {}).setdefault("UserPromptSubmit", [])
-        return _add_hook(hooks, codex_command, legacy_codex_commands,
-                         label="Antiphon bridge")
+        hooks = data.setdefault("hooks", {}).setdefault(codex_pull.event, [])
+        return _add_hook(hooks, codex_pull.command, legacy_codex_commands,
+                         label=codex_pull.label)
 
     install(codex_target, codex_mutate,
             "Codex hook installed", "Codex hook already installed")
 
     # The Codex session id arrives at SessionStart, so the same command is
-    # installed there too. Under both events is also the fallback: if
-    # SessionStart is missed — an older CLI, a config predating this — the first
-    # prompt records the session instead, and a peer becomes routable one turn
-    # later rather than never. SessionEnd is deliberately not installed: it can
-    # be delayed or missed, so nothing may depend on it.
+    # installed there too (the second Codex pull row above). Under both events
+    # is also the fallback: if SessionStart is missed — an older CLI, a config
+    # predating this — the first prompt records the session instead, and a peer
+    # becomes routable one turn later rather than never. SessionEnd is
+    # deliberately not installed: it can be delayed or missed, so nothing may
+    # depend on it.
     def codex_session_mutate(data):
-        hooks = data.setdefault("hooks", {}).setdefault("SessionStart", [])
-        return _add_hook(hooks, codex_command, label="Antiphon bridge")
+        hooks = data.setdefault("hooks", {}).setdefault(codex_session.event, [])
+        return _add_hook(hooks, codex_session.command, label=codex_session.label)
 
     install(codex_target, codex_session_mutate,
             "Codex session hook installed (SessionStart)",
             "Codex session hook already installed")
 
     # --- Codex side: push to Claude (Stop hook) ---
-    reverse_push_command = PUSH_COMMAND.format(target="claude")
     legacy_reverse_push_commands = _legacy_commands(script, "it", "claude")
 
     def reverse_push_mutate(data):
-        hooks = data.setdefault("hooks", {}).setdefault("Stop", [])
-        return _add_hook(hooks, reverse_push_command, legacy_reverse_push_commands)
+        hooks = data.setdefault("hooks", {}).setdefault(codex_push.event, [])
+        return _add_hook(hooks, codex_push.command, legacy_reverse_push_commands)
 
     install(codex_target, reverse_push_mutate,
             "Push-to-Claude hook installed (Stop)",
             "Push-to-Claude hook already installed")
 
     # --- Codex side: the antiphon_read MCP tool (.codex/config.toml) ---
-    codex_config = os.path.join(cwd, ".codex", "config.toml")
+    codex_config = os.path.join(cwd, CODEX_CONFIG_FILE)
     written = _update_codex_config(codex_config, cwd)
     print(f"{'✓' if written else '·'} Codex MCP tool "
           f"{'registered' if written else 'already registered'}: {codex_config}")
 
     # --- Claude Code MCP Channel ---
-    mcp_target = os.path.join(cwd, ".mcp.json")
-    channel_config = {
-        "command": "antiphon",
-        "args": ["channel"],
-        "env": {"ANTIPHON_CWD": cwd},
-    }
+    mcp_target = os.path.join(cwd, MCP_CONFIG_FILE)
+    channel_config = channel_server_entry(cwd)
 
     def mcp_mutate(data):
         servers = data.setdefault("mcpServers", {})
-        if servers.get("antiphon") == channel_config:
+        if servers.get(CHANNEL_SERVER_NAME) == channel_config:
             return False
-        servers["antiphon"] = channel_config
+        servers[CHANNEL_SERVER_NAME] = channel_config
         return True
 
     install(mcp_target, mcp_mutate,
             "Claude MCP Channel registered", "Claude MCP Channel already registered")
 
     # Claude Code may also keep .mcp.json servers in a local allowlist.
-    local_target = os.path.join(cwd, ".claude", "settings.local.json")
+    local_target = os.path.join(cwd, CLAUDE_LOCAL_SETTINGS_FILE)
 
     def local_mutate(data):
         enabled = data.setdefault("enabledMcpjsonServers", [])
-        if "antiphon" in enabled:
+        if CHANNEL_SERVER_NAME in enabled:
             return False
-        enabled.append("antiphon")
+        enabled.append(CHANNEL_SERVER_NAME)
         return True
 
     install(local_target, local_mutate,

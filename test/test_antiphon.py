@@ -7,6 +7,7 @@ import errno
 import fcntl
 import io
 import json
+import shutil
 import subprocess
 import tempfile
 import time
@@ -2488,6 +2489,188 @@ class AntiphonTest(unittest.TestCase):
                     "codex_seen": 12.0,
                     "last_pushed_claude": {"": "fingerprint"},
                 }, "the next write persists the translation")
+
+
+class SetupShapeCharacterizationTest(unittest.TestCase):
+    """Exactly what `setup` writes, file by file, and exactly what it prints.
+
+    These are characterization tests, not new promises: they were written
+    against the shipped behaviour and passed unchanged before the expected
+    shapes moved out of `setup`'s closures into module data. That is the whole
+    point of them — measured, two of the strings the extraction touches
+    (`mcp__antiphon__reply_to_codex` and `default_tools_approval_mode`) were
+    asserted by no test at all, so an extraction that dropped either one passed
+    the entire suite while silencing the bridge in one direction.
+
+    Whole-value assertions, never `assertIn`: a containment check cannot see a
+    key that was added, an entry that was duplicated, or a hook that moved to
+    another event."""
+
+    def install(self):
+        """Runs `setup` into a fresh fixture. Returns (project, stdout)."""
+        project = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, project, ignore_errors=True)
+        out = io.StringIO()
+        with patch.object(antiphon, "project_dir", return_value=project), \
+             contextlib.redirect_stdout(out):
+            self.assertEqual(antiphon.setup(), 0)
+        return project, out.getvalue()
+
+    @staticmethod
+    def written(project, *parts):
+        with open(os.path.join(project, *parts), encoding="utf-8") as f:
+            return f.read()
+
+    def test_setup_writes_the_whole_claude_settings_shape(self):
+        """Both Claude hooks and the permission that lets Claude answer at all.
+
+        Without `mcp__antiphon__reply_to_codex` in `permissions.allow`, the
+        `reply_to_codex` tool needs approval on every use and the Claude→Codex
+        direction goes quiet — the exact failure `doctor` exists to explain."""
+        project, _ = self.install()
+        self.assertEqual(json.loads(self.written(project, ".claude", "settings.json")), {
+            "hooks": {
+                "UserPromptSubmit": [
+                    {"hooks": [{"type": "command",
+                                "command": "antiphon hook claude"}]}],
+                "Stop": [
+                    {"hooks": [{"type": "command",
+                                "command": "antiphon push codex"}]}],
+            },
+            "permissions": {"allow": ["mcp__antiphon__reply_to_codex"]},
+        })
+
+    def test_setup_writes_the_whole_local_allowlist_shape(self):
+        """Claude Code gates `.mcp.json` servers behind this list. Without the
+        entry the channel server never starts and there is no socket to find."""
+        project, _ = self.install()
+        self.assertEqual(
+            json.loads(self.written(project, ".claude", "settings.local.json")),
+            {"enabledMcpjsonServers": ["antiphon"]})
+
+    def test_setup_writes_the_whole_codex_hooks_shape(self):
+        """Three events, and the label a Codex user reads at the hook-approval
+        prompt. One entry per event, never two."""
+        project, _ = self.install()
+        pull = [{"hooks": [{"type": "command",
+                            "command": "antiphon hook codex",
+                            "statusMessage": "Antiphon bridge"}]}]
+        self.assertEqual(json.loads(self.written(project, ".codex", "hooks.json")), {
+            "hooks": {
+                "UserPromptSubmit": pull,
+                "SessionStart": pull,
+                "Stop": [{"hooks": [{"type": "command",
+                                     "command": "antiphon push claude"}]}],
+            },
+        })
+
+    def test_setup_writes_the_whole_codex_mcp_table(self):
+        """Every key and every value, including the approval mode — which no
+        other test asserts — and the project directory the server is aimed at."""
+        project, _ = self.install()
+        self.assertEqual(self.written(project, ".codex", "config.toml"),
+                         '[mcp_servers.antiphon]\n'
+                         'command = "antiphon"\n'
+                         'args = ["mcp"]\n'
+                         '# read-only local bridge; no need to ask on every turn\n'
+                         'default_tools_approval_mode = "approve"\n'
+                         '# forwarded, not set: the peer name comes from the terminal that\n'
+                         '# started this session, and Codex does not pass it down otherwise\n'
+                         'env_vars = ["ANTIPHON_NAME"]\n'
+                         '\n[mcp_servers.antiphon.env]\n'
+                         f'ANTIPHON_CWD = "{project}"\n')
+
+    def test_setup_writes_the_whole_mcp_channel_entry(self):
+        """`args = ["channel"]`, not `["mcp"]`: the two servers hand out
+        different tools and aiming one at the other inverts who may speak."""
+        project, _ = self.install()
+        self.assertEqual(json.loads(self.written(project, ".mcp.json")), {
+            "mcpServers": {
+                "antiphon": {
+                    "command": "antiphon",
+                    "args": ["channel"],
+                    "env": {"ANTIPHON_CWD": project},
+                },
+            },
+        })
+
+    def test_setup_prints_a_line_per_target_and_the_closing_guidance(self):
+        """Measured before this test existed: 19 setup tests discard stdout and
+        none asserted a single line of it, so a refactor of `setup` could
+        rewrite the output of the very function it refactors and stay green."""
+        project, printed = self.install()
+        claude = os.path.join(project, ".claude", "settings.json")
+        codex = os.path.join(project, ".codex", "hooks.json")
+        self.assertEqual(printed, "\n".join([
+            f"✓ Claude hook installed: {claude}",
+            f"✓ Push-to-Codex hook installed (Stop): {claude}",
+            f"✓ Codex hook installed: {codex}",
+            f"✓ Codex session hook installed (SessionStart): {codex}",
+            f"✓ Push-to-Claude hook installed (Stop): {codex}",
+            "✓ Codex MCP tool registered: "
+            + os.path.join(project, ".codex", "config.toml"),
+            "✓ Claude MCP Channel registered: "
+            + os.path.join(project, ".mcp.json"),
+            "✓ Claude MCP local permission updated: "
+            + os.path.join(project, ".claude", "settings.local.json"),
+            "✓ AGENTS.md rule added: " + os.path.join(project, "AGENTS.md"),
+            "✓ CLAUDE.md rule added: " + os.path.join(project, "CLAUDE.md"),
+            "",
+            "— One last step: Codex hooks need a one-time security approval.",
+            "  Open `codex` in this directory; approve the hook at the "
+            "'New hook - review required' prompt.",
+            "  Approval is granted once and then persists (it asks again only "
+            "if the file changes).",
+            "",
+            "— Start Claude with the channel enabled:",
+            "  claude --dangerously-load-development-channels server:antiphon",
+            "  In the research preview, the first launch needs both a "
+            "development channel and an MCP approval.",
+            "",
+            "— More than one terminal on either side? Name every one of them:",
+            "  ANTIPHON_NAME=ui claude --dangerously-load-development-channels "
+            "server:antiphon",
+            "  ANTIPHON_NAME=build codex",
+            "  An unnamed session still runs, but it cannot be addressed by "
+            "name. Name the",
+            "  Codex terminals above all: an unnamed Codex session leaves no "
+            "record at all,",
+            "  so once any Codex peer is named, an unaddressed message to "
+            "Codex is refused",
+            "  rather than sent to a guess.",
+            "",
+        ]))
+
+    def test_a_second_setup_reports_every_target_as_already_done(self):
+        """The `·` spelling is as much a shape as the `✓` one: it is what a
+        person sees when they run `setup` to check, and it distinguishes
+        idempotence from a second install."""
+        project, _ = self.install()
+        out = io.StringIO()
+        with patch.object(antiphon, "project_dir", return_value=project), \
+             contextlib.redirect_stdout(out):
+            self.assertEqual(antiphon.setup(), 0)
+        status_lines = [line for line in out.getvalue().splitlines()
+                        if line[:1] in ("✓", "·")]
+        claude = os.path.join(project, ".claude", "settings.json")
+        codex = os.path.join(project, ".codex", "hooks.json")
+        self.assertEqual(status_lines, [
+            f"· Claude hook already installed: {claude}",
+            f"· Push-to-Codex hook already installed: {claude}",
+            f"· Codex hook already installed: {codex}",
+            f"· Codex session hook already installed: {codex}",
+            f"· Push-to-Claude hook already installed: {codex}",
+            "· Codex MCP tool already registered: "
+            + os.path.join(project, ".codex", "config.toml"),
+            "· Claude MCP Channel already registered: "
+            + os.path.join(project, ".mcp.json"),
+            "· Claude MCP local permission already up to date: "
+            + os.path.join(project, ".claude", "settings.local.json"),
+            "· AGENTS.md rule already up to date: "
+            + os.path.join(project, "AGENTS.md"),
+            "· CLAUDE.md rule already up to date: "
+            + os.path.join(project, "CLAUDE.md"),
+        ])
 
 
 class PagedSummaryModelTest(unittest.TestCase):
