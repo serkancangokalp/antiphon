@@ -5,6 +5,7 @@ import antiphon
 import contextlib
 import errno
 import fcntl
+import hashlib
 import io
 import json
 import shutil
@@ -1244,10 +1245,13 @@ class AntiphonTest(unittest.TestCase):
         self.assertIn(str(antiphon.MAX_CHANNEL_BYTES), detail)
 
     def test_the_send_tool_reports_an_oversized_message_as_an_error(self):
+        """Multi-byte and above `ATTACHMENT_MAX`, where the tool still refuses:
+        below that cap this size parks its words and delivers an envelope."""
         with tempfile.TemporaryDirectory() as project:
             antiphon.peers.register(project, "claude", "ui", "/tmp/ui.sock")
             with patch.object(antiphon.socket, "socket") as opened:
-                result = antiphon._send_tool(project, "ç" * antiphon.MAX_CHANNEL_BYTES)
+                result = antiphon._send_tool(
+                    project, "ç" * (antiphon.ATTACHMENT_MAX // 2 + 10))
                 opened.assert_not_called()
         self.assertIs(result.get("isError"), True)
         self.assertIn("bytes", result["content"][0]["text"])
@@ -8465,7 +8469,17 @@ class RefusedSendHonestyTest(unittest.TestCase):
             return answer
 
     def _oversized(self):
-        return "x" * (antiphon.MAX_CHANNEL_BYTES + 10)
+        """Larger than any store will hold, so it still refuses.
+
+        Between `MAX_CHANNEL_BYTES` and `ATTACHMENT_MAX` an oversized direct
+        send now parks its words and delivers an envelope, so a fixture there
+        would exercise the spill instead of the refusal these cases are about.
+        Above `ATTACHMENT_MAX` there is no store road, the send falls through
+        to the same `oversize` refusal it always made, and every assertion here
+        keeps its meaning. Measured at 11 ms to build and serialize one of
+        these, which is why the move is cheaper than rewriting the cases.
+        """
+        return "x" * (antiphon.ATTACHMENT_MAX + 10)
 
     # ---- the guidance-carrying classes ----
 
@@ -8574,6 +8588,11 @@ class RefusedSendHonestyTest(unittest.TestCase):
              lambda: named_reply(patch.object(antiphon.subprocess, "run",
                                               side_effect=FileNotFoundError())),
              "codex command not found", replied),
+            ("_queue_codex: the exec itself was refused",
+             lambda: named_reply(patch.object(
+                 antiphon.subprocess, "run",
+                 side_effect=OSError(errno.E2BIG, "Argument list too long"))),
+             "Argument list too long", replied),
             ("_queue_codex: the subprocess never completed",
              lambda: named_reply(patch.object(
                  antiphon.subprocess, "run",
@@ -8609,7 +8628,12 @@ class RefusedSendHonestyTest(unittest.TestCase):
                  answer=b'{"ok": false, "error": "channel said no"}')),
              "channel said no", sent),
         ]
-        self.assertEqual(len(sites), 10,
+        # 10 existing rows plus one: `_queue_codex`'s crash-belt, which turns
+        # an exec the kernel refuses — measured at 1.1 MB of message on this
+        # machine — into a classified refusal instead of a traceback out of a
+        # Stop hook. The quota refusal born in the spill branch adds no row: it
+        # is unclassed, and an unwrapped refusal is not a census site.
+        self.assertEqual(len(sites), 11,
                          "one case per wrap site, and every wrap site has one")
         for label, refuse, fragment, guidance in sites:
             with self.subTest(label):
@@ -8799,6 +8823,403 @@ class RefusedSendHonestyTest(unittest.TestCase):
         self.assertTrue(line.endswith(antiphon.TOOL_GUIDANCE.format(
             seen="only a tool-name line")), line)
 
+
+class AttachmentSpillTest(unittest.TestCase):
+    """An oversized direct message parks its words instead of dying.
+
+    The decision lives in the tools, above the transports: measured, a spill
+    inside `send_to_claude` or `_queue_codex` strips the bridge prefix the echo
+    guard is anchored on, and leaves the mid-turn park holding the original. At
+    this layer the envelope simply replaces the outgoing text, and prefixes,
+    labels, the park and dedupe all see an ordinary message.
+
+    The fakes are bounded on purpose. A bare `MagicMock` socket satisfies
+    `connect`/`sendall`/`shutdown` and then hands `send_to_claude`'s reply loop
+    a truthy mock whose `__len__` is 0 — an infinite loop, measured as two
+    suite hangs in exactly this area.
+    """
+
+    UUID = RefusedSendHonestyTest.UUID
+    _DeadSocket = RefusedSendHonestyTest._DeadSocket
+    _LiveSocket = RefusedSendHonestyTest._LiveSocket
+    _Refused = RefusedSendHonestyTest._Refused
+    _Queued = RefusedSendHonestyTest._Queued
+
+    # Measured against `send_to_claude`'s own serialization (Task 1(b)): raw
+    # 130,982 bytes serialize to 131,073 — one byte over a cap the raw length
+    # is 90 bytes under. A trigger on `len(text.encode())` lets this through.
+    ASCII_BAND = "x" * 130_982
+    # Six-fold escaping: every control character costs `\u00XX`. Raw 22,000,
+    # serialized 132,091 — one sixth of the cap by raw bytes and over it by
+    # payload bytes.
+    HIGH_ESCAPE = "\x01" * 22_000
+
+    class _Recorder(RefusedSendHonestyTest._LiveSocket):
+        """A channel that connects, answers, and keeps what it was handed."""
+
+        def __init__(self, **how):
+            super().__init__(**how)
+            self.payloads = []
+
+        def sendall(self, data):
+            self.payloads.append(data)
+            super().sendall(data)
+
+    @staticmethod
+    def _codex_peer(project, alias, owner, session=None):
+        RefusedSendHonestyTest._codex_peer(project, alias, owner, session)
+
+    @staticmethod
+    def _reply(project, payload):
+        return RefusedSendHonestyTest._reply(project, payload)
+
+    @staticmethod
+    def _store(project):
+        return os.path.join(project, ".antiphon", "messages")
+
+    @classmethod
+    def _files(cls, project):
+        """Every entry in the store, by name — foreign ones included."""
+        store = cls._store(project)
+        return sorted(os.listdir(store)) if os.path.isdir(store) else []
+
+    @classmethod
+    def _only_parked(cls, project):
+        """The one parked attachment, as (absolute path, content bytes)."""
+        names = cls._files(project)
+        assert len(names) == 1, names
+        path = os.path.join(cls._store(project), names[0])
+        with open(path, "rb") as f:
+            return path, f.read().partition(b"\n\n")[2]
+
+    @staticmethod
+    def _queue_recorder(queued):
+        """`codex queue` that accepts, and keeps the argv it was exec'd with.
+
+        Everything else runs for real. The registry's own `ps` liveness probe
+        shares this module attribute — measured, it is the first call through
+        here — and answering it with a queue fixture would quietly make every
+        peer look however the fixture looks.
+        """
+        real = antiphon.subprocess.run
+
+        def run(argv, **kw):
+            if list(argv[:2]) != ["codex", "queue"]:
+                return real(argv, **kw)
+            queued.append(argv)
+            return RefusedSendHonestyTest._Queued()
+        return patch.object(antiphon.subprocess, "run", side_effect=run)
+
+    @staticmethod
+    def _spills_over(size):
+        """The queue predicate, patched down to `size` bytes.
+
+        The real bound is computed at call time from `SC_ARG_MAX` minus the
+        live environment, so it moves between machines and between shells —
+        measured at 1,044,907 / 844,907 / 444,907 bytes as the environment
+        grew. Building a payload over it in a test would be both slow and
+        wrong; the predicate is the seam, and it is the thing patched.
+        """
+        return patch.object(antiphon, "_oversized_for_queue",
+                            side_effect=lambda message: len(message) > size)
+
+    @staticmethod
+    def _push_live(project, target, turn_text):
+        """One Stop-hook push against the project's REAL cursor.
+
+        `RefusedSendHonestyTest._push` patches the cursor away, which is right
+        for a refusal fixture and wrong here: the question this arm asks is
+        what the park written a moment ago does to the echo.
+        """
+        transcript = os.path.join(project, "transcript.jsonl")
+        with open(transcript, "w", encoding="utf-8"):
+            pass
+        payload = {"cwd": project, "transcript_path": transcript}
+        turn = "_claude_turn" if target == "codex" else "_codex_turn"
+        err = io.StringIO()
+        with patch.object(antiphon, turn, return_value=(turn_text, "")), \
+             patch.object(antiphon.sys, "stdin",
+                          io.StringIO(json.dumps(payload))), \
+             contextlib.redirect_stderr(err):
+            code = antiphon.push(target)
+        return code, err.getvalue()
+
+    def test_an_oversized_claude_send_parks_and_envelopes(self):
+        """Both measured shapes trigger on the SERIALIZED size, the file holds
+        its own provenance, and the socket is handed only the envelope."""
+        for shape, text in (("the ascii band", self.ASCII_BAND),
+                            ("six-fold escaping", self.HIGH_ESCAPE)):
+            with self.subTest(shape), tempfile.TemporaryDirectory() as project:
+                antiphon.peers.register(project, "claude", "ui", "/tmp/ui.sock")
+                channel = self._Recorder()
+                with patch.object(antiphon.socket, "socket", channel):
+                    result = antiphon._send_tool(project, text, "ui")
+                self.assertIsNot(result.get("isError"), True, result)
+
+                names = self._files(project)
+                self.assertEqual(len(names), 1, names)
+                self.assertRegex(names[0], antiphon.ATTACHMENT_NAME)
+                path, content = self._only_parked(project)
+                self.assertEqual(os.stat(path).st_mode & 0o777, 0o600)
+                self.assertEqual(
+                    os.stat(self._store(project)).st_mode & 0o777, 0o700)
+
+                with open(path, "rb") as f:
+                    header = f.read().partition(b"\n\n")[0]
+                self.assertNotIn(b"\n", header, "one header line, then a blank")
+                self.assertEqual(content, text.encode(), "the content is exact")
+                digest = hashlib.sha256(content).hexdigest()
+                self.assertIn(b"[Antiphon attachment from=", header)
+                self.assertIn(f"sha256={digest}".encode(), header)
+                self.assertIn(f"bytes={len(content)}".encode(), header)
+
+                self.assertEqual(len(channel.payloads), 1)
+                envelope = json.loads(channel.payloads[0].decode())["content"]
+                self.assertIn(digest, envelope)
+                self.assertIn(path, envelope)
+                self.assertIn(str(len(content)), envelope)
+                self.assertNotIn(text[:400], envelope)
+                self.assertLess(len(channel.payloads[0]), 2_000,
+                                "the transport carried the envelope, not the "
+                                "words it stands for")
+                said = result["content"][0]["text"]
+                self.assertIn(path, said, "the sender is told where its words "
+                                          "went")
+                self.assertIn(str(len(content)), said)
+
+    def test_an_oversized_queue_send_parks_and_envelopes(self):
+        """The Claude->Codex mirror, above the runtime queue bound, and the
+        crash-belt underneath it."""
+        text = "y" * 4_000
+        with tempfile.TemporaryDirectory() as project:
+            self._codex_peer(project, "build", "300:build", self.UUID)
+            queued = []
+            with self._spills_over(500), self._queue_recorder(queued):
+                code, out, err = self._reply(project, {"text": text,
+                                                       "to": "build"})
+            self.assertEqual((code, out), (0, ""), err)
+            path, content = self._only_parked(project)
+            self.assertEqual(content, text.encode())
+            self.assertEqual(len(queued), 1)
+            message = queued[0][-1]
+            self.assertTrue(
+                message.startswith(antiphon.CHANNEL_LABEL + " [from="), message)
+            self.assertIn(antiphon.ATTACHMENT_LABEL, message)
+            self.assertIn(path, message)
+            self.assertNotIn(text[:400], message)
+            self.assertLess(len(message.encode()), 2_000)
+
+        # The belt, with the predicate never firing: the exec itself is refused
+        # and the old uncaught OSError becomes a classified refusal. No payload
+        # is built for this — the failure is the seam.
+        with tempfile.TemporaryDirectory() as project:
+            self._codex_peer(project, "build", "300:build", self.UUID)
+            with patch.object(antiphon, "_oversized_for_queue",
+                              return_value=False), \
+                 patch.object(antiphon.subprocess, "run",
+                              side_effect=OSError(errno.E2BIG,
+                                                  "Argument list too long")):
+                code, out, err = self._reply(project, {"text": "hi",
+                                                       "to": "build"})
+            self.assertEqual((code, out), (1, ""))
+            self.assertIn("Argument list too long", err)
+            self.assertTrue(err.strip().endswith(antiphon.TOOL_GUIDANCE.format(
+                seen="only a tool-name line")), err)
+            self.assertEqual(self._files(project), [])
+
+    def test_a_refused_send_leaves_no_file(self):
+        """Write, send, and on any non-delivery unlink at once with a word.
+
+        A refusal never charges the store: an agent retrying an oversized send
+        against a down channel would otherwise write one full-size orphan per
+        attempt and convert a transport outage into a permanent storage
+        refusal.
+        """
+        with tempfile.TemporaryDirectory() as project:
+            antiphon.peers.register(project, "claude", "ui", "/tmp/ui.sock")
+            err = io.StringIO()
+            with patch.object(antiphon.socket, "socket", self._DeadSocket()), \
+                 contextlib.redirect_stderr(err):
+                result = antiphon._send_tool(project, self.ASCII_BAND, "ui")
+            self.assertIs(result.get("isError"), True)
+            self.assertEqual(self._files(project), [],
+                             "a refused send must not charge the store")
+            self.assertIn("attachment", err.getvalue().lower())
+
+        with tempfile.TemporaryDirectory() as project:
+            self._codex_peer(project, "build", "300:build", self.UUID)
+            with self._spills_over(500), \
+                 patch.object(antiphon.subprocess, "run",
+                              return_value=self._Refused("host said no")):
+                code, _out, err = self._reply(project, {"text": "y" * 4_000,
+                                                        "to": "build"})
+            self.assertEqual(code, 1)
+            self.assertEqual(self._files(project), [])
+            self.assertIn("attachment", err.lower())
+
+    def test_the_park_holds_the_envelope(self):
+        """The park takes the BARE envelope — what `deliver_batches` compares —
+        on both tool arms, and the original text enters no fingerprint."""
+        with tempfile.TemporaryDirectory() as project:
+            antiphon.peers.register(project, "claude", "ui", "/tmp/ui.sock")
+            channel = self._Recorder()
+            with patch.object(antiphon.socket, "socket", channel):
+                antiphon._send_tool(project, self.ASCII_BAND, "ui")
+            envelope = json.loads(channel.payloads[0].decode())["content"]
+            park = antiphon.parked_deliveries(
+                antiphon.read_cursor(project, "codex")["last_pushed_claude"])
+            self.assertEqual(park["@ui"],
+                             antiphon.batch_fingerprint([envelope]))
+            self.assertNotEqual(park["@ui"], antiphon.batch_fingerprint(
+                [self.ASCII_BAND]), "the original enters no fingerprint")
+
+            # And the giant echo that ends the same turn is not suppressed by
+            # that park — it is refused, by push's own unchanged oversize
+            # behaviour, which `test_a_failed_push_stays_byte_identical` pins
+            # byte for byte. The words still travel: the visible reply carries
+            # them through the passive pages.
+            code, printed = self._push_live(
+                project, "claude", "@claude:ui " + self.ASCII_BAND)
+            self.assertEqual(code, 0)
+            self.assertTrue(printed.startswith(
+                "antiphon: delivery failed — message is "), printed)
+            self.assertTrue(printed.endswith(
+                "bytes; the channel accepts at most {}\n".format(
+                    antiphon.MAX_CHANNEL_BYTES)), printed)
+
+        # `reply()` parks the bare text while it sends the composed one, and
+        # the two differ by the measured 80-byte `CHANNEL_LABEL` + queue label.
+        with tempfile.TemporaryDirectory() as project:
+            self._codex_peer(project, "build", "300:build", self.UUID)
+            queued = []
+            with self._spills_over(500), self._queue_recorder(queued):
+                self._reply(project, {"text": "y" * 4_000, "to": "build"})
+            composed = queued[0][-1]
+            bare = composed[composed.index(antiphon.ATTACHMENT_LABEL):]
+            prefix = composed[:composed.index(antiphon.ATTACHMENT_LABEL)]
+            self.assertRegex(prefix, r"^\[Antiphon channel\] Claude: "
+                                     r"\[from=<unnamed> id=[0-9a-f-]{36}\] $")
+            # 84 bytes for an unnamed sender, 80 for a short alias — measured
+            # either way as a prefix the park must not hold.
+            self.assertEqual(len(prefix), 84)
+            park = antiphon.parked_deliveries(
+                antiphon.read_cursor(project, "claude")["last_pushed_codex"])
+            self.assertEqual(park["@build"], antiphon.batch_fingerprint([bare]))
+            self.assertNotEqual(park["@build"],
+                                antiphon.batch_fingerprint([composed]))
+            self.assertNotEqual(park["@build"],
+                                antiphon.batch_fingerprint(["y" * 4_000]))
+
+    def test_above_the_attachment_cap_the_guidance_returns(self):
+        """Over `ATTACHMENT_MAX` no store road is left, so the send falls
+        through to the refusal that names the road that still carries words.
+
+        This is where the two moved refused-send fixtures now live:
+        `RefusedSendHonestyTest._oversized` and the inline `"ç"` fixture of
+        `test_the_send_tool_reports_an_oversized_message_as_an_error` both sit
+        above this cap, which is why they still refuse rather than spilling.
+        """
+        with tempfile.TemporaryDirectory() as project:
+            antiphon.peers.register(project, "claude", "ui", "/tmp/ui.sock")
+            with patch.object(antiphon.socket, "socket") as opened:
+                result = antiphon._send_tool(
+                    project, "x" * (antiphon.ATTACHMENT_MAX + 1), "ui")
+                opened.assert_not_called()
+            said = result["content"][0]["text"]
+            self.assertIs(result.get("isError"), True)
+            self.assertIn("the channel accepts at most {}".format(
+                antiphon.MAX_CHANNEL_BYTES), said)
+            self.assertTrue(said.endswith(
+                " — " + antiphon.TOOL_GUIDANCE.format(seen="nothing")), said)
+            self.assertFalse(os.path.exists(self._store(project)),
+                             "nothing is parked for a message no store takes")
+
+    def test_a_small_send_never_touches_the_store(self):
+        """The store directory is created lazily, on the first spill only."""
+        with tempfile.TemporaryDirectory() as project:
+            antiphon.peers.register(project, "claude", "ui", "/tmp/ui.sock")
+            with patch.object(antiphon.socket, "socket", self._LiveSocket()):
+                result = antiphon._send_tool(project, "hi", "ui")
+            self.assertIsNot(result.get("isError"), True, result)
+            self.assertFalse(os.path.exists(self._store(project)))
+
+        with tempfile.TemporaryDirectory() as project:
+            self._codex_peer(project, "build", "300:build", self.UUID)
+            with patch.object(antiphon.subprocess, "run",
+                              return_value=self._Queued()):
+                delivered = self._reply(project, {"text": "hi", "to": "build"})
+            self.assertEqual(delivered, (0, "", ""))
+            self.assertFalse(os.path.exists(self._store(project)))
+
+    def test_the_envelope_fits_both_caps(self):
+        """What this forbids is a content preview, or anything else in the
+        envelope that grows with the message it stands for.
+
+        The Claude cap is a constant, so that half is fit by construction. The
+        queue bound is not — it shrinks byte for byte with the environment — so
+        the fit there is measured against the live bound in this same test. The
+        envelope is never itself a spill candidate, which is what rules out a
+        re-entry when the spill re-composes through the same path.
+        """
+        alias = "a" * 32
+        message_id = self.UUID
+        path = os.path.join("/" + "d" * 200, ".antiphon", "messages",
+                            self.UUID + ".txt")
+        envelope = antiphon.attachment_envelope(
+            path, "f" * 64, antiphon.ATTACHMENT_MAX, alias)
+        self.assertLess(len(envelope.encode()), 1_024, envelope)
+        self.assertFalse(antiphon._oversized_for_claude(
+            envelope, alias, message_id))
+        composed = "{} {} {}".format(antiphon.CHANNEL_LABEL,
+                                     antiphon.queue_label(alias, message_id),
+                                     envelope)
+        self.assertFalse(antiphon._oversized_for_queue(composed))
+
+    def test_the_store_rejects_foreign_names(self):
+        """Only `{uuid4}.txt` is ever counted, swept or unlinked.
+
+        The one foreign entry this feature can create itself is a leftover temp
+        file from a write that died mid-flight; a validation rule that admitted
+        it would sweep it as though it were an attachment. A symlink carrying a
+        perfectly valid name is the other shape: it is refused on the lstat, so
+        nothing outside the store is ever unlinked through it.
+        """
+        with tempfile.TemporaryDirectory() as project:
+            store = self._store(project)
+            os.makedirs(store, 0o700)
+            mine = os.path.join(store, self.UUID + ".txt")
+            with open(mine, "w", encoding="utf-8") as f:
+                f.write("[Antiphon attachment bytes=2]\n\nhi")
+            outside = os.path.join(project, "not-an-attachment.txt")
+            with open(outside, "w", encoding="utf-8") as f:
+                f.write("somebody else's file")
+            foreign = (".tmp9f3a1c.tmp",                   # the writer's own
+                       "notes.txt",                        # hand-dropped
+                       self.UUID + ".txt.bak",             # a near miss
+                       ".." + self.UUID + ".txt")          # traversal-shaped
+            for name in foreign:
+                with open(os.path.join(store, name), "w", encoding="utf-8") as f:
+                    f.write("x")
+            link = os.path.join(store, RefusedSendHonestyTest.OTHER + ".txt")
+            os.symlink(outside, link)
+            expired = time.time() - antiphon.ATTACHMENT_TTL - 60
+            for name in os.listdir(store):
+                os.utime(os.path.join(store, name), (expired, expired),
+                         follow_symlinks=False)
+
+            err = io.StringIO()
+            with contextlib.redirect_stderr(err):
+                antiphon.sweep_attachments(project)
+
+            left = sorted(os.listdir(store))
+            self.assertEqual(left, sorted(foreign + (os.path.basename(link),)),
+                             "only the real attachment was swept")
+            self.assertTrue(os.path.exists(outside),
+                            "the symlink's target is untouched")
+            self.assertIn("not attachments", err.getvalue())
+            self.assertNotIn("notes.txt", err.getvalue(),
+                             "foreign entries are counted, never named — a "
+                             "store report is not a directory listing")
 
 if __name__ == "__main__":
     unittest.main()
