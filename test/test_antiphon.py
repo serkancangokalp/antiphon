@@ -1163,9 +1163,9 @@ class AntiphonTest(unittest.TestCase):
         self.assertNotEqual(responses[0]["result"].get("isError"), True)
 
     def test_antiphon_send_records_the_delivery_so_the_stop_hook_will_not_repeat_it(self):
-        """`push` skips a message equal to `last_pushed_claude`. Without this entry
-        the same text arrives twice when Codex calls the tool and then ends its turn
-        with the same `@claude` line."""
+        """`push` skips a message the park under `last_pushed_claude` already
+        describes. Without this entry the same text arrives twice when Codex calls
+        the tool and then ends its turn with the same `@claude` line."""
         written = []
         with tempfile.TemporaryDirectory() as project, \
              patch.object(antiphon, "send_to_claude", return_value=(True, "")), \
@@ -1173,10 +1173,11 @@ class AntiphonTest(unittest.TestCase):
              patch.object(antiphon, "write_cursor",
                           side_effect=lambda cwd, data, kind: written.append(dict(data)) or True):
             self._run_mcp(project, self._call("antiphon_send", text="run the tests"))
-        self.assertEqual(written, [{"last_pushed_claude":
-                                    {"": antiphon.batch_fingerprint(["run the tests"])}}],
-                         "recorded in the unaddressed slot, in the shape the "
-                         "Stop hook compares against")
+        self.assertEqual(written, [{"last_pushed_claude": {antiphon.MID_TURN_SLOT:
+                                    {"": antiphon.batch_fingerprint(["run the tests"])}}}],
+                         "parked under the unaddressed slot, in the shape the "
+                         "Stop hook consumes — and out of the live slot the "
+                         "next turn's marker is compared against")
 
     def test_antiphon_send_reports_a_dead_channel_as_an_error(self):
         """A silent success is the worst outcome here: Codex would believe Claude had
@@ -1212,8 +1213,8 @@ class AntiphonTest(unittest.TestCase):
                           side_effect=lambda cwd, data, kind: written.append(dict(data)) or True), \
              patch.object(antiphon.sys, "stdin", io.StringIO(json.dumps({"text": "hello"}))):
             self.assertEqual(antiphon.reply(), 0)
-        self.assertEqual(written, [{"last_pushed_codex":
-                                    {"": antiphon.batch_fingerprint(["hello"])}}])
+        self.assertEqual(written, [{"last_pushed_codex": {antiphon.MID_TURN_SLOT:
+                                    {"": antiphon.batch_fingerprint(["hello"])}}}])
 
     # ---- choosing which peer a message goes to: see RoutingTest ----
 
@@ -6039,9 +6040,9 @@ class ToolRecipientTest(unittest.TestCase):
             with patch.object(antiphon, "send_to_claude", return_value=(True, "")):
                 antiphon._send_tool(project, "for ui", "ui")
                 antiphon._send_tool(project, "for api", "api")
-            record = self._pushed(project)
-        self.assertEqual(sorted(record), ["@api", "@ui"])
-        self.assertEqual(record["@ui"], antiphon.batch_fingerprint(["for ui"]))
+            park = antiphon.parked_deliveries(self._pushed(project))
+        self.assertEqual(sorted(park), ["@api", "@ui"])
+        self.assertEqual(park["@ui"], antiphon.batch_fingerprint(["for ui"]))
 
     def test_an_unaddressed_tool_delivery_keeps_its_own_slot(self):
         with tempfile.TemporaryDirectory() as project:
@@ -6049,9 +6050,9 @@ class ToolRecipientTest(unittest.TestCase):
             with patch.object(antiphon, "send_to_claude", return_value=(True, "")):
                 antiphon._send_tool(project, "bare", None)
                 antiphon._send_tool(project, "named", "ui")
-            record = self._pushed(project)
-        self.assertEqual(sorted(record), ["", "@ui"])
-        self.assertEqual(record[""], antiphon.batch_fingerprint(["bare"]))
+            park = antiphon.parked_deliveries(self._pushed(project))
+        self.assertEqual(sorted(park), ["", "@ui"])
+        self.assertEqual(park[""], antiphon.batch_fingerprint(["bare"]))
 
     def test_a_named_delivery_leaves_the_legacy_record_alone(self):
         """The legacy value is the last *unaddressed* delivery. A turn that only
@@ -6089,9 +6090,213 @@ class ToolRecipientTest(unittest.TestCase):
             with patch.object(antiphon, "send_to_claude", return_value=(True, "")):
                 antiphon._send_tool(project, "new bare message")
             record = self._pushed(project)
-        self.assertEqual(sorted(record), [""])
-        self.assertEqual(record[""],
+        self.assertEqual(sorted(record), [antiphon.MID_TURN_SLOT],
+                         "the legacy value goes when the park describes the "
+                         "same unaddressed delivery better")
+        self.assertEqual(antiphon.parked_deliveries(record)[""],
                          antiphon.batch_fingerprint(["new bare message"]))
+
+    # ---- a mid-turn record lives for one Stop, not forever ----
+
+    def _stop(self, project, reply_text, turn_key="", target="codex"):
+        """One Stop hook run, with the transport left to the caller's own patch.
+
+        The reader patched is the one `push` really calls for that direction —
+        the internal (text, key) pair, not its public wrapper. Naming the
+        wrapper leaves the real reader running against the fixture path and
+        the push silently does nothing.
+        """
+        reader = "_claude_turn" if target == "codex" else "_codex_turn"
+        payload = {"cwd": project, "transcript_path": "/tmp/transcript"}
+        err = io.StringIO()
+        with patch.object(antiphon.os.path, "exists", return_value=True), \
+             patch.object(antiphon, reader,
+                          return_value=(reply_text, turn_key)), \
+             patch.object(antiphon.sys, "stdin",
+                          io.StringIO(json.dumps(payload))), \
+             contextlib.redirect_stderr(err):
+            code = antiphon.push(target)
+        return code, err.getvalue()
+
+    def test_a_later_turns_identical_marker_survives_a_tool_reply(self):
+        """The measured BACKLOG loss, verbatim. Turn A answers through the reply
+        tool and ends with no marker; turn B writes the same words as a genuinely
+        new instruction. The mid-turn record must not still be sitting in the
+        slot turn B is compared against."""
+        sent = []
+        with tempfile.TemporaryDirectory() as project, \
+             patch.object(antiphon, "send_to_codex",
+                          side_effect=lambda cwd, message, to=None:
+                              sent.append(message) or (True, "")):
+            code, err = self._reply(project, {"text": "run the suite"})
+            self.assertEqual(code, 0, err)
+            self.assertEqual(self._stop(project, "nothing addressed here")[0], 0)
+            self.assertEqual(len(sent), 1, "a markerless Stop sends nothing")
+            after_own_stop = self._pushed(project, "codex")
+            self.assertEqual(
+                self._stop(project, "@codex run the suite", self.UUID)[0], 0)
+        self.assertEqual(len(sent), 2,
+                         "turn B repeats the wording, not the delivery")
+        self.assertNotIn(antiphon.MID_TURN_SLOT, after_own_stop,
+                         "and it was turn A's own Stop that retired the record")
+
+    def test_a_mid_turn_delivery_is_not_echoed_by_its_own_stop(self):
+        """The rule the park may not break, and the reason the record exists at
+        all: the tool call and the `@codex` line that ends the same turn are one
+        message. Green before this mechanism and after it — what moves is only
+        where the record waits."""
+        sent = []
+        with tempfile.TemporaryDirectory() as project, \
+             patch.object(antiphon, "send_to_codex",
+                          side_effect=lambda cwd, message, to=None:
+                              sent.append(message) or (True, "")):
+            code, err = self._reply(project, {"text": "do X"})
+            self.assertEqual(code, 0, err)
+            self.assertEqual(self._stop(project, "@codex do X", self.UUID)[0], 0)
+            record = self._pushed(project, "codex")
+        self.assertEqual(len(sent), 1, "the Stop hook must not send it again")
+        self.assertEqual(record[""], antiphon.push_fingerprint(self.UUID, ["do X"]),
+                         "and the slot ends up holding this turn's own digest")
+
+    def test_a_refused_stop_send_still_retires_the_park(self):
+        """A Stop whose send is refused records no delivery — but the park has
+        still had the one Stop it was written for. Leaving it there reproduces
+        the same silent loss one turn later, and a refused active send is
+        observed behaviour, not a hypothesis."""
+        sent = []
+
+        def transport(cwd, message, to=None):
+            if "something else" in message:
+                return False, "refused"
+            sent.append(message)
+            return True, ""
+
+        with tempfile.TemporaryDirectory() as project, \
+             patch.object(antiphon, "send_to_codex", side_effect=transport):
+            code, err = self._reply(project, {"text": "run the suite"})
+            self.assertEqual(code, 0, err)
+            self.assertEqual(self._stop(project, "@codex something else")[0], 0)
+            after_refusal = self._pushed(project, "codex")
+            self.assertEqual(
+                self._stop(project, "@codex run the suite", self.UUID)[0], 0)
+        self.assertEqual(len(sent), 2,
+                         "the next turn's identical wording is a new instruction")
+        self.assertNotIn(antiphon.MID_TURN_SLOT, after_refusal,
+                         "a refused send still retires what it observed")
+
+    def test_a_stale_park_is_retired_by_a_markerless_stop(self):
+        """The Codex→Claude direction of the same rule, and the one that pins the
+        markerless return: a turn that addresses nobody reaches no delivery at
+        all, and is still the Stop the park was written for."""
+        sent = []
+        with tempfile.TemporaryDirectory() as project, \
+             patch.object(antiphon, "send_to_claude",
+                          side_effect=lambda cwd, text, to=None, **kwargs:
+                              sent.append(text) or (True, "")):
+            antiphon.peers.register(project, "claude", "api", "/tmp/api.sock")
+            antiphon._send_tool(project, "run the suite", "api")
+            self.assertEqual(
+                self._stop(project, "no markers", target="claude")[0], 0)
+            after_stop = self._pushed(project, "claude")
+            self.assertEqual(
+                self._stop(project, "@claude:api run the suite", "turn-b",
+                           target="claude")[0], 0)
+        self.assertEqual(sent, ["run the suite", "run the suite"],
+                         "the tool sent it once, the later turn asks for it again")
+        self.assertNotIn(antiphon.MID_TURN_SLOT, after_stop,
+                         "the markerless Stop retired the park it found")
+
+    def test_a_newer_park_survives_the_retire(self):
+        """`push` reads, sends outside the lock for as long as the transport
+        takes, and only then retires. A tool call issued inside that window parks
+        a pair this run never observed; a blind pop would delete it, and that
+        message's own Stop would echo it a second time."""
+        with tempfile.TemporaryDirectory() as project:
+            antiphon.write_cursor(project, {"last_pushed_codex": {
+                antiphon.MID_TURN_SLOT: {"": "written since",
+                                         "@review": "observed"}}}, "claude")
+            self.assertEqual(
+                antiphon._retire_park(project, "claude", "last_pushed_codex",
+                                      {"": "observed", "@review": "observed"}), 0)
+            survivor = self._pushed(project, "codex")
+        self.assertEqual(antiphon.parked_deliveries(survivor),
+                         {"": "written since"},
+                         "only the pairs this run observed are deleted")
+
+        with tempfile.TemporaryDirectory() as project:
+            antiphon.write_cursor(project, {"last_pushed_codex": {
+                "@api": "a live slot",
+                antiphon.MID_TURN_SLOT: {"": "observed"}}}, "claude")
+            self.assertEqual(
+                antiphon._retire_park(project, "claude", "last_pushed_codex",
+                                      {"": "observed"}), 0)
+            emptied = self._pushed(project, "codex")
+        self.assertEqual(emptied, {"@api": "a live slot"},
+                         "and an emptied park is absent, never a lingering {}")
+
+    def test_the_park_never_enters_recipient_traffic(self):
+        """The park key is not a peer. It must never be handed to a transport and
+        never named in the line that reports an unrecorded delivery — a slot name
+        printed there is a name somebody will go looking for. The cursor write is
+        forced to fail, because that enumeration is printed nowhere else."""
+        recipients = []
+        with tempfile.TemporaryDirectory() as project, \
+             patch.object(antiphon, "send_to_codex",
+                          side_effect=lambda cwd, message, to=None:
+                              recipients.append(to) or (True, "")):
+            code, err = self._reply(project, {"text": "parked", "to": "review"})
+            self.assertEqual(code, 0, err)
+            recipients.clear()
+            # The sender side's cursor — the same file `update_cursor` is about
+            # to take — with the patience lowered so the push gives up at once.
+            with patch.object(antiphon, "CURSOR_LOCK_PATIENCE", 0.05), \
+                 antiphon.cursor_lock(project, "claude") as held:
+                self.assertTrue(held, "the fixture must really hold the lock")
+                code, err = self._stop(project, "@codex:build ship it")
+        self.assertEqual(code, 1, "a bookkeeping failure is reported")
+        self.assertEqual(recipients, ["build"],
+                         "only real recipients reached the transport")
+        self.assertIn("could not record delivery for build", err)
+        self.assertNotIn("midturn", err,
+                         "and the park is named to nobody")
+
+    def test_a_lost_lock_leaves_a_diagnosed_park(self):
+        """The one window where a park outlives its own turn. It is bounded — the
+        next push retries the retire — and it is never silent."""
+        sent = []
+        with tempfile.TemporaryDirectory() as project, \
+             patch.object(antiphon, "send_to_codex",
+                          side_effect=lambda cwd, message, to=None:
+                              sent.append(message) or (True, "")):
+            code, err = self._reply(project, {"text": "run the suite"})
+            self.assertEqual(code, 0, err)
+            with patch.object(antiphon, "CURSOR_LOCK_PATIENCE", 0.05), \
+                 antiphon.cursor_lock(project, "claude") as held:
+                self.assertTrue(held, "the fixture must really hold the lock")
+                code, err = self._stop(project, "nothing addressed here")
+            self.assertEqual(code, 1, "a caller that could not take the cursor "
+                                      "lock exits non-zero, or the host shows "
+                                      "the person nothing")
+            self.assertIn(antiphon.PARK_LEFT_BEHIND, err)
+            self.assertIn(antiphon.MID_TURN_SLOT, self._pushed(project, "codex"),
+                          "the park really did survive")
+            self.assertEqual(self._stop(project, "still nothing")[0], 0)
+            self.assertNotIn(antiphon.MID_TURN_SLOT,
+                             self._pushed(project, "codex"),
+                             "and the very next push retires it")
+
+            # The delivered path says it too: the deletion rides inside the
+            # write that just failed, so the same park is left behind there.
+            code, err = self._reply(project, {"text": "again"})
+            self.assertEqual(code, 0, err)
+            with patch.object(antiphon, "CURSOR_LOCK_PATIENCE", 0.05), \
+                 antiphon.cursor_lock(project, "claude") as held:
+                self.assertTrue(held)
+                code, err = self._stop(project, "@codex:build ship it")
+        self.assertEqual(code, 1)
+        self.assertIn("could not record delivery", err)
+        self.assertIn(antiphon.PARK_LEFT_BEHIND, err,
+                      "both costs are reported, not one blanket 'not a drop'")
 
     # ---- what arrives from outside is not trusted to be shaped ----
 
@@ -6173,7 +6378,7 @@ class ToolRecipientTest(unittest.TestCase):
             with patch.object(antiphon, "send_to_claude", return_value=(True, "")):
                 antiphon._send_tool(project, "new", "api")
             record = self._pushed(project)
-            self.assertIn("@api", record)
+            self.assertIn("@api", antiphon.parked_deliveries(record))
             kept, already = antiphon.migrate_pushed(record, ["old text"])
             self.assertTrue(already, "the old delivery is still recognised")
             self.assertNotIn(antiphon.LEGACY_SLOT, kept,
@@ -6384,7 +6589,7 @@ class SenderIdentityTest(unittest.TestCase):
                 # directory, so reading it from outside finds the unnamed one.
                 record = antiphon.read_cursor(project,
                                               "codex")["last_pushed_claude"]
-        self.assertEqual(record["@ui"],
+        self.assertEqual(antiphon.parked_deliveries(record)["@ui"],
                          antiphon.batch_fingerprint(["run the tests"]))
 
     def test_each_delivery_attempt_carries_its_own_id(self):

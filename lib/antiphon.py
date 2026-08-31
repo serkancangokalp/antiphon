@@ -136,6 +136,57 @@ def batch_fingerprint(messages):
 # a recipient slot — `""` is the unaddressed one and every other is `@alias`.
 LEGACY_SLOT = "\0legacy"
 
+# Where a mid-turn tool delivery's digest waits for the Stop hook that consumes
+# it. A `\0` sibling for the same reason `LEGACY_SLOT` is one, and nested
+# `{slot: digest}` rather than flat so the per-recipient separation the live
+# slots pay for survives the move. It is not a recipient slot: `push` compares
+# a batch against it, records the batch under its own current-shape
+# fingerprint, and deletes the pair — a digest here has one Stop to be
+# matched by, not an unbounded life in the map the next turn is compared
+# against.
+MID_TURN_SLOT = "\0midturn"
+
+
+def parked_deliveries(record):
+    """The mid-turn park inside one `last_pushed_*` value, as a plain copy.
+
+    Anything else — a pre-digest string cursor, a hand-edited shape, no park
+    at all — is no park. A copy, because the caller compares it against the
+    cursor it re-reads under the lock much later, and the read it came from is
+    stale by then.
+    """
+    if isinstance(record, dict):
+        park = record.get(MID_TURN_SLOT)
+        if isinstance(park, dict):
+            return dict(park)
+    return {}
+
+
+def drop_parked(record, observed):
+    """Deletes exactly the parked pairs in `observed` from `record`, in place.
+
+    Compare-and-clear, never a blind pop: `push` reads, sends outside the lock
+    for up to 15 s, and only then retires. A `reply_to_codex` issued inside
+    that window parks a pair this run never saw, and deleting it would send
+    that message's own Stop echo a second time.
+
+    The key goes with its last pair. An empty park is *absent*, never `{}`:
+    a lingering empty sibling is one more slot every later assertion about
+    "which recipients this record holds" has to know about.
+    """
+    park = record.get(MID_TURN_SLOT)
+    if not isinstance(park, dict):
+        return
+    for slot, digest in observed.items():
+        if park.get(slot) == digest:
+            park.pop(slot)
+    if not park:
+        record.pop(MID_TURN_SLOT, None)
+
+
+PARK_LEFT_BEHIND = ("antiphon: a mid-turn record was left behind; an identical "
+                    "marker may be suppressed one extra turn")
+
 
 def migrate_pushed(sent, unaddressed):
     """(record, already_delivered) for a cursor that may hold the old format.
@@ -1701,6 +1752,41 @@ def codex_session_id(cwd):
     return None
 
 
+def _retire_park(cwd, side, key, observed):
+    """Deletes the parked pairs `observed` on a `push` exit that delivered nothing.
+
+    Only the two returns that reach the cursor stage without a delivery come
+    here. The delivered path folds the same deletion into the `mutate` it
+    already runs: `cursor_lock` is not reentrant, so a second acquisition from
+    inside that one would burn the full patience on every delivered push and
+    then retire nothing.
+
+    Nothing observed means no lock at all — the markerless Stop is the hottest
+    path on the bridge, and this must not put a write on it for the ordinary
+    case where no tool spoke this turn.
+
+    A lost lock exits 1 by `cursor_lock`'s own rule: on exit 0 the host sends
+    stderr to a debug log and shows the person nothing, and the notice below
+    exists precisely to be seen. `push` injects no context, so its non-zero
+    costs nobody a page.
+    """
+    if not observed:
+        return 0
+
+    def mutate(cursor):
+        held = cursor.get(key)
+        if isinstance(held, dict):
+            record = dict(held)
+            drop_parked(record, observed)
+            cursor[key] = record
+        return cursor
+
+    if not update_cursor(cwd, side, mutate):
+        print(PARK_LEFT_BEHIND, file=sys.stderr)
+        return 1
+    return 0
+
+
 def push(target="codex"):
     """Stop hook: pushes explicit target lines in the latest reply to the other side.
 
@@ -1758,11 +1844,16 @@ def push(target="codex"):
         said = [m for m in messages if m.strip()]
         if said:
             batches[recipient] = said
-    if not batches:
-        return 0
 
+    # Hoisted above the markerless return: that return is a cursor-reaching
+    # exit now, because a turn that addresses nobody is still the Stop the
+    # mid-turn park was written for.
     side = sender_side(target)
     key = f"last_pushed_{target}"
+
+    if not batches:
+        return _retire_park(cwd, side, key,
+                            parked_deliveries(read_cursor(cwd, side).get(key)))
 
     # Once for the turn, not once per recipient. Who is speaking cannot change
     # between two lines of one reply, and working it out again for each would
@@ -1812,6 +1903,10 @@ def push(target="codex"):
     # of what actually went out.
     raw_sent, already = migrate_pushed(read_cursor(cwd, side).get(key),
                                        batches.get(None) or [])
+    # The exact pairs this run may retire, noted before anything is sent. Only
+    # these are deleted later, so a park written while the send was in flight
+    # keeps its own Stop.
+    observed = parked_deliveries(raw_sent)
     before_send = dict(raw_sent)
     if already:
         # The exact bare message already went out under the old string
@@ -1820,6 +1915,20 @@ def push(target="codex"):
         # other fingerprint in this function goes through, so the shapes
         # cannot drift apart.
         raw_sent[""] = push_fingerprint(turn_key, batches[None])
+    for recipient, messages in batches.items():
+        # The park's one match. A batch whose *content* is what a tool already
+        # delivered this turn is pre-seeded with the fingerprint it would have
+        # been recorded under, so `deliver_batches` below recognises it and
+        # records it without sending. Seeded here rather than above
+        # `before_send`, following the `already` legacy-migration pre-seed:
+        # seeded earlier the slot would be equal on both sides of the delta,
+        # drop out of `delivered`, and never reach the cursor at all. And
+        # deliberately not guarded by `turn_key` the way the flat→scoped
+        # migration branch inside `deliver_batches` is — a key-less Stop is
+        # exactly the case that echoes its own mid-turn delivery.
+        slot = "" if recipient is None else f"@{recipient}"
+        if observed.get(slot) == batch_fingerprint(messages):
+            raw_sent[slot] = push_fingerprint(turn_key, messages)
     updated = forget_superseded(deliver_batches(batches, raw_sent, deliver, turn_key))
     # The delta: only the slots this call actually resolved — never the whole
     # map computed from the read above. Writing that map back, whole, would
@@ -1829,7 +1938,10 @@ def push(target="codex"):
     delivered = {slot: fingerprint for slot, fingerprint in updated.items()
                 if before_send.get(slot) != fingerprint}
     if not delivered:
-        return 0                      # nothing sent, nothing to record
+        # Nothing sent, nothing to record — but a park observed above has had
+        # its Stop either way, whether the batch matched it, went to somebody
+        # else, or was refused by the transport.
+        return _retire_park(cwd, side, key, observed)
 
     def mutate(cursor):
         # `cursor` is what `update_cursor` just read under the lock, moments
@@ -1839,21 +1951,32 @@ def push(target="codex"):
         fresh, _ = migrate_pushed(cursor.get(key), [])
         merged = dict(fresh)
         merged.update(delivered)
+        # The retire rides here rather than in a helper of its own: this
+        # runs with the cursor lock already held, and `cursor_lock` is not
+        # reentrant. Never expressed through `delivered` — that is a
+        # slot→fingerprint delta with no vocabulary for a deletion, and
+        # `before_send` is a shallow copy sharing this very park, so an
+        # in-place edit would vanish from the diff.
+        drop_parked(merged, observed)
         cursor[key] = forget_superseded(merged)
         return cursor
 
     if not update_cursor(cwd, side, mutate):
         # The message already left this process — `deliver` above said so on
-        # its own line. What failed is only the bookkeeping, so the
-        # consequence is a possible duplicate next turn, never a second copy
-        # of a drop that already happened: say exactly that, and let it be
-        # seen. `push` injects nothing into anyone's context, so returning
-        # non-zero here costs nobody the page a hook's non-zero would.
+        # its own line. What failed is the bookkeeping: the delivery record,
+        # and with it whatever retire this write was carrying. Those are two
+        # different costs to their reader, so they are two lines rather than
+        # one blanket "not a drop" — a surviving park really can suppress a
+        # next-turn marker. `push` injects nothing into anyone's context, so
+        # returning non-zero here costs nobody the page a hook's non-zero
+        # would.
         missed = ", ".join(sorted(
             "(unaddressed)" if slot == "" else slot[1:] for slot in delivered))
         print(f"antiphon: sent to {target} but could not record delivery for "
               f"{missed} in {state_path(cwd, side)}; a duplicate send is "
-              "possible next turn, not a drop", file=sys.stderr)
+              "possible next turn", file=sys.stderr)
+        if observed:
+            print(PARK_LEFT_BEHIND, file=sys.stderr)
         return 1
     return 0
 
@@ -2135,6 +2258,12 @@ def _record_delivery(cwd, target, text, alias=None):
     This used to write a bare string over the whole record, so a delivery to
     `api` erased what `ui` had already been sent and `ui` received it again.
 
+    Parked under `MID_TURN_SLOT`, not written into the live slot itself. The
+    digest here is content-only — this path has no turn to scope to — and a
+    content-only digest sitting in the slot the next turn is compared against
+    swallowed that turn's genuine marker whenever it repeated the wording.
+    Parked, it is matched by exactly one Stop hook and deleted there.
+
     A record from before that scheme is carried forward rather than dropped.
     It holds the joined text, not a digest, so it cannot be converted — a batch
     of two lines and one line joining to the same string are different things —
@@ -2143,13 +2272,23 @@ def _record_delivery(cwd, target, text, alias=None):
     """
     side = sender_side(target)
     key = f"last_pushed_{target}"
+    slot = "" if alias is None else f"@{alias}"
 
     def mutate(cursor):
         held = cursor.get(key)
         sent = dict(held) if isinstance(held, dict) else {}
         if isinstance(held, str):
             sent[LEGACY_SLOT] = held
-        sent["" if alias is None else f"@{alias}"] = batch_fingerprint([text])
+        park = parked_deliveries(sent)
+        park[slot] = batch_fingerprint([text])
+        sent[MID_TURN_SLOT] = park
+        if slot == "":
+            # `forget_superseded` looks at the live unaddressed slot, which
+            # this path no longer writes. The rule it encodes is about the
+            # delivery, not about where the record sits: an unaddressed
+            # delivery has superseded the pre-digest string, and keeping both
+            # leaves a record nothing clears.
+            sent.pop(LEGACY_SLOT, None)
         cursor[key] = forget_superseded(sent)
         return cursor
 

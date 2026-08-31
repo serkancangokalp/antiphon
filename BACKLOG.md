@@ -223,22 +223,18 @@ have one.
   sit beyond the tail (1/127 measured) — the two windows look identical from
   inside.
 
-## P1 — A mid-turn tool reply's digest swallows a later turn's identical marker
-
-Left open by the turn-scoped-markers work above, and named here because the
-entry above would otherwise read as if the whole class were closed.
+## P1 — A mid-turn tool reply's digest swallows a later turn's identical marker (fixed)
 
 `_record_delivery` — the mid-turn `reply_to_codex` / `_send_tool` path —
-writes `batch_fingerprint([text])`, the **flat**, content-only shape, into
-exactly the slot `push`'s dedupe reads. It has to: without that record the
+wrote `batch_fingerprint([text])`, the **flat**, content-only shape, into
+exactly the slot `push`'s dedupe reads. It had to: without that record the
 same text arrives twice, once from the tool and once from the Stop hook that
 ends the turn. But `deliver_batches`'s flat→scoped migration branch reads a
 flat value in that slot as "this batch already went out", and that premise is
-false when the flat digest came from a *different, earlier* turn. So the
-migration is a live path, not a one-time upgrade path, and it consumes one
-genuine send per flat-digest state.
+false when the flat digest came from a *different, earlier* turn.
 
-Measured here (real transcript, real cursor, only `send_to_codex` mocked):
+Measured before the fix (real transcript, real cursor, only `send_to_codex`
+mocked), kept here as the historical record:
 
 - turn A: Claude answers Codex through the reply tool with `run the suite`;
   its visible reply carries no marker, so the Stop hook finds no batch and
@@ -248,18 +244,96 @@ Measured here (real transcript, real cursor, only `send_to_codex` mocked):
   silently; the slot upgrades to the scoped digest `c573f74c…`;
 - turn C: the same words again → 1 send, as expected.
 
-Bounded to one loss per flat-digest state, and strictly better than the
-pre-branch behaviour, where content-only dedupe dropped that instruction
-*permanently* rather than once. Still a loss, and the bridge's contract
-everywhere else is at-least-once.
+### What shipped
 
-Suggested direction: park the flat digest where it can be consumed exactly
-once, the way `LEGACY_SLOT` already parks the pre-digest string cursor, so a
-later turn's identical marker is never matched against another turn's
-delivery record; or give the reply path a turn identity of its own so its
-record is scoped like every other. Either way the mid-turn duplicate the flat
-record exists to prevent must stay prevented — a fix that reintroduces it
-trades a rare loss for a common duplicate.
+The record no longer lives in the live slot. `_record_delivery` merges
+`{slot: digest}` under `MID_TURN_SLOT = "\0midturn"` — out of recipient space
+the way `LEGACY_SLOT` is, and nested so the per-recipient separation the live
+slots pay for survives the move. An *unaddressed* park write still drops the
+pre-digest string beside it: the rule `forget_superseded` encodes is about the
+delivery, not about where the record sits, and keeping both would leave a
+record nothing clears.
+
+`push` retires the park in one phase:
+
+1. **Read** — the existing unlocked cursor read notes the park's exact
+   `{slot: digest}` pairs.
+2. **Consume** — inline in `push`, before `deliver_batches` and without
+   touching its signature: a batch whose *content-only* digest equals its
+   slot's parked digest is pre-seeded into `raw_sent` with that batch's own
+   current-shape fingerprint (scoped where a turn key exists, flat otherwise),
+   so `deliver_batches` recognises it and records it without sending. The
+   pre-seed goes after the `before_send` snapshot; seeded earlier the consumed
+   slot is equal on both sides of the delta and never reaches the cursor at
+   all. It is deliberately not guarded by `turn_key` — a keyless Stop is
+   exactly the case that echoes its own mid-turn delivery.
+3. **Retire** — exactly the pairs observed in step 1 are deleted, by
+   compare-and-clear so a pair written while the send was in flight keeps its
+   own Stop, and the `MID_TURN_SLOT` key goes with its last pair (an empty
+   park is *absent*, never `{}`). On the delivered path the deletion rides
+   inside the `mutate` that already runs under the cursor lock: `cursor_lock`
+   is not reentrant, so a helper taking its own lock there would burn the full
+   patience on every delivered push and retire nothing. The two returns that
+   hold no lock use a small lock-taking helper instead.
+
+Exit paths, exhaustively:
+
+| exit | what happens to a park |
+|---|---|
+| `stop_hook_active` | nothing to do — the invocation that set the flag already retired what existed when it ran. A `_record_delivery` made *after* that retire leaves a park no push in that turn retires: the same one-turn window as the crash case below. |
+| missing / `null` `transcript_path` | the documented ephemeral-Codex case. A park written by an ephemeral turn survives until the next non-ephemeral push. |
+| `if not batches` (markerless Stop) | retired |
+| `if not delivered` (nothing sent, or the send refused) | retired |
+| delivered path | retired inside the same `mutate` as the delivery record |
+
+A write that was carrying a retire and failed prints
+`antiphon: a mid-turn record was left behind; an identical marker may be
+suppressed one extra turn`, and the next push retries. The delivered path's
+own failure line no longer claims "not a drop" — with a park aboard, that
+failure really can suppress one next-turn marker — and prints the left-behind
+notice beside it, so the two costs are reported separately rather than under
+one blanket sentence.
+
+**The trade, stated straight.** In the ordinary flow the park lives exactly
+one Stop. In the crash window (a turn whose Stop never runs — or a push that dies
+between its unlocked read and its retire) and the lost-lock window, a stale park survives into the next push, whose consume can
+then suppress **one** next-turn marker repeating the parked wording — a
+bounded, one-turn loss; the turn after sends. It is diagnosed on stderr in the
+lost-lock case and **silent in the crash case**, where no push ran to say
+anything. Measured: 0 sends where 1 was expected on the next turn, 1 on the
+one after. That is not "never a loss"; it is today's behaviour for exactly one
+turn instead of forever, where today's is unbounded until something overwrites
+the slot.
+
+**Cost.** The markerless Stop did zero cursor I/O before (measured). It now
+does one unlocked read per markerless Stop, and takes the lock only when that
+read actually found a park. One visible side effect of that read: a corrupt
+cursor file is now diagnosed ("could not be read safely") on a path that
+never printed before — a diagnosis, not a behaviour change.
+
+### Named limitations
+
+- Two mid-turn replies to the **same recipient in one turn** still echo —
+  and the echo is the **whole batch** (measured: `line one\nline two`, so the
+  first line is redelivered too). The park holds one digest per slot, the
+  Stop batch hashes both lines together, so nothing matches — unchanged from
+  before this work, not a regression, but it bounds "the mid-turn duplicate
+  stays prevented" to the single-line case.
+- The legacy supersede stays where it was moved to: at park-write time, on an
+  unaddressed delivery.
+- The flat→scoped migration branch inside `deliver_batches` stays live. It is
+  **not** a one-time upgrade path and must not be described as one: any push
+  that resolves **no turn key** — a pre-`turn_id` CLI, a boundary clipped out
+  of the tail window — still writes a flat, content-only digest into the live
+  slot, and a later push that *does* resolve a key and repeats the wording is
+  silently suppressed once by that branch. Measured with no tool call anywhere
+  in the scenario, identical before and after this work: 1 send, then 0, then
+  1 — on `8a2e661d…`, the same digest this entry names above. What this work
+  removes is exactly the *mid-turn tool path* as a feeder of flat digests.
+  The cause is already filed under the turn-scoped entry's content-only
+  fallback limitation; the manifestation is narrower than that entry's
+  wording, which describes keyless→keyless suppression, while this residual is
+  **keyless-write → keyed-identical-push** through the migration branch.
 
 ## P2 — A refused active send does not say the message will still arrive
 
