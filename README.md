@@ -279,10 +279,12 @@ provenance saying whose words follow; the content is everything after the first
 blank line, and the hash covers only that, so `tail -n +3 <path> | shasum -a
 256` verifies it. The path is local, and that is the bound: both agents run on
 this machine, as this user, against this project. One attachment may hold 8 MiB
-of content, the whole store 64 MiB, and a parked file is deleted 7 days after it
-was written — announced on stderr, on the next hook either side runs. `antiphon
-status` reports how many are pending, how many content bytes they hold and how
-old the oldest is, and never deletes anything itself. Above the per-attachment
+of content, the whole store 64 MiB, and a parked file becomes eligible for
+removal 7 days after it was written. There is no timer: it goes on the next
+hook either side runs, announced on stderr and named, so a project where
+neither side takes a turn keeps its files until one does. `antiphon status`
+reports how many are pending, how many content bytes they hold and how old the
+oldest is, and never deletes anything itself. Above the per-attachment
 cap, or with the store full, the send is refused with the reason and nothing is
 written; a send that fails for any other reason removes its parked file at once.
 

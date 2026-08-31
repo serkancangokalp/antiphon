@@ -2510,6 +2510,152 @@ def attachment_dir(cwd):
     return os.path.join(cwd, ".antiphon", "messages")
 
 
+def _sound_store(cwd, create=False):
+    """The store as a directory this code owns outright, or None with a word.
+
+    Checked without following a symlink, at the parent and at the leaf, before
+    anything is written, counted or unlinked. Measured: with
+    `.antiphon/messages` pointed at a directory outside the project,
+    `write_attachment` put the words there and `attachment_usage` counted them
+    as though they were here. This store's whole premise is that everything
+    inside it belongs to this bridge, and a link is somebody else's claim.
+
+    A loose mode found here is tightened rather than trusted:
+    `makedirs(..., exist_ok=True)` leaves a pre-existing 0755 directory exactly
+    as it found it, and this one holds one side's words for the other. It is
+    tightened rather than refused because refusing would take the feature down
+    over a mode a `mkdir -p` could have set; a mode that cannot be tightened
+    fails closed instead, because the alternative is parking private words
+    somewhere the machine can read.
+    """
+    path = attachment_dir(cwd)
+    parent = os.path.dirname(path)
+    if os.path.islink(parent) or (os.path.exists(parent)
+                                  and not os.path.isdir(parent)):
+        print(f"antiphon: the attachment store's parent {parent} is not a "
+              "plain directory; nothing was touched", file=sys.stderr)
+        return None
+    if create:
+        try:
+            os.makedirs(parent, exist_ok=True)
+            if not os.path.exists(path):
+                os.mkdir(path, 0o700)
+        except FileExistsError:
+            # Another peer created it between the test and the call, or the
+            # name is a dangling link. The open below decides which.
+            pass
+        except OSError as error:
+            print(f"antiphon: the attachment store could not be created: "
+                  f"{error}", file=sys.stderr)
+            return None
+    try:
+        # `O_NOFOLLOW` is the atomic half of the check: a symlink here fails
+        # the open rather than being examined and then followed.
+        fd = os.open(path, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    except FileNotFoundError:
+        # No store at all is the overwhelming case and not a problem.
+        return None
+    except OSError as error:
+        print(f"antiphon: the attachment store at {path} is not a plain "
+              f"directory and was left alone: {error}", file=sys.stderr)
+        return None
+    try:
+        mode = os.fstat(fd).st_mode & 0o777
+        if mode & 0o077:
+            try:
+                os.fchmod(fd, 0o700)
+            except OSError as error:
+                print(f"antiphon: the attachment store is {mode:04o} and could "
+                      f"not be tightened to 0700 ({error}); nothing was parked",
+                      file=sys.stderr)
+                return None
+            print(f"antiphon: the attachment store was {mode:04o}; tightened "
+                  "to 0700", file=sys.stderr)
+    finally:
+        os.close(fd)
+    return path
+
+
+# Beside the store, never inside it: only `{uuid4}.txt` names may appear in the
+# directory, and a lock file there would be a foreign entry this code reported
+# at itself on every hook.
+ATTACHMENT_LOCK_PATIENCE = 2.0        # seconds, as the cursor lock allows
+
+
+@contextlib.contextmanager
+def attachment_lock(cwd):
+    """Serializes read-usage → decide → write, and nothing else.
+
+    Yields True when the lock was taken, having already said why not when it
+    was not. Measured without it: two processes released from one barrier, a
+    1,000-byte quota and two 700-byte messages — both passed the check, five
+    rounds out of five, and the store held 1,400. A quota read and the write it
+    authorizes are one transaction or they are not a quota.
+
+    Never held across a transport. `push` records the ruling this follows: a
+    lock held across a send was measured at a 5,008 ms hold against a
+    concurrent reader's own 2,038 ms of patience, and that reader gave up
+    having delivered no context at all. The send happens after this block, with
+    the lock already released.
+    """
+    path = os.path.join(cwd, ".antiphon", "messages.lock")
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        fd = os.open(path, os.O_CREAT | os.O_RDWR, 0o600)
+    except OSError as error:
+        print(f"antiphon: no attachment lock at {path}: {error}",
+              file=sys.stderr)
+        yield False
+        return
+    held = False
+    deadline = time.monotonic() + ATTACHMENT_LOCK_PATIENCE
+    try:
+        while True:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                held = True
+                break
+            except BlockingIOError:
+                if time.monotonic() >= deadline:
+                    break
+                time.sleep(CURSOR_LOCK_RETRY_DELAY)
+        yield held
+    finally:
+        if held:
+            fcntl.flock(fd, fcntl.LOCK_UN)
+        os.close(fd)
+
+
+def _unlink_attachment(store, path):
+    """Removes one file, and only an attachment of this project's.
+
+    Returns `(removed, error)`. The name has to be the final form and the
+    directory has to be the validated store: a path arriving from a caller is
+    an argument, not authority, and a uuid-shaped name somewhere else is not
+    this bridge's file to delete. A symlink is refused for the same reason the
+    store root is.
+    """
+    name = os.path.basename(path)
+    if (not ATTACHMENT_NAME.match(name)
+            or os.path.abspath(path) != os.path.join(store, name)):
+        print(f"antiphon: refusing to delete {path}: it is not one of this "
+              "project's attachments", file=sys.stderr)
+        return False, None
+    if os.path.islink(path):
+        print(f"antiphon: refusing to delete {path}: it is a link, not an "
+              "attachment", file=sys.stderr)
+        return False, None
+    try:
+        os.unlink(path)
+    except FileNotFoundError:
+        # Both sides' hooks sweep this directory; the loser of that race has
+        # nothing to do and nothing to report.
+        return False, None
+    except OSError as error:
+        return False, error
+    return True, None
+
+
 def _attachment_header(alias, message_id, digest, size):
     """One line of provenance, written INTO the parked file.
 
@@ -2538,8 +2684,10 @@ def attachment_envelope(path, digest, size, alias):
             "is everything after the first blank line and the hash covers only "
             "that, so `tail -n +3 <that path> | shasum -a 256` verifies it. "
             "The file is local to this project on this machine and holds the "
-            "sender's own words, not the project's; it is deleted "
-            f"{ATTACHMENT_TTL // 86400} days after it was written.")
+            "sender's own words, not the project's. It becomes eligible for "
+            f"removal {ATTACHMENT_TTL // 86400} days after it was written and "
+            "is removed by the next hook either side runs — there is no "
+            "timer.")
 
 
 def write_attachment(cwd, text, alias, message_id):
@@ -2555,12 +2703,17 @@ def write_attachment(cwd, text, alias, message_id):
     0700 on the directory is defence in depth on a single-user machine: the
     store holds one side's words for the other, and group or world access would
     add readers nobody audited. `makedirs` applies its mode to the leaf only,
-    so a `.antiphon` created on the way keeps the mode it has always had.
+    so a `.antiphon` created on the way keeps the mode it has always had, and
+    `_sound_store` is what proves the leaf is a directory this code owns rather
+    than a link at somebody else's.
     """
     content = text.encode()
     digest = hashlib.sha256(content).hexdigest()
-    directory = attachment_dir(cwd)
-    os.makedirs(directory, 0o700, exist_ok=True)
+    directory = _sound_store(cwd, create=True)
+    if directory is None:
+        raise OSError(errno.EACCES,
+                      f"the attachment store under {attachment_dir(cwd)} "
+                      "cannot be used")
     path = os.path.join(directory, f"{uuid.uuid4()}.txt")
     header = _attachment_header(alias, message_id, digest, len(content))
     fd, tmp = tempfile.mkstemp(dir=directory, prefix=".", suffix=".tmp")
@@ -2589,8 +2742,11 @@ def _attachment_entries(cwd):
     A missing store is the overwhelming case and costs one failed `scandir`.
     """
     attachments, foreign = [], 0
+    store = _sound_store(cwd)
+    if store is None:
+        return [], 0
     try:
-        with os.scandir(attachment_dir(cwd)) as entries:
+        with os.scandir(store) as entries:
             for entry in entries:
                 if not ATTACHMENT_NAME.match(entry.name):
                     foreign += 1
@@ -2670,21 +2826,19 @@ def sweep_attachments(cwd, now=None):
     guarded and a file that vanished under a concurrent sweep is simply gone.
     """
     now = time.time() if now is None else now
+    store = _sound_store(cwd)
     attachments, foreign = _attachment_entries(cwd)
     for path, info in attachments:
         age = now - info.st_mtime
         if age <= ATTACHMENT_TTL:
             continue
-        try:
-            os.unlink(path)
-        except FileNotFoundError:
-            continue
-        except OSError as error:
+        removed, error = _unlink_attachment(store, path)
+        if error is not None:
             print(f"antiphon: an expired attachment could not be deleted: "
                   f"{path}: {error}", file=sys.stderr)
-            continue
-        print(f"antiphon: attachment expired after {int(age // 86400)} days "
-              f"and was deleted: {path}", file=sys.stderr)
+        elif removed:
+            print(f"antiphon: attachment expired after {int(age // 86400)} "
+                  f"days and was deleted: {path}", file=sys.stderr)
     if foreign:
         # Reported and left. This directory is not a namespace this code owns
         # outright, and a count says enough: a report is not a directory
@@ -2694,24 +2848,31 @@ def sweep_attachments(cwd, now=None):
               "alone — not attachments", file=sys.stderr)
 
 
-def drop_attachment(path):
+def drop_attachment(cwd, path):
     """Removes a parked file whose message never left, and says so.
 
     Write, send, and on any non-delivery unlink at once. Without this an agent
     retrying an oversized send against a channel that is down writes one
     full-size orphan per attempt, and a transport outage becomes a permanent
     storage refusal seven days long.
+
+    Through the same validated helper the sweep uses. This runs on a failure
+    path, on a path a caller handed over, so it removes an attachment of this
+    project's or it removes nothing at all.
     """
-    try:
-        os.unlink(path)
-    except FileNotFoundError:
+    store = _sound_store(cwd)
+    if store is None:
+        print(f"antiphon: a send failed and its attachment at {path} could not "
+              "be removed: this project has no usable attachment store",
+              file=sys.stderr)
         return
-    except OSError as error:
+    removed, error = _unlink_attachment(store, path)
+    if error is not None:
         print(f"antiphon: a send failed and its attachment could not be "
               f"removed: {path}: {error}", file=sys.stderr)
-        return
-    print(f"antiphon: the send failed, so its attachment was removed: {path}",
-          file=sys.stderr)
+    elif removed:
+        print(f"antiphon: the send failed, so its attachment was removed: "
+              f"{path}", file=sys.stderr)
 
 
 def attachment_report(cwd, now=None):
@@ -2832,8 +2993,23 @@ def _spill(cwd, text, alias, message_id):
     A refusal here is a plain string, never a `_ClassifiedRefusal`: an attached
     class means "the sender needs telling where its words still travel", and
     these refusals name their own fix instead.
+
+    The lock covers the usage read, the decision and the write, and is released
+    before the caller sends: measured, without it two peers released from one
+    barrier both passed a quota neither of them had invalidated.
     """
     size = len(text.encode())
+    with attachment_lock(cwd) as locked:
+        if not locked:
+            return None, ("another peer in this project is parking an "
+                          "attachment and did not finish within "
+                          f"{ATTACHMENT_LOCK_PATIENCE:.0f} seconds; nothing "
+                          "was written. Sending again is safe.")
+        return _spill_locked(cwd, text, alias, message_id, size)
+
+
+def _spill_locked(cwd, text, alias, message_id, size):
+    """The half of `_spill` that must not interleave with another peer's."""
     parked, held, oldest, _foreign = attachment_usage(cwd)
     if held + size > ATTACHMENT_QUOTA:
         # Nothing is evicted to make room. An unexpired attachment is somebody
@@ -2844,10 +3020,11 @@ def _spill(cwd, text, alias, message_id):
         return None, (
             f"the attachment store is full: {parked} parked attachments hold "
             f"{_mib(held)} of the {_mib(ATTACHMENT_QUOTA)} it may hold, and "
-            f"this message needs {_mib(size)} more. Attachments are deleted "
-            f"{ATTACHMENT_TTL // 86400} days after they are written and the "
-            f"oldest here is {int(oldest // 86400)} days old; "
-            f"{attachment_dir(cwd)} can also be cleared by hand.")
+            f"this message needs {_mib(size)} more. Attachments become "
+            f"eligible for removal {ATTACHMENT_TTL // 86400} days after they "
+            "are written and go on the next hook either side runs — there is "
+            f"no timer; the oldest here is {int(oldest // 86400)} days old, "
+            f"and {attachment_dir(cwd)} can also be cleared by hand.")
     try:
         path, digest = write_attachment(cwd, text, alias, message_id)
     except OSError as error:
@@ -2900,7 +3077,7 @@ def reply(*_):
     ok, detail = send_to_codex(cwd, composed, to)
     if not ok:
         if parked is not None:
-            drop_attachment(parked.path)
+            drop_attachment(cwd, parked.path)
         # `only a tool-name line`: measured on 123 real `reply_to_codex`
         # records, whose `text` argument no parser path can reach.
         print(f"reply: {_guided(detail, 'only a tool-name line')}",
@@ -3118,7 +3295,7 @@ def _send_tool(cwd, text, to=None, sender=None):
                                 message_id=message_id)
     if not ok:
         if parked is not None:
-            drop_attachment(parked.path)
+            drop_attachment(cwd, parked.path)
         # `nothing`, not a tool-name line: Claude's parser emits a tool event
         # only for `exec_command_begin`, and an MCP call is never one — measured
         # at 0 tool events across 21 rollouts.
@@ -3570,8 +3747,10 @@ AGENTS_RULE = ("\n## The Antiphon bridge\n\n"
                "file. It is on this same machine, in this project, and it holds the peer's "
                "own words rather than the project's — its first line says whose, and the "
                "content is everything after the first blank line, which is what the hash "
-               "covers: `tail -n +3 <path> | shasum -a 256`. It is deleted "
-               f"{ATTACHMENT_TTL // 86400} days after it was written. The two roads differ "
+               "covers: `tail -n +3 <path> | shasum -a 256`. It becomes eligible for "
+               f"removal {ATTACHMENT_TTL // 86400} days after it was written and goes on "
+               "the next hook either side runs — there is no timer, so read it rather "
+               "than assuming it waits. The two roads differ "
                "here: your own oversized `antiphon_send` is parked the same way and its "
                "result names the file, while an oversized `@claude` line is not parked — it "
                "is refused, and its words travel with your visible reply through the passive "
@@ -3606,8 +3785,10 @@ CLAUDE_RULE = ("\n## The Antiphon bridge\n\n"
                "file. It is on this same machine, in this project, and it holds the Codex "
                "agent's own words rather than the project's — its first line says whose, and "
                "the content is everything after the first blank line, which is what the hash "
-               "covers: `tail -n +3 <path> | shasum -a 256`. It is deleted "
-               f"{ATTACHMENT_TTL // 86400} days after it was written. The two roads differ "
+               "covers: `tail -n +3 <path> | shasum -a 256`. It becomes eligible for "
+               f"removal {ATTACHMENT_TTL // 86400} days after it was written and goes on "
+               "the next hook either side runs — there is no timer, so read it rather "
+               "than assuming it waits. The two roads differ "
                "here: an oversized `reply_to_codex` is parked the same way, while an "
                "oversized `@codex` line is not parked — it is refused, and its words travel "
                "with your visible reply through the passive pages instead.\n")

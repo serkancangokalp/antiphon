@@ -9460,5 +9460,164 @@ class AttachmentLifecycleTest(unittest.TestCase):
                 antiphon.status()
             self.assertIn("Attachments:        none parked", out.getvalue())
 
+class AttachmentStoreSafetyTest(unittest.TestCase):
+    """The store is a directory this code owns outright, or it is not used.
+
+    Two measured holes closed here. A quota read and the write it authorizes
+    were two separate operations, so two peers sending at once both passed a
+    check neither invalidated. And the store root was taken on trust, so a
+    `.antiphon/messages` symlinked at somewhere else put the words there and
+    counted them as if they were here.
+    """
+
+    UUID = RefusedSendHonestyTest.UUID
+
+    @staticmethod
+    def _store(project):
+        return AttachmentSpillTest._store(project)
+
+    # One child: park 700 bytes against a 1,000-byte quota, released from a
+    # barrier the parent opens once both are waiting on it. Two processes
+    # rather than two threads because the lock is the thing under test and a
+    # test that could pass on the GIL would prove nothing about two terminals.
+    CHILD = (
+        "import os, sys, time\n"
+        "sys.path.insert(0, sys.argv[1])\n"
+        "import antiphon\n"
+        "antiphon.ATTACHMENT_QUOTA = 1000\n"
+        "project, tag, barrier = sys.argv[2:5]\n"
+        "open(os.path.join(barrier, 'ready-' + tag), 'w').close()\n"
+        "go = os.path.join(barrier, 'go')\n"
+        "deadline = time.time() + 20\n"
+        "while not os.path.exists(go) and time.time() < deadline:\n"
+        "    pass\n"
+        "attachment, _refusal = antiphon._spill(project, 'z' * 700, None,\n"
+        "                                       'id-' + tag)\n"
+        "print('OK' if attachment is not None else 'REFUSED')\n")
+
+    def _race(self, project):
+        """Two concurrent spills into `project`; what each of them said."""
+        script = os.path.join(project, "child.py")
+        with open(script, "w", encoding="utf-8") as handle:
+            handle.write(self.CHILD)
+        barrier = os.path.join(project, "barrier")
+        os.makedirs(barrier)
+        lib = os.path.join(os.path.dirname(os.path.abspath(antiphon.__file__)))
+        kids = [subprocess.Popen(
+            [sys.executable, script, lib, project, tag, barrier],
+            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True)
+            for tag in ("a", "b")]
+        deadline = time.time() + 20
+        while (len([n for n in os.listdir(barrier)
+                    if n.startswith("ready-")]) < 2
+               and time.time() < deadline):
+            time.sleep(0.001)
+        with open(os.path.join(barrier, "go"), "w", encoding="utf-8"):
+            pass
+        return sorted(kid.communicate()[0].strip() for kid in kids)
+
+    def test_two_peers_at_the_quota_cannot_both_pass_it(self):
+        """The check and the write are one transaction.
+
+        Measured before the lock: five rounds out of five, both children
+        succeeded and a 1,000-byte store held 1,400. Repeated here so the gate
+        cannot pass by luck — one lucky serialization would otherwise read as
+        a fix.
+        """
+        for attempt in range(3):
+            with self.subTest(round=attempt), \
+                 tempfile.TemporaryDirectory() as project:
+                said = self._race(project)
+                _count, held, _oldest, _foreign = antiphon.attachment_usage(
+                    project)
+                self.assertEqual(said, ["OK", "REFUSED"],
+                                 "exactly one of the two may park")
+                self.assertLessEqual(held, 1000,
+                                     "and the store never goes over quota")
+
+    def test_the_store_lock_is_not_held_across_the_send(self):
+        """The lock covers the quota decision and the write, and nothing else.
+
+        A lock held across a transport is the mistake this project already
+        measured elsewhere: a 5,008 ms hold against a concurrent reader's own
+        2,038 ms of patience, after which that reader gave up having delivered
+        no context at all. Proved from inside the send itself rather than by
+        reading the code.
+        """
+        with tempfile.TemporaryDirectory() as project:
+            antiphon.peers.register(project, "claude", "ui", "/tmp/ui.sock")
+            free = []
+
+            def send(cwd, _text, *_args, **_kw):
+                # A second descriptor on the same file, which `flock` treats
+                # exactly as another process would.
+                with antiphon.attachment_lock(cwd) as locked:
+                    free.append(locked)
+                return True, ""
+
+            with patch.object(antiphon, "send_to_claude", side_effect=send):
+                antiphon._send_tool(project, AttachmentSpillTest.ASCII_BAND,
+                                    "ui")
+            self.assertEqual(free, [True],
+                             "the store lock was already released")
+
+    def test_a_symlinked_store_is_refused_rather_than_followed(self):
+        """The words would have landed outside the project, and been counted as
+        though they were inside it."""
+        with tempfile.TemporaryDirectory() as project, \
+             tempfile.TemporaryDirectory() as elsewhere:
+            os.makedirs(os.path.join(project, ".antiphon"))
+            os.symlink(elsewhere, self._store(project))
+            err = io.StringIO()
+            with contextlib.redirect_stderr(err):
+                with self.assertRaises(OSError):
+                    antiphon.write_attachment(project, "secret words", None,
+                                              self.UUID)
+                usage = antiphon.attachment_usage(project)
+                antiphon.sweep_attachments(project)
+            self.assertEqual(os.listdir(elsewhere), [],
+                             "nothing was written through the link")
+            self.assertEqual(usage[:2], (0, 0),
+                             "and nothing outside the project was counted")
+            self.assertIn("attachment store", err.getvalue())
+
+    def test_a_loose_store_mode_is_tightened_before_anything_is_written(self):
+        """`makedirs(exist_ok=True)` leaves a directory's mode exactly as it
+        found it, so a store somebody once created 0755 stayed 0755 — holding
+        one side's words for the other, readable by anyone on the machine."""
+        with tempfile.TemporaryDirectory() as project:
+            store = self._store(project)
+            os.makedirs(store)
+            os.chmod(store, 0o755)
+            err = io.StringIO()
+            with contextlib.redirect_stderr(err):
+                path, _digest = antiphon.write_attachment(project, "words",
+                                                          None, self.UUID)
+            self.assertEqual(os.stat(store).st_mode & 0o777, 0o700)
+            self.assertEqual(os.stat(path).st_mode & 0o777, 0o600)
+            self.assertIn("0700", err.getvalue())
+
+    def test_a_path_outside_the_store_cannot_be_dropped_through_it(self):
+        """`drop_attachment` runs on the failure path of a send, on a path the
+        caller supplies. It removes an attachment of this project's or it
+        removes nothing — a valid-looking uuid name is not authority."""
+        with tempfile.TemporaryDirectory() as project, \
+             tempfile.TemporaryDirectory() as elsewhere:
+            victim = os.path.join(elsewhere, self.UUID + ".txt")
+            with open(victim, "w", encoding="utf-8") as handle:
+                handle.write("somebody else's file")
+            mine, _digest = antiphon.write_attachment(project, "words", None,
+                                                      self.UUID)
+            err = io.StringIO()
+            with contextlib.redirect_stderr(err):
+                antiphon.drop_attachment(project, victim)
+            self.assertTrue(os.path.exists(victim), "refused, and said so")
+            self.assertIn("refus", err.getvalue().lower())
+
+            with contextlib.redirect_stderr(io.StringIO()):
+                antiphon.drop_attachment(project, mine)
+            self.assertFalse(os.path.exists(mine),
+                             "while this project's own attachment goes")
+
 if __name__ == "__main__":
     unittest.main()

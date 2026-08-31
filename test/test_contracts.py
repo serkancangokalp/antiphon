@@ -422,6 +422,12 @@ class ShippedContractTest(unittest.TestCase):
         self.assertRegex(limits, r"(?i)first\s+blank\s+line", "the hash's subject")
         self.assertRegex(limits, r"(?i)shasum", "and the command that runs it")
         self.assertRegex(limits, r"(?i)this\s+machine", "the same-machine bound")
+        # There is no timer. A file is removed by the first hook after its TTL
+        # and never at all in a project where neither side takes a turn, so
+        # "deleted after 7 days" would be a promise nothing keeps.
+        self.assertRegex(limits, r"(?i)eligible\s+for\s+removal",
+                         "the TTL makes a file eligible, it does not delete it")
+        self.assertRegex(limits, r"(?i)no\s+timer", "and the README says so")
         # The two spec bullets this does not deliver are named as undelivered.
         self.assertRegex(limits, r"(?i)acknowledgement[^.]*not|not[^.]*acknowledgement",
                          "acknowledgement is named as absent")
@@ -444,6 +450,9 @@ class ShippedContractTest(unittest.TestCase):
             self.assertRegex(text, r"(?i)this same machine", name)
             self.assertRegex(text, r"(?i){} days".format(
                 antiphon.ATTACHMENT_TTL // 86400), name)
+            # The same honesty as the README: eligible, not deleted on a timer.
+            self.assertRegex(text, r"(?i)eligible for removal", name)
+            self.assertRegex(text, r"(?i)no timer", name)
             # Operational, not decorative: which road parks and which refuses.
             self.assertRegex(text, r"(?i)is not parked|is parked", name)
             self.assertRegex(text, r"(?i)passive\s+pages", name)
