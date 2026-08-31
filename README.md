@@ -193,7 +193,8 @@ reader is as `unread <reader>: N raw bytes …` — raw transcript bytes, never 
 page count, which cannot be derived from them — and a replaying reader's
 page, `status` line and `doctor` note all name `catch-up`. Upgrading from
 0.1.0 no longer replays from the start of every transcript: the page resumes
-at the first record at or after the old cursor's time.
+at the first record at or after the old cursor's time, and whatever 0.1.0 had
+already left behind before that time is not replayed.
 
 `doctor` answers "why is nothing arriving?" and edits nothing: which copy
 of the package `PATH` resolves and whether the hooks run it, which bridge servers are running and whether any of

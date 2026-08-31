@@ -2595,9 +2595,13 @@ class CatchUpTest(unittest.TestCase):
         codex = os.path.join(project, f"rollout-{self.SID_CODEX}.jsonl")
         claude = os.path.join(project, f"{self.SID_CLAUDE}.jsonl")
         now = time.strftime("%Y-%m-%dT%H:%M:%S.000Z", time.gmtime())
+        def stamped(text, when):
+            return json.dumps({"type": "response_item", "timestamp": when,
+                               "payload": {"type": "message", "role": "assistant",
+                                           "content": [{"type": "output_text", "text": text}]}})
         with open(codex, "w", encoding="utf-8") as f:
-            f.write(codex_msg("old codex words one") + "\n")
-            f.write(codex_msg("old codex words two") + "\n")
+            f.write(stamped("old codex words one", "2025-01-01T00:00:00.000Z") + "\n")
+            f.write(stamped("old codex words two", "2025-01-01T00:00:01.000Z") + "\n")
         with open(claude, "w", encoding="utf-8") as f:
             f.write(json.dumps({"type": "assistant", "timestamp": now,
                                 "message": {"content": [{"type": "text",
@@ -2732,16 +2736,115 @@ class CatchUpTest(unittest.TestCase):
                 antiphon.status()
             printed = out.getvalue()
             unread_codex_rollouts = os.path.getsize(codex) - 10
+            claude_size = os.path.getsize(claude)
         line = next((l for l in printed.splitlines() if l.startswith("unread claude_pages:")), "")
         self.assertIn(f"{unread_codex_rollouts:,} raw bytes", line, printed)
         self.assertIn("1 source", line)
         self.assertIn("antiphon catch-up", line, "a replaying reader is told the escape")
         line = next((l for l in printed.splitlines() if l.startswith("unread codex_pages:")), "")
-        self.assertIn("1 discovered source", line, "a source the cursor has not met yet is counted")
+        self.assertIn(f"{claude_size:,} raw bytes", line,
+                      "a source the cursor has not met is counted from where the reader starts")
+        self.assertIn("1 not yet positioned", line)
         self.assertNotIn("catch-up", line, "no replay, no escape hatch offered")
         unread_lines = [l for l in printed.splitlines() if l.startswith("unread ")]
         self.assertFalse(any(re.search(r"\b\d[\d,]* pages?\b", l) for l in unread_lines),
                          "no page count: it cannot be derived from raw bytes")
+
+    def backlog_after(self, project, cursor_value, key="claude_pages"):
+        antiphon.write_cursor(project, {key: cursor_value}, "claude")
+        cursor, state = antiphon._read_cursor_state(project, "claude")
+        side = "claude" if key == "claude_pages" else "codex"
+        return antiphon.reader_backlog(project, side, cursor, state)
+
+    def test_backlog_counts_from_where_the_reader_will_actually_start(self):
+        """Review of 6089336 (Codex, read-only probe): the backlog re-derived
+        the reader's start rule and got it wrong exactly around migration and
+        recovery — a numeric v1 cursor showed `0 raw bytes … 1 discovered
+        source not yet read` while the reader would start at byte 63 and read
+        126. One resolver now serves both; N is the sum of size − start."""
+        with tempfile.TemporaryDirectory() as project:
+            codex, claude = self.sources(project)
+            self.discovering(project, codex, claude)
+            size = os.path.getsize(codex)
+            gen = antiphon.source_generation(codex)
+            with open(codex, "a", encoding="utf-8") as f:
+                f.write(json.dumps({"type": "response_item", "timestamp": "2030-01-01T00:00:00.000Z",
+                                    "payload": {"type": "message", "role": "assistant",
+                                                "content": [{"type": "output_text",
+                                                             "text": "future words"}]}}) + "\n")
+            total = os.path.getsize(codex)
+            future = antiphon.iso_epoch("2029-12-31T00:00:00.000Z")
+
+            with self.subTest(case="numeric v1 before its first page"):
+                antiphon.write_cursor(project, {"claude_seen": future}, "claude")
+                cursor, state = antiphon._read_cursor_state(project, "claude")
+                unread, positioned, unpositioned, replay = antiphon.reader_backlog(
+                    project, "claude", cursor, state)
+                self.assertEqual(unread, total - size, "only the record at/after the v1 time")
+                self.assertEqual((positioned, unpositioned, replay), (0, 1, "legacy_upgrade"))
+
+            with self.subTest(case="offset past EOF restarts at byte zero"):
+                unread, positioned, unpositioned, _ = self.backlog_after(project, {
+                    "v": 3, "sources": {self.SID_CODEX: {"gen": gen, "offset": total + 500}}})
+                self.assertEqual((unread, positioned, unpositioned), (total, 0, 1))
+
+            with self.subTest(case="generation mismatch restarts at byte zero"):
+                unread, positioned, unpositioned, _ = self.backlog_after(project, {
+                    "v": 3, "sources": {self.SID_CODEX: {"gen": "other:gen:0000", "offset": 10}}})
+                self.assertEqual((unread, positioned, unpositioned), (total, 0, 1))
+
+            with self.subTest(case="a trusted position counts the remainder"):
+                unread, positioned, unpositioned, _ = self.backlog_after(project, {
+                    "v": 3, "sources": {self.SID_CODEX: {"gen": gen, "offset": 10}}})
+                self.assertEqual((unread, positioned, unpositioned), (total - 10, 1, 0))
+
+            with self.subTest(case="a malformed page key recovers from byte zero: the whole file"):
+                unread, positioned, unpositioned, replay = self.backlog_after(
+                    project, {"v": 999, "sources": {"x": "bad"}})
+                self.assertEqual((unread, positioned, unpositioned, replay),
+                                 (total, 0, 1, "cursor_recovery"))
+
+            with self.subTest(case="an unreadable cursor file is unknown, never zero"):
+                with open(antiphon.state_path(project, "claude"), "w", encoding="utf-8") as f:
+                    f.write("{not json")
+                with contextlib.redirect_stderr(io.StringIO()):
+                    cursor, state = antiphon._read_cursor_state(project, "claude")
+                self.assertEqual(state, "invalid")
+                self.assertIsNone(antiphon.reader_backlog(project, "claude", cursor, state))
+
+    def test_status_and_doctor_never_claim_zero_unread_while_replaying(self):
+        """The numeric-v1 case as a person sees it: `status` and `doctor` show
+        the bytes the reader will actually read, and an untrusted cursor says
+        unknown in both places."""
+        with tempfile.TemporaryDirectory() as project:
+            codex, claude = self.sources(project)
+            self.discovering(project, codex, claude)
+            antiphon.write_cursor(project, {"claude_seen": antiphon.iso_epoch("2000-01-01T00:00:00.000Z")},
+                                  "claude")
+            expected = os.path.getsize(codex)      # everything is after year 2000
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out):
+                antiphon.status()
+            line = next((l for l in out.getvalue().splitlines()
+                         if l.startswith("unread claude_pages:")), "")
+            self.assertIn(f"{expected:,} raw bytes", line, line)
+            self.assertIn("antiphon catch-up", line)
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out):
+                antiphon._doctor_replay(antiphon._Report(), project)
+            self.assertIn(f"({expected:,} raw bytes unread)", out.getvalue())
+            self.assertNotIn("(0 raw bytes", out.getvalue())
+
+            with open(antiphon.state_path(project, "claude"), "w", encoding="utf-8") as f:
+                f.write("{not json")
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out), contextlib.redirect_stderr(io.StringIO()):
+                antiphon.status()
+                antiphon._doctor_replay(antiphon._Report(), project)
+            printed = out.getvalue()
+            self.assertIn("unread claude_pages: unknown", printed)
+            self.assertIn("amount unknown", printed)
+            self.assertNotIn("0 raw bytes", printed)
 
     def test_catch_up_is_a_command_with_usage(self):
         self.assertIs(antiphon.COMMANDS["catch-up"], antiphon.catch_up)

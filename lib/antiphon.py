@@ -1003,31 +1003,49 @@ def _start_offset(path, sid, generation, positions, since):
     because repeating records is the error this bridge accepts and skipping
     them is the one it does not.
     """
+    start, reason = _resolve_start(path, sid, generation, positions, since)
+    if reason == "replaced":
+        print("antiphon: a transcript was replaced since it was last read; "
+              "reading it again", file=sys.stderr)
+    elif reason == "unmeasurable":
+        print("antiphon: a transcript could not be measured; reading it again",
+              file=sys.stderr)
+    elif reason == "shrunk":
+        print("antiphon: a transcript is shorter than the %d bytes already "
+              "read from it; reading it again" % positions[sid]["offset"],
+              file=sys.stderr)
+    return start
+
+
+def _resolve_start(path, sid, generation, positions, since):
+    """The reader's start rule, pure: `(start, reason)`.
+
+    `reason` is `"positioned"` for a trusted recorded offset, `"since"` for a
+    source placed by time, `"start"` for byte zero with nothing recorded, and
+    `"replaced"` / `"unmeasurable"` / `"shrunk"` for a recorded offset that
+    cannot be trusted — each of those is byte zero too. One function, because
+    the backlog `status` and `doctor` report re-derived this rule once and got
+    it wrong exactly around migration and recovery (review of 6089336: a
+    numeric v1 cursor showed 0 bytes unread while the reader would read 126).
+    """
     recorded = (positions or {}).get(sid)
     if recorded:
-        # Both branches below return 0, not the shared fallback at the end of
-        # this function. An offset that cannot be trusted says nothing about
-        # what this peer has already seen, so the whole source is offered
-        # again; bounding that by the lookback (the shared fallback) would
-        # skip everything older than it -- a gap, where a repeat is the error
-        # this bridge accepts everywhere else. That fallback answers a
-        # different question: a source with no recorded entry at all.
+        # Every untrusted branch returns 0, not the time-window fallback: an
+        # offset that cannot be trusted says nothing about what this peer has
+        # seen, so the whole source is offered again — bounding that by the
+        # lookback would skip everything older than it, a gap, where a repeat
+        # is the error this bridge accepts everywhere else.
         if recorded.get("gen") != generation:
-            print("antiphon: a transcript was replaced since it was last read; "
-                  "reading it again", file=sys.stderr)
-            return 0
+            return 0, "replaced"
         size = _source_size(path)
         if size is None:
-            print("antiphon: a transcript could not be measured; reading it again",
-                  file=sys.stderr)
-            return 0
+            return 0, "unmeasurable"
         if recorded["offset"] > size:
-            print("antiphon: a transcript is shorter than the %d bytes already "
-                  "read from it; reading it again" % recorded["offset"],
-                  file=sys.stderr)
-            return 0
-        return recorded["offset"]
-    return offset_at_or_after(path, since) if since is not None else 0
+            return 0, "shrunk"
+        return recorded["offset"], "positioned"
+    if since is not None:
+        return offset_at_or_after(path, since), "since"
+    return 0, "start"
 
 
 # ---------- Claude side ----------
@@ -4405,12 +4423,12 @@ def _backlog_line(key, backlog):
     if backlog is None:
         return (f"unread {key}: unknown (the cursor could not be trusted; "
                 "the next turn replays)")
-    unread, met, unmet, replay = backlog
-    line = (f"unread {key}: {unread:,} raw bytes across {met} "
-            f"source{'' if met == 1 else 's'}")
-    if unmet:
-        line += (f"; {unmet} discovered source{'' if unmet == 1 else 's'} "
-                 "not yet read")
+    unread, positioned, unpositioned, replay = backlog
+    line = (f"unread {key}: {unread:,} raw bytes across "
+            f"{positioned + unpositioned} "
+            f"source{'' if positioned + unpositioned == 1 else 's'}")
+    if unpositioned:
+        line += f"; {unpositioned} not yet positioned"
     if replay:
         line += " — replaying history; `antiphon catch-up` skips it"
     return line
@@ -5225,7 +5243,13 @@ def _doctor_replay(report, cwd):
     for side in ("claude", "codex"):
         cursor, state = _read_cursor_state(cwd, side)
         backlog = reader_backlog(cwd, side, cursor, state)
-        if backlog is None or not backlog[3]:
+        if backlog is None:
+            report.note(f"replay: the {side} reader's cursor could not be "
+                        "trusted; its next turn replays discovered history "
+                        "(amount unknown until then); `antiphon catch-up` "
+                        "skips what is left after that page")
+            continue
+        if not backlog[3]:
             continue
         unread = backlog[0]
         report.note(f"replay: the {side} reader is re-delivering history "
@@ -5285,21 +5309,21 @@ def reader_backlog(cwd, side, cursor, cursor_state="valid"):
     if cursor_state == "invalid":
         return None
     positions, since, replay = positions_for(cursor, side, cursor_state)
-    unread, met, unmet = 0, 0, 0
+    unread, positioned, unpositioned = 0, 0, 0
     for path in CATCH_UP_SOURCES[side](cwd):
         try:
             size = os.path.getsize(path)
         except OSError:
             continue
-        entry = positions.get(source_id(path))
-        if entry and entry.get("gen") == source_generation(path):
-            unread += max(0, size - entry["offset"])
-            met += 1
-            continue
-        unmet += 1
-        if replay and since is None:
-            unread += size          # a byte-zero replay reads all of it
-    return unread, met, unmet, replay
+        sid = source_id(path)
+        start, reason = _resolve_start(path, sid, source_generation(path),
+                                       positions, since)
+        unread += max(0, size - start)
+        if reason == "positioned":
+            positioned += 1
+        else:
+            unpositioned += 1
+    return unread, positioned, unpositioned, replay
 
 
 def catch_up(side=None):
