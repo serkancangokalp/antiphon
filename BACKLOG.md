@@ -126,7 +126,7 @@ whose text merely quotes `"To Codex:"` must not assert that it carries relayed
 input, and measured, a string predicate does exactly that. A page with no
 relayed line — including the replay-notice page, which carries no records at
 all — closes exactly as it did before, so no page asserts words it does not
-contain. The sentence costs 143 bytes for a Claude reader and 146 for a Codex
+contain. The sentence costs 140 bytes for a Claude reader and 142 for a Codex
 reader, inside the ordinary `PAGE_BUDGET` arithmetic: on a tuned fixture it is
 what defers a second record to the next page.
 

@@ -7112,7 +7112,11 @@ class StatusTest(unittest.TestCase):
             with patch.object(antiphon.peers, "alive", return_value=False):
                 _, text = self._status(project)
         self.assertNotIn("Peers:", text)
-        self.assertNotIn("ui", text)
+        # Never `assertNotIn("ui", text)`: the page prints the temp project
+        # path, and tempfile's random suffix contains "ui" once in ~200 runs.
+        for line in text.splitlines():
+            if not line.startswith("project:"):
+                self.assertNotIn("ui", line)
 
     # ---- the channel line ----
 
