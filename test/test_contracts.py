@@ -376,6 +376,82 @@ class ShippedContractTest(unittest.TestCase):
         self.assertNotIn("2,600", limits, "the retired summary budget")
         self.assertNotRegex(limits, r"\b420\b", "the retired per-event cut")
 
+    def test_attachment_limits_match_code(self):
+        """The three attachment numbers a person can act on are read back out
+        of README §Limits, by the same technique the paging numbers use — the
+        word-adjacency regex, so prose that rewraps still counts.
+
+        The queue's own bound is deliberately absent from that list. It is not
+        a constant: it is `SC_ARG_MAX` minus the live environment, measured
+        falling from 1,044,820 to 444,759 bytes as the environment grew, and a
+        number pinned here would be a promise about somebody else's shell.
+        """
+        self.assertEqual(antiphon.ATTACHMENT_MAX, 8 * 1024 * 1024)
+        self.assertEqual(antiphon.ATTACHMENT_QUOTA, 64 * 1024 * 1024)
+        self.assertEqual(antiphon.ATTACHMENT_TTL, 7 * 24 * 3600)
+        self.assertFalse(hasattr(antiphon, "QUEUE_ARGV_BOUND"),
+                         "a constant queue bound cannot be correct; the "
+                         "predicate computes it at call time")
+        limits = section(read("README.md"), "Limits")
+        self.assertIsNotNone(limits, "the README has no Limits section")
+        mib = 1024 * 1024
+        for what, words in (
+                ("the per-attachment cap",
+                 (str(antiphon.ATTACHMENT_MAX // mib), "MiB")),
+                ("the whole store's quota",
+                 (str(antiphon.ATTACHMENT_QUOTA // mib), "MiB")),
+                ("the attachment lifetime",
+                 (str(antiphon.ATTACHMENT_TTL // 86400), "days"))):
+            # `\b` in front, unlike the paging pins: these numbers are short
+            # enough to hide inside a bigger one — measured, an `8 MiB` pin
+            # matches the `8 MiB` at the end of `48 MiB`, so a drifted README
+            # would have passed.
+            self.assertRegex(limits, r"\b" + r"\s+".join(map(re.escape, words)),
+                             what)
+        # The two roads, stated separately rather than as one bound promise:
+        # an agent that learns "oversized direct sends work now" and then loses
+        # a `@claude` line to an exit-0 hook was told something untrue.
+        self.assertRegex(limits, r"(?i)direct\s+tools[^.]*park",
+                         "the tool road parks")
+        self.assertRegex(limits, r"(?i)marker\s+road\s+does\s+not\s+park",
+                         "the marker road does not, and the README says so")
+        self.assertRegex(limits, r"(?i)still\s+refused",
+                         "and says what happens there instead")
+        # The hash rule is stated performably, and the locality bound is stated
+        # at all — this is the first feature to make it load-bearing.
+        self.assertRegex(limits, r"(?i)first\s+blank\s+line", "the hash's subject")
+        self.assertRegex(limits, r"(?i)shasum", "and the command that runs it")
+        self.assertRegex(limits, r"(?i)this\s+machine", "the same-machine bound")
+        # The two spec bullets this does not deliver are named as undelivered.
+        self.assertRegex(limits, r"(?i)acknowledgement[^.]*not|not[^.]*acknowledgement",
+                         "acknowledgement is named as absent")
+        self.assertRegex(limits, r"(?i)retry", "and so is retry")
+
+    def test_both_surfaces_teach_the_attachment_envelope(self):
+        """An envelope naming a path an agent has never been told about is a
+        pointer to nothing. Both surfaces name the label, the file's origin,
+        the hash rule with the command that performs it, the same-machine
+        bound, and the road asymmetry — because after this change the direct
+        tool and the marker line are no longer interchangeable at size, and the
+        difference is invisible to the sender."""
+        for name, text in (("AGENTS_RULE", antiphon.AGENTS_RULE),
+                           ("CLAUDE_RULE", antiphon.CLAUDE_RULE)):
+            self.assertIn(antiphon.ATTACHMENT_LABEL, text, name)
+            self.assertIn(".antiphon/messages/", text, name)
+            self.assertRegex(text, r"(?i)first blank line", name)
+            self.assertRegex(text, r"(?i)shasum", name)
+            self.assertRegex(text, r"(?i)own words", name)
+            self.assertRegex(text, r"(?i)this same machine", name)
+            self.assertRegex(text, r"(?i){} days".format(
+                antiphon.ATTACHMENT_TTL // 86400), name)
+            # Operational, not decorative: which road parks and which refuses.
+            self.assertRegex(text, r"(?i)is not parked|is parked", name)
+            self.assertRegex(text, r"(?i)passive\s+pages", name)
+        self.assertIn("antiphon_send", antiphon.AGENTS_RULE)
+        self.assertIn("@claude` line is not parked", antiphon.AGENTS_RULE)
+        self.assertIn("reply_to_codex", antiphon.CLAUDE_RULE)
+        self.assertIn("@codex` line is not parked", antiphon.CLAUDE_RULE)
+
     def test_paged_context_surfaces_teach_has_more(self):
         """An agent that has not been told a page is one of several will treat
         the first page as the whole answer. Both the tool description and the

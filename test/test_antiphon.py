@@ -9221,5 +9221,244 @@ class AttachmentSpillTest(unittest.TestCase):
                              "foreign entries are counted, never named — a "
                              "store report is not a directory listing")
 
+class AttachmentLifecycleTest(unittest.TestCase):
+    """What happens to a parked attachment after the send that made it.
+
+    Every event here is announced. A file that expires says so, a store that
+    is full says so, and `status` says what is waiting — the alternative is a
+    directory that grows in silence and a refusal nobody can explain.
+    """
+
+    UUID = RefusedSendHonestyTest.UUID
+    _DeadSocket = RefusedSendHonestyTest._DeadSocket
+    _LiveSocket = RefusedSendHonestyTest._LiveSocket
+    _Queued = RefusedSendHonestyTest._Queued
+    ASCII_BAND = AttachmentSpillTest.ASCII_BAND
+
+    @staticmethod
+    def _codex_peer(project, alias, owner, session=None):
+        RefusedSendHonestyTest._codex_peer(project, alias, owner, session)
+
+    @staticmethod
+    def _reply(project, payload):
+        return RefusedSendHonestyTest._reply(project, payload)
+
+    @staticmethod
+    def _store(project):
+        return AttachmentSpillTest._store(project)
+
+    @classmethod
+    def _files(cls, project):
+        return AttachmentSpillTest._files(project)
+
+    @classmethod
+    def _park(cls, project, text="parked words", age=0.0, alias=None):
+        """One attachment in the store, aged `age` seconds."""
+        path, _digest = antiphon.write_attachment(
+            project, text, alias, RefusedSendHonestyTest.UUID)
+        when = time.time() - age
+        os.utime(path, (when, when))
+        return path
+
+    @staticmethod
+    def _hook(project, side="claude", extra=(), with_cwd=True,
+              summary=("", None, 0)):
+        """One `UserPromptSubmit` hook, with a summary of the test's choosing.
+
+        The default summary is empty — the ordinary quiet turn, which is the
+        path a sweep placed at a successful tail would never reach.
+        """
+        payload = {"hook_event_name": "UserPromptSubmit"}
+        if with_cwd:
+            payload["cwd"] = project
+        out, err = io.StringIO(), io.StringIO()
+        with contextlib.ExitStack() as stack:
+            enter = stack.enter_context
+            enter(patch.object(antiphon.sys, "stdin",
+                               io.StringIO(json.dumps(payload))))
+            enter(patch.object(antiphon, "build_summary",
+                               return_value=summary))
+            enter(contextlib.redirect_stdout(out))
+            enter(contextlib.redirect_stderr(err))
+            for context in extra:
+                enter(context)
+            code = antiphon.hook(side)
+        return code, out.getvalue(), err.getvalue()
+
+    def test_the_sweep_runs_after_the_cwd_and_before_the_page(self):
+        """Its moment, from a call-sequence spy.
+
+        After `cwd` is resolved, because there is no store path before that;
+        before the page is built, because a sweep at a successful tail never
+        runs on the ordinary quiet turn — `hook` has five exits and that is the
+        common one. Outside every lock, because this project measured a slow
+        operation under `cursor_lock` at a 5,008 ms hold against a concurrent
+        reader's 2,038 ms of patience.
+        """
+        calls = []
+
+        def sweep(cwd, *_a, **_k):
+            calls.append(("sweep", cwd))
+
+        def page(cwd, *_a, **_k):
+            calls.append(("page", cwd))
+            return "", None, 0
+
+        with tempfile.TemporaryDirectory() as project:
+            code, _out, _err = self._hook(project, extra=[
+                patch.object(antiphon, "sweep_attachments", side_effect=sweep),
+                patch.object(antiphon, "build_summary", side_effect=page)])
+            self.assertEqual(code, 0)
+            self.assertEqual([what for what, _ in calls], ["sweep", "page"])
+            self.assertEqual(calls[0][1], os.path.abspath(project),
+                             "the sweep is handed the resolved cwd")
+
+    def test_an_expired_attachment_is_swept_by_any_hook(self):
+        """Including the quiet turn, and out loud. An unexpired one stays."""
+        with tempfile.TemporaryDirectory() as project:
+            expired = self._park(project, "old words",
+                                 age=antiphon.ATTACHMENT_TTL + 3600)
+            fresh = self._park(project, "new words", age=3600)
+            code, out, err = self._hook(project)
+            self.assertEqual((code, out), (0, ""))
+            self.assertFalse(os.path.exists(expired))
+            self.assertTrue(os.path.exists(fresh))
+            self.assertIn(expired, err)
+            self.assertIn("expired", err)
+            self.assertNotIn(fresh, err)
+
+    def test_a_hook_on_the_fallback_root_never_sweeps(self):
+        """`cwd` comes from the payload or from `project_dir()`, and this code
+        deliberately does not trust the second — a hook process's own working
+        directory is not a claim about which project it serves. No payload
+        `cwd`, no sweep: deleting a person's files off a guess is not a
+        lifecycle."""
+        with tempfile.TemporaryDirectory() as project:
+            expired = self._park(project, "old words",
+                                 age=antiphon.ATTACHMENT_TTL + 3600)
+            swept = []
+            code, _out, err = self._hook(
+                project, with_cwd=False,
+                extra=[patch.object(antiphon, "project_dir",
+                                    return_value=project),
+                       patch.object(antiphon, "sweep_attachments",
+                                    side_effect=lambda *a, **k: swept.append(a))])
+            self.assertEqual(code, 0)
+            self.assertEqual(swept, [])
+            self.assertTrue(os.path.exists(expired))
+            self.assertEqual(err, "")
+
+    def test_the_sweep_can_never_change_the_hook_exit_code(self):
+        """A non-zero exit suppresses the page this hook exists to deliver, so
+        nothing the sweep can do may reach it."""
+        with tempfile.TemporaryDirectory() as project:
+            code, _out, err = self._hook(project, extra=[
+                patch.object(antiphon, "sweep_attachments",
+                             side_effect=OSError(errno.EIO, "I/O error"))])
+            self.assertEqual(code, 0)
+            self.assertIn("attachment", err.lower())
+
+    def test_a_full_store_refuses_without_deleting_anything(self):
+        """At quota the send is refused with the store's honest state, and
+        nothing is evicted: an unexpired attachment is somebody's undelivered
+        words, and making room by deleting them would be the silent loss this
+        whole feature exists to remove.
+
+        The refusal is UNCLASSED. `_ClassifiedRefusal`'s own invariant is that
+        a class means "the sender needs telling where its words still travel";
+        this refusal names its own fix instead, so it joins the addressing
+        family and stays byte-identical by construction. The object is asserted
+        because the two renderings are not distinguishable — measured, a
+        classed and an unclassed refusal print identically, since the class is
+        a `str` subclass.
+        """
+        with tempfile.TemporaryDirectory() as project, \
+             patch.object(antiphon, "ATTACHMENT_QUOTA", 4_096):
+            antiphon.peers.register(project, "claude", "ui", "/tmp/ui.sock")
+            held = self._park(project, "z" * 4_000)
+            before = self._files(project)
+
+            attachment, detail = antiphon._spill(project, self.ASCII_BAND,
+                                                 None, self.UUID)
+            self.assertIsNone(attachment)
+            self.assertIsNone(getattr(detail, "refusal_class", None),
+                              "a class would attach the passive-page guidance "
+                              "to a refusal that names its own fix")
+
+            with patch.object(antiphon.socket, "socket") as opened:
+                result = antiphon._send_tool(project, self.ASCII_BAND, "ui")
+                opened.assert_not_called()
+            said = result["content"][0]["text"]
+            self.assertIs(result.get("isError"), True)
+            self.assertIn("attachment store", said)
+            self.assertNotIn(antiphon.TOOL_GUIDANCE.format(seen="nothing"),
+                             said)
+            self.assertEqual(self._files(project), before,
+                             "nothing was evicted and nothing was added")
+            self.assertTrue(os.path.exists(held))
+
+        # The `reply()` side mirrors it, with the same unclassed text.
+        with tempfile.TemporaryDirectory() as project, \
+             patch.object(antiphon, "ATTACHMENT_QUOTA", 4_096):
+            self._codex_peer(project, "build", "300:build", self.UUID)
+            held = self._park(project, "z" * 4_000)
+            with AttachmentSpillTest._spills_over(500), \
+                 patch.object(antiphon.subprocess, "run",
+                              return_value=self._Queued()):
+                code, _out, err = self._reply(project, {"text": "y" * 4_000,
+                                                        "to": "build"})
+            self.assertEqual(code, 1)
+            self.assertIn("attachment store", err)
+            self.assertNotIn(antiphon.TOOL_GUIDANCE.format(
+                seen="only a tool-name line"), err)
+            self.assertTrue(os.path.exists(held))
+
+    def test_status_reports_the_store_and_never_touches_it(self):
+        """Count, content bytes and the oldest age in whole days — no names.
+
+        `status` is a reader. It does not sweep: a person asking what is
+        pending must not be the thing that deletes it, and a status run that
+        changed the store would make two consecutive runs disagree, which is
+        the pin `test_status_lists_peers_in_a_stable_order` already holds.
+        """
+        with tempfile.TemporaryDirectory() as project:
+            fresh = self._park(project, "y" * 1_500, age=3 * 86_400 + 60)
+            expired = self._park(project, "y" * 700,
+                                 age=antiphon.ATTACHMENT_TTL + 3600)
+            before = self._files(project)
+
+            def run():
+                out = io.StringIO()
+                with patch.object(antiphon, "project_dir",
+                                  return_value=project), \
+                     contextlib.redirect_stdout(out), \
+                     contextlib.redirect_stderr(io.StringIO()):
+                    antiphon.status()
+                return out.getvalue()
+
+            first, second = run(), run()
+            self.assertEqual(first, second, "two runs a second apart agree")
+            line = next(row for row in first.splitlines()
+                        if row.startswith("Attachments:"))
+            self.assertIn("1 parked", line, "the expired one is not pending")
+            self.assertIn("1,500 bytes", line)
+            self.assertIn("3 days old", line)
+            self.assertNotIn(os.path.basename(fresh), first)
+            self.assertNotIn(os.path.basename(expired), first)
+            self.assertNotIn(self._store(project), first)
+            self.assertEqual(self._files(project), before,
+                             "status swept nothing")
+
+    def test_status_says_so_when_nothing_is_parked(self):
+        """A line that only appears when something is wrong teaches nobody what
+        it means when it does."""
+        with tempfile.TemporaryDirectory() as project:
+            out = io.StringIO()
+            with patch.object(antiphon, "project_dir", return_value=project), \
+                 contextlib.redirect_stdout(out), \
+                 contextlib.redirect_stderr(io.StringIO()):
+                antiphon.status()
+            self.assertIn("Attachments:        none parked", out.getvalue())
+
 if __name__ == "__main__":
     unittest.main()

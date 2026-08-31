@@ -258,17 +258,53 @@ with no stable-id retrieval yet, discovery has no catalog (the newest-3 window
 above), and there is no backward paging into history an older version already
 marked seen. Those are tracked in [BACKLOG.md](BACKLOG.md).
 
-### The Codex-to-Claude channel refuses rather than truncates
+### An oversized direct message is parked, never truncated
 
 A message sent from Codex to Claude with `antiphon_send` or `@claude` uses the
 Unix-socket channel. Its serialized payload has a separate 128 KiB byte cap,
-checked by the sender before transport and by the server on arrival. Over that,
-the send fails with an error you can see; it is never silently shortened, so
-ordinary long code and SQL within the cap travel intact.
+checked by the sender before transport and by the server on arrival — the
+serialized size, not the character count, because JSON escaping is unbounded: a
+message of control characters crosses the cap at a sixth of its raw length.
+Nothing is ever silently shortened, so ordinary long code and SQL within the cap
+travel intact.
 
-The reverse Claude-to-Codex path uses `codex queue` and does not share that
-explicit Antiphon byte cap. It also has no oversized-message attachment
-protocol yet, so extremely large direct transfers in either direction remain a
-P1 item in [BACKLOG.md](BACKLOG.md).
+Past that cap the two roads behave differently, and which one you are on
+matters.
+
+The direct tools park the words. Over the cap, `antiphon_send` and
+`reply_to_codex` write the full text to `.antiphon/messages/<uuid>.txt` — mode
+0600, inside a 0700 directory — and deliver a small envelope naming the absolute
+path, the content's size and its SHA-256. The file opens with one line of
+provenance saying whose words follow; the content is everything after the first
+blank line, and the hash covers only that, so `tail -n +3 <path> | shasum -a
+256` verifies it. The path is local, and that is the bound: both agents run on
+this machine, as this user, against this project. One attachment may hold 8 MiB
+of content, the whole store 64 MiB, and a parked file is deleted 7 days after it
+was written — announced on stderr, on the next hook either side runs. `antiphon
+status` reports how many are pending, how many content bytes they hold and how
+old the oldest is, and never deletes anything itself. Above the per-attachment
+cap, or with the store full, the send is refused with the reason and nothing is
+written; a send that fails for any other reason removes its parked file at once.
+
+The `@claude` and `@codex` marker road does not park. A marker line over the cap
+is still refused, and that refusal prints on an exit-0 Stop hook, which this
+project measured as reaching a debug log rather than the agent. It is a
+deliberate asymmetry rather than an unfinished half: a marker line's words are
+already in the visible reply, and the passive pull pages carry that reply
+whole, so an attachment there would duplicate for nobody what pull already
+delivers.
+
+The reverse Claude-to-Codex path uses `codex queue` and has no Antiphon byte cap
+of its own. What bounds it is the kernel's `ARG_MAX` — one budget argv shares
+with the environment, so the largest message that can be handed over shrinks
+byte for byte as the environment grows, measured here from 1,044,820 down to
+444,759. `reply_to_codex` computes that bound at call time and parks above it,
+and an exec the kernel refuses for any other reason comes back as a named
+refusal instead of a traceback.
+
+Acknowledgement and retry are not part of this: an envelope rides the same
+at-least-once delivery every message does, nothing ever learns the file was
+read, and a resent message parks a second file rather than reusing the first.
+Those two remain a P1 item in [BACKLOG.md](BACKLOG.md).
 
 MIT.

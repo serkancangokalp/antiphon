@@ -1612,8 +1612,32 @@ def hook(side="claude"):
         # `[]` and `"x"` are valid JSON. `.get` on either raises, and out of a
         # Stop hook that is a traceback in somebody's terminal.
         input_data = {}
-    cwd = os.path.abspath(input_data.get("cwd") or project_dir())
+    stated_cwd = input_data.get("cwd")
+    cwd = os.path.abspath(stated_cwd or project_dir())
     event = input_data.get("hook_event_name") or "UserPromptSubmit"
+
+    # The sweep's moment: immediately after `cwd` is resolved, because there is
+    # no store path before that, and before the page is built, because a sweep
+    # at a successful tail never runs on the ordinary quiet turn — this
+    # function has five exits and `if not text` is the common one. Outside
+    # every lock: at 1.32 µs against a missing store and 93.9 µs across 50
+    # files the cost is nothing, but a hold across `cursor_lock` was measured
+    # at 5,008 ms against a concurrent reader's 2,038 ms of patience.
+    #
+    # Only on a `cwd` the payload stated. `project_dir()` is the fallback this
+    # code deliberately does not trust for anything else, and deleting a
+    # person's files off a guess about which project this is would be worse
+    # than an unswept store.
+    #
+    # Its own `try/except` because a non-zero exit suppresses the page: this
+    # function spends a paragraph below on why that costs the reader more than
+    # any error it could report.
+    if stated_cwd:
+        try:
+            sweep_attachments(cwd)
+        except OSError as error:
+            print(f"antiphon: the attachment sweep failed: {error}",
+                  file=sys.stderr)
 
     if side == "codex":
         # On every event, not only `SessionStart`. A missed one then costs a
@@ -2612,6 +2636,11 @@ def _attachment_content_bytes(path, size):
     return stated if 0 <= stated <= size else size
 
 
+def _mib(size):
+    """Bytes as MiB, for the one refusal a person has to act on."""
+    return f"{size / (1024 * 1024):.1f} MiB"
+
+
 def attachment_usage(cwd, now=None):
     """`(count, content bytes, oldest age in seconds, foreign count)`.
 
@@ -2683,6 +2712,29 @@ def drop_attachment(path):
         return
     print(f"antiphon: the send failed, so its attachment was removed: {path}",
           file=sys.stderr)
+
+
+def attachment_report(cwd, now=None):
+    """The `status` line for the parked store. A reader, never a sweeper.
+
+    Never a filename: `status` prints no path, address or session id anywhere
+    else either, and a parked file's name is the one thing in this feature a
+    person cannot be shown by accident. The oldest age renders in whole days
+    because two consecutive `status` runs are pinned equal, and a duration
+    derived from `now` at any finer grain would make that pin flake.
+    """
+    parked, held, oldest, foreign = attachment_usage(cwd, now)
+    if not parked:
+        line = "Attachments:        none parked"
+    else:
+        days = int(oldest // 86400)
+        aged = "today" if days == 0 else f"{days} day{'' if days == 1 else 's'} old"
+        line = (f"Attachments:        {parked} parked, {held:,} bytes, "
+                f"oldest {aged}")
+    if foreign:
+        noun = "entry" if foreign == 1 else "entries"
+        line += f"; {foreign} other {noun} left alone"
+    return line
 
 
 def _oversized_for_claude(text, alias=None, message_id=None):
@@ -2782,6 +2834,20 @@ def _spill(cwd, text, alias, message_id):
     these refusals name their own fix instead.
     """
     size = len(text.encode())
+    parked, held, oldest, _foreign = attachment_usage(cwd)
+    if held + size > ATTACHMENT_QUOTA:
+        # Nothing is evicted to make room. An unexpired attachment is somebody
+        # else's undelivered words, and deleting them to fit these would be
+        # exactly the silent loss this store exists to remove. So the refusal
+        # reports the state and names the two ways out of it: wait, or clear
+        # the directory by hand.
+        return None, (
+            f"the attachment store is full: {parked} parked attachments hold "
+            f"{_mib(held)} of the {_mib(ATTACHMENT_QUOTA)} it may hold, and "
+            f"this message needs {_mib(size)} more. Attachments are deleted "
+            f"{ATTACHMENT_TTL // 86400} days after they are written and the "
+            f"oldest here is {int(oldest // 86400)} days old; "
+            f"{attachment_dir(cwd)} can also be cleared by hand.")
     try:
         path, digest = write_attachment(cwd, text, alias, message_id)
     except OSError as error:
@@ -3497,7 +3563,19 @@ AGENTS_RULE = ("\n## The Antiphon bridge\n\n"
                "unaddressed send is refused rather than delivered to a guess. For the same "
                "reason every terminal in a project with more than one session per side has to "
                "be started with `ANTIPHON_NAME` set — a session without a name is live but "
-               "unaddressable, and nothing can be sent back to it.\n")
+               "unaddressable, and nothing can be sent back to it.\n\n"
+               "A message too large for the channel arrives as an envelope instead of the "
+               "words: a line starting with `[Antiphon attachment]` naming an absolute path "
+               "under `.antiphon/messages/`, the content's size and its SHA-256. Read that "
+               "file. It is on this same machine, in this project, and it holds the peer's "
+               "own words rather than the project's — its first line says whose, and the "
+               "content is everything after the first blank line, which is what the hash "
+               "covers: `tail -n +3 <path> | shasum -a 256`. It is deleted "
+               f"{ATTACHMENT_TTL // 86400} days after it was written. The two roads differ "
+               "here: your own oversized `antiphon_send` is parked the same way and its "
+               "result names the file, while an oversized `@claude` line is not parked — it "
+               "is refused, and its words travel with your visible reply through the passive "
+               "pages instead.\n")
 
 CLAUDE_RULE = ("\n## The Antiphon bridge\n\n"
                "You are working alongside another agent on this project. What happens on the "
@@ -3521,7 +3599,18 @@ CLAUDE_RULE = ("\n## The Antiphon bridge\n\n"
                "same reason every terminal in a project with more than one session per side "
                "has to be started with `ANTIPHON_NAME` set — Codex terminals above all, "
                "because an unnamed Codex session leaves no record at all, and one that exists "
-               "unseen is why a bare message to Codex is refused.\n")
+               "unseen is why a bare message to Codex is refused.\n\n"
+               "A message too large for the transport arrives as an envelope instead of the "
+               "words: a line starting with `[Antiphon attachment]` naming an absolute path "
+               "under `.antiphon/messages/`, the content's size and its SHA-256. Read that "
+               "file. It is on this same machine, in this project, and it holds the Codex "
+               "agent's own words rather than the project's — its first line says whose, and "
+               "the content is everything after the first blank line, which is what the hash "
+               "covers: `tail -n +3 <path> | shasum -a 256`. It is deleted "
+               f"{ATTACHMENT_TTL // 86400} days after it was written. The two roads differ "
+               "here: an oversized `reply_to_codex` is parked the same way, while an "
+               "oversized `@codex` line is not parked — it is refused, and its words travel "
+               "with your visible reply through the passive pages instead.\n")
 
 
 class ConfigFileError(Exception):
@@ -4065,6 +4154,7 @@ def status():
     channel = ("live" if live["claude"]
                else "live" if os.path.exists(claude_socket_path(cwd)) else "down")
     print(f"Claude channel:     {channel}")
+    print(attachment_report(cwd))
     for line in _peer_report(live):
         print(line)
     snapshots = {}
