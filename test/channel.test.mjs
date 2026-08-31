@@ -897,17 +897,47 @@ try {
   });
 
   // The alias crossed a socket, so it is a claim rather than a fact. Anything
-  // that is not a name the registry would accept reaches the agent as null —
-  // never as text it might read as a name to reply to.
+  // that is not a name the registry would accept reaches the agent as the
+  // reserved `<unnamed>` key — never as text it might read as a name to reply
+  // to, and never as null: measured on Claude Code 2.1.251, the host validates
+  // `meta.sender_alias` as a string and drops the whole notification on null
+  // ("ProtocolError: Invalid params … expected string, received null") while
+  // this server has already answered the sender `{ok:true}`. Every message
+  // from an unnamed Codex — the default install — was lost that way.
   for (const claimed of ["Not A Name", "a b", "a]b", 42, null, ["ui"], "",
-                         "a".repeat(40)]) {
+                         "a".repeat(40), "<unnamed>"]) {
     const pending = nextNotification();
     await sendToSocket({ content: `claim ${JSON.stringify(claimed)}`,
                          sender_alias: claimed });
     const seen = await pending;
-    assert.equal(seen.params.meta.sender_alias, null,
-      `an unusable alias must not reach the agent: ${JSON.stringify(claimed)}`);
+    assert.equal(seen.params.meta.sender_alias, "<unnamed>",
+      `an unusable alias must reach the agent as the sentinel: ${JSON.stringify(claimed)}`);
+    assert.equal(typeof seen.params.meta.sender_alias, "string",
+      "the host schema accepts only a string here");
   }
+
+  // The sentinel is what the agent now reads in `sender_alias`, and the
+  // instructions tell it to pass a *name* back as `to`. An agent that passes
+  // the sentinel anyway must get the bare-reply outcome, not "no peer named
+  // <unnamed>": the two refusals (or two deliveries) have to be word-for-word
+  // the same, and both have to differ from a genuinely unknown name.
+  const outcome = async (args) => {
+    try {
+      const result = await client.callTool({ name: "reply_to_codex", arguments: args });
+      return result.content[0].text;
+    } catch (error) {
+      // A refusal surfaces as a tool error; its wording is the outcome.
+      return String(error?.message || error);
+    }
+  };
+  const bare = await outcome({ text: "sentinel probe" });
+  const viaSentinel = await outcome({ text: "sentinel probe", to: "<unnamed>" });
+  const unknown = await outcome({ text: "sentinel probe", to: "nobody" });
+  assert.equal(viaSentinel, bare,
+    "`to: \"<unnamed>\"` must be handled exactly like leaving `to` out");
+  assert.notEqual(unknown, bare,
+    "the premise: an unknown name is answered differently from a bare reply");
+  console.log("the sentinel as a recipient means no recipient: ok");
 
   // ---- large attachments, end to end -------------------------------------
   // The one place the whole road is real at once: the real Python tool, the

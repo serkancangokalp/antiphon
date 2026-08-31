@@ -60,7 +60,7 @@ A Codex → Claude message never pastes text into the terminal and never imperso
 <channel source="antiphon" sender="codex" sender_kind="agent" sender_alias="build" message_id="...">
 ```
 
-Claude Code's interface shows this as an incoming channel event, and Claude treats the message as the words of the Codex agent, not of the human user. It sends its reply back with the `reply_to_codex` MCP tool, passing `sender_alias` as `to` whenever it is non-null. A bare reply is refused as soon as any named Codex peer is registered: an unnamed Codex session leaves no registry record, so one visible peer cannot be shown to be the only one running. A `null` `sender_alias` is a peer with no name — it cannot be addressed by name, and a bare reply reaches it only in a project where nothing is registered.
+Claude Code's interface shows this as an incoming channel event, and Claude treats the message as the words of the Codex agent, not of the human user. It sends its reply back with the `reply_to_codex` MCP tool, passing `sender_alias` as `to` whenever it is a name rather than the literal `<unnamed>`. A bare reply is refused as soon as any named Codex peer is registered: an unnamed Codex session leaves no registry record, so one visible peer cannot be shown to be the only one running. A `sender_alias` of `<unnamed>` is a peer with no name — it cannot be addressed by name, and a bare reply reaches it only in a project where nothing is registered; passing `<unnamed>` as `to` is the same as leaving it out.
 
 Nothing pairs peers up. There is no automatic Claude↔Codex partnership, and no reply correlation: a message is routed only by the name written on it.
 

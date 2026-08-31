@@ -2671,7 +2671,7 @@ class DoctorTest(unittest.TestCase):
         # somebody started one. Everything after it still runs.
         self.assertTrue(
             self.line_for(printed, antiphon.MCP_CONFIG_FILE).startswith("✓"))
-        self.assertTrue(self.line_for(printed, "alias").startswith(("✓", "·")),
+        self.assertTrue(self.line_for(printed, "alias:").startswith(("✓", "·")),
                         printed)
 
     def test_doctor_probes_the_socket_not_the_file(self):
@@ -2729,14 +2729,17 @@ class DoctorTest(unittest.TestCase):
         with patch.dict(os.environ, {"ANTIPHON_NAME": "bad name"}):
             code, printed = self.run_doctor(project)
         self.assertEqual(code, 1)
-        line = self.line_for(printed, "alias")
+        # `alias:` with the colon, as the channel test does with `channel:`:
+        # the bare word matched the install line first when the checkout sat
+        # under a path that happened to contain it (`.worktrees/alias-string`).
+        line = self.line_for(printed, "alias:")
         self.assertTrue(line.startswith("✗"), line)
         self.assertIn("lower-case", line, "the accepted shape is named")
 
         with patch.dict(os.environ, {"ANTIPHON_NAME": "ui"}):
             code, printed = self.run_doctor(project)
         self.assertEqual(code, 0, printed)
-        self.assertEqual(self.line_for(printed, "alias"), '✓ alias: named "ui"')
+        self.assertEqual(self.line_for(printed, "alias:"), '✓ alias: named "ui"')
 
         # Measured: `explicit_name()` lower-cases, so production accepts "UI"
         # while `NAME_PATTERN` refuses the raw value — a doctor reading the
@@ -2745,7 +2748,7 @@ class DoctorTest(unittest.TestCase):
         with patch.dict(os.environ, {"ANTIPHON_NAME": "UI"}):
             code, printed = self.run_doctor(project)
         self.assertEqual(code, 0, printed)
-        self.assertEqual(self.line_for(printed, "alias"), '✓ alias: named "ui"')
+        self.assertEqual(self.line_for(printed, "alias:"), '✓ alias: named "ui"')
 
     def test_doctor_names_an_endpoint_that_records_no_owner_key(self):
         """The one place an operator finds out why their named session is never
