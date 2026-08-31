@@ -433,11 +433,14 @@ async function everySessionSignsTheValidNameItWasGiven() {
       arguments: { text: "from the loser", to: "build" },
     });
 
-    assert.match(readFileSync(stubs[0].log, "utf8"), /\[from=ui id=/,
+    const winnerQueue = readFileSync(stubs[0].log, "utf8");
+    assert.match(winnerQueue, /\[from=ui id=/,
       "the session that holds `ui` signs itself `ui`");
+    assert.ok(!winnerQueue.includes("reply_to=<unavailable>"),
+      `the channel owner must remain addressable: ${winnerQueue}`);
     const loserQueue = readFileSync(stubs[1].log, "utf8");
-    assert.match(loserQueue, /\[from=ui id=/,
-      "the session that cannot receive there still signs its configured identity");
+    assert.match(loserQueue, /\[from=ui reply_to=<unavailable> id=/,
+      "the loser keeps its identity but exposes no route to the winner's channel");
     assert.ok(!loserQueue.includes("[from=<unnamed> "),
       `a named session silently denied its own identity: ${loserQueue}`);
 

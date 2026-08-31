@@ -448,6 +448,25 @@ def claimed_alias(cwd, kind):
     return None
 
 
+def reply_available(cwd, kind, alias):
+    """Whether a reply to this published alias returns to the same session.
+
+    Only Claude separates configured identity from channel ownership. Codex
+    publishes no alias until it owns the registry claim, and an unnamed sender
+    carries no named return route to qualify. For Claude, the same owner-key
+    join that used to suppress its identity now answers only reachability.
+    """
+    if kind != "claude" or not alias:
+        return True
+    owner = peers.owner_key()
+    if not owner:
+        return False
+    for peer in peers.read_peers(cwd, kind):
+        if peer.get("name") == alias:
+            return peer.get("owner") == owner
+    return False
+
+
 def delivery_id():
     """An id for one delivery attempt.
 
@@ -466,9 +485,10 @@ def delivery_id():
 # `from=unnamed` would mean either "this peer has no name" or "this peer is
 # called unnamed", and the reader could not tell which.
 NO_ALIAS = peers.UNNAMED
+NO_RETURN = "<unavailable>"
 
 
-def queue_label(alias, message_id):
+def queue_label(alias, message_id, reply_available=True):
     """`[from=<alias> id=<uuid>]` for the paths that carry only text.
 
     `codex queue` takes a message and no metadata, so what the socket puts in
@@ -478,9 +498,13 @@ def queue_label(alias, message_id):
     back as new traffic and delivered again.
 
     `alias` is already validated, so it cannot close this bracket and open
-    another.
+    another. A configured Claude identity that does not own its return channel
+    stays visible as `from`, while the deliberately invalid `reply_to` token
+    makes even a literal-minded reply fail closed instead of reaching whichever
+    other process owns that name.
     """
-    return f"[from={alias or NO_ALIAS} id={message_id}]"
+    route = f" reply_to={NO_RETURN}" if alias and not reply_available else ""
+    return f"[from={alias or NO_ALIAS}{route} id={message_id}]"
 
 
 # ---------- helpers ----------
@@ -2130,13 +2154,15 @@ def push(target="codex"):
     # between two lines of one reply, and working it out again for each would
     # walk the process tree again for an answer that is already known.
     who = claimed_alias(cwd, side)
+    can_reply = reply_available(cwd, side, who)
 
     def deliver(recipient, messages):
         outgoing = "\n".join(messages)
         attempt = delivery_id()       # but each attempt is its own attempt
         if target == "codex":
             ok, detail = send_to_codex(
-                cwd, f"{PUSH_LABEL} {queue_label(who, attempt)} {outgoing}",
+                cwd, (f"{PUSH_LABEL} "
+                      f"{queue_label(who, attempt, can_reply)} {outgoing}"),
                 recipient)
         else:
             ok, detail = send_to_claude(cwd, outgoing, recipient,
@@ -2399,8 +2425,12 @@ def _peer_states(live):
         for peer in live))
 
 
-def resolve_target(cwd, kind, alias=None):
-    """Which peer a message goes to. Returns (address, detail).
+ResolvedTarget = collections.namedtuple("ResolvedTarget",
+                                        "address detail origin")
+
+
+def _resolve_target(cwd, kind, alias=None):
+    """Which peer a message goes to, including how its address was found.
 
     `address` is None when nothing can be delivered safely. The bridge does not
     choose between peers and does not broadcast: a choice made here is invisible
@@ -2421,34 +2451,43 @@ def resolve_target(cwd, kind, alias=None):
     live, and nothing can reach it yet.
     """
     if not peers.valid_kind(kind):
-        return None, f"not delivered: unknown peer kind {kind!r} (claude | codex)"
+        return ResolvedTarget(
+            None, f"not delivered: unknown peer kind {kind!r} (claude | codex)",
+            "refusal")
 
     live = peers.read_peers(cwd, kind)
     names = ", ".join(sorted(p.get("name") or "?" for p in live))
 
     if alias is not None:
         if not peers.valid_name(alias):
-            return None, (f"not delivered: {alias!r} is not a usable peer name"
-                          + (f"; live {kind} peers: {names}" if names else ""))
+            return ResolvedTarget(
+                None, (f"not delivered: {alias!r} is not a usable peer name"
+                       + (f"; live {kind} peers: {names}" if names else "")),
+                "refusal")
         # Exact, or not at all. A near miss is a different peer.
         match = [p for p in live if p.get("name") == alias]
         if not match:
-            return None, (f"not delivered: no live {kind} peer named {alias!r}"
-                          + (f"; live peers: {names}" if names else ""))
+            return ResolvedTarget(
+                None, (f"not delivered: no live {kind} peer named {alias!r}"
+                       + (f"; live peers: {names}" if names else "")),
+                "refusal")
         if match[0].get("address") is None:
-            return None, (f"not delivered: {alias!r} is live but not yet routable "
-                          "— it has not run a turn yet")
-        return match[0]["address"], ""
+            return ResolvedTarget(
+                None, (f"not delivered: {alias!r} is live but not yet routable "
+                       "— it has not run a turn yet"), "refusal")
+        return ResolvedTarget(match[0]["address"], "", "registered")
 
     if not live:
         # Nothing registered at all: the unnamed single pair, exactly as it was
         # before any of this. Not provably unique either, but it is the shipped
         # behaviour of every existing install and breaking it would cost far
         # more than the guess it makes.
-        return _legacy_target(cwd, kind)
+        address, detail = _legacy_target(cwd, kind)
+        return ResolvedTarget(address, detail, "legacy")
     if len(live) > 1:
-        return None, (f"not delivered: {len(live)} {kind} peers are live "
-                      f"({_peer_states(live)}); address one by name")
+        return ResolvedTarget(
+            None, (f"not delivered: {len(live)} {kind} peers are live "
+                   f"({_peer_states(live)}); address one by name"), "refusal")
     if kind == "codex":
         # One record is not one session. A Codex session registers only when it
         # was given a name, so any number of unnamed ones can be running beside
@@ -2456,14 +2495,21 @@ def resolve_target(cwd, kind, alias=None):
         # would be a guess wearing a certainty. The asymmetry stops here: a
         # Claude channel server always registers, named or not, so one live
         # record on that side really is one live peer.
-        return None, (f"not delivered: {_peer_states(live)} is the only "
-                      "registered Codex peer, but unnamed Codex sessions are "
-                      "not discoverable and cannot be ruled out — address a "
-                      "peer by name")
+        return ResolvedTarget(
+            None, (f"not delivered: {_peer_states(live)} is the only "
+                   "registered Codex peer, but unnamed Codex sessions are "
+                   "not discoverable and cannot be ruled out — address a "
+                   "peer by name"), "refusal")
     # Reached only for Claude, whose live records always carry a usable address:
     # the addressless shape is Codex-only and `read_peers` skips every other
     # unusable one.
-    return live[0]["address"], ""
+    return ResolvedTarget(live[0]["address"], "", "registered")
+
+
+def resolve_target(cwd, kind, alias=None):
+    """Public routing answer as the stable `(address, detail)` pair."""
+    target = _resolve_target(cwd, kind, alias)
+    return target.address, target.detail
 
 
 def send_to_codex(cwd, message, alias=None):
@@ -2548,7 +2594,8 @@ def send_to_claude(cwd, text, alias=None, sender_alias=None, message_id=None):
     while True:
         # Re-resolved every attempt: a named peer can register in the meantime,
         # which moves the address from the project-wide path to its own.
-        address, detail = resolve_target(cwd, "claude", alias)
+        target = _resolve_target(cwd, "claude", alias)
+        address, detail = target.address, target.detail
         if address is None:
             # `mcp.connect` finishes before channel.mjs publishes its registry
             # claim. With an explicit, valid alias the first lookup can
@@ -2576,7 +2623,7 @@ def send_to_claude(cwd, text, alias=None, sender_alias=None, message_id=None):
             if error.errno in NOT_LISTENING_YET and time.monotonic() < deadline:
                 time.sleep(CONNECT_RETRY_DELAY)
                 continue
-            if alias is None and error.errno == errno.ENOENT:
+            if target.origin == "legacy" and error.errno == errno.ENOENT:
                 return False, _ClassifiedRefusal(
                     "not delivered: no Claude peer is registered for this "
                     "project and its project-wide channel is not running; a "
@@ -3202,8 +3249,9 @@ def reply(*_):
     text = text.strip()
     # `channel.mjs` passes the peer name it validated for itself.
     who = sender_alias(input_data.get("sender_alias"))
+    can_reply = input_data.get("sender_reachable") is not False
     message_id = delivery_id()
-    label = queue_label(who, message_id)
+    label = queue_label(who, message_id, can_reply)
     # The FULL outgoing message is composed first and that is what the
     # predicate measures: the prefix and label are 84 bytes the kernel counts
     # too, and a predicate on the bare text would let them straddle the
@@ -3874,15 +3922,19 @@ AGENTS_RULE = ("\n## The Antiphon bridge\n\n"
                "message starting with `[Antiphon bridge] Claude:` (pushed from Claude's Stop "
                "hook) or `[Antiphon channel] Claude:` (a direct reply through the channel) — "
                "either way, these are Claude's words, not the user's. After that prefix comes "
-               "`[from=<alias> id=<uuid>]`, naming which Claude peer spoke: reply to that one "
-               "with `antiphon_send(to=<alias>)` or `@claude:<alias>`. A literal "
+               "`[from=<alias> id=<uuid>]`, naming which Claude peer spoke; when the "
+               "same label also contains `reply_to=<unavailable>`, follow the exception "
+               "below instead of addressing it back. Otherwise reply with "
+               "`antiphon_send(to=<alias>)` or `@claude:<alias>`. A literal "
                "`from=<unnamed>` means that peer has no name and cannot be addressed back — "
                "with only one Claude peer live you can leave the recipient out entirely. The "
                "id names one delivery attempt; nothing routes replies by it. A Claude "
                "alias is its configured identity, not proof that its named return channel "
                "is reachable. If a direct reply is refused, keep that refusal: `antiphon "
                "doctor` can name the broken channel, which needs the Claude session to "
-               "restart. An `Antiphon delivery notice:` event is a bridge-authored "
+               "restart. If a label carries `reply_to=<unavailable>`, do not reply to its "
+               "`from` alias: that channel belongs to a different session. An `Antiphon "
+               "delivery notice:` event is a bridge-authored "
                "diagnostic: it carries no original message content and does not turn the "
                "sender's refusal into delivery.\n\n"
                "When you want to hand Claude a task directly, put `@claude` at the start of a "
@@ -3933,7 +3985,9 @@ CLAUDE_RULE = ("\n## The Antiphon bridge\n\n"
                "valid Claude `ANTIPHON_NAME` is also your configured identity on "
                "outgoing bridge messages, not proof that your named return channel is "
                "reachable. If startup warned that the channel was not acquired, run "
-               "`antiphon doctor` and restart this Claude session. An `Antiphon delivery "
+               "`antiphon doctor` and restart this Claude session. If your outgoing label "
+               "carries `reply_to=<unavailable>`, do not reply to its `from` alias: that "
+               "channel belongs to a different session. An `Antiphon delivery "
                "notice:` event is a bridge-authored diagnostic: it carries no original "
                "message content and does not turn the sender's refusal into delivery.\n\n"
                "A reply reaches one peer and is never broadcast, and the same holds when you "

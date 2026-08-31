@@ -1084,14 +1084,19 @@ without treating ownership of the return socket as identity. Codex keeps the
 stricter owner-key rule because its MCP server is not the session it names.
 The duplicate-name loser is still refused the channel and the startup warning
 now asks for a *unique* name; `identitySettled` still resolves after every
-startup route.
+startup route. Its label keeps `from=ui` but adds
+`reply_to=<unavailable>`; that deliberately invalid return token prevents a
+literal reply from reaching the different process that owns `ui`. The channel
+owner's ordinary label stays byte-compatible and addressable.
 
 `doctor` derives the current named socket and reports a live listener with no
 live endpoint holding that alias as broken, without writing the registry or
 socket. A bare send with neither a registry record nor a live legacy socket is
 now a classified `no-peer` refusal that says no Claude peer is registered and
 suggests addressing a named channel, rather than exposing `ENOENT` for the
-implementation path. The already-honest explicit-name refusal remains
+implementation path. `_resolve_target` carries that legacy origin internally,
+so an ENOENT from one registered peer's missing socket remains the distinct
+channel-outage refusal. The already-honest explicit-name refusal remains
 byte-identical.
 
 On that explicit-name refusal only, Antiphon makes one best-effort connection
