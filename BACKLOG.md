@@ -396,6 +396,17 @@ same validated helper the sweep uses: a uuid-shaped name in somebody else's
 directory is not this bridge's file to delete, and before the fix it was
 deleting it.
 
+Named limitation, ruled at the review gate: a hair of TOCTOU remains — the
+store is proved sound with `O_NOFOLLOW` and then re-opened by path for the
+write, so a same-user process racing its OWN store between the two steps could
+redirect it. Under this project's stated threat model (one person, one
+machine; the envelope itself teaches "same machine, same user") that race is
+self-sabotage, not an attack surface, and the reviewer's verdict was PASS on
+exactly that condition. The absolute closure is known and named: dir-fd-based
+creation (`open(..., O_NOFOLLOW, dir_fd=…)` + `os.replace(..., dst_dir_fd=…)`),
+which would replace the `mkstemp` idiom — future work if the threat model ever
+widens, not a silent gap.
+
 **The quota is one transaction.** A usage read and the write it authorizes are
 not two operations. Measured before the lock: two processes released from one
 barrier, a 1,000-byte quota and two 700-byte messages — both passed the check,
