@@ -3738,8 +3738,12 @@ def _doctor_install(report, hooks_configured):
         return
     mine_key, other_key = _version_key(mine), _version_key(other)
     if mine_key is None or other_key is None:
-        report.note(f"install: hooks run {other} from {found} while this copy "
-                    f"is {mine}; cannot compare versions")
+        # `mine`/`other` may be None when a package.json is unreadable; name
+        # that plainly instead of interpolating the Python literal.
+        mine_text = mine or "unreadable"
+        other_text = other or "unreadable"
+        report.note(f"install: hooks run {other_text} from {found} while this "
+                    f"copy is {mine_text}; cannot compare versions")
     elif other_key < mine_key:
         report.bad(f"install: hooks run {other} from {found} while this copy "
                    f"is {mine} — update the PATH install")

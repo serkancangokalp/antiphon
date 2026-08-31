@@ -496,7 +496,18 @@ unchanged here on purpose; aligning it is a separate change.
 
 **Privacy.** No session ids, no cursor contents, no addresses in the peer
 list. One deliberate exception: the stale-socket and not-a-socket repair lines
-print the socket path, because that is the file the person may need to remove.
+print the socket path, because that is the file the person may need to remove
+(five repair lines in total print it — every not-listening/not-a-socket/
+cannot-connect arm, per probed address).
+
+Known incompleteness, deliberately parked: the config *envelope keys*
+(`permissions`/`allow`, `mcpServers`, `enabledMcpjsonServers` as a key, the
+hook envelope fields) are still spelled once in setup and once in doctor.
+Latent, not live — those keys are owned by Claude Code and Codex and never
+change unilaterally — but a future extraction pass could move them into the
+shared shapes too. Note also that `status` may say `live` purely from the
+registry, not only from the socket file; doctor's answered/unanswered remains
+the authoritative reachability verdict either way.
 
 **Also fixed:** `antiphon --help`, `-h` and `help` print the usage and exit 0.
 They exited 1 on all three spellings, and the check runs before the command
