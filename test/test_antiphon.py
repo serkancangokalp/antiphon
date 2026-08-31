@@ -2497,6 +2497,144 @@ class AntiphonTest(unittest.TestCase):
                 }, "the next write persists the translation")
 
 
+class CatchUpTest(unittest.TestCase):
+    """`antiphon catch-up`: the page cursors jump to the live edge.
+
+    Measured on the maintainer's project after the v2→v3 upgrade: the
+    byte-zero replay of two days of transcripts (16 MB one way, 44 MB the
+    other) was still draining twenty hours later, one 8 KB page per turn,
+    while every new message queued behind it. Nothing could skip it."""
+
+    SID_CODEX = "01a05745-bc86-73d3-b95d-41754c16fd0f"
+    SID_CLAUDE = "4eecac24-1c21-47ad-ab11-a650708f3098"
+
+    def sources(self, project):
+        codex = os.path.join(project, f"rollout-{self.SID_CODEX}.jsonl")
+        claude = os.path.join(project, f"{self.SID_CLAUDE}.jsonl")
+        now = time.strftime("%Y-%m-%dT%H:%M:%S.000Z", time.gmtime())
+        with open(codex, "w", encoding="utf-8") as f:
+            f.write(codex_msg("old codex words one") + "\n")
+            f.write(codex_msg("old codex words two") + "\n")
+        with open(claude, "w", encoding="utf-8") as f:
+            f.write(json.dumps({"type": "assistant", "timestamp": now,
+                                "message": {"content": [{"type": "text",
+                                                         "text": "old claude words"}]}}) + "\n")
+        return codex, claude
+
+    def discovering(self, project, codex, claude):
+        return contextlib.ExitStack.__enter__(self._stack(project, codex, claude))
+
+    def _stack(self, project, codex, claude):
+        stack = contextlib.ExitStack()
+        stack.enter_context(patch.object(antiphon, "project_dir", return_value=project))
+        stack.enter_context(patch.object(antiphon, "codex_rollout_files", return_value=[codex]))
+        stack.enter_context(patch.object(antiphon, "claude_transcripts", return_value=[claude]))
+        self.addCleanup(stack.close)
+        return stack
+
+    @staticmethod
+    def stored(project):
+        with open(antiphon.state_path(project, "claude"), encoding="utf-8") as f:
+            return json.load(f)
+
+    def test_catch_up_moves_both_page_cursors_to_the_end_and_ends_the_replay(self):
+        """The page after catch-up is empty; the page after one new record
+        holds exactly that record. The legacy `_seen` value stays, because it
+        is what a pre-v3 process still reads."""
+        with tempfile.TemporaryDirectory() as project:
+            codex, claude = self.sources(project)
+            self.discovering(project, codex, claude)
+            gen_codex = antiphon.source_generation(codex)
+            antiphon.write_cursor(project, {
+                "claude_seen": {"v": 2, "sources": {"legacy": {"gen": "g", "offset": 7}}},
+                "claude_pages": {"v": 3, "replay": "legacy_upgrade",
+                                 "sources": {self.SID_CODEX: {"gen": gen_codex, "offset": 0}}},
+            }, "claude")
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out):
+                self.assertEqual(antiphon.catch_up(), 0)
+            cursor = self.stored(project)
+            self.assertEqual(cursor["claude_pages"], {
+                "v": 3, "sources": {self.SID_CODEX: {"gen": gen_codex,
+                                                     "offset": os.path.getsize(codex)}}})
+            self.assertEqual(cursor["codex_pages"], {
+                "v": 3, "sources": {self.SID_CLAUDE: {
+                    "gen": antiphon.source_generation(claude),
+                    "offset": os.path.getsize(claude)}}})
+            self.assertEqual(cursor["claude_seen"]["sources"]["legacy"]["offset"], 7,
+                             "the v2 value is left for pre-v3 processes")
+            self.assertIn(f"{os.path.getsize(codex):,} bytes", out.getvalue(),
+                          "the report says how much history was skipped")
+
+            positions, since, replay = antiphon.positions_for(cursor, "claude")
+            self.assertIsNone(replay)
+            text, _, _ = antiphon.build_summary(project, "claude", positions, since, replay)
+            self.assertEqual(text, "", "nothing old is delivered after catch-up")
+            with open(codex, "a", encoding="utf-8") as f:
+                f.write(codex_msg("fresh codex words") + "\n")
+            text, _, _ = antiphon.build_summary(project, "claude", positions, since, replay)
+            self.assertIn("fresh codex words", text)
+            self.assertNotIn("old codex words", text)
+
+    def test_catch_up_stops_before_a_record_still_being_written(self):
+        """A resume that begins inside a half-written line would drop that
+        record when the line completes: the parser skips what it cannot parse.
+        The frontier is the end of the last newline-terminated record."""
+        with tempfile.TemporaryDirectory() as project:
+            codex, claude = self.sources(project)
+            self.discovering(project, codex, claude)
+            complete = os.path.getsize(codex)
+            tail = codex_msg("words still being written")
+            with open(codex, "a", encoding="utf-8") as f:
+                f.write(tail[:20])
+            with contextlib.redirect_stdout(io.StringIO()):
+                self.assertEqual(antiphon.catch_up("claude"), 0)
+            cursor = self.stored(project)
+            self.assertEqual(cursor["claude_pages"]["sources"][self.SID_CODEX]["offset"],
+                             complete)
+            with open(codex, "a", encoding="utf-8") as f:
+                f.write(tail[20:] + "\n")
+            positions, since, replay = antiphon.positions_for(cursor, "claude")
+            text, _, _ = antiphon.build_summary(project, "claude", positions, since, replay)
+            self.assertIn("words still being written", text)
+
+    def test_catch_up_in_a_named_terminal_needs_a_side(self):
+        """A named peer keeps one cursor file per side under its own name, so
+        the command cannot move "both" — it would write a file for a peer that
+        does not exist. It asks instead, and writes nothing."""
+        with tempfile.TemporaryDirectory() as project:
+            codex, claude = self.sources(project)
+            self.discovering(project, codex, claude)
+            err = io.StringIO()
+            with patch.dict(os.environ, {"ANTIPHON_NAME": "ui"}), \
+                 contextlib.redirect_stderr(err):
+                self.assertEqual(antiphon.catch_up(), 2)
+            self.assertIn("catch-up claude|codex", err.getvalue())
+            self.assertFalse(os.path.exists(os.path.join(project, ".antiphon")),
+                             "nothing was written")
+
+    def test_catch_up_reports_a_lost_lock_and_moves_nothing(self):
+        with tempfile.TemporaryDirectory() as project:
+            codex, claude = self.sources(project)
+            self.discovering(project, codex, claude)
+            path = antiphon.state_path(project, "claude") + ".lock"
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            fd = os.open(path, os.O_CREAT | os.O_RDWR, 0o600)
+            fcntl.flock(fd, fcntl.LOCK_EX)
+            self.addCleanup(os.close, fd)
+            err = io.StringIO()
+            with patch.object(antiphon, "CURSOR_LOCK_PATIENCE", 0.2), \
+                 contextlib.redirect_stderr(err), \
+                 contextlib.redirect_stdout(io.StringIO()):
+                self.assertEqual(antiphon.catch_up("claude"), 1)
+            self.assertIn("lock", err.getvalue())
+            self.assertFalse(os.path.exists(antiphon.state_path(project, "claude")))
+
+    def test_catch_up_is_a_command_with_usage(self):
+        self.assertIs(antiphon.COMMANDS["catch-up"], antiphon.catch_up)
+        self.assertIn("antiphon catch-up", antiphon.__doc__)
+
+
 class DoctorTest(unittest.TestCase):
     """`antiphon doctor` explains a quiet bridge without touching it.
 

@@ -52,7 +52,15 @@ the write-and-flush-before-advance transaction.
 - The durable source catalog and the degraded-discovery marker: discovery
   still reads the newest 3 transcripts per side, and `has_more: false` cannot
   distinguish complete discovery from that window.
-- Backward paging into history an older version already marked seen.
+- Backward paging into history an older version already marked seen. Its
+  cost was measured on 2026-08-31: the byte-zero `legacy_upgrade` replay of
+  two days of transcripts (16 MB one way, 44 MB the other) was still draining
+  twenty hours after the upgrade, one page per turn, and every live message
+  waited behind it — the bridge was delivering yesterday. `antiphon catch-up`
+  is the operational escape (page cursors jump to the live edge; the
+  history is abandoned, not delivered later). The upgrade itself still needs
+  to start from the legacy timestamp's position rather than byte zero, and
+  `status`/`doctor` still say nothing about how far behind a reader is.
 - The last-record content anchor (an in-place rewrite that keeps inode,
   length and first line still resumes silently).
 - Descriptor-safe reading of registry-supplied transcript paths.
