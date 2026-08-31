@@ -6,6 +6,7 @@ Two terminals, two separate agents: what you tell one, the other finds out.
 Usage:
   antiphon setup               # installs the hook on both sides
   antiphon status              # shows what's happening on both sides (for humans)
+  antiphon doctor              # read-only checkup: why is the bridge quiet?
   antiphon summary [side]      # the text that side would see (claude | codex)
   antiphon hook <side>         # prompt and session hook (reads JSON from stdin)
   antiphon push <target>       # Stop hook: pushes `@codex` / `@claude` lines
@@ -39,6 +40,7 @@ import json
 import math
 import os
 import re
+import shutil
 import socket
 import subprocess
 import sys
@@ -2666,8 +2668,132 @@ def _mcp_serve(cwd, alias=None):
 
 # ---------- setup ----------
 
+# --- what setup writes, as data ---
+#
+# Every shape below used to be a literal inside one of `setup`'s closures,
+# reachable from nothing else. `doctor` has to read back exactly what `setup`
+# wrote, and a diagnostic holding its own spelling of a string the writer may
+# change is a bridge that reports itself healthy while one direction is silent.
+# So the shapes are module data with one spelling each, and both the writer and
+# the reader consume them.
+#
+# Measured before the split: `mcp__antiphon__reply_to_codex` and
+# `default_tools_approval_mode` were asserted by no test in the suite, so an
+# extraction that dropped either passed all 525 tests.
+
 HOOK_COMMAND = "antiphon hook {side}"
 PUSH_COMMAND = "antiphon push {target}"
+
+# What a Codex user reads at the "New hook - review required" prompt.
+CODEX_HOOK_LABEL = "Antiphon bridge"
+
+# Without this in `permissions.allow`, Claude is asked to approve the reply tool
+# on every single use, and the Claude → Codex direction goes quiet in practice.
+REPLY_TOOL_PERMISSION = "mcp__antiphon__reply_to_codex"
+
+# The `.mcp.json` server key. `.claude/settings.local.json` allow-lists the same
+# name — it is one server, so it is one fact and one spelling.
+CHANNEL_SERVER_NAME = "antiphon"
+
+# Paths relative to the project directory, so the writer and the reader cannot
+# disagree about which file holds which shape.
+CLAUDE_SETTINGS_FILE = os.path.join(".claude", "settings.json")
+CLAUDE_LOCAL_SETTINGS_FILE = os.path.join(".claude", "settings.local.json")
+CODEX_HOOKS_FILE = os.path.join(".codex", "hooks.json")
+CODEX_CONFIG_FILE = os.path.join(".codex", "config.toml")
+MCP_CONFIG_FILE = ".mcp.json"
+
+CODEX_MCP_TABLE = "mcp_servers.antiphon"
+CODEX_MCP_ENV_TABLE = CODEX_MCP_TABLE + ".env"
+
+# Each assignment in `[mcp_servers.antiphon]` with the comment that precedes it
+# in the written file. The comments belong to the writer alone: `doctor` looks
+# up the assignments and never the prose, so re-wording a comment is not drift.
+CODEX_TABLE_ASSIGNMENTS = (
+    ('command = "antiphon"', ""),
+    ('args = ["mcp"]', ""),
+    ('default_tools_approval_mode = "approve"',
+     "# read-only local bridge; no need to ask on every turn\n"),
+    ('env_vars = ["ANTIPHON_NAME"]',
+     "# forwarded, not set: the peer name comes from the terminal that\n"
+     "# started this session, and Codex does not pass it down otherwise\n"),
+)
+
+HookShape = collections.namedtuple("HookShape", "path event command label")
+
+
+def hook_shapes():
+    """Every hook `setup` installs: which file, which event, which command.
+
+    One table, two readers — `setup` installs each row and `doctor` looks each
+    row back up in the file it finds. Two enumerations would be two spellings
+    of one fact, and the one that drifts is the one nothing runs.
+
+    The Codex pull hook appears twice on purpose. The session id arrives at
+    `SessionStart`; `UserPromptSubmit` is the fallback for a CLI that never
+    sends one, which makes a peer routable one turn later rather than never.
+    """
+    return (
+        HookShape(CLAUDE_SETTINGS_FILE, "UserPromptSubmit",
+                  HOOK_COMMAND.format(side="claude"), None),
+        HookShape(CLAUDE_SETTINGS_FILE, "Stop",
+                  PUSH_COMMAND.format(target="codex"), None),
+        HookShape(CODEX_HOOKS_FILE, "UserPromptSubmit",
+                  HOOK_COMMAND.format(side="codex"), CODEX_HOOK_LABEL),
+        HookShape(CODEX_HOOKS_FILE, "SessionStart",
+                  HOOK_COMMAND.format(side="codex"), CODEX_HOOK_LABEL),
+        HookShape(CODEX_HOOKS_FILE, "Stop",
+                  PUSH_COMMAND.format(target="claude"), None),
+    )
+
+
+def channel_server_entry(cwd):
+    """The `.mcp.json` entry that starts Claude's MCP Channel server.
+
+    `args = ["channel"]`, never `["mcp"]`: the `mcp` server is Codex's side and
+    hands out `antiphon_read`. `env` carries the absolute project directory
+    because the server is invoked as a bare `antiphon` with no path argument,
+    and has no other way to know which project it serves."""
+    return {"command": "antiphon", "args": ["channel"],
+            "env": {"ANTIPHON_CWD": cwd}}
+
+
+def codex_env_assignments(cwd):
+    """The `[mcp_servers.antiphon.env]` assignments, in written order.
+
+    The value, not just the key: a table left pointing at a renamed directory
+    reads another project's registry and delivers nothing, which is a quiet
+    bridge with every key present."""
+    return [f'ANTIPHON_CWD = "{cwd}"']
+
+
+def hook_installed(data, shape):
+    """Whether one hook row is already present in a parsed settings file.
+
+    The reading `_add_hook` performs when it decides there is nothing to add,
+    without the mutation that makes that answer unusable to a read-only caller.
+    A shape naming a label demands that label too: a stale one is what a Codex
+    user is asked to approve.
+
+    Everything here comes off disk, so every level is type-checked rather than
+    indexed — a hand-edited file may hold any shape at all and a diagnostic
+    must not raise on one."""
+    events = data.get("hooks") if isinstance(data, dict) else None
+    groups = events.get(shape.event) if isinstance(events, dict) else None
+    if not isinstance(groups, list):
+        return False
+    for group in groups:
+        entries = group.get("hooks") if isinstance(group, dict) else None
+        for entry in entries if isinstance(entries, list) else []:
+            if not isinstance(entry, dict):
+                continue
+            if entry.get("command") != shape.command:
+                continue
+            if shape.label is not None and entry.get("statusMessage") != shape.label:
+                continue
+            return True
+    return False
+
 
 SECTION_HEADING = "## The Antiphon bridge"
 
@@ -2740,7 +2866,17 @@ class ConfigFileError(Exception):
     A trailing comma, a `//` comment or a UTF-8 BOM is enough to make a
     hand-edited settings file unparseable. Overwriting it would silently throw
     away the user's permissions, env, statusLine and every other tool's hooks,
-    so `setup` reports the file and leaves it exactly as it found it."""
+    so `setup` reports the file and leaves it exactly as it found it.
+
+    `reason` is the same finding without the writer's voice. The message is a
+    writer's message — "refusing to overwrite it", "run `antiphon setup`
+    again" — and a read-only reader that echoed it would claim it had declined
+    to do something it was never going to do, and would print the repair twice.
+    """
+
+    def __init__(self, message, reason=None):
+        super().__init__(message)
+        self.reason = reason or message
 
 
 def _read_json_object(path):
@@ -2757,11 +2893,13 @@ def _read_json_object(path):
         raise ConfigFileError(
             f"{path} could not be read ({e.strerror or type(e).__name__}); "
             "refusing to overwrite it. Fix the file's permissions or move it "
-            "aside, then run `antiphon setup` again.") from e
+            "aside, then run `antiphon setup` again.",
+            reason=f"could not be read ({e.strerror or type(e).__name__})") from e
     except UnicodeDecodeError as e:
         raise ConfigFileError(
             f"{path} is not valid UTF-8; refusing to overwrite it. Fix the "
-            "file or move it aside, then run `antiphon setup` again.") from e
+            "file or move it aside, then run `antiphon setup` again.",
+            reason="not valid UTF-8") from e
     if not text.strip():
         return {}                     # an empty file has nothing to lose
     try:
@@ -2772,12 +2910,15 @@ def _read_json_object(path):
             f"{e.colno}); refusing to overwrite it — that would throw away "
             "everything else in the file. Fix the file (a trailing comma, a "
             "`//` comment and a byte-order mark are the usual culprits) or "
-            "move it aside, then run `antiphon setup` again.") from e
+            "move it aside, then run `antiphon setup` again.",
+            reason=f"not valid JSON ({e.msg}, line {e.lineno} column "
+                   f"{e.colno})") from e
     if not isinstance(data, dict):
         raise ConfigFileError(
             f"{path} holds a JSON {type(data).__name__}, not an object; "
             "refusing to overwrite it. Fix the file or move it aside, then "
-            "run `antiphon setup` again.")
+            "run `antiphon setup` again.",
+            reason=f"holds a JSON {type(data).__name__}, not an object")
     return data
 
 
@@ -2895,7 +3036,6 @@ def _update_instructions(current, rule):
     return current[:start].rstrip("\n") + rule + tail, "updated"
 
 
-CODEX_MCP_TABLE = "mcp_servers.antiphon"
 # Matches `[table]` and `[[table]]` headers, capturing the name between them.
 TOML_HEADER = re.compile(r"^\s*\[\[?\s*([^\[\]]+?)\s*\]\]?\s*$")
 
@@ -2913,16 +3053,11 @@ def _codex_config_block(cwd):
     a curated set plus whatever `env` declares. Without this line `ANTIPHON_NAME`
     never reaches `antiphon mcp` however the terminal was started, so the server
     and the hook could not agree on which peer they belong to."""
-    return (f'[{CODEX_MCP_TABLE}]\n'
-            'command = "antiphon"\n'
-            'args = ["mcp"]\n'
-            '# read-only local bridge; no need to ask on every turn\n'
-            'default_tools_approval_mode = "approve"\n'
-            '# forwarded, not set: the peer name comes from the terminal that\n'
-            "# started this session, and Codex does not pass it down otherwise\n"
-            'env_vars = ["ANTIPHON_NAME"]\n'
-            f'\n[{CODEX_MCP_TABLE}.env]\n'
-            f'ANTIPHON_CWD = "{cwd}"\n')
+    table = "".join(f"{comment}{line}\n"
+                    for line, comment in CODEX_TABLE_ASSIGNMENTS)
+    env = "".join(f"{line}\n" for line in codex_env_assignments(cwd))
+    return (f'[{CODEX_MCP_TABLE}]\n{table}'
+            f'\n[{CODEX_MCP_ENV_TABLE}]\n{env}')
 
 
 def _strip_toml_table(text, table):
@@ -2976,18 +3111,20 @@ def setup():
             return
         print(f"{'✓' if changed else '·'} {done if changed else already}: {target}")
 
+    # Every command, event and label comes from the shared table; only the
+    # legacy spellings to upgrade and the lines to print belong to the writer.
+    claude_pull, claude_push, codex_pull, codex_session, codex_push = hook_shapes()
+
     # --- Claude Code side: .claude/settings.json ---
-    claude_target = os.path.join(cwd, ".claude", "settings.json")
-    claude_command = HOOK_COMMAND.format(side="claude")
+    claude_target = os.path.join(cwd, CLAUDE_SETTINGS_FILE)
     legacy_commands = _legacy_commands(script, "kanca", "claude")
 
     def claude_mutate(data):
-        hooks = data.setdefault("hooks", {}).setdefault("UserPromptSubmit", [])
-        changed = _add_hook(hooks, claude_command, legacy_commands)
+        hooks = data.setdefault("hooks", {}).setdefault(claude_pull.event, [])
+        changed = _add_hook(hooks, claude_pull.command, legacy_commands)
         allowed = data.setdefault("permissions", {}).setdefault("allow", [])
-        reply_tool = "mcp__antiphon__reply_to_codex"
-        if reply_tool not in allowed:
-            allowed.append(reply_tool)
+        if REPLY_TOOL_PERMISSION not in allowed:
+            allowed.append(REPLY_TOOL_PERMISSION)
             changed = True
         return changed
 
@@ -2995,88 +3132,82 @@ def setup():
             "Claude hook installed", "Claude hook already installed")
 
     # --- Claude side: push to Codex (Stop hook) ---
-    push_command = PUSH_COMMAND.format(target="codex")
     legacy_push_commands = _legacy_commands(script, "it", "codex")
 
     def push_mutate(data):
-        hooks = data.setdefault("hooks", {}).setdefault("Stop", [])
-        return _add_hook(hooks, push_command, legacy_push_commands)
+        hooks = data.setdefault("hooks", {}).setdefault(claude_push.event, [])
+        return _add_hook(hooks, claude_push.command, legacy_push_commands)
 
     install(claude_target, push_mutate,
             "Push-to-Codex hook installed (Stop)",
             "Push-to-Codex hook already installed")
 
     # --- Codex side: .codex/hooks.json (same contract, same body) ---
-    codex_target = os.path.join(cwd, ".codex", "hooks.json")
-    codex_command = HOOK_COMMAND.format(side="codex")
+    codex_target = os.path.join(cwd, CODEX_HOOKS_FILE)
     legacy_codex_commands = _legacy_commands(script, "kanca", "codex")
 
     def codex_mutate(data):
-        hooks = data.setdefault("hooks", {}).setdefault("UserPromptSubmit", [])
-        return _add_hook(hooks, codex_command, legacy_codex_commands,
-                         label="Antiphon bridge")
+        hooks = data.setdefault("hooks", {}).setdefault(codex_pull.event, [])
+        return _add_hook(hooks, codex_pull.command, legacy_codex_commands,
+                         label=codex_pull.label)
 
     install(codex_target, codex_mutate,
             "Codex hook installed", "Codex hook already installed")
 
     # The Codex session id arrives at SessionStart, so the same command is
-    # installed there too. Under both events is also the fallback: if
-    # SessionStart is missed — an older CLI, a config predating this — the first
-    # prompt records the session instead, and a peer becomes routable one turn
-    # later rather than never. SessionEnd is deliberately not installed: it can
-    # be delayed or missed, so nothing may depend on it.
+    # installed there too (the second Codex pull row above). Under both events
+    # is also the fallback: if SessionStart is missed — an older CLI, a config
+    # predating this — the first prompt records the session instead, and a peer
+    # becomes routable one turn later rather than never. SessionEnd is
+    # deliberately not installed: it can be delayed or missed, so nothing may
+    # depend on it.
     def codex_session_mutate(data):
-        hooks = data.setdefault("hooks", {}).setdefault("SessionStart", [])
-        return _add_hook(hooks, codex_command, label="Antiphon bridge")
+        hooks = data.setdefault("hooks", {}).setdefault(codex_session.event, [])
+        return _add_hook(hooks, codex_session.command, label=codex_session.label)
 
     install(codex_target, codex_session_mutate,
             "Codex session hook installed (SessionStart)",
             "Codex session hook already installed")
 
     # --- Codex side: push to Claude (Stop hook) ---
-    reverse_push_command = PUSH_COMMAND.format(target="claude")
     legacy_reverse_push_commands = _legacy_commands(script, "it", "claude")
 
     def reverse_push_mutate(data):
-        hooks = data.setdefault("hooks", {}).setdefault("Stop", [])
-        return _add_hook(hooks, reverse_push_command, legacy_reverse_push_commands)
+        hooks = data.setdefault("hooks", {}).setdefault(codex_push.event, [])
+        return _add_hook(hooks, codex_push.command, legacy_reverse_push_commands)
 
     install(codex_target, reverse_push_mutate,
             "Push-to-Claude hook installed (Stop)",
             "Push-to-Claude hook already installed")
 
     # --- Codex side: the antiphon_read MCP tool (.codex/config.toml) ---
-    codex_config = os.path.join(cwd, ".codex", "config.toml")
+    codex_config = os.path.join(cwd, CODEX_CONFIG_FILE)
     written = _update_codex_config(codex_config, cwd)
     print(f"{'✓' if written else '·'} Codex MCP tool "
           f"{'registered' if written else 'already registered'}: {codex_config}")
 
     # --- Claude Code MCP Channel ---
-    mcp_target = os.path.join(cwd, ".mcp.json")
-    channel_config = {
-        "command": "antiphon",
-        "args": ["channel"],
-        "env": {"ANTIPHON_CWD": cwd},
-    }
+    mcp_target = os.path.join(cwd, MCP_CONFIG_FILE)
+    channel_config = channel_server_entry(cwd)
 
     def mcp_mutate(data):
         servers = data.setdefault("mcpServers", {})
-        if servers.get("antiphon") == channel_config:
+        if servers.get(CHANNEL_SERVER_NAME) == channel_config:
             return False
-        servers["antiphon"] = channel_config
+        servers[CHANNEL_SERVER_NAME] = channel_config
         return True
 
     install(mcp_target, mcp_mutate,
             "Claude MCP Channel registered", "Claude MCP Channel already registered")
 
     # Claude Code may also keep .mcp.json servers in a local allowlist.
-    local_target = os.path.join(cwd, ".claude", "settings.local.json")
+    local_target = os.path.join(cwd, CLAUDE_LOCAL_SETTINGS_FILE)
 
     def local_mutate(data):
         enabled = data.setdefault("enabledMcpjsonServers", [])
-        if "antiphon" in enabled:
+        if CHANNEL_SERVER_NAME in enabled:
             return False
-        enabled.append("antiphon")
+        enabled.append(CHANNEL_SERVER_NAME)
         return True
 
     install(local_target, local_mutate,
@@ -3305,6 +3436,559 @@ def status():
     return 0
 
 
+# ---------- doctor ----------
+
+# The floor this package is tested and installed under. A contract test reads
+# the same number back out of the README: one number, one fact.
+PYTHON_FLOOR = (3, 9)
+
+# Seconds to wait for the channel's answer to a half-closed connection.
+# Measured against the real server: with `shutdown(SHUT_WR)` the reply arrives
+# in 0 ms, so this is not a budget for a healthy reply — it bounds the one case
+# a healthy reply cannot produce, a listener that accepts and never answers.
+# Half a second is long enough that a loaded machine's scheduling is not read as
+# silence, and short enough that a per-peer probe still returns promptly.
+DOCTOR_REPLY_TIMEOUT = 0.5
+
+# Enough for the channel's one-line answer; the probe is not a protocol client.
+DOCTOR_REPLY_BYTES = 8192
+
+NODE_ENGINE_FLOOR = re.compile(r"^\s*>=\s*v?(\d+)(?:\.(\d+))?(?:\.(\d+))?\s*$")
+VERSION_IN_BANNER = re.compile(r"(\d+)\.(\d+)(?:\.(\d+))?")
+
+
+def _which(name):
+    """Where PATH resolves `name`, or None. One of doctor's two seams.
+
+    Every external lookup goes through here or `_tool_version` so a test can
+    state what the machine looks like without patching the standard library
+    underneath unrelated code."""
+    return shutil.which(name)
+
+
+def _tool_version(command):
+    """A tool's `--version` line, or None. Doctor's second and last seam.
+
+    Bounded: a diagnostic that hangs on a wedged interpreter is worse than one
+    that cannot name a version. Five seconds is the ceiling the registry's own
+    process lookups use, and a version banner either prints at once or never.
+
+    Measured trap this seam exists for: patching `shutil.which` alone leaves
+    this subprocess reading the host, so a Node 18 machine reddens tests that
+    have nothing to do with Node."""
+    try:
+        done = subprocess.run([command, "--version"], capture_output=True,
+                              text=True, timeout=5, stdin=subprocess.DEVNULL)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if done.returncode != 0:
+        return None
+    return (done.stdout or done.stderr).strip() or None
+
+
+def _version_key(version):
+    """A dotted version as a tuple of ints, or None when it is not one.
+
+    Measured: string comparison inverts on three of four realistic pairs —
+    `0.9.0` reads as newer than `0.10.0`, `0.3.1` as newer than `0.10.0`. A
+    version that will not parse this way gets no ordering guess at all; saying
+    "cannot compare" is cheaper than telling somebody to downgrade."""
+    if not isinstance(version, str):
+        return None
+    try:
+        return tuple(int(part) for part in version.split("."))
+    except ValueError:
+        return None
+
+
+def _banner_key(banner):
+    """The first dotted version in a `--version` line, as ints.
+
+    `Python 3.9.6` and `v20.11.0` are the two shapes this reads; both put the
+    number somewhere in one line and nowhere else."""
+    match = VERSION_IN_BANNER.search(banner or "")
+    if not match:
+        return None
+    return tuple(int(part or 0) for part in match.groups())
+
+
+def _package_root():
+    """The directory holding `package.json` for the copy running right now.
+
+    `realpath` because `bin/antiphon.mjs` hands Python an unnormalised
+    `bin/../lib/antiphon.py`, and because a Homebrew or `npm link` shim on PATH
+    resolves into a completely different tree — measured, comparing the
+    unresolved paths calls a working `npm link` install broken."""
+    return os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
+
+
+def _package_version(root):
+    """The version in the `package.json` beside a package root, or None.
+
+    Measured with `npm pack`: `package.json` sits beside `lib/` and `bin/` in
+    the repo and under `node_modules/antiphon/` alike, so one join finds it in
+    either layout."""
+    try:
+        with open(os.path.join(root, "package.json"), encoding="utf-8") as f:
+            data = json.load(f)
+    except (OSError, ValueError):
+        return None
+    version = data.get("version") if isinstance(data, dict) else None
+    return version if isinstance(version, str) else None
+
+
+def _node_floor():
+    """`engines.node` as a tuple of ints, or None. The floor npm enforces."""
+    try:
+        with open(os.path.join(_package_root(), "package.json"),
+                  encoding="utf-8") as f:
+            data = json.load(f)
+        spec = data["engines"]["node"]
+    except (OSError, ValueError, KeyError, TypeError):
+        return None
+    match = NODE_ENGINE_FLOOR.match(spec) if isinstance(spec, str) else None
+    if not match:
+        return None
+    return tuple(int(part or 0) for part in match.groups())
+
+
+ConfigState = collections.namedtuple("ConfigState", "path data reason")
+
+
+def _config_state(cwd):
+    """Every configuration file read once, as facts the checks render from.
+
+    Once, because two checks ask about the same files: the install check has to
+    know whether anything calls `antiphon` from a hook before the configuration
+    check prints its verdict, and a second parse is a second chance to disagree
+    with the first.
+
+    A file that cannot be read is a fact too — recorded, never raised. This is
+    the command somebody runs *because* a file is broken.
+    """
+    states = {}
+    for name in (CLAUDE_SETTINGS_FILE, CLAUDE_LOCAL_SETTINGS_FILE,
+                 CODEX_HOOKS_FILE, MCP_CONFIG_FILE):
+        path = os.path.join(cwd, name)
+        try:
+            states[name] = ConfigState(path, _read_json_object(path), None)
+        except ConfigFileError as error:
+            states[name] = ConfigState(path, None, error.reason)
+    # The TOML file has no `_read_json_object` to raise for it — the writer
+    # reads it with a bare `open` — so the pre-pass supplies its own bound and
+    # its own reason, and the promise "every file, once, or a stated reason"
+    # covers all five.
+    path = os.path.join(cwd, CODEX_CONFIG_FILE)
+    try:
+        with open(path, encoding="utf-8") as f:
+            states[CODEX_CONFIG_FILE] = ConfigState(path, f.read(), None)
+    except FileNotFoundError:
+        states[CODEX_CONFIG_FILE] = ConfigState(path, "", None)
+    except OSError as error:
+        states[CODEX_CONFIG_FILE] = ConfigState(
+            path, None, f"could not be read "
+                        f"({error.strerror or type(error).__name__})")
+    except UnicodeDecodeError:
+        states[CODEX_CONFIG_FILE] = ConfigState(path, None, "not valid UTF-8")
+    return states
+
+
+def _hooks_configured(states):
+    """Whether anything in this project calls `antiphon` from a hook.
+
+    Three answers, not two. A settings file that cannot be parsed makes the
+    question unanswerable, and the install check must say so rather than report
+    a project whose hooks it could not read as one that has none.
+    """
+    unreadable = False
+    for shape in hook_shapes():
+        state = states[shape.path]
+        if state.reason is not None:
+            unreadable = True
+        elif hook_installed(state.data, shape):
+            return True
+    return None if unreadable else False
+
+
+def _toml_table_text(text, table):
+    """Just `[table]` and its sub-tables — the complement of
+    `_strip_toml_table`, which keeps everything else. The writer discards this
+    section and rewrites it; a reader needs exactly the part it discards."""
+    kept, taking = [], False
+    for line in text.splitlines():
+        header = TOML_HEADER.match(line)
+        if header:
+            name = header.group(1)
+            taking = name == table or name.startswith(table + ".")
+        if taking:
+            kept.append(line.strip())
+    return kept
+
+
+Probe = collections.namedtuple("Probe", "error answered")
+
+
+def _probe_channel(path, patient):
+    """Connect, half-close, read one reply. Returns (errno or None, answered).
+
+    Nothing is ever sent. Three of the four steps are counter-intuitive, so:
+
+    - The half-close is load-bearing. `lib/channel.mjs` answers from its `end`
+      handler, so it replies only once the client has sent FIN. Measured
+      against the real server: with `shutdown(SHUT_WR)` the reply arrives in
+      0 ms; without it the read times out at 2 s and a working bridge reads as
+      broken — a diagnostic telling every healthy user to restart.
+    - `patient` is spent only where a registered live peer claims the address.
+      `NOT_LISTENING_YET` includes `ENOENT`, so retrying at the unregistered
+      project default spins 1,545 ms over 28 attempts on the perfectly normal
+      no-socket state. The split cannot reintroduce the race the patience
+      exists for: the channel server claims the registry *before* it binds
+      (a contract test pins that ordering), so a session inside the measured
+      27-41 ms window is always in the registered branch.
+    - One timeout covers connect and read both, rather than adding a second
+      spelling of a number this file already holds once.
+    """
+    deadline = time.monotonic() + CONNECT_PATIENCE
+    while True:
+        sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        sock.settimeout(DOCTOR_REPLY_TIMEOUT)
+        try:
+            sock.connect(path)
+        except OSError as error:
+            sock.close()
+            if (patient and error.errno in NOT_LISTENING_YET
+                    and time.monotonic() < deadline):
+                time.sleep(CONNECT_RETRY_DELAY)
+                continue
+            return Probe(error.errno, False)
+        break
+    try:
+        with sock:
+            sock.shutdown(socket.SHUT_WR)
+            reply = sock.recv(DOCTOR_REPLY_BYTES)
+    except OSError:
+        return Probe(None, False)       # accepted, then said nothing
+    try:
+        answer = json.loads(reply.decode())
+    except (UnicodeDecodeError, ValueError):
+        return Probe(None, False)
+    # The minimum shape, deliberately not the protocol: any process can bind
+    # that path, and none of them answers a bare half-closed connection with a
+    # JSON object carrying `ok`. The *presence* of the key is the signal and
+    # its value is ignored on purpose — the healthy handshake is
+    # `{"ok":false,"error":"Unexpected end of JSON input"}`, because doctor
+    # deliberately sends nothing for the server to parse.
+    return Probe(None, isinstance(answer, dict) and "ok" in answer)
+
+
+class _Report:
+    """Doctor's lines and its exit code, in one place.
+
+    Every line goes to stdout, including the bad news: `antiphon doctor >
+    report.txt` has to capture the whole report, which is the point of a
+    diagnostic somebody pastes into an issue. `setup` splits the streams
+    because its failures are its own; doctor's findings are the output.
+
+    Only `✗` moves the exit code. `·` means "nothing to do here" — an idle
+    project is not a degraded one.
+    """
+
+    def __init__(self):
+        self.broken = False
+
+    def ok(self, text):
+        print(f"✓ {text}")
+
+    def note(self, text):
+        print(f"· {text}")
+
+    def bad(self, text):
+        self.broken = True
+        print(f"✗ {text}")
+
+
+def _doctor_install(report, hooks_configured):
+    """Which copy of the package the hooks actually run."""
+    here = _package_root()
+    mine = _package_version(here)
+    found = _which("antiphon")
+    if not found:
+        if hooks_configured is None:
+            report.note("install: no `antiphon` on PATH, and the hook "
+                        "configuration could not be read — see below")
+        elif hooks_configured:
+            report.bad("install: hooks call `antiphon` but PATH has none — "
+                       "install the package or fix PATH")
+        else:
+            report.note("install: no `antiphon` on PATH and no hooks "
+                        "configured here")
+        return
+    theirs = os.path.dirname(os.path.dirname(os.path.realpath(found)))
+    if theirs == here:
+        report.ok(f"install: {found} — version {mine or 'unknown'}")
+        return
+    other = _package_version(theirs)
+    if other is None:
+        report.bad(f"install: the copy on PATH is broken — no readable "
+                   f"package.json beside {found}; reinstall it")
+        return
+    if other == mine:
+        report.note(f"install: {found} is a different copy of the same "
+                    f"version {other}; hooks use that one")
+        return
+    mine_key, other_key = _version_key(mine), _version_key(other)
+    if mine_key is None or other_key is None:
+        # `mine`/`other` may be None when a package.json is unreadable; name
+        # that plainly instead of interpolating the Python literal.
+        mine_text = mine or "unreadable"
+        other_text = other or "unreadable"
+        report.note(f"install: hooks run {other_text} from {found} while this "
+                    f"copy is {mine_text}; cannot compare versions")
+    elif other_key < mine_key:
+        report.bad(f"install: hooks run {other} from {found} while this copy "
+                   f"is {mine} — update the PATH install")
+    else:
+        report.note(f"install: hooks run the newer {other} from {found}; this "
+                    f"diagnostic is the older copy {mine}")
+
+
+def _doctor_interpreters(report):
+    """The two interpreters the bridge runs on, and the one the hooks get."""
+    running = sys.version_info[:3]
+    floor = ".".join(str(part) for part in PYTHON_FLOOR)
+    if running[:len(PYTHON_FLOOR)] >= PYTHON_FLOOR:
+        report.ok("python: this run is %d.%d.%d (floor %s)"
+                  % (running + (floor,)))
+    else:
+        report.bad("python: this run is %d.%d.%d, below the %s floor"
+                   % (running + (floor,)))
+
+    # `bin/antiphon.mjs` spawns a bare `python3`, so the interpreter every hook
+    # gets is whatever PATH resolves — measured on this machine, Anaconda 3.14
+    # rather than the /usr/bin 3.9 the suite runs under. Reporting only
+    # `sys.version_info` answers a different question from the diagnostic one.
+    hook_python = _which("python3")
+    if not hook_python:
+        report.bad("python: PATH has no `python3` — every hook the wrapper "
+                   "starts fails; install one or fix PATH")
+    else:
+        banner = _tool_version(hook_python)
+        key = _banner_key(banner)
+        if key is None:
+            report.note(f"python: hooks run {hook_python}, whose version could "
+                        "not be read")
+        elif key[:len(PYTHON_FLOOR)] < PYTHON_FLOOR:
+            report.bad(f"python: hooks run {hook_python} ({banner}), below the "
+                       f"{floor} floor — fix PATH or install a newer python3")
+        elif os.path.realpath(hook_python) != os.path.realpath(sys.executable):
+            report.note(f"python: hooks run {hook_python} ({banner}), not the "
+                        f"{sys.executable} running this check")
+        else:
+            report.ok(f"python: hooks run {hook_python} ({banner})")
+
+    node = _which("node")
+    declared = _node_floor()
+    wanted = (".".join(str(part) for part in declared) if declared
+              else "the declared floor")
+    if not node:
+        report.bad("node: PATH has no `node` — the Claude channel server "
+                   f"cannot start; install Node {wanted} or newer")
+        return
+    banner = _tool_version(node)
+    key = _banner_key(banner)
+    if key is None or declared is None:
+        report.note(f"node: {node}, version or floor could not be read")
+    elif key < declared:
+        report.bad(f"node: {node} is {banner}, below the {wanted} this package "
+                   "declares — the channel server will not run")
+    else:
+        report.ok(f"node: {node} ({banner}), floor {wanted}")
+
+
+def _doctor_config(report, cwd, states):
+    """Every file `setup` writes, read back through the shapes it wrote.
+
+    The expectations are the shared module data, never a second spelling: a
+    diagnostic holding its own copy of a string the writer may change is the
+    drift this whole arrangement exists to prevent.
+    """
+    def verdict(name, missing):
+        state = states[name]
+        if state.reason is not None:
+            report.bad(f"{name}: unreadable: {state.reason} — fix or delete "
+                       "it, then run `antiphon setup`")
+        elif missing:
+            report.bad(f"{name}: missing {', '.join(missing)} — run "
+                       "`antiphon setup`")
+        else:
+            report.ok(f"{name}: complete")
+
+    hooks_by_file = collections.defaultdict(list)
+    for shape in hook_shapes():
+        hooks_by_file[shape.path].append(shape)
+
+    for name in (CLAUDE_SETTINGS_FILE, CODEX_HOOKS_FILE):
+        data = states[name].data
+        missing = [f"the {shape.event} hook `{shape.command}`"
+                   for shape in hooks_by_file[name]
+                   if not hook_installed(data, shape)]
+        if name == CLAUDE_SETTINGS_FILE:
+            allowed = (data or {}).get("permissions") or {}
+            allowed = allowed.get("allow") if isinstance(allowed, dict) else None
+            if not (isinstance(allowed, list)
+                    and REPLY_TOOL_PERMISSION in allowed):
+                missing.append(f"the `{REPLY_TOOL_PERMISSION}` permission")
+        verdict(name, missing)
+
+    # Claude Code gates every `.mcp.json` server behind this allowlist. Without
+    # the entry the server never starts, no socket appears, and the channel
+    # check reports a true "no socket" with a useless repair.
+    enabled = (states[CLAUDE_LOCAL_SETTINGS_FILE].data or {}).get(
+        "enabledMcpjsonServers")
+    verdict(CLAUDE_LOCAL_SETTINGS_FILE,
+            [] if isinstance(enabled, list) and CHANNEL_SERVER_NAME in enabled
+            else [f"`{CHANNEL_SERVER_NAME}` in enabledMcpjsonServers"])
+
+    servers = (states[MCP_CONFIG_FILE].data or {}).get("mcpServers")
+    servers = servers if isinstance(servers, dict) else {}
+    verdict(MCP_CONFIG_FILE,
+            [] if servers.get(CHANNEL_SERVER_NAME) == channel_server_entry(cwd)
+            else [f"the `{CHANNEL_SERVER_NAME}` MCP server entry for {cwd}"])
+
+    # The value, not the key. A table left pointing at a renamed directory
+    # reads another project's registry and delivers nothing — a quiet bridge
+    # with every key present.
+    toml = states[CODEX_CONFIG_FILE].data
+    present = set(_toml_table_text(toml or "", CODEX_MCP_TABLE))
+    expected = ([line for line, _comment in CODEX_TABLE_ASSIGNMENTS]
+                + codex_env_assignments(cwd))
+    verdict(CODEX_CONFIG_FILE,
+            [f"[{CODEX_MCP_TABLE}]"] if not present
+            else [f"`{line}`" for line in expected if line not in present])
+
+
+def _doctor_alias(report):
+    """Through `peers.explicit_name()`, which is what the routing uses.
+
+    Measured: it lower-cases, so `ANTIPHON_NAME=UI` is a working named session
+    that a raw environment read calls invalid. The name printed is the one it
+    returns — `@claude:UI` addresses nobody."""
+    name = peers.explicit_name()
+    if not name:
+        report.ok("alias: unnamed (single-pair default)")
+    elif peers.valid_name(name):
+        report.ok(f'alias: named "{name}"')
+    else:
+        report.bad(f'alias: ANTIPHON_NAME resolves to "{name}", which cannot '
+                   "be addressed — use lower-case letters, digits, `_` and "
+                   "`-`, starting with a letter or digit, at most 32 characters")
+
+
+def _doctor_peers(report, cwd):
+    """The registry as it stands, without changing it.
+
+    `_scan` + `_record_alive`, never `read_peers`, `_live_by_kind` or
+    `resolve_target`: all three prune, so any of them would delete the stale
+    record somebody ran this command to ask about. Returns the live records,
+    for the channel check to probe.
+    """
+    live = []
+    records = peers._scan(cwd)
+    if not records:
+        report.note("peers: none registered — a session registers on its "
+                    "first turn")
+        return live
+    for record in sorted(records, key=lambda r: (r.get("kind") or "",
+                                                 r.get("name") or "")):
+        # Named in words, never by session id or address: whoever reads this is
+        # deciding who to address, and neither answers that.
+        who = f"{record.get('kind')}/{record.get('name')}"
+        if not peers._record_alive(record):
+            report.note(f"peer {who}: stale record; a live session cleans this "
+                        "up on its next pass")
+        elif peers._address_of(record) is None:
+            report.note(f"peer {who}: live, waiting for its first turn")
+        else:
+            live.append(record)
+            report.ok(f"peer {who}: live and addressed")
+    return live
+
+
+def _doctor_channel(report, cwd, live):
+    """Somebody answered, or nobody did — not "the file exists".
+
+    Doctor is authoritative over `status` here. `status` reports `live` when
+    the socket file is present, so a stale socket makes the two disagree about
+    the headline fact; the difference is stated in BACKLOG and `status` is
+    unchanged."""
+    claude = [record for record in live if record.get("kind") == "claude"]
+    # A registered live peer claims its address, so patience is warranted
+    # there and nowhere else.
+    targets = ([(record.get("name"), peers._address_of(record), True)
+                for record in claude]
+               if claude else [(None, claude_socket_path(cwd), False)])
+    for name, path, registered in targets:
+        who = f'channel: peer "{name}"' if registered else "channel:"
+        probe = _probe_channel(path, patient=registered)
+        if probe.answered:
+            report.ok(f"{who} answered")
+        elif probe.error == errno.ENOENT and registered:
+            report.bad(f"{who} the session's channel socket is gone — "
+                       "restart that session")
+        elif probe.error == errno.ENOENT:
+            report.note(f"{who} no socket — the channel starts with the "
+                        "Claude session")
+        elif probe.error == errno.ECONNREFUSED:
+            report.bad(f"{who} socket file present but nothing listening — "
+                       f"restart the Claude session or remove {path}")
+        elif probe.error == errno.ENOTSOCK:
+            report.bad(f"{who} {path} is not a socket — remove it")
+        elif probe.error == errno.EACCES:
+            report.bad(f"{who} the socket exists but this user cannot "
+                       f"connect to it: {path}")
+        elif probe.error is not None:
+            report.bad(f"{who} {os.strerror(probe.error)} at {path}")
+        else:
+            report.bad(f"{who} something is listening at {path}, but it does "
+                       "not answer as an Antiphon channel — remove it or stop "
+                       "whatever holds it")
+
+
+def _doctor_codex(report):
+    """Presence only. Executing `codex` from a diagnostic can block on auth or
+    spawn a session; the boundary is stated in BACKLOG."""
+    found = _which("codex")
+    if found:
+        report.ok(f"codex CLI: {found}")
+    else:
+        report.note("codex CLI: not on PATH — push-to-Codex needs it (fine on "
+                    "a Claude-only install)")
+
+
+def doctor():
+    """Explains a quiet bridge without touching it.
+
+    Read-only by construction: nothing here opens a file for writing, takes the
+    registry lock, or calls one of the three readers that prune. A test
+    snapshots both roots — the project and the socket directory — before and
+    after, with a dead peer record armed.
+
+    `✓` fine, `·` nothing to do here, `✗` broken. Only `✗` sets the exit code,
+    so a set-up project with no session running exits 0.
+    """
+    cwd = project_dir()
+    print(f"project: {cwd}\n")
+    report = _Report()
+    states = _config_state(cwd)
+    _doctor_install(report, _hooks_configured(states))
+    _doctor_interpreters(report)
+    _doctor_config(report, cwd, states)
+    _doctor_alias(report)
+    _doctor_channel(report, cwd, _doctor_peers(report, cwd))
+    _doctor_codex(report)
+    return 1 if report.broken else 0
+
+
 def print_summary(side="claude"):
     cwd = project_dir()
     text, _, _ = build_summary(cwd, side, since=time.time() - LOOKBACK)
@@ -3313,7 +3997,8 @@ def print_summary(side="claude"):
 
 
 COMMANDS = {
-    "setup": setup, "status": status, "hook": hook, "summary": print_summary,
+    "setup": setup, "status": status, "doctor": doctor,
+    "hook": hook, "summary": print_summary,
     "push": push, "reply": reply, "mcp": mcp, "register_peer": register_peer,
     "unregister_peer": unregister_peer,
     # Legacy aliases for old local installs, kept during the transition period.
@@ -3333,6 +4018,14 @@ def _max_args(func):
 
 if __name__ == "__main__":
     command = sys.argv[1] if len(sys.argv) > 1 else "status"
+    # Answered before the command table on purpose. As a `COMMANDS` entry
+    # `help` would pick up the arity check below, and `antiphon help doctor`
+    # would exit 2 with "takes no arguments" instead of printing the usage.
+    # Asking how to use something is not an error, so this exits 0; an unknown
+    # command still exits 1.
+    if command in ("--help", "-h", "help"):
+        print(__doc__)
+        sys.exit(0)
     func = COMMANDS.get(command)
     if not func:
         print(__doc__)

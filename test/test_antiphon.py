@@ -7,8 +7,11 @@ import errno
 import fcntl
 import io
 import json
+import shutil
+import socket
 import subprocess
 import tempfile
+import threading
 import time
 try:
     import tomllib          # Python 3.11+
@@ -2488,6 +2491,498 @@ class AntiphonTest(unittest.TestCase):
                     "codex_seen": 12.0,
                     "last_pushed_claude": {"": "fingerprint"},
                 }, "the next write persists the translation")
+
+
+class DoctorTest(unittest.TestCase):
+    """`antiphon doctor` explains a quiet bridge without touching it.
+
+    Every test that asserts an exit code patches the two seams doctor routes
+    external lookups through — `_which` and `_tool_version` — never the stdlib
+    underneath them. Measured trap this exists for: patching `shutil.which`
+    alone leaves the `node --version` subprocess reading the host, so a Node 18
+    contributor reds two tests that have nothing to do with Node."""
+
+    def project(self):
+        project = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, project, ignore_errors=True)
+        return project
+
+    def socket_dir(self):
+        """A short base for AF_UNIX fixtures.
+
+        Measured: the bindable ceiling is 103 bytes and the platform default
+        TMPDIR alone spends 49 of them, so a socket under a nested
+        TemporaryDirectory lands exactly on the limit with no margin.
+        `dir="/tmp"` spends five."""
+        base = tempfile.mkdtemp(dir="/tmp", prefix="a")
+        self.addCleanup(shutil.rmtree, base, ignore_errors=True)
+        return base
+
+    def set_up(self, project):
+        with patch.object(antiphon, "project_dir", return_value=project), \
+             contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(antiphon.setup(), 0)
+
+    def healthy_tools(self):
+        """A machine where everything the bridge needs is installed, and the
+        `antiphon` on PATH is the copy under test."""
+        root = os.path.dirname(os.path.dirname(os.path.realpath(antiphon.__file__)))
+        return {"antiphon": os.path.join(root, "bin", "antiphon.mjs"),
+                "python3": "/usr/bin/python3", "node": "/usr/bin/node",
+                "codex": "/usr/bin/codex"}
+
+    HEALTHY_VERSIONS = {"/usr/bin/python3": "Python 3.9.6",
+                        "/usr/bin/node": "v20.11.0"}
+
+    @contextlib.contextmanager
+    def hermetic(self, project, tools=None, versions=None):
+        """doctor against a fixed machine: the fixture's project, a stated
+        PATH, stated tool versions."""
+        found = self.healthy_tools() if tools is None else dict(tools)
+        banners = dict(self.HEALTHY_VERSIONS if versions is None else versions)
+        with patch.object(antiphon, "project_dir", return_value=project), \
+             patch.object(antiphon, "_which", side_effect=found.get), \
+             patch.object(antiphon, "_tool_version", side_effect=banners.get):
+            yield
+
+    def run_doctor(self, project, **hermetic):
+        out = io.StringIO()
+        with self.hermetic(project, **hermetic), \
+             contextlib.redirect_stdout(out):
+            code = antiphon.doctor()
+        return code, out.getvalue()
+
+    @staticmethod
+    def snapshot(*roots):
+        """Every file under each root, by bytes, size and mtime.
+
+        Two roots because the channel socket cannot live in the project: it is
+        named from a hash under TMPDIR, so a test watching only the project
+        could not see doctor create, touch or remove one."""
+        seen = {}
+        for root in roots:
+            for base, _dirs, files in os.walk(root):
+                for name in sorted(files):
+                    path = os.path.join(base, name)
+                    info = os.lstat(path)
+                    try:
+                        with open(path, "rb") as f:
+                            body = f.read()
+                    except OSError:
+                        body = None       # a socket has no readable contents
+                    seen[path] = (body, info.st_mtime, info.st_size)
+        return seen
+
+    # ---- the checks ----
+
+    def test_doctor_reports_an_unconfigured_project(self):
+        """An empty directory: every configuration file is missing, each says
+        so with the same repair, and the command exits 1."""
+        project = self.project()
+        code, printed = self.run_doctor(project)
+        self.assertEqual(code, 1)
+        for name in (antiphon.CLAUDE_SETTINGS_FILE,
+                     antiphon.CLAUDE_LOCAL_SETTINGS_FILE,
+                     antiphon.CODEX_HOOKS_FILE, antiphon.CODEX_CONFIG_FILE,
+                     antiphon.MCP_CONFIG_FILE):
+            line = self.line_for(printed, name)
+            self.assertTrue(line.startswith("✗"), f"{name}: {line!r}")
+            self.assertIn("antiphon setup", line, name)
+
+    def test_doctor_passes_on_a_set_up_project(self):
+        """`setup` writes; doctor reads back. Every configuration check is ✓.
+
+        This is the agreement test the drift gate turns on: setup and doctor
+        run in one process against one set of shapes, so mutating a shared
+        shape moves both and this test stays green. A doctor holding its own
+        copy of a string would not move, and it would red."""
+        project = self.project()
+        self.set_up(project)
+        code, printed = self.run_doctor(project)
+        for name in (antiphon.CLAUDE_SETTINGS_FILE,
+                     antiphon.CLAUDE_LOCAL_SETTINGS_FILE,
+                     antiphon.CODEX_HOOKS_FILE, antiphon.CODEX_CONFIG_FILE,
+                     antiphon.MCP_CONFIG_FILE):
+            self.assertTrue(self.line_for(printed, name).startswith("✓"),
+                            f"{name}: {self.line_for(printed, name)!r}")
+        self.assertEqual(code, 0, printed)
+
+    def test_a_healthy_idle_project_prints_no_x(self):
+        """A set-up project with no session running is not broken. No socket,
+        no peers, no ✗, exit 0 — a diagnostic that warns about the normal
+        resting state is one people learn to ignore."""
+        project = self.project()
+        self.set_up(project)
+        code, printed = self.run_doctor(project)
+        self.assertEqual(code, 0, printed)
+        self.assertEqual([line for line in printed.splitlines()
+                          if line.startswith("✗")], [])
+        self.assertTrue(any(line.startswith("·") for line in printed.splitlines()),
+                        "an idle project still has something to say calmly")
+
+    def test_doctor_never_writes(self):
+        """Bytes, sizes and mtimes under both roots, before and after, on a
+        broken fixture and a healthy one, each with a dead peer record armed.
+
+        The corpse is the point. `read_peers`, `_live_by_kind` and
+        `resolve_target` all delete one on the way past, so a doctor built on
+        any of them changes the tree it was asked to describe — and deletes
+        exactly the stale record the person ran it to ask about."""
+        for set_up in (False, True):
+            with self.subTest(set_up=set_up):
+                project = self.project()
+                sockets = self.socket_dir()
+                if set_up:
+                    self.set_up(project)
+                antiphon.peers.register(project, "claude", "gone",
+                                        "/nowhere/gone.sock", pid=os.getpid())
+                record = antiphon.peers._peer_file(project, "claude", "gone")
+                with patch.dict(os.environ, {"TMPDIR": sockets}), \
+                     patch.object(antiphon.peers, "alive", return_value=False):
+                    before = self.snapshot(project, sockets)
+                    self.run_doctor(project)
+                    after = self.snapshot(project, sockets)
+                self.assertEqual(before, after)
+                self.assertTrue(os.path.exists(record),
+                                "the stale record doctor was asked about is "
+                                "still there to be explained")
+
+    def test_doctor_survives_a_malformed_config(self):
+        """The canonical quiet bridge: a hand-edited settings file with a
+        trailing comma. The reader raises; doctor must explain instead of
+        crashing, and must not borrow the writer's voice — it never intended to
+        overwrite anything, so it cannot have refused to."""
+        project = self.project()
+        self.set_up(project)
+        with open(os.path.join(project, antiphon.CLAUDE_SETTINGS_FILE), "w",
+                  encoding="utf-8") as f:
+            f.write('{\n  "permissions": {"allow": ["Bash(ls:*)"]},\n}\n')
+        code, printed = self.run_doctor(project)
+        self.assertEqual(code, 1)
+        line = self.line_for(printed, antiphon.CLAUDE_SETTINGS_FILE)
+        self.assertTrue(line.startswith("✗"), line)
+        self.assertIn("not valid JSON", line)
+        self.assertNotIn("refusing to overwrite", line)
+        # One broken file is not the end of a diagnostic; it is the reason
+        # somebody started one. Everything after it still runs.
+        self.assertTrue(
+            self.line_for(printed, antiphon.MCP_CONFIG_FILE).startswith("✓"))
+        self.assertTrue(self.line_for(printed, "alias").startswith(("✓", "·")),
+                        printed)
+
+    def test_doctor_probes_the_socket_not_the_file(self):
+        """Four states one `os.path.exists` cannot tell apart."""
+        project = self.project()
+        self.set_up(project)
+        base = self.socket_dir()
+        with patch.dict(os.environ, {"TMPDIR": base}):
+            path = antiphon.claude_socket_path(project)
+
+            # (a) a listener answering the shape the channel server answers
+            with self.listener(path, b'{"ok":false,"error":"empty"}'):
+                code, printed = self.run_doctor(project)
+            self.assertEqual(code, 0, printed)
+            self.assertTrue(self.line_for(printed, "channel:").startswith("✓"),
+                            printed)
+
+            # (b) a plain file where the socket should be
+            with open(path, "w", encoding="utf-8") as f:
+                f.write("not a socket")
+            code, printed = self.run_doctor(project)
+            self.assertEqual(code, 1)
+            self.assertIn("not a socket", self.line_for(printed, "channel:"))
+            os.unlink(path)
+
+            # (c) bound, listened, then closed without unlinking — what a
+            # SIGKILLed channel server leaves behind
+            dead = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            dead.bind(path)
+            dead.listen(1)
+            dead.close()
+            code, printed = self.run_doctor(project)
+            self.assertEqual(code, 1)
+            line = self.line_for(printed, "channel:")
+            self.assertIn("nothing listening", line)
+            self.assertIn(path, line, "the repair line names the file to remove")
+            self.assertNotIn("not a socket", line,
+                             "(b) and (c) are different diagnoses")
+            os.unlink(path)
+
+            # (d) a listener that accepts and answers something else. The ✓ is
+            # falsifiable or it is nothing: any process can bind that path.
+            with self.listener(path, b"hello there"):
+                code, printed = self.run_doctor(project)
+            self.assertEqual(code, 1)
+            self.assertFalse(self.line_for(printed, "channel:").startswith("✓"),
+                             "an arbitrary listener is not an Antiphon channel")
+
+    def test_doctor_reports_a_broken_alias(self):
+        """Through `peers.explicit_name()` — the exact function production
+        routing uses — never the raw environment variable."""
+        project = self.project()
+        self.set_up(project)
+
+        with patch.dict(os.environ, {"ANTIPHON_NAME": "bad name"}):
+            code, printed = self.run_doctor(project)
+        self.assertEqual(code, 1)
+        line = self.line_for(printed, "alias")
+        self.assertTrue(line.startswith("✗"), line)
+        self.assertIn("lower-case", line, "the accepted shape is named")
+
+        with patch.dict(os.environ, {"ANTIPHON_NAME": "ui"}):
+            code, printed = self.run_doctor(project)
+        self.assertEqual(code, 0, printed)
+        self.assertEqual(self.line_for(printed, "alias"), '✓ alias: named "ui"')
+
+        # Measured: `explicit_name()` lower-cases, so production accepts "UI"
+        # while `NAME_PATTERN` refuses the raw value — a doctor reading the
+        # environment directly calls a working session broken. And the name it
+        # prints is the one the bridge can address: `@claude:UI` reaches nobody.
+        with patch.dict(os.environ, {"ANTIPHON_NAME": "UI"}):
+            code, printed = self.run_doctor(project)
+        self.assertEqual(code, 0, printed)
+        self.assertEqual(self.line_for(printed, "alias"), '✓ alias: named "ui"')
+
+    def test_help_exits_zero(self):
+        """Asking for help is not an error. Measured before this change:
+        `--help`, `-h` and `help` each printed the usage and exited 1."""
+        script = os.path.join(os.path.dirname(antiphon.__file__), "antiphon.py")
+        for spelling in ("--help", "-h", "help"):
+            with self.subTest(spelling=spelling):
+                done = subprocess.run([sys.executable, script, spelling],
+                                      capture_output=True, text=True, timeout=60,
+                                      stdin=subprocess.DEVNULL)
+                self.assertEqual(done.returncode, 0, done.stderr)
+                self.assertIn("Usage:", done.stdout)
+                self.assertIn("antiphon doctor", done.stdout)
+        done = subprocess.run([sys.executable, script, "nonsense"],
+                              capture_output=True, text=True, timeout=60,
+                              stdin=subprocess.DEVNULL)
+        self.assertEqual(done.returncode, 1,
+                         "an unknown command is still an error")
+
+    # ---- helpers ----
+
+    @staticmethod
+    def line_for(printed, needle):
+        for line in printed.splitlines():
+            if needle in line:
+                return line
+        return ""
+
+    @contextlib.contextmanager
+    def listener(self, path, reply):
+        """A server that accepts one connection, waits for FIN, answers `reply`.
+
+        The wait is what the real server does: `lib/channel.mjs` answers from
+        its `end` handler, so a probe that never half-closes is never answered
+        — measured, 0 ms with the half-close and a 2 s timeout without it."""
+        server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        server.bind(path)
+        server.listen(1)
+
+        def serve():
+            try:
+                conn, _ = server.accept()
+            except OSError:
+                return
+            with conn:
+                while conn.recv(4096):
+                    pass
+                with contextlib.suppress(OSError):
+                    conn.sendall(reply)
+
+        thread = threading.Thread(target=serve, daemon=True)
+        thread.start()
+        try:
+            yield
+        finally:
+            server.close()
+            thread.join(timeout=5)
+            with contextlib.suppress(OSError):
+                os.unlink(path)
+
+
+class SetupShapeCharacterizationTest(unittest.TestCase):
+    """Exactly what `setup` writes, file by file, and exactly what it prints.
+
+    These are characterization tests, not new promises: they were written
+    against the shipped behaviour and passed unchanged before the expected
+    shapes moved out of `setup`'s closures into module data. That is the whole
+    point of them — measured, two of the strings the extraction touches
+    (`mcp__antiphon__reply_to_codex` and `default_tools_approval_mode`) were
+    asserted by no test at all, so an extraction that dropped either one passed
+    the entire suite while silencing the bridge in one direction.
+
+    Whole-value assertions, never `assertIn`: a containment check cannot see a
+    key that was added, an entry that was duplicated, or a hook that moved to
+    another event."""
+
+    def install(self):
+        """Runs `setup` into a fresh fixture. Returns (project, stdout)."""
+        project = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, project, ignore_errors=True)
+        out = io.StringIO()
+        with patch.object(antiphon, "project_dir", return_value=project), \
+             contextlib.redirect_stdout(out):
+            self.assertEqual(antiphon.setup(), 0)
+        return project, out.getvalue()
+
+    @staticmethod
+    def written(project, *parts):
+        with open(os.path.join(project, *parts), encoding="utf-8") as f:
+            return f.read()
+
+    def test_setup_writes_the_whole_claude_settings_shape(self):
+        """Both Claude hooks and the permission that lets Claude answer at all.
+
+        Without `mcp__antiphon__reply_to_codex` in `permissions.allow`, the
+        `reply_to_codex` tool needs approval on every use and the Claude→Codex
+        direction goes quiet — the exact failure `doctor` exists to explain."""
+        project, _ = self.install()
+        self.assertEqual(json.loads(self.written(project, ".claude", "settings.json")), {
+            "hooks": {
+                "UserPromptSubmit": [
+                    {"hooks": [{"type": "command",
+                                "command": "antiphon hook claude"}]}],
+                "Stop": [
+                    {"hooks": [{"type": "command",
+                                "command": "antiphon push codex"}]}],
+            },
+            "permissions": {"allow": ["mcp__antiphon__reply_to_codex"]},
+        })
+
+    def test_setup_writes_the_whole_local_allowlist_shape(self):
+        """Claude Code gates `.mcp.json` servers behind this list. Without the
+        entry the channel server never starts and there is no socket to find."""
+        project, _ = self.install()
+        self.assertEqual(
+            json.loads(self.written(project, ".claude", "settings.local.json")),
+            {"enabledMcpjsonServers": ["antiphon"]})
+
+    def test_setup_writes_the_whole_codex_hooks_shape(self):
+        """Three events, and the label a Codex user reads at the hook-approval
+        prompt. One entry per event, never two."""
+        project, _ = self.install()
+        pull = [{"hooks": [{"type": "command",
+                            "command": "antiphon hook codex",
+                            "statusMessage": "Antiphon bridge"}]}]
+        self.assertEqual(json.loads(self.written(project, ".codex", "hooks.json")), {
+            "hooks": {
+                "UserPromptSubmit": pull,
+                "SessionStart": pull,
+                "Stop": [{"hooks": [{"type": "command",
+                                     "command": "antiphon push claude"}]}],
+            },
+        })
+
+    def test_setup_writes_the_whole_codex_mcp_table(self):
+        """Every key and every value, including the approval mode — which no
+        other test asserts — and the project directory the server is aimed at."""
+        project, _ = self.install()
+        self.assertEqual(self.written(project, ".codex", "config.toml"),
+                         '[mcp_servers.antiphon]\n'
+                         'command = "antiphon"\n'
+                         'args = ["mcp"]\n'
+                         '# read-only local bridge; no need to ask on every turn\n'
+                         'default_tools_approval_mode = "approve"\n'
+                         '# forwarded, not set: the peer name comes from the terminal that\n'
+                         '# started this session, and Codex does not pass it down otherwise\n'
+                         'env_vars = ["ANTIPHON_NAME"]\n'
+                         '\n[mcp_servers.antiphon.env]\n'
+                         f'ANTIPHON_CWD = "{project}"\n')
+
+    def test_setup_writes_the_whole_mcp_channel_entry(self):
+        """`args = ["channel"]`, not `["mcp"]`: the two servers hand out
+        different tools and aiming one at the other inverts who may speak."""
+        project, _ = self.install()
+        self.assertEqual(json.loads(self.written(project, ".mcp.json")), {
+            "mcpServers": {
+                "antiphon": {
+                    "command": "antiphon",
+                    "args": ["channel"],
+                    "env": {"ANTIPHON_CWD": project},
+                },
+            },
+        })
+
+    def test_setup_prints_a_line_per_target_and_the_closing_guidance(self):
+        """Measured before this test existed: 19 setup tests discard stdout and
+        none asserted a single line of it, so a refactor of `setup` could
+        rewrite the output of the very function it refactors and stay green."""
+        project, printed = self.install()
+        claude = os.path.join(project, ".claude", "settings.json")
+        codex = os.path.join(project, ".codex", "hooks.json")
+        self.assertEqual(printed, "\n".join([
+            f"✓ Claude hook installed: {claude}",
+            f"✓ Push-to-Codex hook installed (Stop): {claude}",
+            f"✓ Codex hook installed: {codex}",
+            f"✓ Codex session hook installed (SessionStart): {codex}",
+            f"✓ Push-to-Claude hook installed (Stop): {codex}",
+            "✓ Codex MCP tool registered: "
+            + os.path.join(project, ".codex", "config.toml"),
+            "✓ Claude MCP Channel registered: "
+            + os.path.join(project, ".mcp.json"),
+            "✓ Claude MCP local permission updated: "
+            + os.path.join(project, ".claude", "settings.local.json"),
+            "✓ AGENTS.md rule added: " + os.path.join(project, "AGENTS.md"),
+            "✓ CLAUDE.md rule added: " + os.path.join(project, "CLAUDE.md"),
+            "",
+            "— One last step: Codex hooks need a one-time security approval.",
+            "  Open `codex` in this directory; approve the hook at the "
+            "'New hook - review required' prompt.",
+            "  Approval is granted once and then persists (it asks again only "
+            "if the file changes).",
+            "",
+            "— Start Claude with the channel enabled:",
+            "  claude --dangerously-load-development-channels server:antiphon",
+            "  In the research preview, the first launch needs both a "
+            "development channel and an MCP approval.",
+            "",
+            "— More than one terminal on either side? Name every one of them:",
+            "  ANTIPHON_NAME=ui claude --dangerously-load-development-channels "
+            "server:antiphon",
+            "  ANTIPHON_NAME=build codex",
+            "  An unnamed session still runs, but it cannot be addressed by "
+            "name. Name the",
+            "  Codex terminals above all: an unnamed Codex session leaves no "
+            "record at all,",
+            "  so once any Codex peer is named, an unaddressed message to "
+            "Codex is refused",
+            "  rather than sent to a guess.",
+            "",
+        ]))
+
+    def test_a_second_setup_reports_every_target_as_already_done(self):
+        """The `·` spelling is as much a shape as the `✓` one: it is what a
+        person sees when they run `setup` to check, and it distinguishes
+        idempotence from a second install."""
+        project, _ = self.install()
+        out = io.StringIO()
+        with patch.object(antiphon, "project_dir", return_value=project), \
+             contextlib.redirect_stdout(out):
+            self.assertEqual(antiphon.setup(), 0)
+        status_lines = [line for line in out.getvalue().splitlines()
+                        if line[:1] in ("✓", "·")]
+        claude = os.path.join(project, ".claude", "settings.json")
+        codex = os.path.join(project, ".codex", "hooks.json")
+        self.assertEqual(status_lines, [
+            f"· Claude hook already installed: {claude}",
+            f"· Push-to-Codex hook already installed: {claude}",
+            f"· Codex hook already installed: {codex}",
+            f"· Codex session hook already installed: {codex}",
+            f"· Push-to-Claude hook already installed: {codex}",
+            "· Codex MCP tool already registered: "
+            + os.path.join(project, ".codex", "config.toml"),
+            "· Claude MCP Channel already registered: "
+            + os.path.join(project, ".mcp.json"),
+            "· Claude MCP local permission already up to date: "
+            + os.path.join(project, ".claude", "settings.local.json"),
+            "· AGENTS.md rule already up to date: "
+            + os.path.join(project, "AGENTS.md"),
+            "· CLAUDE.md rule already up to date: "
+            + os.path.join(project, "CLAUDE.md"),
+        ])
 
 
 class PagedSummaryModelTest(unittest.TestCase):

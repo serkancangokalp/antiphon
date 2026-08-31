@@ -423,17 +423,107 @@ next turn rather than a loss. Worth checking first whether any refusal exists
 that the pull path genuinely cannot cover; if one does, it needs a different
 message from the ones that merely arrive late.
 
-## P1 — `antiphon doctor`
+## Shipped — `antiphon doctor`
 
-Add one read-only command that explains the common “bridge is quiet” cases:
+One read-only command that explains the common “bridge is quiet” cases.
+Seven checks, in print order:
 
-- command/package version and which executable `PATH` resolves;
-- Node/Python compatibility;
-- hook, MCP and environment-forwarding configuration;
-- current alias validity, live peers, readiness and stale records;
-- channel socket reachability and Codex queue availability;
-- actionable repair text. A future `--fix` may call the existing idempotent
-  setup path, but the default command must not edit anything.
+1. **Install** — which `antiphon` `PATH` resolves, against the package root of
+   the copy running the check, `realpath` on both sides. Same install is `✓`
+   with the version; a different copy of the same version is `·` (a
+   maintainer's clone beside a global install is not broken, and the hooks use
+   `PATH`'s copy either way); an **older** copy on `PATH` is `✗`, because the
+   hooks that actually run are the old ones; a newer one is `·`. Versions are
+   compared as tuples of ints — measured, plain string comparison inverts on
+   three of four realistic pairs, `0.9.0` reading as newer than `0.10.0` — and
+   anything that will not parse that way is `·` “cannot compare”, never an
+   ordering guess. No `antiphon` on `PATH` while hooks call it is `✗`.
+2. **Interpreters** — this run's Python against a `PYTHON_FLOOR` constant bound
+   to the README by contract test; what the wrapper's bare `python3` actually
+   resolves to on `PATH`, which is a different question (measured on the
+   maintainer's machine: Anaconda 3.14, not the 3.9 the suite runs under); and
+   `node --version` against `engines.node`.
+3. **Configuration** — `.claude/settings.json` (both hooks and the
+   `mcp__antiphon__reply_to_codex` permission), `.claude/settings.local.json`
+   (the `enabledMcpjsonServers` entry that gates the channel server at all),
+   `.codex/hooks.json` (three events and the approval-prompt label),
+   `.codex/config.toml` (the table, its `env_vars` line, and the `ANTIPHON_CWD`
+   **value** — a table pointing at a renamed directory reads another project's
+   registry with every key present), `.mcp.json` (the channel entry). Missing
+   pieces are named; the repair is `antiphon setup`.
+4. **Alias** — through `peers.explicit_name()`, the exact function production
+   routing uses, never the raw environment. Measured: it lower-cases, so
+   `ANTIPHON_NAME=UI` is a working named session a raw read calls invalid.
+   Doctor prints the name it returns, because `@claude:UI` addresses nobody.
+5. **Peers** — `_scan` plus `_record_alive`, listed by kind and alias.
+6. **Channel reachability** — a probe, not a `stat`.
+7. **Codex delivery** — `codex` on `PATH`, presence only.
+
+**Vocabulary and exit contract.** `✓` fine, `·` nothing to do here, `✗`
+broken; only `✗` makes the command exit 1. A set-up project with no session
+running prints only `✓` and `·` and exits 0 — pinned by test. A diagnostic
+that warns about the normal resting state is one people learn to ignore.
+
+**Zero writes, enforced.** Doctor never opens a file for writing, never takes
+the registry lock, and calls none of the three readers that prune —
+`peers.read_peers` (`peers.py:425`), `_live_by_kind` (`antiphon.py`, what
+`status` uses) and `resolve_target`. All three delete a dead peer's record on
+the way past, which would remove exactly the stale record somebody ran the
+command to ask about. A test snapshots bytes, sizes and mtimes under two roots
+— the project fixture and the external socket directory — before and after, on
+a broken fixture and a healthy one, each with a corpse armed.
+
+**The socket `✓` is falsifiable.** Connect → `shutdown(SHUT_WR)` → read one
+reply → close; nothing is ever sent. The half-close is load-bearing: the
+channel server answers from its `end` handler, so measured against the real
+server the reply arrives in 0 ms with it and never without — the obvious
+order reports every healthy bridge as broken and tells the user to restart.
+The reply must parse as a JSON object carrying an `ok` key; the *presence* is
+the signal and the value is ignored deliberately, because the healthy answer
+to a bare connection is `{"ok":false,"error":"Unexpected end of JSON input"}`.
+Any process can bind that path, so without reading the answer the check would
+pass for all of them. Retry patience is spent only where a registered live
+peer claims the address: `NOT_LISTENING_YET` includes `ENOENT`, so a blind
+retry at the unregistered project default spends 1,545 ms over 28 attempts on
+the perfectly normal no-socket state. That split cannot reintroduce the race
+the patience exists for — the channel server claims the registry before it
+binds, and a contract test pins that ordering.
+
+**Doctor is authoritative over `status` on reachability.** `status` prints
+`Claude channel: live` when the socket *file* exists; doctor means somebody
+answered. On a stale socket the two disagree, and doctor is right. `status` is
+unchanged here on purpose; aligning it is a separate change.
+
+**Privacy.** No session ids, no cursor contents, no addresses in the peer
+list. One deliberate exception: the stale-socket and not-a-socket repair lines
+print the socket path, because that is the file the person may need to remove
+(five repair lines in total print it — every not-listening/not-a-socket/
+cannot-connect arm, per probed address).
+
+Known incompleteness, deliberately parked: the config *envelope keys*
+(`permissions`/`allow`, `mcpServers`, `enabledMcpjsonServers` as a key, the
+hook envelope fields) are still spelled once in setup and once in doctor.
+Latent, not live — those keys are owned by Claude Code and Codex and never
+change unilaterally — but a future extraction pass could move them into the
+shared shapes too. Note also that `status` may say `live` purely from the
+registry, not only from the socket file; doctor's answered/unanswered remains
+the authoritative reachability verdict either way.
+
+**Also fixed:** `antiphon --help`, `-h` and `help` print the usage and exit 0.
+They exited 1 on all three spellings, and the check runs before the command
+table so `antiphon help doctor` is not an arity error.
+
+### Still future
+
+- `--fix`. The default command must keep editing nothing; a repair mode would
+  call the existing idempotent `setup` path.
+- Executing `codex` to prove queue liveness. Check 7 is presence on `PATH`
+  only: running it from a diagnostic can block on authentication or spawn a
+  session, and a command run because things are broken must do neither.
+- Per-peer Codex reachability, for the same reason.
+- Whether Codex actually *forwards* `ANTIPHON_NAME`. Doctor verifies the
+  `env_vars` line that asks for the forward; only a live Codex process can
+  show that it happened.
 
 ## P2 — Reply correlation
 
