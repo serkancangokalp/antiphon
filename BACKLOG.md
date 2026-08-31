@@ -710,6 +710,37 @@ never printed before — a diagnosis, not a behaviour change.
   wording, which describes keyless→keyless suppression, while this residual is
   **keyless-write → keyed-identical-push** through the migration branch.
 
+## Shipped — a bare push goes to a running Codex, never to the newest file
+
+Measured on Codex 0.151.0: a thread opened at 13:03 got its rollout file at
+15:13, on the user's first turn, 7,832 s later. Discovery reads rollouts, so
+until then the running session did not exist for the bridge, and a push at
+15:04 was queued — `codex queue --thread` accepted it, Claude's Stop hook saw
+success — into the newest file's thread: an empty session from 12:55 that
+nothing would ever drain. A second message had been waiting the same way in a
+thread closed at 11:42. Nothing anywhere said so.
+
+What shipped: Codex holds an exclusive flock on
+`~/.codex/thread-writer-locks/<id>.lock` from the moment a thread opens and
+removes the file when it closes (measured: the live terminal and one desktop
+thread held theirs; every closed thread's file was gone). `codex_session_id`
+now takes the newest *running* session among the rollouts recording this
+directory; where a Codex keeps no such locks the old newest-file rule stands
+unchanged. When rollouts exist and none is running, the push is refused with
+the reason — a running session gets a transcript only on its first turn and
+cannot be addressed until then — instead of stranding the words; the refusal
+is classified `no-peer`, so the honest-refusal sentence about the passive page
+still follows it. `doctor` reads Codex's own queue read-only and notes, as `·`,
+messages waiting in a thread that is not running; only Codex can drain that
+queue, so it is never ✗.
+
+Named limitations: the lock is Codex's internal behaviour, feature-detected
+and measured on one version, not a contract. A running thread that has not
+taken its first turn is still unaddressable from here — the Codex hook does
+receive its `session_id` and `cwd` at `SessionStart`, and recording that as a
+delivery hint would close the gap, but it changes the rule that an unnamed
+Codex leaves no record, and belongs with the automatic-peer-identity entry.
+
 ## Shipped — the channel never hands Claude Code a null sender
 
 Measured on Claude Code 2.1.251, in the host's own MCP log: every
