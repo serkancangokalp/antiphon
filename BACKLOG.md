@@ -1017,6 +1017,101 @@ reply routing needs a durable design before implementation:
 - fail closed when several unanswered senders remain;
 - define expiry and cleanup without losing a late reply.
 
+## P1 — Same-vendor bridging: Codex ↔ Codex and Claude ↔ Claude
+
+Asked for on 2026-08-31 after running two Codex terminals and one Claude on a
+second machine. Today the bridge is defined by its two sides: a Claude session
+reaches Codex and a Codex session reaches Claude, and neither can reach a peer
+of its own kind. That is a property of the surfaces, not of the machinery —
+which is why this is worth doing and why it is not free.
+
+**What already exists.** The registry is kind-aware end to end: `peer_dir` and
+every record carry `kind`, `read_peers(cwd, kind)` filters on it, and
+`resolve_target(cwd, kind, alias)` takes the kind as an argument rather than
+assuming one. Both transports are per-kind and already written: a Claude peer
+is reached by writing its Unix socket (`send_to_claude`), a Codex peer by
+`codex queue --thread` (`send_to_codex`). So `claude → claude` and
+`codex → codex` are, mechanically, calls that already compile.
+
+**What is missing.** The surfaces, and every sentence that assumes the other
+side. `@codex:name` is parsed only out of a Claude transcript and `@claude:name`
+only out of a Codex one; `reply_to_codex` names its recipient kind in the tool
+itself; the CLAUDE.md and AGENTS.md rules, the channel instructions and the
+README all describe a two-sided bridge. The passive pull is the same shape: a
+side's page is built from *the other* kind's transcripts, so a Claude session
+would not see another Claude session's work at all.
+
+**The questions this opens, none of them settled.**
+
+- *Identity.* An event arriving from a peer of the same kind must still say
+  which session spoke, and a Claude reader must not read another Claude's words
+  as its own or as its user's. The `sender_kind` field exists; the labelling
+  rules were written when kind and side were the same thing.
+- *Loops.* Two peers of one kind, each pushing markers the other renders, is
+  the first shape in this project where a message can come back to its author.
+  The relayed-words work keeps provenance readable, but nothing today bounds a
+  hop count, and the cross-vendor entry below wants the same budget.
+- *The unnamed default.* Two same-kind peers are exactly the case where names
+  stop being optional. See the entry below on unnamed addressability: on the
+  Codex side an unnamed session leaves no record at all, so two unnamed Codex
+  terminals cannot be told apart, let alone addressed.
+- *Scope.* Whether the passive page should carry same-kind activity too, or
+  whether same-vendor stays a direct-message-only road. Carrying it doubles
+  what a page can hold and re-opens the discovery window question.
+
+The honest order is: unnamed addressability first (below), because same-vendor
+routing is unusable without it, then the surfaces, then loop bounds.
+
+## P1 — An unnamed peer is invisible, and two of them are indistinguishable
+
+Measured on 2026-08-31, from a real session on a second machine: with two
+unnamed Codex terminals and one Claude, Claude could only answer whichever
+Codex it had last exchanged with, and could not reach the other at all. A Codex
+terminal that had not been typed into could not be reached either.
+
+**The mechanism, read out of the code.** `record_codex_session`
+(`lib/antiphon.py`) returns False before writing anything unless
+`peers.valid_name(peers.explicit_name())` — so an unnamed Codex session writes
+*no registry record whatsoever*. `register_codex_peer` returns None on the same
+condition. `resolve_target` therefore cannot see it, cannot name it in an
+ambiguity refusal, and falls back to `_legacy_target`, which picks the newest
+*running* rollout — one session, chosen by recency, with no way to ask for the
+other. This is deliberate: the project refuses to guess a recipient. But the
+cost lands on the default install, where naming is the thing nobody did yet.
+
+**What was measured today, and what was not.**
+
+- `ANTIPHON_NAME` *is* forwarded by Codex to the `antiphon mcp` server it
+  spawns: a session started as `ANTIPHON_NAME=probe codex exec` had a live MCP
+  child carrying `ANTIPHON_NAME=probe` in its environment. This closes the
+  open question in the doctor entry above, which could only verify that the
+  `env_vars` line asks for the forward.
+- In that same `codex exec` probe no registry record appeared at all, named or
+  not. Not root-caused: `register_codex_peer` gives up silently when
+  `peers.owner_key()` cannot identify the owning Codex process, and `codex
+  exec` is not an interactive session. Whether an interactive
+  `ANTIPHON_NAME=x codex` registers before its first turn is **unmeasured**,
+  and it is the measurement this entry needs first.
+
+**The option, and why it is not the guess the project refuses.** The Codex hook
+receives `session_id` at `SessionStart`, before any turn — the same id
+`codex queue --thread` needs. Registering an unnamed session under that id
+(displayed as a short prefix) would make two unnamed terminals distinguishable
+and addressable, and would make a terminal addressable the moment it opens.
+That is the host's own identity arriving in the host's own payload, not a
+choice the bridge invents. The reason it was not done is recorded in the
+automatic-peer-identity entry below, and most of that caution is about the
+*Claude* side, where identity needs `claude agents --json`.
+
+**The decisions this needs, and they are product decisions.** Whether an
+id-shaped peer should be addressable at all or only *visible* (so a refusal can
+say "two Codex sessions are live, name them"); whether the display is the id, a
+short prefix, or a generated word; whether an unnamed peer may receive a bare
+message when it is provably the only one; and whether the Claude side stays
+asymmetric until its own identity source is proven. A visible-but-unaddressable
+peer is the smallest step that fixes the worst symptom — a refusal that says
+*why* rather than a silent delivery to the wrong terminal.
+
 ## P2 — Automatic peer identity
 
 Aliases are intentionally explicit in the first multi-peer release. A later
