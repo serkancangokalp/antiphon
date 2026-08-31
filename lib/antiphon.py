@@ -56,6 +56,14 @@ from datetime import datetime
 HOME = os.path.expanduser("~")
 CLAUDE_PROJECTS = os.path.join(HOME, ".claude", "projects")
 CODEX_SESSIONS = os.path.join(HOME, ".codex", "sessions")
+# Measured on Codex 0.151.0: a thread holds an exclusive flock on its file here
+# from the moment it opens — two hours before its rollout existed, in the case
+# that was measured — and the file is removed when the thread closes.
+CODEX_THREAD_LOCKS = os.path.join(HOME, ".codex", "thread-writer-locks")
+# Codex's own queue: `codex queue` writes here and a running thread drains it.
+# Read by doctor only, read-only, to name messages waiting for a thread that
+# is no longer running.
+CODEX_QUEUE_DBS = os.path.join(HOME, ".codex", "queue_*.sqlite")
 
 TAIL_BYTES = 300_000      # amount to read from the tail of each transcript file
 EVENT_LIMIT = 40          # completed source records per page
@@ -1919,12 +1927,59 @@ def last_codex_reply(transcript_path, turn_id=None):
     return _codex_turn(transcript_path, turn_id)[0]
 
 
+def codex_thread_alive(session):
+    """Whether a Codex thread is running, read off its writer lock.
+
+    True or False when this Codex keeps per-thread locks; None when it keeps
+    none, so a caller can fall back rather than treat every thread as dead.
+    Measured on Codex 0.151.0: `thread-writer-locks/<id>.lock` is created and
+    held under an exclusive flock when the thread opens and removed when it
+    closes — while the rollout file, which discovery reads, appears only on
+    the user's first turn (7,832 s later in the measured case). A shared
+    non-blocking probe is refused exactly while the writer holds it; the probe
+    takes nothing when it succeeds and releases at once.
+    """
+    if not os.path.isdir(CODEX_THREAD_LOCKS):
+        return None
+    try:
+        fd = os.open(os.path.join(CODEX_THREAD_LOCKS, session + ".lock"),
+                     os.O_RDONLY)
+    except OSError:
+        return False
+    try:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_SH | fcntl.LOCK_NB)
+        except OSError as e:
+            return e.errno in (errno.EAGAIN, errno.EWOULDBLOCK, errno.EACCES)
+        fcntl.flock(fd, fcntl.LOCK_UN)
+        return False
+    finally:
+        os.close(fd)
+
+
 def codex_session_id(cwd):
-    """The UUID of the newest Codex session matching cwd (None if there isn't one)."""
-    for path in codex_rollout_files(cwd)[:1]:
+    """The Codex session a bare message goes to.
+
+    The newest *running* session whose rollout records this directory. The
+    newest file alone chose wrong, measured: a session opened at 13:03 had no
+    rollout until 15:13, so a push at 15:04 was queued into the newest file's
+    thread — an empty session from 12:55 that nothing would ever drain.
+    Where this Codex keeps no thread locks, the old newest-file rule stands.
+    None when nothing can be chosen; `_legacy_target` says why.
+    """
+    candidates = []
+    for path in codex_rollout_files(cwd):
         m = SESSION_ID.search(os.path.basename(path))
         if m:
-            return m.group(1)
+            candidates.append(m.group(1))
+    if not candidates:
+        return None
+    alive = {sid: codex_thread_alive(sid) for sid in candidates}
+    if all(state is None for state in alive.values()):
+        return candidates[0]
+    for sid in candidates:
+        if alive[sid]:
+            return sid
     return None
 
 
@@ -2274,6 +2329,15 @@ def _legacy_target(cwd, kind):
         # found no rollout to *address* — which is not a statement about a
         # peer's ability to read: the Codex-side page is built from Claude's
         # transcripts and carries these words either way, measured.
+        if codex_rollout_files(cwd):
+            # Rollouts exist and none belongs to a running thread. The one
+            # that is running may simply not have a rollout yet: Codex writes
+            # it on the first user turn, so until then it cannot be found from
+            # here, and queueing into a closed thread would strand the words.
+            return None, _ClassifiedRefusal(
+                "not delivered: the Codex sessions recorded in this directory "
+                "are not running, and a running one gets a transcript only on "
+                "its first turn — until then it cannot be addressed", "no-peer")
         return None, _ClassifiedRefusal(
             "not delivered: no Codex session found in this directory", "no-peer")
     return session, ""
@@ -4913,6 +4977,39 @@ def _doctor_codex(report):
     else:
         report.note("codex CLI: not on PATH — push-to-Codex needs it (fine on "
                     "a Claude-only install)")
+    _doctor_codex_queue(report)
+
+
+def _doctor_codex_queue(report):
+    """Messages `codex queue` accepted for a thread that is no longer running.
+
+    Measured: two bridge messages sat in Codex's queue for closed threads —
+    one since 12:17, one since 15:04 — and nothing anywhere said so. Read
+    read-only (`mode=ro`), schema feature-detected, and silent on any failure:
+    this is Codex's own database and its shape is not this project's to
+    promise. A note, never ✗: only Codex can drain its queue, and a permanent
+    ✗ over it is one people learn to ignore. Thread ids are printed as their
+    first eight characters — enough to match `codex resume`, nothing more.
+    """
+    import sqlite3
+    paths = sorted(glob.glob(CODEX_QUEUE_DBS))
+    if not paths:
+        return
+    try:
+        con = sqlite3.connect(f"file:{paths[-1]}?mode=ro", uri=True)
+        try:
+            rows = con.execute("SELECT thread_id, COUNT(*) FROM queued_items "
+                               "GROUP BY thread_id").fetchall()
+        finally:
+            con.close()
+    except (sqlite3.Error, OSError):
+        return
+    stranded = [(tid, n) for tid, n in rows
+                if isinstance(tid, str) and codex_thread_alive(tid) is False]
+    for tid, n in stranded:
+        report.note(f"codex queue: {n} message(s) wait in Codex thread "
+                    f"{tid[:8]}…, which is not running — they are read only if "
+                    "that thread is resumed")
 
 
 def doctor():

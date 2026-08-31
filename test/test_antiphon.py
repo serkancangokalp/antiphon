@@ -2497,6 +2497,89 @@ class AntiphonTest(unittest.TestCase):
                 }, "the next write persists the translation")
 
 
+class LiveCodexTargetTest(unittest.TestCase):
+    """A bare `@codex` push goes to a *running* Codex session, never to the
+    newest transcript file. Measured on Codex 0.151.0: a thread opened at
+    13:03 got its rollout file at 15:13, on the user's first turn, and the
+    message pushed at 15:04 was queued into the newest file's thread — an
+    empty session from 12:55 that nobody will ever read. Codex holds an
+    exclusive flock on `thread-writer-locks/<id>.lock` from the moment a
+    thread opens and removes the file when it closes; that lock is the
+    liveness this test reads."""
+
+    LIVE = "01a05745-bc86-73d3-b95d-41754c16fd0f"
+    DEAD = "01a0573e-8a71-7fc3-830f-fbf0b0b5dc22"
+    CWD = "/Users/x/project"
+
+    def locks(self):
+        directory = tempfile.mkdtemp(prefix="antiphon-locks-")
+        self.addCleanup(lambda: __import__("shutil").rmtree(directory, ignore_errors=True))
+        return directory
+
+    def hold(self, directory, session):
+        path = os.path.join(directory, session + ".lock")
+        fd = os.open(path, os.O_CREAT | os.O_RDWR, 0o600)
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        self.addCleanup(os.close, fd)
+        return path
+
+    def rollouts(self, sessions, *ids):
+        """Rollouts for CWD, written oldest first so mtime order is the id order."""
+        day = os.path.join(sessions, "2026", "08", "31")
+        os.makedirs(day, exist_ok=True)
+        paths = []
+        for i, sid in enumerate(ids):
+            path = os.path.join(day, f"rollout-2026-08-31T1{i}-00-00-{sid}.jsonl")
+            with open(path, "w", encoding="utf-8") as f:
+                f.write(json.dumps({"type": "session_meta",
+                                    "payload": {"session_id": sid, "cwd": self.CWD}}) + "\n")
+            recent = time.time() - 600 + i          # discovery drops files older than 3 days
+            os.utime(path, (recent, recent))
+            paths.append(path)
+        return paths
+
+    def test_the_writer_lock_says_whether_a_thread_is_running(self):
+        directory = self.locks()
+        with patch.object(antiphon, "CODEX_THREAD_LOCKS", directory):
+            self.hold(directory, self.LIVE)
+            self.assertIs(antiphon.codex_thread_alive(self.LIVE), True)
+            open(os.path.join(directory, self.DEAD + ".lock"), "w").close()
+            self.assertIs(antiphon.codex_thread_alive(self.DEAD), False,
+                          "a lock file nobody holds is a thread that is gone")
+            self.assertIs(antiphon.codex_thread_alive("no-such-thread"), False)
+        with patch.object(antiphon, "CODEX_THREAD_LOCKS",
+                          os.path.join(directory, "absent")):
+            self.assertIsNone(antiphon.codex_thread_alive(self.LIVE),
+                              "a Codex that keeps no locks cannot answer")
+
+    def test_a_bare_target_is_the_newest_running_session_not_the_newest_file(self):
+        directory = self.locks()
+        with tempfile.TemporaryDirectory() as sessions:
+            self.rollouts(sessions, self.LIVE, self.DEAD)     # DEAD is the newer file
+            with patch.object(antiphon, "CODEX_SESSIONS", sessions):
+                with patch.object(antiphon, "CODEX_THREAD_LOCKS", directory):
+                    self.hold(directory, self.LIVE)
+                    self.assertEqual(antiphon.codex_session_id(self.CWD), self.LIVE)
+                with patch.object(antiphon, "CODEX_THREAD_LOCKS",
+                                  os.path.join(directory, "absent")):
+                    self.assertEqual(antiphon.codex_session_id(self.CWD), self.DEAD,
+                                     "without locks the old newest-file rule stands")
+
+    def test_no_running_session_is_refused_rather_than_queued_into_a_dead_one(self):
+        directory = self.locks()
+        with tempfile.TemporaryDirectory() as sessions, \
+             tempfile.TemporaryDirectory() as project, \
+             patch.object(antiphon, "CODEX_SESSIONS", sessions), \
+             patch.object(antiphon, "CODEX_THREAD_LOCKS", directory):
+            self.rollouts(sessions, self.DEAD)
+            address, detail = antiphon.resolve_target(project if False else self.CWD, "codex")
+            self.assertIsNone(address)
+            self.assertEqual(detail.refusal_class, "no-peer")
+            self.assertIn("not running", detail)
+            self.assertIn("first turn", detail,
+                          "the reader learns why a session it can see is not addressable")
+
+
 class CatchUpTest(unittest.TestCase):
     """`antiphon catch-up`: the page cursors jump to the live edge.
 
@@ -2919,6 +3002,47 @@ class DoctorTest(unittest.TestCase):
                                 pid=os.getpid(), owner_key="300:x")
         _, printed = self.run_doctor(project)
         self.assertNotIn("no owner key", printed)
+
+    def test_doctor_notes_messages_queued_to_a_codex_thread_that_is_not_running(self):
+        """Measured: two bridge messages sat in Codex's queue for threads that
+        had closed (one since 12:17, one since 15:04), invisible to everyone.
+        Doctor reads Codex's queue read-only and names them; nothing to fix
+        from here, so it is a note, not a failure — a permanent ✗ over a queue
+        only Codex can drain is one people learn to ignore."""
+        project = self.project()
+        self.set_up(project)
+        locks = tempfile.mkdtemp(prefix="antiphon-locks-")
+        self.addCleanup(lambda: __import__("shutil").rmtree(locks, ignore_errors=True))
+        home = tempfile.mkdtemp(prefix="antiphon-codexhome-")
+        self.addCleanup(lambda: __import__("shutil").rmtree(home, ignore_errors=True))
+        db = os.path.join(home, "queue_1.sqlite")
+        con = __import__("sqlite3").connect(db)
+        con.execute("CREATE TABLE queued_items (id TEXT PRIMARY KEY, thread_id TEXT, "
+                    "payload_json TEXT, queue_order INTEGER, created_at_ms INTEGER, "
+                    "updated_at_ms INTEGER)")
+        dead = "01a0573e-8a71-7fc3-830f-fbf0b0b5dc22"
+        live = "01a05745-bc86-73d3-b95d-41754c16fd0f"
+        for i, tid in enumerate((dead, dead, live)):
+            con.execute("INSERT INTO queued_items VALUES (?,?,?,?,?,?)",
+                        (f"q{i}", tid, "{}", i, 1, 1))
+        con.commit(); con.close()
+        fd = os.open(os.path.join(locks, live + ".lock"), os.O_CREAT | os.O_RDWR, 0o600)
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        self.addCleanup(os.close, fd)
+        with patch.object(antiphon, "CODEX_THREAD_LOCKS", locks), \
+             patch.object(antiphon, "CODEX_QUEUE_DBS", os.path.join(home, "queue_*.sqlite")):
+            _, printed = self.run_doctor(project)
+        line = self.line_for(printed, "codex queue:")
+        self.assertTrue(line.startswith("·"), line)
+        self.assertIn("2 message(s)", line)
+        self.assertIn(dead[:8], line)
+        self.assertNotIn(live[:8], line, "the running thread's queue is normal")
+        self.assertNotIn(project, line)
+        with patch.object(antiphon, "CODEX_THREAD_LOCKS", locks), \
+             patch.object(antiphon, "CODEX_QUEUE_DBS", os.path.join(home, "nothing_*.sqlite")):
+            _, printed = self.run_doctor(project)
+        self.assertEqual(self.line_for(printed, "codex queue:"), "",
+                         "no queue database, no line")
 
     def test_help_exits_zero(self):
         """Asking for help is not an error. Measured before this change:
