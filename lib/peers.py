@@ -227,7 +227,14 @@ def _addressless(record):
 
 
 def _session_address(cwd, peer):
-    """The session id an addressless Codex endpoint answers to, or None.
+    """The session id this endpoint's own hook has claimed for it, or None.
+
+    Kind-neutral, and used both ways. For a Codex endpoint the id is also the
+    address: a Codex peer registers before it has one and this is what it comes
+    to answer to. For a Claude endpoint it is not an address at all — the
+    socket is — and the id says only which transcript that peer is writing,
+    which is what a pull page joins a session label on. Same halves, same
+    owner, same refusal either way.
 
     The two halves are joined on the owner key and nothing else. A missing
     session record, one with no owner, one from a different owner, and one whose

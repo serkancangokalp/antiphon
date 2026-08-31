@@ -1275,6 +1275,59 @@ OTHER_SIDE = {
 }
 
 
+# What one page build knows about the sessions behind the other side's peers.
+SessionJoin = collections.namedtuple("SessionJoin", "aliases unnamed")
+
+# A page with nothing to join against: no source is labelled, no envelope line
+# fires, and every byte is what it was before any of this existed.
+NO_SESSION_JOIN = SessionJoin({}, False)
+
+
+def _session_join(cwd, kind):
+    """Which sessions of one kind can be named right now, from the registry as
+    it stands. Returns `SessionJoin(aliases, unnamed)`.
+
+    `aliases` maps a session id to the alias whose endpoint is live and claims
+    it. The join is `peers._session_address`, which the registry already
+    implements: liveness on the endpoint, session identity from the hook's
+    half, and the owner key between them — a missing record, one with no owner,
+    one from a different owner and one whose id is not a canonical UUID all
+    read the same way.
+
+    Pure `_scan`-family reads. `read_peers`, `_live_by_kind` and
+    `resolve_target` all prune, and a page build that deleted a stale record
+    would be answering a question about the registry by changing it — deleting
+    exactly what the next `doctor` exists to explain.
+
+    A session two live endpoints claim under different aliases is dropped
+    rather than decided: `sorted(os.listdir(...))` order is not an answer, and
+    reaching for the likeliest is what the misattribution was. The reserved key
+    is filtered by `valid_name`, which refuses it — it is a place in the
+    registry, not a name anything may print.
+
+    `unnamed` is whether a live endpoint of this kind holds that reserved key.
+    It is read here, once, with everything else: the page's remedy line needs
+    it, and the budget loop must never go back to the registry for it.
+    """
+    claims = {}
+    unnamed = False
+    for record in peers._scan(cwd):
+        if record.get("kind") != kind or not peers._record_alive(record):
+            continue
+        name = record.get("name")
+        if name == peers.UNNAMED:
+            unnamed = True
+            continue
+        if not peers.valid_name(name):
+            continue
+        session = peers._session_address(cwd, record)
+        if session is not None:
+            claims.setdefault(session, set()).add(name)
+    return SessionJoin({session: next(iter(names))
+                        for session, names in claims.items()
+                        if len(names) == 1}, unnamed)
+
+
 def _ordered_records(events):
     """Return completed source records in a source-prefix-preserving merge."""
     grouped = {}
@@ -1315,11 +1368,24 @@ def _ordered_records(events):
     return records
 
 
-def _render_record(record, side):
+def _render_record(record, side, join=None):
     """Render one completed source record without cutting its non-tool text."""
     # A `you`-kind event is what the other side received as input — including
     # host text no human wrote — so the label names the slot, not an author.
-    labels = dict(LABEL, you="To {}".format(LABEL[OTHER_SIDE[side][0]]))
+    #
+    # The session label is per record, not per kind of line. Every line this
+    # block renders comes out of one source, so they take the suffix together
+    # or none of them does: a labelled agent line beside a bare relayed line
+    # from the same rollout would show two speakers where there is one.
+    alias = (join or NO_SESSION_JOIN).aliases.get(record.source)
+    named = LABEL[OTHER_SIDE[side][0]] + (" ({})".format(alias) if alias else "")
+    labels = dict(LABEL, you="To {}".format(named))
+    labels[OTHER_SIDE[side][0]] = named
+    # The tool line has no `Name:` shape for a suffix to attach to, and it is
+    # the majority render on the Codex side — measured, 26 of 40 records there
+    # show a tool line and nothing else, so it is the only place their label
+    # can go.
+    mark = "· ({})".format(alias) if alias else "·"
     pieces = []
     tools = []
     run_kind = None
@@ -1328,8 +1394,8 @@ def _render_record(record, side):
 
     def flush_tools():
         if tools:
-            pieces.append("  · {} tool calls: {}".format(
-                len(tools), truncate(" | ".join(tools[-3:]), 130)))
+            pieces.append("  {} {} tool calls: {}".format(
+                mark, len(tools), truncate(" | ".join(tools[-3:]), 130)))
             del tools[:]
 
     def flush_run():
@@ -1372,8 +1438,9 @@ def _append_page_section(text, section):
     return text + "\n" + section
 
 
-def _render_page(side, records, has_more, replay_reason):
+def _render_page(side, records, has_more, replay_reason, join=None):
     """Render the exact visible envelope whose UTF-8 size is page-bounded."""
+    join = join or NO_SESSION_JOIN
     other = OTHER_SIDE[side][1]
     text = "## What happened on the {} side (since your last turn)".format(other)
     text = _append_page_section(text, "has_more: {}".format(str(has_more).lower()))
@@ -1381,22 +1448,61 @@ def _render_page(side, records, has_more, replay_reason):
     if replay_reason is not None:
         text = _append_page_section(text, REPLAY_NOTICES[replay_reason])
     for record in records:
-        text = _append_page_section(text, _render_record(record, side))
+        text = _append_page_section(text, _render_record(record, side, join))
     if has_more:
         if side == "codex":
             text = _append_page_section(
                 text, "More remains; call antiphon_read again or continue on a later turn.")
         else:
             text = _append_page_section(text, "More remains; it will continue on a later turn.")
+
+    # Over the SELECTED records, never the candidates. The measured shape of a
+    # real page is two sources discovered and one delivered — 55 of 60 — and a
+    # count taken over the candidates would annotate every one of them about a
+    # session whose words are not on the page.
+    #
+    # A page carries exactly one peer kind (`build_summary` reads the other
+    # side's transcripts and nothing else), so "sources on the page" is the
+    # whole count; there is no per-kind split to make.
+    sources = {record.source for record in records}
+    labelled = {source for source in sources if source in join.aliases}
+    name = LABEL[OTHER_SIDE[side][0]]
+    if labelled and len(sources) > 1:
+        # Anchored on a live claim. Sources with none are one terminal's
+        # earlier sessions — measured, that is 8% of this install's pages — and
+        # telling their reader that "some of this is old" is noise they learn
+        # to skip past.
+        text = _append_page_section(text, (
+            "This page interleaves {count} {name} sessions; unlabelled blocks "
+            "are earlier or unnamed sessions.".format(count=len(sources),
+                                                      name=name)))
+        if join.unnamed and sources - labelled:
+            # Only a Claude endpoint can hold the reserved key —
+            # `valid_key("codex", UNNAMED)` is False — so this can only ever
+            # appear on a page Codex reads. An unnamed Codex session leaves no
+            # record at all, so its concurrency is undetectable rather than
+            # unmentioned, and the page says nothing instead of guessing.
+            text = _append_page_section(text, (
+                "A {name} session is running now with no name; name each "
+                "terminal (ANTIPHON_NAME) to tell them apart.".format(name=name)))
+
     closing = ("This record belongs to the Antiphon bridge — this is what actually "
                "happened there. Do not assume anything that is not in it.")
     # Predicated on the selected events, never on the rendered text: agent text
     # that quotes the label must not make the page assert relayed input.
     if any(event.kind == "you" for record in records for event in record.events):
-        name = LABEL[OTHER_SIDE[side][0]]
-        closing = ('Lines marked "To {name}:" are what {name} received as input in its '
+        relayed = ('Lines marked "To {name}:" are what {name} received as input in its '
                    "own session — relayed here for awareness, not addressed to your "
-                   "session. ".format(name=name) + closing)
+                   "session. ".format(name=name))
+        if labelled:
+            # It rides the relayed sentence rather than the page. Measured, 4 of
+            # the 6 real labellable pages carry no `you` event at all, and a
+            # sentence about what follows a recipient, on a page with no
+            # recipient line, is the same defect the relayed-words entry was
+            # opened to close.
+            relayed += ("A parenthesised session label after the recipient "
+                        "names which live session's line it is. ")
+        closing = relayed + closing
     return _append_page_section(text, closing)
 
 
@@ -1412,7 +1518,7 @@ def _page_frontier(records, selected, scanned):
     return frontier
 
 
-def _build_page(events, scanned, side, replay_reason=None):
+def _build_page(events, scanned, side, replay_reason=None, join=None):
     """Build one bounded, whole-record page and its safe source frontier."""
     if replay_reason not in (None, "legacy_upgrade", "cursor_recovery"):
         raise ValueError("unknown replay reason")
@@ -1422,7 +1528,10 @@ def _build_page(events, scanned, side, replay_reason=None):
             return "", None, 0
         if replay_reason is None:
             return "", PageAdvance(dict(scanned), False, None), 0
-        text = _render_page(side, [], False, replay_reason)
+        # No records, so no sources and nothing to label. The join this
+        # replay would have used says the same thing; passing the empty one
+        # says it where a reader can see it.
+        text = _render_page(side, [], False, replay_reason, NO_SESSION_JOIN)
         return text, PageAdvance(dict(scanned), False, replay_reason), 0
 
     maximum = min(EVENT_LIMIT, len(records))
@@ -1430,7 +1539,8 @@ def _build_page(events, scanned, side, replay_reason=None):
     text = ""
     for length in range(1, maximum + 1):
         has_more = length < len(records)
-        candidate = _render_page(side, records[:length], has_more, replay_reason)
+        candidate = _render_page(side, records[:length], has_more, replay_reason,
+                                 join)
         if len(candidate.encode("utf-8")) <= PAGE_BUDGET:
             selected = length
             text = candidate
@@ -1438,7 +1548,7 @@ def _build_page(events, scanned, side, replay_reason=None):
     if selected == 0:
         selected = 1
         text = _render_page(side, records[:selected], len(records) > selected,
-                            replay_reason)
+                            replay_reason, join)
 
     has_more = selected < len(records)
     frontier = _page_frontier(records, selected, scanned)
@@ -1460,7 +1570,12 @@ def build_summary(cwd, side, positions=None, since=None, replay_reason=None):
     else:
         events, reached = claude_events(
             cwd, positions, since, visible_record_limit=EVENT_LIMIT + 1)
-    return _build_page(events, reached, side, replay_reason)
+    # Once per build, and threaded down. `_render_page` runs once per prefix
+    # length inside the budget loop — up to `EVENT_LIMIT` times — and the join
+    # walks the registry, `ps` and all: measured, 343 ms per turn if it were
+    # built there, against a 46 ms whole-page build.
+    join = _session_join(cwd, OTHER_SIDE[side][0])
+    return _build_page(events, reached, side, replay_reason, join)
 
 
 # ---------- hook (both sides share the same contract) ----------
