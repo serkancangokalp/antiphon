@@ -36,7 +36,9 @@
 #     word of the code under test is a risk no test script may take.
 #
 # Usage:  test/e2e/fresh-user.sh [--version <npm-version>] [--keep]
-#   default: packs this working tree.  --version: installs that release instead.
+#   default:  packs an immutable copy of HEAD (refuses a dirty tree) and prints
+#             the commit its result describes.
+#   --version: installs that published release instead; no commit involved.
 #   --keep:   leaves the temp tree and the transcripts in place.
 
 set -uo pipefail
@@ -142,8 +144,27 @@ echo "e2e: $TMP"
 step "T0 — the published shape installs and names its version"
 if [ -n "$VERSION" ]; then
   TARBALL="antiphon@$VERSION"
+  echo "  ---- testing the published $VERSION; no commit of this tree is involved"
 else
-  TARBALL="$(cd "$TMP" && npm pack "$REPO" --silent 2>/dev/null | tail -1)"
+  # A commit, not a working tree. Packing $REPO directly proves whatever bytes
+  # happened to be on disk — uncommitted edits, untracked files npm would
+  # include — and the run is long enough for the tree to move under it. So the
+  # gate names a SHA and packs an immutable copy of exactly that: `git archive`
+  # writes the commit's tree, and nothing that happens in the repo afterwards
+  # can reach it. A dirty tree is refused, because a gate that certifies bytes
+  # nobody can name is not a gate.
+  TESTED_HEAD="$(git -C "$REPO" rev-parse HEAD)"
+  DIRT="$(git -C "$REPO" status --porcelain --untracked-files=all)"
+  if [ -n "$DIRT" ]; then
+    echo "the working tree is not clean, so no commit describes what would be tested:" >&2
+    printf '%s\n' "$DIRT" >&2
+    echo "commit or stash first, or use --version <release> to test a published one." >&2
+    exit 2
+  fi
+  echo "  ---- testing commit $TESTED_HEAD (packed from git archive, not the working tree)"
+  mkdir -p "$TMP/src"
+  git -C "$REPO" archive --format=tar "$TESTED_HEAD" | tar -x -C "$TMP/src"
+  TARBALL="$(cd "$TMP" && npm pack "$TMP/src" --silent 2>/dev/null | tail -1)"
   TARBALL="$TMP/$TARBALL"
 fi
 npm install -g --prefix "$PREFIX" "$TARBALL" --silent >/dev/null 2>&1 \
@@ -315,6 +336,16 @@ entry = (data.get('projects') or {}).get('$PROJECT') or {}
 print('granted' if entry.get('hasTrustDialogAccepted') else 'not granted')")"
 check "the script never granted workspace trust" "$TRUSTED" "not granted"
 
+# The evidence is only worth the commit it names: if HEAD moved or the tree
+# went dirty while the run was in flight, this result describes a state that
+# no longer exists.
+if [ -n "${TESTED_HEAD:-}" ]; then
+  step "the result names a commit"
+  check "HEAD is where the run started" "$(git -C "$REPO" rev-parse HEAD)" "$TESTED_HEAD"
+  check "and the tree is still clean" "$(git -C "$REPO" status --porcelain --untracked-files=all | wc -l | tr -d ' ')" "0"
+fi
+
 printf '\n%s\n' "----------------------------------------"
 printf 'passed %d, failed %d\n' "$PASSED" "$FAILED"
+[ -n "${TESTED_HEAD:-}" ] && printf 'tested commit %s\n' "$TESTED_HEAD"
 [ "$FAILED" -eq 0 ] || exit 1
