@@ -48,7 +48,13 @@ fail() { FAILED=$((FAILED + 1)); printf '  \033[31mFAIL\033[0m %s\n' "$1"; }
 step() { printf '\n== %s\n' "$1"; }
 check() { if [ "$2" = "$3" ]; then pass "$1"; else fail "$1 (beklenen: $3, ölçülen: $2)"; fi; }
 contains() { case "$2" in *"$3"*) pass "$1" ;; *) fail "$1 — bulunamadı: $3" ;; esac; }
-lacks() { case "$2" in *"$3"*) fail "$1 — olmamalıydı: $3" ;; *) pass "$1" ;; esac; }
+# An absence proves nothing about a text that is not there: an empty page
+# lacks every word, and a check reading "the page does not replay" would pass
+# for a page that was never produced.
+lacks() {
+  if [ -z "$2" ]; then fail "$1 — kanıt yok: ölçülen metin boş"; return; fi
+  case "$2" in *"$3"*) fail "$1 — olmamalıydı: $3" ;; *) pass "$1" ;; esac
+}
 
 for tool in claude codex node npm python3 sqlite3; do
   command -v "$tool" >/dev/null || { echo "gerekli araç yok: $tool" >&2; exit 2; }
@@ -63,7 +69,8 @@ SLUG="$(printf '%s' "$PROJECT" | sed 's|[^A-Za-z0-9]|-|g')"
 CLAUDE_DIR="$HOME/.claude/projects/$SLUG"
 QUEUE="$HOME/.codex/queue_1.sqlite"
 CODEX_CONFIG_BEFORE="$(shasum -a 256 "$HOME/.codex/config.toml" 2>/dev/null | cut -d' ' -f1)"
-queued() { sqlite3 "$QUEUE" 'SELECT count(*) FROM queued_items;' 2>/dev/null || echo 0; }
+# A queue that cannot be read must not answer 0 twice and call that proof.
+queued() { sqlite3 "$QUEUE" 'SELECT count(*) FROM queued_items;' 2>/dev/null || echo unreadable; }
 
 cleanup() {
   if [ "$KEEP" = "1" ]; then
@@ -71,9 +78,19 @@ cleanup() {
     return
   fi
   rm -rf "$TMP"
-  # Only this run's own transcript directory, named after its own temp project.
-  case "$CLAUDE_DIR" in *antiphon-e2e*) rm -rf "$CLAUDE_DIR" ;; esac
-  [ -n "${ROLLOUT:-}" ] && rm -f "$ROLLOUT"
+  # This run's own transcript directory and nothing else: the path is derived
+  # from its own temp project, so the name carries the proof. Checked again
+  # here rather than trusted, because the variable is built by substitution and
+  # an empty PROJECT would name the whole store.
+  case "$CLAUDE_DIR" in
+    "$HOME/.claude/projects/"*antiphon-e2e*-project)
+      [ -d "$CLAUDE_DIR" ] && [ ! -L "$CLAUDE_DIR" ] && rm -rf "$CLAUDE_DIR" ;;
+  esac
+  # Nothing under ~/.codex is ever deleted. `$ROLLOUT` comes from discovery
+  # over the person's whole session store, and one wrong match would destroy a
+  # real Codex session's history — a price no test script may risk. It is
+  # named instead, for whoever wants to prune it.
+  [ -n "${ROLLOUT:-}" ] && echo "left in place: $ROLLOUT"
 }
 trap cleanup EXIT
 
@@ -108,6 +125,7 @@ lacks "doctor finds nothing broken" "$DOCTOR" "✗"
 
 step "T2 — Claude writes to a Codex that does not exist yet"
 BEFORE_QUEUE="$(queued)"
+case "$BEFORE_QUEUE" in ''|*[!0-9]*) fail "Codex's queue could not be read; the stranding check would prove nothing" ;; esac
 # Two turns, so T5 has two distinct moments to place a cursor between. One
 # turn renders both of its lines in the same second, and the `>=` boundary
 # rule repeats the whole cohort sharing it — nothing to bound.
@@ -186,7 +204,9 @@ UPGRADE_PAGE="$(page_now)"; BOUNDED="$(events_in "$UPGRADE_PAGE")"
 contains "the upgrade page says it is replaying" "$UPGRADE_PAGE" "replay:"
 contains "and how to skip it" "$UPGRADE_PAGE" "antiphon catch-up"
 if [ "$FULL" -lt 2 ]; then
-  echo "  ---- too few visible events ($FULL) to compare the two legacy shapes"
+  # Never a silent skip: a summary reading "failed 0" while the central
+  # assertion never ran is the wrong-reason pass this script exists to avoid.
+  fail "the fixture holds $FULL visible event(s); the two legacy shapes cannot be compared"
 elif [ "$BOUNDED" -lt "$FULL" ]; then
   pass "a 0.1.0 time bounds the replay ($BOUNDED of $FULL events, v2 map replays all $FULL)"
 else
