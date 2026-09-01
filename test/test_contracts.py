@@ -400,8 +400,8 @@ class ShippedContractTest(unittest.TestCase):
         for what, words in (
                 ("the page target", ("8,000", "UTF-8", "bytes")),
                 ("the page record limit", ("40", "completed", "source", "records")),
-                ("the transcript window",
-                 (str(antiphon.RECENT_FILES), "transcript", "files")),
+                ("the catalog hook batch",
+                 (str(antiphon.CATALOG_BATCH), "candidate", "records", "per", "hook")),
                 ("the direct-channel cap",
                  (str(antiphon.MAX_CHANNEL_BYTES // 1024), "KiB"))):
             self.assertRegex(limits, r"\s+".join(map(re.escape, words)), what)
@@ -501,20 +501,24 @@ class ShippedContractTest(unittest.TestCase):
     def test_paged_context_surfaces_teach_has_more(self):
         """An agent that has not been told a page is one of several will treat
         the first page as the whole answer. Both the tool description and the
-        agent instructions teach the loop, and both scope `has_more: false` to
-        the sources discovery can currently see — it is not an inventory of
-        project history."""
+        agent instructions teach the loop. A false value proves the durable
+        catalog only when discovery is complete; building or degraded is an
+        explicitly incomplete boundary."""
         tool = next(t for t in antiphon.TOOLS if t["name"] == "antiphon_read")
-        for name, text in (("the antiphon_read description", tool["description"]),
-                           ("AGENTS_RULE", antiphon.AGENTS_RULE)):
+        surfaces = (("the antiphon_read description", tool["description"]),
+                    ("AGENTS_RULE", antiphon.AGENTS_RULE),
+                    ("CLAUDE_RULE", antiphon.CLAUDE_RULE))
+        for name, text in surfaces:
             self.assertIn("has_more", text, name)
             self.assertRegex(text, r"(?i)one page|a single page", name)
-            self.assertRegex(text, r"(?i)discover", name)
-            # Operational, not decorative: the surface must tell the agent what
-            # to DO while has_more is true — call again, or let later turns
-            # drain it. Naming the field without the loop teaches nothing.
-            self.assertRegex(text, r"(?i)again", name)
+            self.assertIn("has_more_scope", text, name)
+            self.assertRegex(text, r"(?i)catalogued project sources", name)
+            self.assertRegex(text, r"(?i)building", name)
+            self.assertRegex(text, r"(?i)degraded", name)
+            self.assertRegex(text, r"(?i)incomplete", name)
             self.assertRegex(text, r"(?i)drain", name)
+        for name, text in surfaces[:2]:
+            self.assertRegex(text, r"(?i)again", name)
         # The replay lifecycle lives on the agent surface too: an agent that
         # sees dozens of duplicate-history pages with no framing will treat
         # recovery as malfunction. Deleting this guidance left every test
@@ -556,7 +560,7 @@ class ShippedContractTest(unittest.TestCase):
         for gap, pattern in (
                 ("compressed tool detail", r"(?i)tool (call|detail)s? (are|remain|stay)[a-z ]*compressed"),
                 ("backward paging", r"(?i)backward"),
-                ("catalog completeness", r"(?i)newest 3|newest three"),
+                ("catalog failure visibility", r"(?i)building|degraded"),
                 ("host spill contents", r"(?i)verbatim"),
                 ("the replay size", r"69"),
                 ("the replay size, codex side", r"53")):
@@ -610,6 +614,13 @@ class ShippedContractTest(unittest.TestCase):
         self.assertIsNotNone(still_open, "the P0 ledger is gone")
         self.assertNotRegex(still_open, r"(?i)direct-channel\s+spill",
                             "the spill is no longer an open P0 loss")
+        open_phase = capture(
+            r"(?ms)^### Still open, by name\s*$(.*?)(?=^### |\Z)",
+            still_open)
+        self.assertIsNotNone(open_phase, "the open P0 sub-ledger is gone")
+        self.assertNotRegex(open_phase, r"(?i)durable\s+source\s+catalog|"
+                             r"degraded-discovery|descriptor-safe",
+                            "Wave 1A work is recorded as completed, not open")
         self.assertRegex(
             backlog,
             r"## P1 — Large direct-message attachments[^\n]*"

@@ -116,6 +116,11 @@ queued() {
   [ -f "$QUEUE" ] || { echo absent; return; }
   sqlite3 -readonly "$QUEUE" 'SELECT count(*) FROM queued_items;' 2>/dev/null || echo unreadable
 }
+cursor_digest() {
+  local path="$1/.antiphon/cursor.json"
+  [ -f "$path" ] || { echo absent; return; }
+  shasum -a 256 "$path" | cut -d' ' -f1
+}
 
 cleanup() {
   if [ "$KEEP" = "1" ]; then
@@ -223,6 +228,64 @@ lacks "the repaired project has no broken finding" "$AFTER_REPAIR" "✗"
 check "doctor --fix left global Codex config untouched" \
   "$(shasum -a 256 "$HOME/.codex/config.toml" 2>/dev/null | cut -d' ' -f1)" \
   "$CODEX_CONFIG_BEFORE"
+
+step "T1C — a durable catalog proves the whole project or names its boundary"
+CATALOG_HOME="$TMP/catalog-home"; CATALOG_PROJECT="$TMP/catalog-project"
+mkdir -p "$CATALOG_HOME" "$CATALOG_PROJECT"
+(cd "$CATALOG_PROJECT" && git init -q)
+CATALOG_SLUG="$(printf '%s' "$CATALOG_PROJECT" | sed 's|[^A-Za-z0-9]|-|g')"
+CATALOG_CLAUDE="$CATALOG_HOME/.claude/projects/$CATALOG_SLUG"
+mkdir -p "$CATALOG_CLAUDE"
+python3 - "$CATALOG_CLAUDE" "$NONCE" <<'PY'
+import datetime, json, os, sys
+root, nonce = sys.argv[1:]
+now = datetime.datetime.now(datetime.timezone.utc)
+for number in range(4):
+    sid = f"{number:08x}-4444-4444-8444-{number:012x}"
+    text = f"{nonce}-catalog-{'oldest' if number == 0 else number}"
+    record = {
+        "type": "assistant",
+        "timestamp": (now + datetime.timedelta(seconds=number)).isoformat(),
+        "message": {"content": [{"type": "text", "text": text}]},
+    }
+    path = os.path.join(root, sid + ".jsonl")
+    with open(path, "w", encoding="utf-8") as stream:
+        stream.write(json.dumps(record) + "\n")
+    os.utime(path, (100 + number, 100 + number))
+PY
+HOME="$CATALOG_HOME" ANTIPHON_CWD="$CATALOG_PROJECT" \
+  antiphon setup >/dev/null 2>&1 \
+  && pass "catalog fixture setup exits 0" || fail "catalog fixture setup failed"
+BUILDING="$(HOME="$CATALOG_HOME" ANTIPHON_CWD="$CATALOG_PROJECT" antiphon summary codex 2>&1)"
+contains "an incomplete bootstrap says building" "$BUILDING" "discovery: building"
+contains "the incomplete page still names its scope" "$BUILDING" "has_more_scope: catalogued project sources"
+lacks "the newest-three fallback cannot claim the fourth source" "$BUILDING" "$NONCE-catalog-oldest"
+CURSOR_BEFORE="$(cursor_digest "$CATALOG_PROJECT")"
+CATALOG_SCAN="$(HOME="$CATALOG_HOME" ANTIPHON_CWD="$CATALOG_PROJECT" antiphon sources scan 2>&1)"; CATALOG_SCAN_CODE=$?
+check "sources scan completes" "$CATALOG_SCAN_CODE" "0"
+contains "sources scan reports completion" "$CATALOG_SCAN" "source catalog: complete"
+check "sources scan does not move a cursor" "$(cursor_digest "$CATALOG_PROJECT")" "$CURSOR_BEFORE"
+COMPLETE="$(HOME="$CATALOG_HOME" ANTIPHON_CWD="$CATALOG_PROJECT" antiphon summary codex 2>&1)"
+contains "complete discovery sees the fourth older source" "$COMPLETE" "$NONCE-catalog-oldest"
+lacks "a complete page has no building marker" "$COMPLETE" "discovery: building"
+lacks "a complete page has no degraded marker" "$COMPLETE" "discovery: degraded"
+CATALOG_STATE="$CATALOG_PROJECT/.antiphon/sources/state.json"
+cp "$CATALOG_STATE" "$TMP/catalog-state.saved"
+printf '{malformed\n' > "$CATALOG_STATE"
+DEGRADED="$(HOME="$CATALOG_HOME" ANTIPHON_CWD="$CATALOG_PROJECT" antiphon summary codex 2>&1)"
+contains "an untrusted catalog says degraded" "$DEGRADED" "discovery: degraded"
+cp "$TMP/catalog-state.saved" "$CATALOG_STATE"
+CATALOG_STATUS="$(HOME="$CATALOG_HOME" ANTIPHON_CWD="$CATALOG_PROJECT" antiphon status 2>&1)"
+contains "status reports the catalog complete" "$CATALOG_STATUS" "source catalog codex_pages: complete"
+check "status does not move a cursor" "$(cursor_digest "$CATALOG_PROJECT")" "$CURSOR_BEFORE"
+CATALOG_DOCTOR="$(HOME="$CATALOG_HOME" ANTIPHON_CWD="$CATALOG_PROJECT" antiphon doctor 2>&1)"; CATALOG_DOCTOR_CODE=$?
+check "doctor accepts the complete catalog fixture" "$CATALOG_DOCTOR_CODE" "0"
+contains "doctor reports the catalog complete" "$CATALOG_DOCTOR" "source catalog codex_pages: complete"
+check "doctor does not move a cursor" "$(cursor_digest "$CATALOG_PROJECT")" "$CURSOR_BEFORE"
+CATALOG_PAGE="$(printf '{"cwd":"%s","hook_event_name":"UserPromptSubmit"}' "$CATALOG_PROJECT" \
+  | HOME="$CATALOG_HOME" ANTIPHON_CWD="$CATALOG_PROJECT" antiphon hook codex 2>/dev/null \
+  | python3 -c "import json,sys; print(json.load(sys.stdin)['hookSpecificOutput']['additionalContext'])")"
+contains "the passive hook delivers the fourth older source" "$CATALOG_PAGE" "$NONCE-catalog-oldest"
 
 step "T2 — Claude writes to a Codex that does not exist yet"
 BEFORE_QUEUE="$(queued)"

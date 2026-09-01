@@ -5220,7 +5220,7 @@ class CatalogDiscoveryTest(unittest.TestCase):
             self.project, "codex", {}, since=0)
         self.assertIn("oldest", text)
         self.assertIn("has_more_scope: catalogued project sources", text)
-        self.assertNotIn("discovery:", text)
+        self.assertNotIn("\ndiscovery:", text)
 
     def test_building_and_malformed_catalogs_cannot_look_complete(self):
         for number in range(4):
@@ -5229,13 +5229,17 @@ class CatalogDiscoveryTest(unittest.TestCase):
             antiphon._catalog_scan_step(self.project, "claude")
         building, _advance, _count = antiphon.build_summary(
             self.project, "codex", {}, since=0)
-        self.assertIn("discovery: building", building)
+        self.assertIn(
+            "discovery: building — source catalog bootstrap is incomplete",
+            building)
         state_path = antiphon._catalog_state_path(self.project)
         with open(state_path, "wb") as f:
             f.write(b"{broken\n")
         degraded, _advance, _count = antiphon.build_summary(
             self.project, "codex", {}, since=0)
-        self.assertIn("discovery: degraded", degraded)
+        self.assertIn(
+            "discovery: degraded — some project sources could not be proved",
+            degraded)
 
     def test_two_distinct_codex_files_claiming_one_source_are_both_refused(self):
         sid = "eeeeeeee-4444-4444-8444-eeeeeeeeeeee"
@@ -5374,6 +5378,59 @@ class CatalogDiscoveryTest(unittest.TestCase):
         self.assertEqual(positions["unresolved"], held)
         for sid, path in sources:
             self.assertEqual(positions[sid]["offset"], os.path.getsize(path))
+
+    def test_status_reports_catalog_truth_per_reader_without_writing(self):
+        sid, path = self._claude(6, "consumed before removal")
+        self._scan()
+        record = antiphon._read_catalog_record(
+            self.project, "claude", os.path.relpath(path, self.claude_root))
+        os.unlink(path)
+        antiphon.write_cursor(self.project, {"codex_pages": {
+            "v": antiphon.PAGE_CURSOR_VERSION,
+            "sources": {sid: {"gen": record["generation"],
+                               "offset": record["complete_size"]}}}}, "codex")
+        before = DoctorTest.snapshot(self.project)
+        out = io.StringIO()
+        with patch.object(antiphon, "project_dir", return_value=self.project), \
+             patch.object(antiphon, "_live_by_kind",
+                          return_value={"claude": [], "codex": []}), \
+             patch.object(antiphon, "_channel_answering", return_value=False), \
+             patch.object(antiphon, "build_summary",
+                          return_value=("", None, 0)), \
+             contextlib.redirect_stdout(out):
+            self.assertEqual(antiphon.status(), 0)
+        printed = out.getvalue()
+        self.assertIn("source catalog codex_pages: complete", printed)
+        self.assertIn("0 readable; 0 pending; 0 refused; 1 gone", printed)
+        self.assertIn("source catalog claude_pages: complete", printed)
+        for secret in (sid, path, self.claude_root):
+            self.assertNotIn(secret, printed)
+        self.assertEqual(DoctorTest.snapshot(self.project), before)
+
+    def test_doctor_reports_catalog_advice_read_only(self):
+        before = DoctorTest.snapshot(self.project)
+        out = io.StringIO()
+        report = antiphon._Report()
+        with contextlib.redirect_stdout(out):
+            antiphon._doctor_sources(report, self.project)
+        self.assertFalse(report.broken)
+        self.assertIn("source catalog codex_pages: building", out.getvalue())
+        self.assertIn("antiphon sources scan", out.getvalue())
+        self.assertEqual(DoctorTest.snapshot(self.project), before)
+
+        os.makedirs(os.path.dirname(antiphon._catalog_state_path(self.project)),
+                    exist_ok=True)
+        with open(antiphon._catalog_state_path(self.project), "wb") as f:
+            f.write(b"{malformed\n")
+        before = DoctorTest.snapshot(self.project)
+        out = io.StringIO()
+        report = antiphon._Report()
+        with contextlib.redirect_stdout(out):
+            antiphon._doctor_sources(report, self.project)
+        self.assertTrue(report.broken)
+        self.assertIn("source catalog codex_pages: degraded", out.getvalue())
+        self.assertIn("inspect its stderr", out.getvalue())
+        self.assertEqual(DoctorTest.snapshot(self.project), before)
 
 
 class SourceCatalogLockTest(unittest.TestCase):
@@ -10448,7 +10505,7 @@ class StatusTest(unittest.TestCase):
         # Never `assertNotIn("ui", text)`: the page prints the temp project
         # path, and tempfile's random suffix contains "ui" once in ~200 runs.
         for line in text.splitlines():
-            if not line.startswith("project:"):
+            if line.startswith("  Claude "):
                 self.assertNotIn("ui", line)
 
     # ---- the channel line ----

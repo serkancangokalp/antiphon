@@ -186,6 +186,7 @@ antiphon doctor            # read-only checkup: why is the bridge quiet?
 antiphon summary [side]    # show the context that would be injected
 antiphon setup             # (re)install the project setup
 antiphon catch-up [side]   # skip undelivered history: page cursors jump to the live edge
+antiphon sources scan      # finish or refresh the durable source catalog
 antiphon --version         # the installed version
 npm test                   # Python unit tests + real MCP protocol test
 test/e2e/fresh-user.sh     # what a new user gets, with the real CLIs (not in npm test)
@@ -195,8 +196,10 @@ test/e2e/fresh-user.sh     # what a new user gets, with the real CLIs (not in np
 After an upgrade the bridge may re-deliver history from the start of every
 transcript it can see, one page per turn, and a new message waits behind all
 of it. `catch-up` pins each side's page cursor at the live edge — the end of
-the last complete record in every discovered transcript — under the same lock
-the readers take, and says how many bytes it abandoned. What it skips is not
+the last complete record in every safely proved catalog source — under the
+same lock the readers take, and says how many bytes it abandoned. Sources that
+cannot be proved are counted and left alone, as are their existing cursor
+entries. What it skips is not
 delivered later; run it when both terminals have already been read by the
 person sitting at them. Unnamed, it moves both sides; a named terminal has its
 own cursor and is told which side to move. `status` shows how far behind each
@@ -213,7 +216,8 @@ them started before its own code last changed (a server loads its code once;
 the hooks reload every turn), the Node and
 Python the bridge actually gets, every file `setup` writes read back
 through the shapes `setup` wrote, the current alias, the registered peers,
-and whether the Claude channel *answers* — a connect and a one-line reply,
+whether the durable source catalog is complete for each reader, and whether
+the Claude channel *answers* — a connect and a one-line reply,
 not a file that exists. `✓` fine, `·` nothing to do here, `✗` broken; only
 a `✗` makes it exit non-zero, so a set-up project with no session running
 exits 0. It never takes a lock, never writes, and never removes the stale
@@ -251,9 +255,31 @@ SQL formatting travel intact, and a record is never split across pages.
 
 A page that leaves work behind says so with a visible `has_more: true` line;
 calling `antiphon_read` again (or simply letting later turns run) drains the
-rest. Either `has_more` value describes only the transcripts discovery can
-currently see — discovery still reads only the newest 3 transcript files per
-side, so `has_more: false` is not an inventory of all project history.
+rest. `has_more_scope: catalogued project sources` names the boundary. A
+`has_more: false` page proves the current durable project catalog is drained
+only when it has no `discovery: building` or `discovery: degraded` line. Either
+marker makes the incomplete discovery boundary explicit instead of allowing a
+newest-file fallback to masquerade as project completeness.
+
+The catalog lives under `.antiphon/sources/` as small state, immutable
+generation manifests and partitioned per-candidate records; it stores paths and
+fingerprints, never transcript content. Each hook records its own current
+source first and inspects at most 8 candidate records per hook. A generation is
+finite (`base`, one reconciliation pass, one delta, then `complete`); later
+changes start a new refresh. `antiphon sources scan` runs the same bounded
+steps explicitly until the catalog is complete, returns nonzero for pending or
+refused work, and never moves a page cursor.
+
+Every admitted transcript is opened beneath its host root without following
+symlinks, checked as a regular file, and read for identity, metadata, generation
+and records through that one descriptor. Claude membership comes from the
+selected host project slug; Codex membership requires an exact project path in
+session metadata. The newest 3 files remain only a bounded current-window and
+degraded fallback, not the correctness inventory. A missing path becomes
+`gone` only when every recorded path for that source is missing; whether that
+gap still matters is calculated separately from each reader's own cursor and
+the six-hour lookback. Permissions, unsafe paths, type changes, identity
+collisions and transient I/O stay refused and keep discovery degraded.
 
 One record larger than an ordinary page is handled asymmetrically, from
 measurement rather than preference. Both hosts' automatic prompt hooks save an
@@ -285,9 +311,10 @@ mistaken for a malfunction. A failed delivery leaves the cursor bytes exactly
 as they were.
 
 What still loses, by name: tool calls remain compressed one-line summaries
-with no stable-id retrieval yet, discovery has no catalog (the newest-3 window
-above), and there is no backward paging into history an older version already
-marked seen. Those are tracked in [BACKLOG.md](BACKLOG.md).
+with no stable-id retrieval yet, there is no last-record anchor against an
+in-place rewrite that preserves the first record, and there is no backward
+paging into history an older version already marked seen. Those are tracked in
+[BACKLOG.md](BACKLOG.md).
 
 ### An oversized direct message is parked, never truncated
 

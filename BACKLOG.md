@@ -26,8 +26,8 @@ the write-and-flush-before-advance transaction.
   split across pages.
 - The non-tool 420-character cut and the 2,600-character summary trim are
   gone; whitespace, indentation and line structure are preserved exactly.
-- `has_more` is visible on every page, explicitly scoped to the currently
-  discovered sources.
+- `has_more` is visible on every page. Wave 1A later replaced its temporary
+  newest-file scope with the durable catalog contract below.
 - An oversized record is handed whole to the automatic hooks, whose hosts
   were measured (2026-08-30, Claude Code 2.1.251 and Codex CLI 0.151.0) to
   spill above 10,000 characters and expose a path; both 400,251-character
@@ -45,13 +45,12 @@ the write-and-flush-before-advance transaction.
   the reviewed snapshots — with a fixed replay reason visible on every page
   until the final persisted one clears it.
 
-### Still open, by name
+### Completed by Wave 1A durable discovery
 
-- Stable event ids and full tool-call retrieval: tool calls remain compressed
-  one-line summaries with no `antiphon_read(id)` route.
-- The durable source catalog and the degraded-discovery marker: discovery
-  still reads the newest 3 transcripts per side, and `has_more: false` cannot
-  distinguish complete discovery from that window. Wave 1A selected a fixed
+- The durable source catalog and degraded-discovery marker replace the newest
+  3 correctness boundary. A `has_more: false` page is scoped to catalogued
+  project sources; `discovery: building` and `discovery: degraded` make an
+  incomplete boundary explicit. Wave 1A selected a fixed
   batch of 8 from a read-only 25-sample descriptor benchmark on 2026-09-01:
   the main project exposed 3 Claude and 156 Codex candidates; batch 8 measured
   Claude median/p95 0.171/0.175 ms and Codex 1.192/3.896 ms. The resumed-hook
@@ -59,9 +58,28 @@ the write-and-flush-before-advance transaction.
   8 and made exactly 11 atomic writes, totalling 5,164 versus 5,155 bytes (the
   largest single write was 1,284 bytes in both). Initial immutable manifest
   publication is one-time; subsequent hook write count and volume are therefore
-  independent of catalog size. The state machine and explicit scanner are in
-  the local Wave 1A branch; page discovery and its degraded marker remain the
-  next review unit before this item can close.
+  independent of catalog size. Hooks record their current source first, then
+  inspect one bounded batch through finite base/reconcile/delta generations;
+  `antiphon sources scan` completes or refreshes the same catalog without
+  moving a page cursor. Status and doctor report aggregate complete/building/
+  degraded truth separately for each reader, without paths or source ids.
+- Descriptor-safe reading now covers catalog, fallback, event parsing,
+  backlog and catch-up. The Task 2 pre-commit narrowing gate ran read-only on
+  2026-09-01 against both real host roots for the main project and its
+  implementation worktree. On the main project, old/new admitted identity
+  counts were Claude 3/3 and Codex 3/3, with zero missing, zero extra and no
+  refusal class; the worktree had 0/0 on both hosts, also with no refusal. A
+  transcript is opened beneath its host root without following symlinks, then
+  identity, metadata, generation, prefix and records come from that one
+  descriptor. Whole-union source-id collisions refuse every claimant. Gone
+  means every recorded path is `ENOENT`, and its relevance is read-only and
+  reader-specific. Ordinary advancement and catch-up merge safe fronts onto
+  the prior v3 map, preserving every unresolved subtree.
+
+### Still open, by name
+
+- Stable event ids and full tool-call retrieval: tool calls remain compressed
+  one-line summaries with no `antiphon_read(id)` route.
 - Backward paging into history an older version already marked seen —
   **settled for the published path, ruled for the rest.** Its cost was
   measured on 2026-08-31: the byte-zero `legacy_upgrade` replay of two days
@@ -91,17 +109,6 @@ the write-and-flush-before-advance transaction.
   byte zero.
 - The last-record content anchor (an in-place rewrite that keeps inode,
   length and first line still resumes silently).
-- Descriptor-safe reading of registry-supplied transcript paths. Wave 1A's
-  Task 2 pre-commit narrowing gate ran read-only on 2026-09-01 against both
-  real host roots for the main project and its implementation worktree. On the
-  main project, old/new admitted identity counts were Claude 3/3 and Codex 3/3,
-  with zero missing, zero extra and no refusal class; the worktree had 0/0 on
-  both hosts, also with no refusal. The comparison used the old newest-three
-  admission rules versus the descriptor primitive's exact source-id sets; it
-  printed aggregate counts only and touched no cursor or registry. Thus the
-  safe-reader commit is blocked by any unexplained missing identity, and this
-  measured corpus had none. The durable catalog and degraded page marker remain
-  open in the separate item above.
 - Retirement of the preserved v2 sibling key once pre-v3 processes and
   rollback support are no longer needed.
 
@@ -115,9 +122,10 @@ agent said another agent's words.
 The entry asked for the source alias on every event. What shipped is narrower
 and, measured, more honest: a *source* is a **session**, not a peer. `Event.source`
 is `source_id(path)` — the session UUID in the transcript's own filename, which
-both hosts write and which survives a move or a rename — and `RECENT_FILES = 3`
-means the sources on an ordinary page are usually one terminal's *consecutive*
-sessions. Measured on this machine over a real drain: 5 of 60 Claude-read pages
+both hosts write and which survives a move or a rename. The original
+`RECENT_FILES = 3` sample meant the sources on an ordinary page were usually
+one terminal's *consecutive* sessions; the durable catalog changes completeness,
+not that identity model. Measured on this machine over a real drain: 5 of 60 Claude-read pages
 and 1 of 60 Codex-read pages carry more than one source, and every one of those
 is one person's Codex session restarted, not two terminals. Labelling all of
 them, and advising their reader to "name each terminal", would have been advice
@@ -240,9 +248,10 @@ readiness, never an address, never a session id.
   returned nothing at registration. `doctor` names the observable and offers the
   common cause as a cause; the hook stays silent, because saying it once per
   prompt forever is not a diagnosis.
-- **Discovery is unchanged.** `RECENT_FILES = 3` still bounds which transcripts
-  pull reads at all, and the label work neither widens it nor claims to — see
-  the durable source catalog under P0's "Still open, by name".
+- **Discovery later became durable without changing labels.** The catalog is
+  the project inventory; `RECENT_FILES = 3` is now only current-window/degraded
+  fallback. Labels still name only live claims among sources actually selected
+  for that page, so completeness never becomes dispatch.
 
 ### The guardrails, kept verbatim
 
@@ -903,10 +912,10 @@ its call succeeded or not.
   measured Codex-MCP-result caveat above). It cannot bite the `oversize` class,
   whose reader is always Claude and whose channel exposes no `antiphon_read`,
   and the automatic hook delivers the record whole either way.
-- Discovery reads the newest `RECENT_FILES = 3` transcripts per side
-  (`lib/antiphon.py:60`): a sender whose session is not among them contributes
-  nothing to the peer's page. Filed under the durable source catalog in *Still
-  open, by name*.
+- Complete discovery reads every safely proved project source in the durable
+  catalog. While the catalog is building or degraded, the newest
+  `RECENT_FILES = 3` transcripts remain a bounded fallback and the page says
+  explicitly that its boundary is incomplete.
 - A peer with no cursor positions starts its window at `LOOKBACK` —
   **six hours** (`lib/antiphon.py:61`, applied in `positions_for` at `708`). A
   Codex session that starts more than six hours after the words were written

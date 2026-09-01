@@ -15,12 +15,13 @@ Usage:
   antiphon channel             # long-lived Node.js MCP Channel server (started by Claude Code)
   antiphon mcp                 # MCP stdio server for Codex (fallback path)
   antiphon catch-up [side]     # skip undelivered history: page cursors jump to the live edge
+  antiphon sources scan        # finish or refresh the durable source catalog
   antiphon --version           # the installed version (also -V, version)
 
-Design: NO SHARED LOG IS KEPT. Both CLIs already write transcripts; Antiphon
-reads and derives from them. That way there's no write race, no stale record,
-and no second source of truth. The only persistent state is a cursor tracking
-how far each side has read.
+Design: NO SHARED MESSAGE LOG IS KEPT. Both CLIs already write transcripts;
+Antiphon reads them as the content authority. Project-local metadata tracks
+page cursors, routable peers and a bounded catalog of transcript candidates;
+it never copies transcript content.
 
 Both sides are symmetric: Claude Code and Codex CLI speak the same hook
 contract (the same input fields, the same output wrapper), so a single `hook`
@@ -71,13 +72,14 @@ CODEX_QUEUE_DBS = os.path.join(HOME, ".codex", "queue_*.sqlite")
 TAIL_BYTES = 300_000      # amount to read from the tail of each transcript file
 EVENT_LIMIT = 40          # completed source records per page
 PAGE_BUDGET = 8_000       # UTF-8 bytes in an ordinary complete page envelope
-RECENT_FILES = 3          # transcript files per side the summary reads at all
+RECENT_FILES = 3          # bounded fallback/current-window discovery per side
 LOOKBACK = 6 * 3600       # anything older than this doesn't count as part of "this session"
 CATALOG_VERSION = 1
 CATALOG_BATCH = 8
 
-# EVENT_LIMIT and PAGE_BUDGET bound a complete page. RECENT_FILES still bounds
-# discovery; it does not authorize cutting any record selected from that set.
+# EVENT_LIMIT and PAGE_BUDGET bound a complete page. The catalog is the
+# correctness inventory; RECENT_FILES bounds only degraded fallback and cheap
+# refresh detection. CATALOG_BATCH bounds transcript inspection per hook.
 
 # A marker at the start of a line in a reply says that line should be pushed
 # to the target. The line-start requirement is deliberate: mentioning the
@@ -4511,9 +4513,11 @@ TOOLS = [{
     "description": ("Returns one page of what happened on the Claude Code side since "
                     "your last turn, oldest first. When the page ends with "
                     "`has_more: true`, more completed records are already waiting: call "
-                    "this tool again, or let later turns drain them. `has_more: false` "
-                    "covers only the transcripts discovery can currently see, not all "
-                    "project history. If the next record alone is larger than an "
+                    "this tool again, or let later turns drain them. A `has_more: false` "
+                    "page with `has_more_scope: catalogued project sources` covers the "
+                    "durable project catalog only when it has no `discovery: building` "
+                    "or `discovery: degraded` line; either marker means the boundary is "
+                    "explicitly incomplete. If the next record alone is larger than an "
                     "ordinary page, this tool refuses it instead of truncating: nothing "
                     "is read or marked seen, and the next automatic prompt hook — whose "
                     "host can spill an oversized record to a file — delivers it whole. "
@@ -5032,8 +5036,11 @@ AGENTS_RULE = ("\n## The Antiphon bridge\n\n"
                "turn — you don't need to do anything else. It arrives as one page of "
                "completed records, oldest first; a `has_more: true` line means more is "
                "already waiting, so call the `antiphon_read` tool again (or let later turns "
-               "drain it) until it reports `has_more: false` — which covers only the "
-               "currently discovered transcripts, not all project history. A page carrying "
+               "drain it) until it reports `has_more: false`. Its "
+               "`has_more_scope: catalogued project sources` covers the durable project "
+               "catalog only when the page has no `discovery: building` or "
+               "`discovery: degraded` line; either marker means discovery is explicitly "
+               "incomplete. A page carrying "
                "a replay notice is re-delivering history after an upgrade or cursor "
                "recovery and can contain duplicates; it is complete when the notice "
                "disappears. If the single next record is larger than an ordinary page, "
@@ -5095,7 +5102,13 @@ AGENTS_RULE = ("\n## The Antiphon bridge\n\n"
 
 CLAUDE_RULE = ("\n## The Antiphon bridge\n\n"
                "You are working alongside another agent on this project. What happens on the "
-               "other side is injected into your context at the start of each turn. That "
+               "other side is injected into your context at the start of each turn, as one "
+               "page of completed records, oldest first. A `has_more: true` line means more "
+               "is waiting; let later turns drain it until `has_more: false`. Its "
+               "`has_more_scope: catalogued project sources` covers the durable project "
+               "catalog only when the page has no `discovery: building` or "
+               "`discovery: degraded` line; either marker means discovery is explicitly "
+               "incomplete. That "
                "injected context is project-wide awareness rather than mail addressed to you: "
                "it may merge activity from several project transcripts under one Codex label, "
                "so read it as what is happening nearby.\n\n"
@@ -5765,6 +5778,20 @@ def _backlog_line(key, backlog):
     return line
 
 
+def _reader_discovery(cwd, side, cursor, cursor_state="valid"):
+    """The catalog view for one reader and that reader's own position map."""
+    positions, since, _replay = positions_for(cursor, side, cursor_state)
+    kind = "codex" if side == "claude" else "claude"
+    return _discover_sources(cwd, kind, side, positions, since)
+
+
+def _catalog_status_line(side, discovery):
+    """Aggregate catalog truth without transcript paths or source identities."""
+    return (f"source catalog {page_cursor_key(side)}: {discovery.state}; "
+            f"{len(discovery.sources)} readable; {discovery.pending} pending; "
+            f"{discovery.refusals} refused; {discovery.gone} gone")
+
+
 def _status_preview(text):
     """Clip only a display preview, preserving UTF-8 and delivery semantics."""
     encoded = text.encode("utf-8")
@@ -5815,6 +5842,10 @@ def status():
             shown_key = (key if key in _STATUS_CURSOR_KEYS
                          else "unknown cursor entry")
             print(f"cursor {label}{shown_key}: {_cursor_entry(key, value)}")
+    for side in ("claude", "codex"):
+        cursor, cursor_state = snapshots[side]
+        print(_catalog_status_line(
+            side, _reader_discovery(cwd, side, cursor, cursor_state)))
     for side in ("claude", "codex"):
         cursor, cursor_state = snapshots[side]
         print(_backlog_line(page_cursor_key(side),
@@ -6645,6 +6676,7 @@ def _doctor_readonly():
     _doctor_alias(report)
     _doctor_channel(report, cwd, _doctor_peers(report, cwd))
     _doctor_codex(report, cwd)
+    _doctor_sources(report, cwd)
     _doctor_replay(report, cwd)
     return 1 if report.broken else 0
 
@@ -6684,6 +6716,26 @@ def _doctor_replay(report, cwd):
         unread = backlog[0]
         report.note(f"replay: the {side} reader is re-delivering history "
                     f"({unread:,} raw bytes unread); `antiphon catch-up` skips it")
+
+
+def _doctor_sources(report, cwd):
+    """Report catalog completeness per reader without changing catalog/cursor."""
+    snapshots = {}
+    for side in ("claude", "codex"):
+        path = state_path(cwd, side)
+        if path not in snapshots:
+            snapshots[path] = _read_cursor_state(cwd, side)
+        cursor, cursor_state = snapshots[path]
+        discovery = _reader_discovery(cwd, side, cursor, cursor_state)
+        line = _catalog_status_line(side, discovery)
+        if discovery.state == "complete":
+            report.ok(line)
+        elif discovery.state == "building":
+            report.note(f"{line} — `antiphon sources scan` completes the "
+                        "finite catalog build")
+        else:
+            report.bad(f"{line} — run `antiphon sources scan` and inspect "
+                       "its stderr; delivery remains explicitly incomplete")
 
 
 def _complete_prefix_end(path):
