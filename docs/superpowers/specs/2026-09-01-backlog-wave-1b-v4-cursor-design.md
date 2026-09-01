@@ -75,9 +75,10 @@ The reader chooses formats in this order:
 
 If a v4 key exists but is malformed, the reader never falls back to a sibling
 that may be older and farther ahead. It recovers from byte zero. Old sibling
-keys are preserved byte-for-byte in this wave; retiring them requires a minimum
-supported-reader/rollback policy that cannot be inferred from local process
-state.
+keys retain deeply equal parsed values in this wave, including JSON types and
+unknown fields. Canonical whole-file serialization may change whitespace or
+key order. Retiring the keys requires a minimum supported-reader/rollback
+policy that cannot be inferred from local process state.
 
 The **selected format** is the first valid format in the precedence list above,
 not the set of every sibling key present. A cursor with a valid v4 value is a
@@ -261,11 +262,16 @@ Relevant cursor files and the owner evidence deciding dormant/relevant are
 snapshotted one at a time under their own locks, then released before the
 catalog lock is acquired. Under the catalog lock the command re-proves that the
 source is missing, the catalog generation has not changed and the set plus
-classification inputs of cursor files are unchanged. It publishes a new
-compact base manifest, atomically switches state, then removes the retired
-candidate records and invokes unreferenced-manifest cleanup. A source, cursor
-or owner classification that changes in the window causes a retry/refusal,
-never a partial retirement.
+classification inputs of cursor files are unchanged. It then writes a durable
+prepared journal naming the old and proposed states plus hashes of the exact
+candidate records. Readers continue to expose the old state after the atomic
+switch until source/cursor/owner evidence is revalidated and the journal is
+marked committed. Only a committed journal authorizes deletion of its matching,
+still-detached regular records. A crash, failed rollback or failed unlink is
+therefore retryable; an unjournaled detached record is evidence of nothing and
+is retained. Hooks may roll a prepared transaction back but never finalize or
+delete a retired candidate. Manifest cleanup waits until the journal no longer
+needs either generation.
 
 Because the source is already gone and older than every new reader's lookback,
 a cursor created immediately after the census cannot make its bytes readable;
@@ -286,7 +292,7 @@ are done with a source.
   fairness are notes; failed manifest cleanup or a blocked compaction is named
   without attempting repair.
 - `catch-up` writes anchors and clears `adopting_v3` only for sources it safely
-  pins. It preserves unresolved entries byte-for-byte.
+  pins. It preserves unresolved parsed entries with deep type equality.
 - README, BACKLOG, `CLAUDE_RULE`, `AGENTS_RULE` and channel instructions agree
   on the new key, one-record adoption repeat, dead-proof rule, alternation and
   compaction boundary. Agent rules contain no private cursor values.

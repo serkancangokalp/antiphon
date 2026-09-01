@@ -321,10 +321,10 @@ catalog, because its Wave 0 contract is project configuration only.
 - Normal page advancement starts from the existing position map and merges only
   the safe scanned fronts it proved in this read. It never rebuilds the map from
   the currently readable subset: every unproven, missing or refused source keeps
-  its existing cursor entry byte-for-byte.
+  its existing parsed cursor entry with deep type equality.
 - `catch-up` follows the same preservation rule. It moves only safely opened
-  sources, retains every unresolved source position byte-for-byte, and reports
-  the aggregate number it could not move.
+  sources, retains every unresolved parsed source position with deep type
+  equality, and reports the aggregate number it could not move.
 - Within the discovered source set, record ordering, page budget, event limit,
   record atomicity and frontier advancement are unchanged.
 - No live/unknown/dead priority is introduced. Unknown is not dead; Wave 1B
@@ -408,7 +408,8 @@ Red-before-green tests must cover:
   than lookback, a gone source that may contain unread bytes, and unproven
   permission/symlink/type/identity failures;
 - normal page advancement and `catch-up` preserving every existing unresolved
-  source position byte-for-byte, with `catch-up` reporting the unresolved count;
+  parsed source position with deep type equality, with `catch-up` reporting the
+  unresolved count;
 - existing v3 replay, catch-up, page budget and source-aware label tests
   unchanged.
 

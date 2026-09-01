@@ -295,9 +295,11 @@ lifecycle. Codex's MCP tool-result surface showed no such verified path, so
 seen, and the next automatic prompt hook delivers it.
 
 Page positions now live under `<side>_pages_v4`, beside the preserved v3 sibling
-`<side>_pages` and legacy `<side>_seen` key. The siblings remain
-byte-for-byte available to rolling old processes and rollback; v4 never lets a
-later sibling write move its frozen adoption frontier. Each v4 position anchors
+`<side>_pages` and legacy `<side>_seen` key. Every sibling's parsed value,
+including unknown fields and JSON types, remains deeply equal for rolling old
+processes and rollback; canonical reserialization may change whitespace or key
+order. V4 never lets a later sibling write move its frozen adoption frontier.
+Each v4 position anchors
 the last complete source record by content. During adoption from a valid v3
 frontier, that last record repeats at most once while the anchor is established;
 an in-place rewrite that keeps inode, length and the first line no longer skips
@@ -325,7 +327,11 @@ current process fingerprint proves its recorded owner dead. Unknown ownership
 stays relevant. The command revalidates catalog generation, source absence,
 cursor bytes and owner evidence around its atomic state switch, reports only
 aggregate blocker classes and reclaimed files/bytes, and preserves all cursor
-files. Hooks never retire candidates.
+files. A durable prepared/committed journal keeps the old catalog visible until
+post-switch proof succeeds; a crash or failed rollback therefore retries or
+rolls back instead of turning an unproved detached record into deletion proof.
+Hooks never retire candidates; they may only recover a prepared safe view.
+Committed record cleanup remains an explicit `sources compact` operation.
 
 What still loses, by name: tool calls remain compressed one-line summaries
 with no stable-id retrieval yet, and there is no backward paging into history

@@ -677,7 +677,8 @@ def catalog_lock(cwd, patience=None, shared=False):
             return
         raise
     except OSError as exc:
-        print(f"antiphon: source catalog lock could not be opened: {exc}",
+        detail = exc.strerror or "operating system error"
+        print(f"antiphon: source catalog lock could not be opened: {detail}",
               file=sys.stderr)
         yield False
         return
@@ -698,7 +699,8 @@ def catalog_lock(cwd, patience=None, shared=False):
                     break
                 time.sleep(CURSOR_LOCK_RETRY_DELAY)
             except OSError as exc:
-                print(f"antiphon: source catalog cannot be locked: {exc}",
+                detail = exc.strerror or "operating system error"
+                print(f"antiphon: source catalog cannot be locked: {detail}",
                       file=sys.stderr)
                 break
         if held:
@@ -721,9 +723,14 @@ def _catalog_phase(cwd, operation):
         if not locked:
             return CatalogPhaseResult(False, "lock-contention", None)
         try:
+            if not _recover_prepared_compactions_locked(cwd):
+                return CatalogPhaseResult(
+                    False, "compaction-recovery-pending", None)
             return CatalogPhaseResult(True, None, operation())
         except OSError as exc:
-            print(f"antiphon: source catalog work failed: {exc}", file=sys.stderr)
+            detail = exc.strerror or "operating system error"
+            print(f"antiphon: source catalog work failed: {detail}",
+                  file=sys.stderr)
             return CatalogPhaseResult(False, "catalog-error", None)
 
 
@@ -1546,17 +1553,8 @@ def _atomic_json(path, data):
         return False
 
 
-def _read_source_catalog(cwd):
-    path = _catalog_state_path(cwd)
-    try:
-        with open(path, encoding="utf-8") as stream:
-            state = json.load(stream)
-    except FileNotFoundError:
-        return CatalogLoad(None, "absent", None)
-    except PermissionError:
-        return CatalogLoad(None, "unreadable", "unreadable")
-    except (OSError, json.JSONDecodeError, ValueError):
-        return CatalogLoad(None, "invalid", "malformed")
+def _catalog_load_value(cwd, state):
+    """Validate an already-decoded catalog state for this project."""
     if not isinstance(state, dict):
         return CatalogLoad(None, "invalid", "malformed")
     version = state.get("v")
@@ -1571,6 +1569,27 @@ def _read_source_catalog(cwd):
                    for kind, entry in kinds.items())):
         return CatalogLoad(None, "invalid", "wrong-project-or-schema")
     return CatalogLoad(state, "valid", None)
+
+
+def _read_source_catalog_raw(cwd):
+    """Read physical state, without a pending-compaction safety overlay."""
+    path = _catalog_state_path(cwd)
+    try:
+        with open(path, encoding="utf-8") as stream:
+            state = json.load(stream)
+    except FileNotFoundError:
+        return CatalogLoad(None, "absent", None)
+    except PermissionError:
+        return CatalogLoad(None, "unreadable", "unreadable")
+    except (OSError, json.JSONDecodeError, ValueError):
+        return CatalogLoad(None, "invalid", "malformed")
+    return _catalog_load_value(cwd, state)
+
+
+def _read_source_catalog(cwd):
+    """Read the catalog view safe for readers during interrupted compaction."""
+    loaded = _read_source_catalog_raw(cwd)
+    return _compaction_safe_catalog_load(cwd, loaded)
 
 
 def _catalog_generation(value):
@@ -1685,6 +1704,21 @@ def _referenced_catalog_manifests(cwd):
             filename = entry.get(key)
             if filename is not None:
                 referenced.add(filename)
+    # A prepared transaction serves the old state; a committed cleanup receipt
+    # still needs both states to validate after a crash. Neither generation is
+    # an orphan until the journal itself is gone.
+    for kind in ("claude", "codex"):
+        journal, status = _read_compaction_journal(cwd, kind)
+        if status == "missing":
+            continue
+        if status != "valid":
+            return None
+        for state in (journal["old_state"], journal["new_state"]):
+            for entry in state["kinds"].values():
+                for key in ("base_manifest", "delta_manifest"):
+                    filename = entry.get(key)
+                    if filename is not None:
+                        referenced.add(filename)
     return referenced
 
 
@@ -7555,6 +7589,19 @@ def _doctor_sources(report, cwd):
     elif cleanup_pending:
         report.note(f"source manifests: {cleanup_pending} cleanup pending — "
                     "the next catalog mutation retries it")
+    for kind in ("claude", "codex"):
+        analysis = _analyze_compaction_kind(
+            cwd, kind, lock_cursors=False)
+        blocked = sum(analysis.result["blockers"].values())
+        pending = analysis.result["pending"]
+        if not analysis.result["considered"] and not blocked and not pending:
+            continue
+        state = "blocked" if blocked else "pending" if pending else "ready"
+        blockers = ", ".join(
+            f"{name}={analysis.result['blockers'][name]}"
+            for name in COMPACTION_BLOCKERS)
+        report.note(f"source compaction {kind}: {state}; {pending} cleanup "
+                    f"transaction(s) pending; {blockers}")
 
 
 def _complete_prefix_end(path):
@@ -7690,7 +7737,8 @@ def catch_up(side=None):
                 frontier[source.source] = entry
         skipped = {"bytes": 0}
 
-        def mutate(cursor, key=key, frontier=frontier, skipped=skipped):
+        def mutate(cursor, key=key, frontier=frontier, skipped=skipped,
+                   reader_side=one):
             held = cursor.get(key)
             if _valid_v4_page_cursor(held):
                 sources = json.loads(json.dumps(held["sources"]))
@@ -7698,12 +7746,8 @@ def catch_up(side=None):
                 next_lane = held["next_lane"]
             else:
                 sources, adopting, next_lane = {}, {}, "active"
-            for sid, entry in frontier.items():
-                was = (positions or {}).get(sid)
-                was = (was.get("offset") if isinstance(was, dict)
-                       and isinstance(was.get("offset"), int) else 0)
-                skipped["bytes"] += max(0, entry["offset"] - was)
-
+            current_positions, _current_since, _current_replay = positions_for(
+                cursor, reader_side)
             def merge(entries):
                 for sid, raw in entries.items():
                     entry = dict(raw)
@@ -7715,8 +7759,26 @@ def catch_up(side=None):
                             "gen": entry["gen"], "offset": entry["offset"]}
                         sources.pop(sid, None)
 
-            merge(positions or {})
-            merge(frontier)
+            # The expensive source measurement happened before this cursor
+            # transaction. Re-read the freshly held cursor and never let that
+            # stale snapshot overwrite a hook that advanced in between.
+            merge(current_positions)
+            for sid, entry in frontier.items():
+                current = current_positions.get(sid)
+                if (isinstance(current, dict)
+                        and current.get("gen") != entry.get("gen")):
+                    continue
+                current_offset = (current.get("offset")
+                                  if isinstance(current, dict) else -1)
+                if (isinstance(current_offset, int)
+                        and current_offset > entry["offset"]):
+                    continue
+                if (current_offset == entry["offset"]
+                        and _valid_anchored_position(current)):
+                    continue
+                was = current_offset if isinstance(current_offset, int) else 0
+                skipped["bytes"] += max(0, entry["offset"] - was)
+                merge({sid: entry})
             cursor[key] = {
                 "v": ANCHORED_PAGE_CURSOR_VERSION,
                 "sources": sources,
@@ -7744,9 +7806,13 @@ COMPACTION_BLOCKERS = (
     "unknown-owner", "source-not-gone", "snapshot-raced",
 )
 COMPACTION_INPUT_LIMIT = 4 * 1024 * 1024
+COMPACTION_JOURNAL_VERSION = 1
 CompactionCursor = collections.namedtuple(
     "CompactionCursor",
     "path status raw named owner_status owner_raw owner_state owner_unknown")
+CompactionAnalysis = collections.namedtuple(
+    "CompactionAnalysis",
+    "result eligible detached loaded view records cursor_signature")
 
 
 def _read_compaction_file(path):
@@ -7774,6 +7840,132 @@ def _read_compaction_file(path):
         return "invalid", b""
     finally:
         os.close(fd)
+
+
+def _compaction_journal_path(cwd, kind):
+    return os.path.join(
+        _catalog_root(cwd), f"compaction-{kind}.json")
+
+
+def _valid_compaction_receipt(value):
+    return (isinstance(value, dict)
+            and set(value) == {"relative", "sha256", "bytes"}
+            and _filesystem_safe_relative(value.get("relative"))
+            and isinstance(value.get("sha256"), str)
+            and len(value["sha256"]) == 64
+            and all(char in "0123456789abcdef"
+                    for char in value["sha256"])
+            and isinstance(value.get("bytes"), int)
+            and not isinstance(value.get("bytes"), bool)
+            and value["bytes"] >= 0)
+
+
+def _read_compaction_journal(cwd, kind):
+    """Return a validated durable retirement transaction, if one exists."""
+    status, raw = _read_compaction_file(_compaction_journal_path(cwd, kind))
+    if status == "missing":
+        return None, "missing"
+    if status != "valid":
+        return None, "invalid"
+    try:
+        value = json.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError, ValueError):
+        return None, "invalid"
+    if (not isinstance(value, dict)
+            or set(value) != {"v", "project", "kind", "phase",
+                              "old_state", "new_state", "records"}
+            or value.get("v") != COMPACTION_JOURNAL_VERSION
+            or value.get("project") != os.path.abspath(cwd)
+            or value.get("kind") != kind
+            or value.get("phase") not in ("prepared", "committed")
+            or _catalog_load_value(cwd, value.get("old_state")).status != "valid"
+            or _catalog_load_value(cwd, value.get("new_state")).status != "valid"
+            or not isinstance(value.get("records"), list)
+            or not value["records"]
+            or not all(_valid_compaction_receipt(item)
+                       for item in value["records"])
+            or len({item["relative"] for item in value["records"]})
+            != len(value["records"])):
+        return None, "invalid"
+    old_load = _catalog_load_value(cwd, value["old_state"])
+    new_load = _catalog_load_value(cwd, value["new_state"])
+    old_view = _catalog_view(cwd, kind, old_load)
+    new_view = _catalog_view(cwd, kind, new_load)
+    other = "codex" if kind == "claude" else "claude"
+    retired = {item["relative"] for item in value["records"]}
+    if (old_view.state != "complete" or new_view.state != "complete"
+            or value["old_state"]["kinds"].get(other)
+            != value["new_state"]["kinds"].get(other)
+            or set(old_view.candidates) - set(new_view.candidates) != retired
+            or not set(new_view.candidates).issubset(old_view.candidates)):
+        return None, "invalid"
+    return value, "valid"
+
+
+def _write_compaction_journal(cwd, journal):
+    return _atomic_json(
+        _compaction_journal_path(cwd, journal["kind"]), journal)
+
+
+def _remove_compaction_journal(cwd, kind):
+    try:
+        os.unlink(_compaction_journal_path(cwd, kind))
+        return True
+    except FileNotFoundError:
+        return True
+    except OSError:
+        return False
+
+
+def _compaction_safe_catalog_load(cwd, loaded):
+    """Expose the old catalog while a prepared state switch is unresolved.
+
+    The journal is written before the compact state. If the process dies or a
+    rollback write fails, readers continue through the old manifests instead
+    of treating an unfinalized retirement as authoritative.
+    """
+    if loaded.status != "valid":
+        return loaded
+    for kind in ("claude", "codex"):
+        journal, status = _read_compaction_journal(cwd, kind)
+        if status == "missing":
+            continue
+        if status != "valid":
+            return CatalogLoad(None, "invalid", "compaction-journal")
+        if journal["phase"] != "prepared":
+            continue
+        if loaded.state not in (journal["old_state"], journal["new_state"]):
+            return CatalogLoad(None, "invalid", "compaction-journal-raced")
+        return CatalogLoad(
+            json.loads(json.dumps(journal["old_state"])), "valid", None)
+    return loaded
+
+
+def _recover_prepared_compactions_locked(cwd):
+    """Roll a prepared transaction back; committed cleanup stays explicit."""
+    if getattr(_PROJECT_LOCK_STATE, "kind", None) != "catalog":
+        raise RuntimeError("compaction recovery requires the catalog lock")
+    for kind in ("claude", "codex"):
+        journal, status = _read_compaction_journal(cwd, kind)
+        if status == "missing":
+            continue
+        if status != "valid":
+            return False
+        if journal["phase"] == "committed":
+            continue
+        current = _read_source_catalog_raw(cwd)
+        if current.status != "valid":
+            return False
+        if current.state == journal["new_state"]:
+            if not _write_catalog_state(
+                    cwd, journal["old_state"], cleanup=False):
+                return False
+        elif current.state != journal["old_state"]:
+            return False
+        if not _remove_compaction_journal(cwd, kind):
+            return False
+        _cleanup_catalog_manifests(cwd)
+    return True
 
 
 @contextlib.contextmanager
@@ -7854,7 +8046,8 @@ def _parse_compaction_json(status, raw):
     return _translate_cursor_keys(value), "valid"
 
 
-def _compaction_cursor_inputs(cwd, side, locked=True):
+def _compaction_cursor_inputs(cwd, side, locked=True,
+                              classify_owners=False):
     """Snapshot cursor and owner bytes; process liveness is sampled once."""
     candidates = _compaction_cursor_paths(cwd, side)
     if candidates is None:
@@ -7895,7 +8088,7 @@ def _compaction_cursor_inputs(cwd, side, locked=True):
                     or peers.owner_key_version(owner)
                     != peers.PROCESS_FINGERPRINT_VERSION):
                 owner_state, owner_unknown = "unknown", True
-            elif locked:
+            elif locked or classify_owners:
                 owner_state = peers._owner_liveness(owner)
                 owner_unknown = owner_state == "unknown"
             else:
@@ -7955,12 +8148,13 @@ def _compaction_cursor_block(item, reader_side, source, generation, size):
 def _compaction_result():
     return {
         "considered": 0, "retired": 0, "files": 0, "bytes": 0,
-        "dormant": 0, "blockers": {name: 0 for name in COMPACTION_BLOCKERS},
+        "dormant": 0, "pending": 0,
+        "blockers": {name: 0 for name in COMPACTION_BLOCKERS},
     }
 
 
-def _compact_catalog_kind(cwd, kind):
-    """Conservatively retire cursor-proved, aged, already-gone candidates."""
+def _analyze_compaction_kind(cwd, kind, lock_cursors):
+    """Read the proof set shared by explicit compaction and doctor."""
     result = _compaction_result()
     reader_side = "codex" if kind == "claude" else "claude"
     snapshot = _catalog_snapshot(cwd, kind)
@@ -7968,23 +8162,30 @@ def _compact_catalog_kind(cwd, kind):
     if (loaded.status != "valid" or view.state != "complete"
             or kind not in loaded.state["kinds"]):
         result["blockers"]["source-not-gone"] += 1
-        return result
+        return CompactionAnalysis(
+            result, {}, (), loaded, view, (), None)
     records, structural, _retryable = _catalog_record_inventory(cwd, kind, view)
     by_relative = {record["relative"]: record for record in records}
     if structural:
         result["blockers"]["source-not-gone"] += structural
-        return result
+        return CompactionAnalysis(
+            result, {}, (), loaded, view, tuple(records), None)
     groups = collections.defaultdict(list)
     for relative in view.candidates:
         record = by_relative.get(relative)
         if record is not None:
             groups[record["source"]].append(record)
     result["considered"] = len(groups)
-    cursor_inputs, cursor_signature = _compaction_cursor_inputs(
-        cwd, reader_side, locked=True)
+    if lock_cursors:
+        cursor_inputs, cursor_signature = _compaction_cursor_inputs(
+            cwd, reader_side, locked=True)
+    else:
+        cursor_inputs, cursor_signature = _compaction_cursor_inputs(
+            cwd, reader_side, locked=False, classify_owners=True)
     if cursor_inputs is None:
         result["blockers"]["snapshot-raced"] += 1
-        return result
+        return CompactionAnalysis(
+            result, {}, (), loaded, view, tuple(records), None)
     result["dormant"] = sum(
         item.named and item.owner_state == "dead" for item in cursor_inputs)
 
@@ -8021,10 +8222,126 @@ def _compact_catalog_kind(cwd, kind):
             continue
         eligible[source] = tuple(record["relative"] for record in source_records)
 
-    detached = [record for record in records
-                if record["relative"] not in set(view.candidates)]
-    if not eligible and not detached:
+    detached = tuple(record for record in records
+                     if record["relative"] not in set(view.candidates))
+    journal, journal_status = _read_compaction_journal(cwd, kind)
+    proved_detached = ({item["relative"] for item in journal["records"]}
+                       if journal_status == "valid"
+                       and journal["phase"] == "committed" else set())
+    if journal_status != "missing":
+        result["pending"] = 1
+    # A record detached without a committed retirement journal has no cursor
+    # proof attached to it. Leaking metadata is safer than guessing it retired.
+    result["blockers"]["snapshot-raced"] += sum(
+        record["relative"] not in proved_detached for record in detached)
+    return CompactionAnalysis(
+        result, eligible, detached, loaded, view, tuple(records),
+        cursor_signature)
+
+
+def _compaction_receipts(cwd, kind, eligible):
+    receipts = []
+    for relative in sorted({item for group in eligible.values()
+                            for item in group}):
+        status, raw = _read_compaction_file(
+            _catalog_record_path(cwd, kind, relative))
+        if status != "valid":
+            return None
+        receipts.append({
+            "relative": relative,
+            "sha256": hashlib.sha256(raw).hexdigest(),
+            "bytes": len(raw),
+        })
+    return receipts
+
+
+def _finish_committed_compaction_locked(cwd, kind, journal):
+    """Delete only records named by a durable committed proof receipt."""
+    current = _read_source_catalog_raw(cwd)
+    view = _catalog_view(cwd, kind, current)
+    if current.status != "valid" or view.state != "complete":
+        return 0, 0, 1, True
+    candidates = set(view.candidates)
+    remaining = []
+    files = reclaimed = raced = 0
+    for receipt in journal["records"]:
+        relative = receipt["relative"]
+        path = _catalog_record_path(cwd, kind, relative)
+        status, raw = _read_compaction_file(path)
+        if status == "missing":
+            continue
+        if (relative in candidates or status != "valid"
+                or len(raw) != receipt["bytes"]
+                or hashlib.sha256(raw).hexdigest() != receipt["sha256"]):
+            raced += 1
+            continue
+        try:
+            info = os.lstat(path)
+            if not stat.S_ISREG(info.st_mode):
+                raced += 1
+                continue
+            os.unlink(path)
+        except OSError:
+            remaining.append(receipt)
+            continue
+        files += 1
+        reclaimed += info.st_size
+    if remaining:
+        pending = json.loads(json.dumps(journal))
+        pending["records"] = remaining
+        _write_compaction_journal(cwd, pending)
+    else:
+        _remove_compaction_journal(cwd, kind)
+    _cleanup_catalog_manifests(cwd)
+    pending = os.path.lexists(_compaction_journal_path(cwd, kind))
+    return files, reclaimed, raced, pending
+
+
+def _resume_compaction_kind(cwd, kind):
+    """Recover a crash residue before considering another retirement."""
+    result = _compaction_result()
+    with catalog_lock(cwd) as locked:
+        if not locked:
+            result["blockers"]["snapshot-raced"] += 1
+            return result, True
+        journal, status = _read_compaction_journal(cwd, kind)
+        if status == "missing":
+            return result, False
+        if status != "valid":
+            result["blockers"]["snapshot-raced"] += 1
+            result["pending"] = 1
+            return result, True
+        if journal["phase"] == "prepared":
+            if not _recover_prepared_compactions_locked(cwd):
+                result["blockers"]["snapshot-raced"] += 1
+            pending = os.path.lexists(_compaction_journal_path(cwd, kind))
+            result["pending"] = 1 if pending else 0
+            return result, pending
+        files, reclaimed, raced, pending = _finish_committed_compaction_locked(
+            cwd, kind, journal)
+        result["files"] += files
+        result["bytes"] += reclaimed
+        result["blockers"]["snapshot-raced"] += raced
+        result["pending"] = 1 if pending else 0
+    return result, pending
+
+
+def _compact_catalog_kind(cwd, kind):
+    """Conservatively retire cursor-proved, aged, already-gone candidates."""
+    result, pending_receipt = _resume_compaction_kind(cwd, kind)
+    if result["blockers"]["snapshot-raced"] or pending_receipt:
         return result
+    analysis = _analyze_compaction_kind(cwd, kind, lock_cursors=True)
+    for key in ("considered", "dormant", "pending"):
+        result[key] += analysis.result[key]
+    for key in COMPACTION_BLOCKERS:
+        result["blockers"][key] += analysis.result["blockers"][key]
+    eligible = analysis.eligible
+    loaded, view = analysis.loaded, analysis.view
+    cursor_signature = analysis.cursor_signature
+    if not eligible:
+        return result
+    reader_side = "codex" if kind == "claude" else "claude"
 
     old_state = json.loads(json.dumps(loaded.state))
     old_entry = old_state["kinds"][kind]
@@ -8038,7 +8355,7 @@ def _compact_catalog_kind(cwd, kind):
         if not locked:
             result["blockers"]["snapshot-raced"] += max(1, len(eligible))
             return result
-        current = _read_source_catalog(cwd)
+        current = _read_source_catalog_raw(cwd)
         current_view = _catalog_view(cwd, kind, current)
         current_entry = (((current.state or {}).get("kinds") or {}).get(kind))
         if (current.status != "valid" or current_view.state != "complete"
@@ -8059,54 +8376,76 @@ def _compact_catalog_kind(cwd, kind):
                 result["blockers"]["snapshot-raced"] += 1
                 return result
 
-        if eligible:
-            generation = uuid.uuid4().hex
-            base_name = _catalog_manifest_name(kind, generation, "base")
-            delta_name = _catalog_manifest_name(kind, generation, "delta")
-            common = {
-                "v": CATALOG_VERSION, "project": os.path.abspath(cwd),
-                "kind": kind, "generation": generation,
-                "root_stamp": old_entry.get("root_stamp"),
-            }
-            base_manifest = dict(common, phase="base", paths=list(retained))
-            delta_manifest = dict(common, phase="delta", paths=[])
-            if (not _write_catalog_manifest(cwd, base_name, base_manifest)
-                    or not _write_catalog_manifest(
-                        cwd, delta_name, delta_manifest)):
-                result["blockers"]["snapshot-raced"] += len(eligible)
-                return result
-            new_state = json.loads(json.dumps(old_state))
-            new_state["kinds"][kind] = {
-                "generation": generation, "phase": "complete",
-                "base_manifest": base_name, "base_next": len(retained),
-                "delta_manifest": delta_name, "delta_next": 0,
-                "root_stamp": old_entry.get("root_stamp"), "inflight": None,
-            }
-            if not _write_catalog_state(cwd, new_state, cleanup=False):
-                result["blockers"]["snapshot-raced"] += len(eligible)
-                return result
-            _inputs, after_signature = _compaction_cursor_inputs(
-                cwd, reader_side, locked=False)
-            if after_signature != cursor_signature:
-                _write_catalog_state(cwd, old_state, cleanup=False)
-                result["blockers"]["snapshot-raced"] += len(eligible)
-                return result
+        generation = uuid.uuid4().hex
+        base_name = _catalog_manifest_name(kind, generation, "base")
+        delta_name = _catalog_manifest_name(kind, generation, "delta")
+        common = {
+            "v": CATALOG_VERSION, "project": os.path.abspath(cwd),
+            "kind": kind, "generation": generation,
+            "root_stamp": old_entry.get("root_stamp"),
+        }
+        base_manifest = dict(common, phase="base", paths=list(retained))
+        delta_manifest = dict(common, phase="delta", paths=[])
+        if (not _write_catalog_manifest(cwd, base_name, base_manifest)
+                or not _write_catalog_manifest(
+                    cwd, delta_name, delta_manifest)):
+            result["blockers"]["snapshot-raced"] += len(eligible)
+            return result
+        new_state = json.loads(json.dumps(old_state))
+        new_state["kinds"][kind] = {
+            "generation": generation, "phase": "complete",
+            "base_manifest": base_name, "base_next": len(retained),
+            "delta_manifest": delta_name, "delta_next": 0,
+            "root_stamp": old_entry.get("root_stamp"), "inflight": None,
+        }
+        receipts = _compaction_receipts(cwd, kind, eligible)
+        if receipts is None:
+            result["blockers"]["snapshot-raced"] += len(eligible)
+            return result
+        journal = {
+            "v": COMPACTION_JOURNAL_VERSION,
+            "project": os.path.abspath(cwd), "kind": kind,
+            "phase": "prepared", "old_state": old_state,
+            "new_state": new_state, "records": receipts,
+        }
+        if not _write_compaction_journal(cwd, journal):
+            result["blockers"]["snapshot-raced"] += len(eligible)
+            return result
+        if not _write_catalog_state(cwd, new_state, cleanup=False):
+            # A failed caller may have reached os.replace and then lost its
+            # acknowledgement. Inspect through the prepared journal recovery;
+            # never delete the only durable route back to the old view.
+            _recover_prepared_compactions_locked(cwd)
+            result["blockers"]["snapshot-raced"] += len(eligible)
+            return result
 
-        removable = list(retired_relatives)
-        removable.extend(record["relative"] for record in detached)
-        for relative in sorted(set(removable)):
-            path = _catalog_record_path(cwd, kind, relative)
-            try:
-                info = os.lstat(path)
-                if not stat.S_ISREG(info.st_mode):
-                    continue
-                os.unlink(path)
-            except OSError:
-                continue
-            result["files"] += 1
-            result["bytes"] += info.st_size
-        _cleanup_catalog_manifests(cwd)
-    result["retired"] = len(eligible)
+        _inputs, after_signature = _compaction_cursor_inputs(
+            cwd, reader_side, locked=False)
+        sources_still_gone = all(
+            _observe_catalog_candidate(cwd, kind, relative).get("reason")
+            == "missing"
+            for relatives in eligible.values() for relative in relatives)
+        if after_signature != cursor_signature or not sources_still_gone:
+            _recover_prepared_compactions_locked(cwd)
+            # On rollback failure the prepared journal remains. Every current
+            # reader overlays its old state until a later mutation recovers it.
+            result["blockers"]["snapshot-raced"] += len(eligible)
+            return result
+
+        committed = json.loads(json.dumps(journal))
+        committed["phase"] = "committed"
+        if not _write_compaction_journal(cwd, committed):
+            _recover_prepared_compactions_locked(cwd)
+            result["blockers"]["snapshot-raced"] += len(eligible)
+            return result
+
+        files, reclaimed, raced, pending = _finish_committed_compaction_locked(
+            cwd, kind, committed)
+        result["files"] += files
+        result["bytes"] += reclaimed
+        result["blockers"]["snapshot-raced"] += raced
+        result["pending"] = 1 if pending else 0
+        result["retired"] += len(eligible)
     return result
 
 
@@ -8152,7 +8491,8 @@ def sources(action=None):
         else:
             for kind in ("claude", "codex"):
                 partial = _compact_catalog_kind(cwd, kind)
-                for key in ("considered", "retired", "files", "bytes"):
+                for key in ("considered", "retired", "files", "bytes",
+                            "pending"):
                     combined[key] += partial[key]
                 combined["dormant"] += partial["dormant"]
                 for key in COMPACTION_BLOCKERS:
@@ -8161,12 +8501,14 @@ def sources(action=None):
             f"{key}={combined['blockers'][key]}"
             for key in COMPACTION_BLOCKERS)
         blocked = sum(combined["blockers"].values())
-        state = "refused" if blocked else "complete"
+        state = ("refused" if blocked else
+                 "pending" if combined["pending"] else "complete")
         print(f"source compaction: {state}; {combined['considered']} considered; "
               f"{combined['retired']} retired; {combined['files']} files / "
               f"{combined['bytes']} bytes reclaimed; {combined['dormant']} "
-              f"dormant readers ignored; blockers {blockers}")
-        return 1 if blocked else 0
+              f"dormant readers ignored; {combined['pending']} cleanup "
+              f"transaction(s) pending; blockers {blockers}")
+        return 1 if blocked or combined["pending"] else 0
     state = "degraded" if failed or refused else "complete"
     cleanup_pending = _catalog_cleanup_pending(cwd)
     cleanup = ("cleanup pending unknown" if cleanup_pending is None else

@@ -464,7 +464,8 @@ project, source, sid = sys.argv[1:]
 cursor = {"codex_pages": {"v": 3, "sources": {sid: {
     "gen": antiphon.source_generation(source),
     "offset": os.path.getsize(source),
-}}}}
+}}, "future": {"integer": 1, "float": 1.0,
+                 "flag": True, "nested": [None, "kept"]}}}
 path = os.path.join(project, ".antiphon", "cursor.json")
 os.makedirs(os.path.dirname(path), exist_ok=True)
 with open(path, "w", encoding="utf-8") as stream:
@@ -502,7 +503,7 @@ value = json.load(open(sys.argv[1], encoding="utf-8"))["codex_pages"]
 print(hashlib.sha256(json.dumps(value, sort_keys=True).encode()).hexdigest())
 PY
 )"
-check "the preserved v3 sibling is byte-equivalent" "$V3_AFTER" "$V3_BEFORE"
+check "the preserved v3 sibling remains deeply value-equivalent" "$V3_AFTER" "$V3_BEFORE"
 V4_STATE="$(python3 - "$ANCHOR_CURSOR" "$ANCHOR_SID" <<'PY'
 import json, sys
 cursor = json.load(open(sys.argv[1], encoding="utf-8"))

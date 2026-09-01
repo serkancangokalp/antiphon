@@ -42,8 +42,8 @@ integration suite.
   are unproven. Gone relevance is computed read-only and separately for each
   reader's own cursor.
 - Cursor version stays 3. Normal advancement and catch-up begin with the
-  existing position map and merge safe fronts; unresolved entries remain
-  byte-for-byte equal.
+  existing position map and merge safe fronts; unresolved parsed entries remain
+  deeply equal, including their JSON types and unknown fields.
 - No path, source id, session id or message content appears in page/status/
   doctor catalog diagnostics.
 - No push, merge, version bump or publish.

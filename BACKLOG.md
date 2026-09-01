@@ -37,9 +37,9 @@ the write-and-flush-before-advance transaction.
   refuses an oversized record without advancing, and the next automatic hook
   delivers it. That is a measured host behaviour, not an inference about its
   internal truncation.
-- A rolling-upgrade-safe v3 page key: the legacy v2 value is preserved
-  byte-for-byte for still-running old processes and is never trusted as a
-  delivered frontier. Any present legacy key, and any malformed or unreadable
+- A rolling-upgrade-safe v3 page key: the legacy v2 parsed value is preserved
+  with deep type equality for still-running old processes and is never trusted
+  as a delivered frontier. Any present legacy key, and any malformed or unreadable
   existing cursor, conservatively replays the currently discovered sources
   from byte zero — measured at 69 Claude-source and 53 Codex-source pages on
   the reviewed snapshots — with a fixed replay reason visible on every page
@@ -125,8 +125,11 @@ the write-and-flush-before-advance transaction.
   proves consumed or has no entry for after lookback. The shared cursor is
   always relevant; a named cursor is dormant only when the recorded owner is
   proved dead by a current process fingerprint. Cursor, owner, source and
-  catalog inputs are revalidated around the atomic state switch; output exposes
-  only aggregate blocker classes and reclaimed files/bytes. Hooks never retire
+  catalog inputs are revalidated around the atomic state switch. A durable
+  prepared/committed journal exposes the old catalog through a crash or failed
+  rollback and authorizes cleanup only after post-switch proof; an unjournaled
+  detached record is never guessed safe. Output exposes only aggregate blocker
+  classes and reclaimed files/bytes across stdout and stderr. Hooks never retire
   candidates.
 
 ### Still open, by name

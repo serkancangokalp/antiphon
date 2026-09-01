@@ -25,8 +25,10 @@ upgrade breakage.
   peer registry. Real-host checks are read-only; mutations use temp projects.
 - Do not nest catalog and cursor locks. Transcript/process work happens outside
   both.
-- Keep v3 and `_seen` siblings byte-for-byte unless an existing writer changes
-  its own key. v4 never advances them.
+- Keep every parsed v3 and `_seen` sibling value deeply equal, including JSON
+  types and unknown fields, unless an existing writer changes its own key. A
+  canonical whole-file rewrite may change whitespace or key order; v4 never
+  advances the sibling values.
 - Stop after a reviewed local exact commit. No push, merge, version or publish.
 
 ### Task 1: Pin the v4 schema and rolling reader selection
@@ -212,8 +214,11 @@ Observe the command/interface missing before implementation.
 - Snapshot cursor files and owner-classification evidence one lock at a time,
   release, then revalidate catalog generation, source absence and the cursor/
   owner input set under the catalog lock.
-- Publish compact state before removing eligible records; invoke safe manifest
-  cleanup after the switch.
+- Publish a durable prepared journal before the compact state, revalidate after
+  the switch while readers still see the old state, then mark the journal
+  committed before removing only its receipt-named records. A crash or failed
+  rollback must preserve the safe old view; invoke safe manifest cleanup only
+  after the journal no longer needs either generation.
 - Refuse on any uncertainty and preserve the old complete catalog.
 
 Run command, cursor, catalog and interruption tests and commit compaction.
