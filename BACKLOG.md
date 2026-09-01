@@ -1371,3 +1371,55 @@ The asymmetry that governs a doubtful case: a tag missing from a set lets one
 stray host line leak into a summary — visible, and cheap to fix by adding it.
 A tag wrongly present deletes a person's message — silently, with nothing left
 behind to notice it happened. When the evidence is thin, leave the tag out.
+
+## P1 — `reply_to_codex` can report success while the peer receives nothing
+
+Measured 2026-09-01 across one long working session: the active channel tool
+returns `Channel reply delivered to Codex.` and the peer, asked directly,
+reports its `antiphon_read` empty. It happened repeatedly and the peer had to
+ask for the same content again. Separately and more visibly, the same tool
+sometimes fails loudly with `thread/queue/add failed: direct app-server input
+is not allowed for unloaded spawned sub-agents (code -32600)`.
+
+The loud failure is tolerable: it tells the sender to use the other road, and
+the passive pull page then carries the words. Silent success is not. A sender
+that is told "delivered" has no reason to repeat itself, and the only thing
+that surfaced the loss here was the peer volunteering that it had received
+nothing — which will not happen between an agent and a person.
+
+### What was ruled out, so nobody re-derives it
+
+- **Attachment parking.** The first guess was that oversized replies were being
+  parked and the envelope lost. Measured against: `.antiphon/messages/` did not
+  exist at all, so nothing had ever been parked, and `MAX_CHANNEL_BYTES` is
+  131,072 bytes while the lost replies were roughly 3,000. Parking cannot be
+  the mechanism. This guess was stated before it was measured, which is the
+  error the entry below is written to prevent repeating.
+- **`_legacy_target` picking the first live thread.** That selection governs
+  `antiphon push codex`, not the MCP reply road, so it cannot explain this.
+  Worth its own scrutiny anyway: it returns the first live candidate without
+  counting how many are live, which is the rule the identity work forbids
+  elsewhere — never choose among several positive candidates.
+
+### What is not established
+
+That short replies arrive and long ones do not. It is an impression from a
+handful of cases and no mechanism supports it. It is recorded because it is
+what the sender noticed, not because it is evidence.
+
+### Conditions measured at the time, for whoever picks this up
+
+Five live Codex thread-writer locks; no Codex peer registered in this project's
+`.antiphon/peers/` at all; five candidate rollouts for the main checkout and
+none for the worktree the peer was working in; three distinct Claude sessions
+committing to this repository. Multiple unnamed peers on both sides is exactly
+the condition under which a target-selection defect would be invisible, and it
+is the condition this bridge is currently being rebuilt to remove.
+
+### What a fix has to provide
+
+Delivery has to be reported from the thing that proves it, not from the queue
+accepting a write. Either the tool returns success only once the message is in
+the peer's readable position, or it stops saying "delivered" and says what it
+actually did — queued, to which peer, with what left to prove. A refusal that
+names its reason is worth more than a success that does not mean anything.
