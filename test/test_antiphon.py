@@ -16646,3 +16646,127 @@ class AttachmentStoreSafetyTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class AutomaticReadyVerdictTest(unittest.TestCase):
+    """One predicate, consumed by everything that decides.
+
+    A boolean could not drive self-retirement: the same false covers a listener
+    whose proof has not been written yet and a listener whose proof now names
+    someone else. The first is bootstrap or a transient read error and must fail
+    closed without destroying anything; only the second is the stale identity
+    this repair retires.
+    """
+
+    SESSION = "8261c119-2c20-4bf4-87ab-f152ac87dbda"
+    OTHER = "0199a1b2-2222-7000-8000-00000000000b"
+    OWNER = "4242:v1:Mon Sep  1 00:00:00 2026"
+
+    def _automatic_peer(self, project, session_id=None):
+        session_id = session_id or self.SESSION
+        alias, digest = antiphon.peers.auto_identity(session_id)
+        socket = os.path.join(project, alias + ".sock")
+        antiphon.peers.register(project, "claude", alias, socket,
+                                pid=os.getpid(), owner_key=self.OWNER,
+                                identity_digest=digest)
+        antiphon.peers.write_session(project, "claude", alias, session_id,
+                                     f"/t/{alias}.jsonl", self.OWNER, digest,
+                                     True)
+        for peer in antiphon.peers.read_peers(project, "claude"):
+            if peer.get("name") == alias:
+                return peer
+        raise AssertionError("the fixture did not produce a readable peer")
+
+    def _verdict(self, project, peer):
+        state, proof = antiphon.peers.read_identity_proof(project, self.OWNER)
+        return antiphon.automatic_verdict(project, "claude", peer,
+                                          (state, proof))
+
+    def test_automatic_ready_requires_endpoint_session_and_proof(self):
+        with tempfile.TemporaryDirectory() as project:
+            peer = self._automatic_peer(project)
+            self.assertEqual(self._verdict(project, peer), "UNREADY",
+                             "no proof has been written yet")
+            antiphon.peers.write_identity_proof(
+                project, self.OWNER, self.SESSION,
+                antiphon.peers.auto_identity(self.SESSION)[1])
+            self.assertEqual(self._verdict(project, peer), "READY")
+
+    def test_automatic_ready_separates_unready_unknown_from_proved_stale(self):
+        """Three answers that a bool would have made one."""
+        with tempfile.TemporaryDirectory() as project:
+            peer = self._automatic_peer(project)
+            self.assertEqual(self._verdict(project, peer), "UNREADY")
+
+            antiphon.peers.write_identity_proof(
+                project, self.OWNER, self.OTHER,
+                antiphon.peers.auto_identity(self.OTHER)[1])
+            self.assertEqual(self._verdict(project, peer), "PROVED_STALE",
+                             "a valid proof naming another session")
+
+            self.assertEqual(
+                antiphon.automatic_verdict(project, "claude", peer,
+                                           ("unreadable", None)),
+                "UNKNOWN", "a transient read error must not retire anything")
+            self.assertEqual(
+                antiphon.automatic_verdict(project, "claude", peer,
+                                           ("invalid", None)),
+                "STRUCTURAL_INVALID")
+
+    def test_automatic_ready_leaves_explicit_and_codex_peers_alone(self):
+        """Scope is structural: this contract governs automatic Claude only."""
+        with tempfile.TemporaryDirectory() as project:
+            antiphon.peers.register(project, "claude", "build",
+                                    os.path.join(project, "build.sock"),
+                                    pid=os.getpid(), owner_key=self.OWNER)
+            explicit = [p for p in antiphon.peers.read_peers(project, "claude")
+                        if p.get("name") == "build"][0]
+            self.assertIsNone(
+                antiphon.automatic_verdict(project, "claude", explicit,
+                                           ("absent", None)),
+                "an explicit peer is not governed by the proof")
+            automatic = self._automatic_peer(project)
+            self.assertIsNone(
+                antiphon.automatic_verdict(project, "codex", automatic,
+                                           ("absent", None)),
+                "no Codex path is governed by the proof")
+
+    def test_automatic_ready_stops_claimed_alias_signing_after_rotation(self):
+        """Behavioural through the production Stop-signing identity."""
+        with tempfile.TemporaryDirectory() as project:
+            self._automatic_peer(project)
+            alias = antiphon.peers.auto_identity(self.SESSION)[0]
+            with patch.object(antiphon.peers, "owner_key",
+                              return_value=self.OWNER):
+                antiphon.peers.write_identity_proof(
+                    project, self.OWNER, self.SESSION,
+                    antiphon.peers.auto_identity(self.SESSION)[1])
+                self.assertEqual(
+                    antiphon.claimed_alias(project, "claude", self.SESSION),
+                    alias, "a valid proof signs the automatic alias")
+
+                antiphon.peers.write_identity_proof(
+                    project, self.OWNER, self.OTHER,
+                    antiphon.peers.auto_identity(self.OTHER)[1])
+                self.assertIsNone(
+                    antiphon.claimed_alias(project, "claude", self.SESSION),
+                    "once the proof names another session, nothing automatic "
+                    "may be signed")
+
+    def test_automatic_ready_is_the_only_copy_of_the_rule(self):
+        """Resolver, status and doctor must all reach the same verdict.
+
+        Patching the predicate is enough to change every decision; if any
+        surface kept its own copy, one of these would disagree.
+        """
+        with tempfile.TemporaryDirectory() as project:
+            self._automatic_peer(project)
+            alias = antiphon.peers.auto_identity(self.SESSION)[0]
+            antiphon.peers.write_identity_proof(
+                project, self.OWNER, self.SESSION,
+                antiphon.peers.auto_identity(self.SESSION)[1])
+            with patch.object(antiphon, "automatic_verdict",
+                              return_value="PROVED_STALE"):
+                resolved = antiphon._resolve_target(project, "claude", alias)
+                self.assertIsNone(resolved.address,
+                                  "the resolver consults the predicate")

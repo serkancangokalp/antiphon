@@ -511,6 +511,56 @@ def sender_alias(candidate):
     return candidate if peers.valid_name(candidate) else None
 
 
+def automatic_verdict(cwd, kind, peer, proof):
+    """What an automatic Claude record is right now, or None if ungoverned.
+
+    `READY`, `UNREADY`, `UNKNOWN`, `PROVED_STALE`, `STRUCTURAL_INVALID` — and
+    `None` for every record this contract does not govern: any Codex path, and
+    any explicit or legacy Claude peer. That scoping is structural rather than
+    a fact about which caller happens to reach here today, because `register`
+    is shared and a reader told "automatic endpoint" could otherwise require a
+    proof of a peer that never had one.
+
+    A bool could not drive self-retirement. The same false would cover a
+    listener whose proof has not been written yet — bootstrap, or a transient
+    read error — and a listener whose proof now names another session. The
+    first must fail closed without destroying anything, because the next hook
+    is about to make it ready; only the second is the stale identity worth
+    retiring. So the answers stay apart, and only `PROVED_STALE` authorises
+    anything destructive.
+    """
+    if kind != "claude":
+        return None
+    digest = peers._identity_digest_of(peer)
+    if digest is None or peer.get("automatic") is not True:
+        return None
+    state, record = proof
+    if state == "absent":
+        return "UNREADY"
+    if state == "unreadable":
+        return "UNKNOWN"
+    if state != "valid":
+        return "STRUCTURAL_INVALID"
+    bound = peers._session_address(cwd, peer)
+    if bound is None:
+        return "UNREADY"
+    if (record.get("session_id") == bound
+            and record.get("identity_digest") == digest):
+        return "READY"
+    return "PROVED_STALE"
+
+
+def _automatic_ready(cwd, kind, peer):
+    """Whether this record may be used. Ungoverned records always may.
+
+    One place asks the question, so the resolver, `status`, `doctor` and the
+    Stop-signing identity cannot disagree about the same moment.
+    """
+    verdict = automatic_verdict(
+        cwd, kind, peer, peers.read_identity_proof(cwd, peer.get("owner")))
+    return verdict is None or verdict == "READY"
+
+
 def claimed_alias(cwd, kind, session_id=None):
     """The identity this side may publish on a Stop-hook message.
 
@@ -557,7 +607,8 @@ def claimed_alias(cwd, kind, session_id=None):
             if (peer.get("name") == name
                     and peer.get("owner") == owner
                     and peers._identity_digest_of(peer) == digest
-                    and peers._session_address(cwd, peer) == session_id):
+                    and peers._session_address(cwd, peer) == session_id
+                    and _automatic_ready(cwd, "claude", peer)):
                 return name
     return None
 
@@ -4853,7 +4904,8 @@ def _resolve_target(cwd, kind, alias=None):
             None, f"not delivered: unknown peer kind {kind!r} (claude | codex)",
             "refusal")
 
-    registered = peers.read_peers(cwd, kind)
+    registered = [peer for peer in peers.read_peers(cwd, kind)
+                  if _automatic_ready(cwd, kind, peer)]
     registered_names = ", ".join(
         sorted(p.get("name") or "?" for p in registered))
 
@@ -7498,6 +7550,8 @@ def status():
     # patience doctor gives them; the ordinary idle-project path is tried once.
     live = _live_by_kind(cwd)
     identities = _codex_identity_snapshot(cwd, live["codex"])
+    live["claude"] = [peer for peer in live["claude"]
+                      if _automatic_ready(cwd, "claude", peer)]
     displayed = {"claude": live["claude"],
                  "codex": live["codex"] + list(identities.automatic)}
     channel = ("live" if _channel_answering(cwd, live["claude"])
