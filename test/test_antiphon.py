@@ -9388,7 +9388,9 @@ class StatusTest(unittest.TestCase):
                 "address": "/tmp/ui.sock", "started_at": 1.0}
         with tempfile.TemporaryDirectory() as project, \
              patch.object(antiphon.peers, "read_peers",
-                          side_effect=[[peer], [], [], []]):
+                          side_effect=[[peer], [], [], []]), \
+             patch.object(antiphon, "_probe_channel",
+                          return_value=antiphon.Probe(None, True)):
             _, text = self._status(project)
         self.assertIn("Claude channel:     live", text)
         self.assertIn("Claude ui — ready", text,
@@ -9429,22 +9431,69 @@ class StatusTest(unittest.TestCase):
 
     # ---- the channel line ----
 
-    def test_a_registered_claude_peer_is_never_reported_as_down(self):
-        """A named session serves its own socket, not the project-wide one.
-        Probing the legacy path would call a working channel dead."""
+    def test_a_registered_peer_is_live_only_when_its_channel_answers(self):
         with tempfile.TemporaryDirectory() as project:
             antiphon.peers.register(project, "claude", "ui", "/tmp/ui.sock",
                                     pid=os.getpid())
-            with patch.object(antiphon.os.path, "exists", return_value=False):
+            with patch.object(antiphon, "_probe_channel",
+                              return_value=antiphon.Probe(None, False)) as probe:
                 _, text = self._status(project)
+        probe.assert_called_once_with("/tmp/ui.sock", patient=True)
+        self.assertIn("Claude channel:     down", text)
+
+    def test_an_answering_registered_peer_is_live(self):
+        with tempfile.TemporaryDirectory() as project:
+            antiphon.peers.register(project, "claude", "ui", "/tmp/ui.sock",
+                                    pid=os.getpid())
+            with patch.object(antiphon, "_probe_channel",
+                              return_value=antiphon.Probe(None, True)) as probe:
+                _, text = self._status(project)
+        probe.assert_called_once_with("/tmp/ui.sock", patient=True)
         self.assertIn("Claude channel:     live", text)
 
-    def test_with_nothing_registered_the_legacy_socket_still_decides(self):
+    def test_an_idle_project_probes_legacy_once_without_patience(self):
+        with tempfile.TemporaryDirectory() as project, \
+             patch.object(antiphon, "_probe_channel",
+                          return_value=antiphon.Probe(errno.ENOENT, False)) as probe:
+            _, text = self._status(project)
+        probe.assert_called_once_with(
+            antiphon.claude_socket_path(project), patient=False)
+        self.assertIn("Claude channel:     down", text)
+
+    def test_a_configured_unregistered_alias_probes_only_its_named_path(self):
+        with tempfile.TemporaryDirectory() as project, \
+             patch.object(antiphon.peers, "explicit_name", return_value="ui"), \
+             patch.object(antiphon, "_probe_channel",
+                          return_value=antiphon.Probe(None, True)) as probe:
+            _, text = self._status(project)
+        probe.assert_called_once_with(
+            antiphon.claude_socket_path(project, "ui"), patient=False)
+        self.assertIn("Claude channel:     live", text)
+
+    def test_a_registered_claude_peer_uses_its_recorded_address(self):
+        """A named session serves its recorded socket, not the legacy one."""
         with tempfile.TemporaryDirectory() as project:
-            with patch.object(antiphon.os.path, "exists", return_value=True):
+            antiphon.peers.register(project, "claude", "ui", "/tmp/ui.sock",
+                                    pid=os.getpid())
+            with patch.object(antiphon, "_probe_channel",
+                              return_value=antiphon.Probe(None, True)) as probe:
+                _, text = self._status(project)
+        probe.assert_called_once_with("/tmp/ui.sock", patient=True)
+        self.assertIn("Claude channel:     live", text)
+
+    def test_with_nothing_registered_the_legacy_channel_answer_decides(self):
+        with tempfile.TemporaryDirectory() as project:
+            with patch.object(antiphon, "_probe_channel",
+                              return_value=antiphon.Probe(None, True)) as probe:
                 _, live = self._status(project)
-            with patch.object(antiphon.os.path, "exists", return_value=False):
+                probe.assert_called_once_with(
+                    antiphon.claude_socket_path(project), patient=False)
+            with patch.object(antiphon, "_probe_channel",
+                              return_value=antiphon.Probe(errno.ENOENT,
+                                                          False)) as probe:
                 _, down = self._status(project)
+                probe.assert_called_once_with(
+                    antiphon.claude_socket_path(project), patient=False)
         self.assertIn("Claude channel:     live", live)
         self.assertIn("Claude channel:     down", down)
 

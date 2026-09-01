@@ -4661,13 +4661,13 @@ def status():
     x = codex_rollout_files(cwd)
     print(f"Claude transcripts: {_file_count(len(c))}")
     print(f"Codex rollouts:     {_file_count(len(x))}")
-    # One snapshot for the channel line and the peer list both. Derived from the
-    # registry when anything is registered: a named session serves its own
-    # socket, so probing the project-wide path would report a working channel as
-    # down. The path itself is never printed either way.
+    # One registry snapshot for the channel line and the peer list both. The
+    # headline is earned by an Antiphon answer, not by an endpoint record or a
+    # socket-file-shaped pathname. Registered peers get the same startup
+    # patience doctor gives them; the ordinary idle-project path is tried once.
     live = _live_by_kind(cwd)
-    channel = ("live" if live["claude"]
-               else "live" if os.path.exists(claude_socket_path(cwd)) else "down")
+    channel = ("live" if _channel_answering(cwd, live["claude"])
+               else "down")
     print(f"Claude channel:     {channel}")
     print(attachment_report(cwd))
     for line in _peer_report(live):
@@ -4899,6 +4899,8 @@ def _toml_table_text(text, table):
 
 
 Probe = collections.namedtuple("Probe", "error answered")
+ChannelTarget = collections.namedtuple(
+    "ChannelTarget", "name path state patient")
 
 
 def _probe_channel(path, patient):
@@ -4952,6 +4954,38 @@ def _probe_channel(path, patient):
     # `{"ok":false,"error":"Unexpected end of JSON input"}`, because doctor
     # deliberately sends nothing for the server to parse.
     return Probe(None, isinstance(answer, dict) and "ok" in answer)
+
+
+def _channel_targets(cwd, live):
+    """Claude channel addresses both status and doctor must tell the truth about.
+
+    A registry claim earns startup patience. An explicitly configured alias is
+    one exact address even before it has a record; falling through to the bare
+    project path would answer a question the caller did not ask. Only a project
+    with neither a Claude record nor an explicit alias gets the legacy target.
+    """
+    claude = [record for record in live
+              if record.get("kind") == "claude"]
+    requested = sender_alias(peers.explicit_name())
+    registered_names = {record.get("name") for record in claude}
+    targets = [ChannelTarget(record.get("name"),
+                             peers._address_of(record),
+                             "registered", True)
+               for record in claude if peers._address_of(record) is not None]
+    if requested and requested not in registered_names:
+        targets.insert(0, ChannelTarget(
+            requested, claude_socket_path(cwd, requested),
+            "unregistered", False))
+    if not claude and not requested:
+        targets.append(ChannelTarget(
+            None, claude_socket_path(cwd), "legacy", False))
+    return targets
+
+
+def _channel_answering(cwd, live):
+    """Whether any relevant Claude address answers as an Antiphon channel."""
+    return any(_probe_channel(target.path, patient=target.patient).answered
+               for target in _channel_targets(cwd, live))
 
 
 class _Report:
@@ -5375,28 +5409,12 @@ def _doctor_peers(report, cwd):
 
 
 def _doctor_channel(report, cwd, live):
-    """Somebody answered, or nobody did — not "the file exists".
-
-    Doctor is authoritative over `status` here. `status` reports `live` when
-    the socket file is present, so a stale socket makes the two disagree about
-    the headline fact; the difference is stated in BACKLOG and `status` is
-    unchanged."""
-    claude = [record for record in live if record.get("kind") == "claude"]
-    requested = sender_alias(peers.explicit_name())
-    registered_names = {record.get("name") for record in claude}
-    # A registered live peer claims its address, so patience is warranted
-    # there and nowhere else.
-    targets = [(record.get("name"), peers._address_of(record), "registered")
-               for record in claude]
-    if requested and requested not in registered_names:
-        targets.insert(0, (requested, claude_socket_path(cwd, requested),
-                           "unregistered"))
-    if not claude:
-        targets.append((None, claude_socket_path(cwd), "legacy"))
-    for name, path, state in targets:
+    """Somebody answered, or nobody did — not "the file exists"."""
+    for target in _channel_targets(cwd, live):
+        name, path, state = target.name, target.path, target.state
         registered = state == "registered"
         who = f'channel: peer "{name}"' if name else "channel:"
-        probe = _probe_channel(path, patient=registered)
+        probe = _probe_channel(path, patient=target.patient)
         if probe.answered and state == "unregistered":
             report.bad(f'{who} answers, but no live endpoint record holds '
                        f'alias "{name}" — restart that Claude session')
