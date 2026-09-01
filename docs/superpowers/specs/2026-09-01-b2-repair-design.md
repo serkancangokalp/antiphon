@@ -164,8 +164,14 @@ caller happens to reach it today.
   carries the automatic identity digest.
 - Explicit and legacy Claude registration, reassert and routing keep their
   present semantics exactly. They require no proof and no mode.
-- Every Codex path — registration, observation, projection, routing — is
-  untouched by this repair.
+- The new machinery — the owner-current proof, the composite verdict, and the
+  `initial`/`reassert` startup gate — **never applies to Codex at all**. Codex
+  registration, projection and routing keep their current semantics.
+- One intentional exception, and it is this repair's own: §7 changes the
+  configured-invalid Codex hook so that it durably withdraws its own stale
+  observation. That is a deliberate part of this work, not a regression, and
+  the non-regression rule above must not be read as forbidding it. Nothing
+  else on the Codex side moves.
 
 This is written down because the failure it prevents is a faithful
 implementation, not a careless one: a reader told "automatic endpoint" about a
