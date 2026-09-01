@@ -4267,18 +4267,27 @@ def _validate_hook_groups(groups, event=None):
                 f"{where} contains a non-object group; refusing to overwrite "
                 "it. Fix the file or move it aside, then run `antiphon "
                 "setup` again.")
-        entries = group.get(CONFIG_KEYS.hook_entries)
-        if entries is not None and not isinstance(entries, list):
+        missing = object()
+        entries = group.get(CONFIG_KEYS.hook_entries, missing)
+        if entries is missing:
+            continue
+        if not isinstance(entries, list):
             raise ConfigFileError(
                 f"a hook group has non-array `{CONFIG_KEYS.hook_entries}`; "
                 "refusing to overwrite it. Fix the file or move it aside, "
                 "then run `antiphon setup` again.")
-        if isinstance(entries, list) and any(
-                not isinstance(entry, dict) for entry in entries):
-            raise ConfigFileError(
-                f"a `{CONFIG_KEYS.hook_entries}` array contains a non-object "
-                "entry; refusing to overwrite it. Fix the file or move it "
-                "aside, then run `antiphon setup` again.")
+        for entry in entries:
+            if not isinstance(entry, dict):
+                raise ConfigFileError(
+                    f"a `{CONFIG_KEYS.hook_entries}` array contains a "
+                    "non-object entry; refusing to overwrite it. Fix the file "
+                    "or move it aside, then run `antiphon setup` again.")
+            command = CONFIG_KEYS.hook_command
+            if command in entry and not isinstance(entry[command], str):
+                raise ConfigFileError(
+                    f"a hook entry has non-string `{command}`; refusing to "
+                    "overwrite it. Fix the file or move it aside, then run "
+                    "`antiphon setup` again.")
 
 
 def _validate_hook_events(events):

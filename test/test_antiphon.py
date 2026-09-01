@@ -3173,25 +3173,35 @@ class DoctorTest(unittest.TestCase):
         project = self.project()
         self.set_up(project)
         target = os.path.join(project, antiphon.CLAUDE_SETTINGS_FILE)
-        broken = b'{"hooks": []}\n'
-        with open(target, "wb") as stream:
-            stream.write(broken)
-        out, error = io.StringIO(), io.StringIO()
+        malformed = (
+            {"hooks": []},
+            {"hooks": {"UserPromptSubmit": [{"hooks": None}]}},
+            {"hooks": {"Stop": [{"hooks": [
+                {"type": "command", "command": 42},
+            ]}]}},
+        )
         original_recheck = antiphon._doctor_readonly
-        with self.hermetic(project), \
-             patch.object(antiphon, "_doctor_readonly",
-                          wraps=original_recheck) as recheck, \
-             contextlib.redirect_stdout(out), \
-             contextlib.redirect_stderr(error):
-            code = antiphon.doctor("--fix")
-        self.assertEqual(code, 1)
-        recheck.assert_called_once_with()
-        with open(target, "rb") as stream:
-            self.assertEqual(stream.read(), broken,
-                             "setup refusal must leave the file byte-identical")
-        self.assertIn("refusing to overwrite", error.getvalue())
-        self.assertIn("doctor re-check (read-only)", out.getvalue())
-        self.assertIn(".claude/settings.json: missing", out.getvalue())
+        for data in malformed:
+            with self.subTest(data=data):
+                broken = (json.dumps(data, separators=(",", ":")) + "\n").encode()
+                with open(target, "wb") as stream:
+                    stream.write(broken)
+                out, error = io.StringIO(), io.StringIO()
+                with self.hermetic(project), \
+                     patch.object(antiphon, "_doctor_readonly",
+                                  wraps=original_recheck) as recheck, \
+                     contextlib.redirect_stdout(out), \
+                     contextlib.redirect_stderr(error):
+                    code = antiphon.doctor("--fix")
+                self.assertEqual(code, 1)
+                recheck.assert_called_once_with()
+                with open(target, "rb") as stream:
+                    self.assertEqual(
+                        stream.read(), broken,
+                        "setup refusal must leave the file byte-identical")
+                self.assertIn("refusing to overwrite", error.getvalue())
+                self.assertIn("doctor re-check (read-only)", out.getvalue())
+                self.assertIn(".claude/settings.json: missing", out.getvalue())
 
     def test_doctor_rejects_unknown_mode_and_help_names_write_boundary(self):
         error = io.StringIO()
@@ -3976,7 +3986,13 @@ class SetupShapeCharacterizationTest(unittest.TestCase):
             (antiphon.CLAUDE_SETTINGS_FILE,
              {"hooks": {"UserPromptSubmit": [{"hooks": {}}]}}),
             (antiphon.CLAUDE_SETTINGS_FILE,
+             {"hooks": {"UserPromptSubmit": [{"hooks": None}]}}),
+            (antiphon.CLAUDE_SETTINGS_FILE,
              {"hooks": {"UserPromptSubmit": [{"hooks": [42]}]}}),
+            (antiphon.CLAUDE_SETTINGS_FILE,
+             {"hooks": {"Stop": [{"hooks": [
+                 {"type": "command", "command": 42},
+             ]}]}}),
             (antiphon.CLAUDE_SETTINGS_FILE, {"permissions": []}),
             (antiphon.CLAUDE_SETTINGS_FILE,
              {"permissions": {"allow": {}}}),
@@ -9418,6 +9434,12 @@ class StatusTest(unittest.TestCase):
             code = antiphon.status()
         return code, out.getvalue()
 
+    def _formatting_status(self, project, summary=("", None, 0)):
+        """Status text tests must not probe shared hard-coded socket paths."""
+        with patch.object(antiphon, "_probe_channel",
+                          return_value=antiphon.Probe(errno.ENOENT, False)):
+            return self._status(project, summary)
+
     @staticmethod
     def _codex_peer(project, alias, owner, session=None):
         antiphon.peers.register(project, "codex", alias, None,
@@ -9431,7 +9453,7 @@ class StatusTest(unittest.TestCase):
             antiphon.peers.register(project, "claude", "ui", "/tmp/ui.sock",
                                     pid=os.getpid())
             self._codex_peer(project, "build", "300:build")
-            _, text = self._status(project)
+            _, text = self._formatting_status(project)
         self.assertIn("Peers:", text)
         self.assertIn("Claude ui — ready", text)
         self.assertIn("Codex build — waiting for first turn", text)
@@ -9457,7 +9479,7 @@ class StatusTest(unittest.TestCase):
                  patch.object(antiphon, "codex_rollout_files",
                               return_value=[f"/home/me/.codex/sessions/"
                                             f"rollout-2026-08-30T00-00-00-{self.UUID}.jsonl"]):
-                _, text = self._status(project)
+                _, text = self._formatting_status(project)
         for secret in ("antiphon-secret-ui.sock", ".sock", self.UUID,
                        self.UUID[:8], "a1b2c3d4-dead-beef-cafe-0123456789ab",
                        ".jsonl", antiphon.claude_socket_path(project)):
@@ -9544,7 +9566,7 @@ class StatusTest(unittest.TestCase):
                                     pid=os.getpid())
             with patch.object(antiphon.peers, "read_peers",
                               wraps=antiphon.peers.read_peers) as read:
-                self._status(project)
+                self._formatting_status(project)
         self.assertEqual(read.call_count, 1)
 
     def test_a_peer_that_leaves_mid_report_cannot_split_the_output(self):
@@ -9570,8 +9592,8 @@ class StatusTest(unittest.TestCase):
             for alias in ("zeta", "alpha", "mid"):
                 antiphon.peers.register(project, "claude", alias,
                                         f"/tmp/{alias}.sock", pid=os.getpid())
-            _, first = self._status(project)
-            _, second = self._status(project)
+            _, first = self._formatting_status(project)
+            _, second = self._formatting_status(project)
         names = [line.strip() for line in first.splitlines()
                  if line.startswith("  Claude ")]
         self.assertEqual(names, ["Claude alpha — ready", "Claude mid — ready",
@@ -9670,7 +9692,7 @@ class StatusTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as project:
             antiphon.peers.register(project, "claude", "ui", "/tmp/ui.sock",
                                     pid=os.getpid())
-            _, text = self._status(project)
+            _, text = self._formatting_status(project)
         self.assertNotIn("@claude:", text)
 
     def test_several_claude_peers_say_how_to_address_one(self):
@@ -9679,7 +9701,7 @@ class StatusTest(unittest.TestCase):
                                     pid=os.getpid())
             antiphon.peers.register(project, "claude", "api", "/tmp/api.sock",
                                     pid=os.getppid())
-            _, text = self._status(project)
+            _, text = self._formatting_status(project)
         self.assertIn("@claude:ui", text)
         self.assertIn("@claude:api", text)
 
@@ -9691,7 +9713,7 @@ class StatusTest(unittest.TestCase):
                                     pid=os.getpid())
             antiphon.peers.register(project, "claude", antiphon.peers.UNNAMED,
                                     "/tmp/bare.sock", pid=os.getppid())
-            _, text = self._status(project)
+            _, text = self._formatting_status(project)
         self.assertIn(f"Claude {antiphon.peers.UNNAMED} — ready", text)
         self.assertIn("cannot be addressed", text)
         self.assertIn("ANTIPHON_NAME", text)
@@ -9714,7 +9736,7 @@ class StatusTest(unittest.TestCase):
                                     pid=os.getppid())
             self._codex_peer(project, "build", "300:build", self.UUID)
             self._codex_peer(project, "review", "301:review")   # not ready
-            _, text = self._status(project)
+            _, text = self._formatting_status(project)
         self.assertIn("@claude:api", text)
         self.assertIn("@codex:build", text)
         self.assertIn("@codex:review", text)
