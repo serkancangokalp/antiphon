@@ -7810,6 +7810,10 @@ COMPACTION_BLOCKERS = (
     "selected-legacy", "invalid-or-unreadable", "unconsumed-v4",
     "unknown-owner", "source-not-gone", "snapshot-raced",
 )
+COMPACTION_COUNTERS = (
+    "considered", "retired", "files", "bytes", "dormant", "pending",
+    "retryable",
+)
 COMPACTION_INPUT_LIMIT = 4 * 1024 * 1024
 COMPACTION_JOURNAL_VERSION = 1
 CompactionCursor = collections.namedtuple(
@@ -8158,9 +8162,32 @@ def _compaction_result():
     }
 
 
+def _valid_compaction_result(result):
+    """Validate one internal result before aggregate arithmetic trusts it."""
+    if not isinstance(result, dict):
+        return False
+    blockers = result.get("blockers")
+    if not isinstance(blockers, dict):
+        return False
+    for key in COMPACTION_COUNTERS:
+        value = result.get(key)
+        if (not isinstance(value, int) or isinstance(value, bool)
+                or value < 0):
+            return False
+    for key in COMPACTION_BLOCKERS:
+        value = blockers.get(key)
+        if (not isinstance(value, int) or isinstance(value, bool)
+                or value < 0):
+            return False
+    return result["retryable"] <= blockers["snapshot-raced"]
+
+
 def _compaction_snapshot_race(result, count=1, retryable=False):
     """Classify an uncertain snapshot without widening blocker contracts."""
-    if not isinstance(count, int) or isinstance(count, bool) or count <= 0:
+    if not isinstance(count, int) or isinstance(count, bool) or count < 0:
+        result["blockers"]["snapshot-raced"] += 1
+        return
+    if count == 0:
         return
     result["blockers"]["snapshot-raced"] += count
     if retryable:
@@ -8541,15 +8568,18 @@ def sources(action=None):
     failed, processed, refused, gone = _scan_source_catalogs(cwd)
     if action == "compact":
         combined = _compaction_result()
+        classification_untrusted = False
         if failed or refused:
             combined["blockers"]["source-not-gone"] = max(1, refused)
         else:
             for kind in ("claude", "codex"):
                 partial = _compact_catalog_kind(cwd, kind)
-                for key in ("considered", "retired", "files", "bytes",
-                            "pending", "retryable"):
+                if not _valid_compaction_result(partial):
+                    classification_untrusted = True
+                    _compaction_snapshot_race(combined)
+                    continue
+                for key in COMPACTION_COUNTERS:
                     combined[key] += partial[key]
-                combined["dormant"] += partial["dormant"]
                 for key in COMPACTION_BLOCKERS:
                     combined["blockers"][key] += partial["blockers"][key]
         blockers = ", ".join(
@@ -8565,8 +8595,7 @@ def sources(action=None):
               f"transaction(s) pending; blockers {blockers}")
         snapshot_raced = combined["blockers"]["snapshot-raced"]
         retryable = combined["retryable"]
-        if (not isinstance(retryable, int) or isinstance(retryable, bool)
-                or retryable < 0 or retryable > snapshot_raced):
+        if classification_untrusted or not _valid_compaction_result(combined):
             print("source compaction: snapshot classification could not be "
                   "trusted; no automatic remedy was attempted")
             return 1

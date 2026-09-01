@@ -7178,6 +7178,66 @@ class SourceCompactionTest(unittest.TestCase):
         self.assertIn("proofs were checked; retry", printed)
         self.assertIn("no automatic remedy was attempted", printed)
 
+    def test_untrusted_snapshot_classification_refuses_without_arithmetic(self):
+        cases = (2, True, False, -1, "one")
+
+        for retryable in cases:
+            with self.subTest(retryable=retryable):
+                invalid = antiphon._compaction_result()
+                invalid["blockers"]["snapshot-raced"] = 1
+                invalid["retryable"] = retryable
+                empty = antiphon._compaction_result()
+                out, err = io.StringIO(), io.StringIO()
+
+                with patch.object(
+                        antiphon, "project_dir", return_value=self.project), \
+                     patch.object(antiphon, "_scan_source_catalogs",
+                                  return_value=(False, 0, 0, 0)), \
+                     patch.object(antiphon, "_compact_catalog_kind",
+                                  side_effect=(invalid, empty)), \
+                     contextlib.redirect_stdout(out), \
+                     contextlib.redirect_stderr(err):
+                    code = antiphon.sources("compact")
+
+                printed = out.getvalue() + err.getvalue()
+                self.assertEqual(code, 1, printed)
+                self.assertIn(
+                    "snapshot classification could not be trusted; "
+                    "no automatic remedy was attempted", printed)
+                self.assertNotIn("proofs were checked; retry", printed)
+                self.assertNotIn(
+                    "proof failure(s) could not be interpreted", printed)
+
+    def test_every_compaction_counter_rejects_bool_or_non_integer(self):
+        counters = (
+            "considered", "retired", "files", "bytes", "dormant",
+            "pending", "retryable",
+        )
+        for key in counters:
+            for value in (True, "one"):
+                with self.subTest(key=key, value=value):
+                    result = antiphon._compaction_result()
+                    result[key] = value
+                    self.assertFalse(
+                        antiphon._valid_compaction_result(result))
+        for key in antiphon.COMPACTION_BLOCKERS:
+            for value in (True, "one"):
+                with self.subTest(blocker=key, value=value):
+                    result = antiphon._compaction_result()
+                    result["blockers"][key] = value
+                    self.assertFalse(
+                        antiphon._valid_compaction_result(result))
+
+    def test_invalid_snapshot_race_count_becomes_persistent_uncertainty(self):
+        for count in (True, False, "one", -1):
+            with self.subTest(count=count):
+                result = antiphon._compaction_result()
+                antiphon._compaction_snapshot_race(
+                    result, count, retryable=True)
+                self.assertEqual(
+                    result["blockers"]["snapshot-raced"], 1)
+                self.assertEqual(result["retryable"], 0)
+
     def test_manifest_before_state_failure_and_record_cleanup_retry_converge(self):
         sid, _relative, record_path, proof = self._aged_gone(24)
         self._shared_v4(sid, proof)
