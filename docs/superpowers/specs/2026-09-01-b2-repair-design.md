@@ -72,6 +72,19 @@ never arrive. Python preserves that class through `_ClassifiedRefusal` rather
 than recasting every negative reply as `transport`, so a sender learns the
 identity moved instead of that the socket failed.
 
+**What triggers retirement is a validated action, never a closing socket.**
+`doctor` probes the channel with a half-close and expects `{ok:...}`, and
+`doctor` is bound by a byte-for-byte read-only contract. If the proof check and
+self-retire hung off "socket end", a diagnostic run would retire a stale
+listener, and the first symptom anyone met would be that running `doctor` kills
+their channel.
+
+There are therefore exactly two triggers, both verified before anything is
+destroyed: the explicit retire control, content-free but not empty and
+authenticated as its own control action; and a real delivery, where the proof is
+checked against a valid delivery payload. `doctor`'s empty half-close probe is
+neither, and answers without touching registry or socket state.
+
 The retire control becomes an optimisation rather than a correctness mechanism:
 routing is already safe from the proof, and cleanup is already guaranteed by the
 first stale delivery attempt.
