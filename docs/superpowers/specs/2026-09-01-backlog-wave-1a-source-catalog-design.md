@@ -1,8 +1,9 @@
 # Backlog Wave 1A: Durable Source Truth and Safe Reads
 
-**Status:** Proposed after the user's delegated plan approval; Claude approved
-the 1A/1B split and required the cursor migration to move into its own later
-review unit. This exact text still needs Claude's approval before implementation.
+**Status:** Approved by Claude for implementation after the user's delegated
+plan approval. Claude approved the 1A/1B split and required the cursor migration
+to move into its own later review unit. Exact-commit review remains a separate
+release gate.
 
 **Scope:** Build a durable, truthful inventory of Claude and Codex transcript
 sources, make every catalog-backed transcript read descriptor-safe, and expose
@@ -81,6 +82,9 @@ and directory footprint is the current snapshot, not a steady-state bound.
 The catalog is structurally monotone through Wave 1A: it retains every proved
 candidate until cursor-aware v4 retirement, the accepted price of bounded
 normal-hook writes without silent narrowing.
+Starting or refreshing a generation publishes the full retained-candidate
+manifest and is therefore O(catalog size); only resumed batch turns have the
+size-independent write bound measured below.
 
 Every mutation holds `.antiphon/sources/.lock` and persists through an adjacent
 temporary file plus `os.replace`. A normal hook rewrites at most its current

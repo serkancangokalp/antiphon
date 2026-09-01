@@ -1350,7 +1350,7 @@ def _atomic_json(path, data):
             stream.write("\n")
         os.replace(temporary, path)
         return True
-    except OSError:
+    except (OSError, UnicodeError, ValueError):
         try:
             os.unlink(temporary)
         except OSError:
@@ -1396,13 +1396,22 @@ def _catalog_manifest_name(kind, generation, phase):
 
 def _filesystem_safe_relative(value):
     """Whether a JSON path string can reach path validation without raising."""
-    if not isinstance(value, str) or not value or "\0" in value:
+    if (not isinstance(value, str) or not value or "\0" in value
+            or any(0xD800 <= ord(char) <= 0xDFFF for char in value)):
         return False
     try:
         os.fsencode(value)
     except (UnicodeError, ValueError):
         return False
     return True
+
+
+def _valid_catalog_enumeration(kind, enumeration):
+    return (isinstance(enumeration, CatalogEnumeration)
+            and enumeration.kind == kind
+            and isinstance(enumeration.relative_paths, tuple)
+            and all(_filesystem_safe_relative(path)
+                    for path in enumeration.relative_paths))
 
 
 def _finite_number(value):
@@ -1672,6 +1681,8 @@ def _claude_catalog_prefix(cwd):
 
 
 def _start_catalog_generation(cwd, kind, enumeration):
+    if not _valid_catalog_enumeration(kind, enumeration):
+        return False
     loaded = _read_source_catalog(cwd)
     if loaded.status in ("invalid", "newer", "unreadable"):
         return False
@@ -1819,6 +1830,8 @@ def _merge_catalog_batch(cwd, reservation, observations):
 
 
 def _install_reconciliation(cwd, kind, enumeration):
+    if not _valid_catalog_enumeration(kind, enumeration):
+        return False
     loaded = _read_source_catalog(cwd)
     if loaded.status != "valid":
         return False
@@ -1843,9 +1856,12 @@ def _install_reconciliation(cwd, kind, enumeration):
         if existing != manifest:
             # The immutable publication landed, but the host snapshot changed
             # before state could name it. Leave that orphan untouched and
-            # start a finite generation from the new snapshot; retrying the
-            # deterministic old filename could never converge.
-            return _start_catalog_generation(cwd, kind, enumeration)
+            # start a finite generation from the new snapshot plus everything
+            # the committed base already retained; retrying the deterministic
+            # old filename could never converge.
+            replacement = enumeration._replace(relative_paths=tuple(sorted(
+                set(enumeration.relative_paths).union(base["paths"]))))
+            return _start_catalog_generation(cwd, kind, replacement)
     entry["delta_manifest"] = filename
     entry["delta_next"] = 0
     entry["root_stamp"] = enumeration.root_stamp
@@ -7165,6 +7181,7 @@ def sources(action=None):
     processed = refused = gone = 0
     failed = False
     for kind in ("claude", "codex"):
+        kind_refused = 0
         loaded = _read_source_catalog(cwd)
         entry = ((loaded.state or {}).get("kinds") or {}).get(kind)
         force = bool(entry and entry.get("phase") == "complete")
@@ -7172,7 +7189,7 @@ def sources(action=None):
             progress = _catalog_scan_step(cwd, kind, force=force)
             force = False
             processed += progress.processed
-            refused += progress.refusals
+            kind_refused = progress.refusals
             gone += progress.gone
             if progress.state == "degraded":
                 failed = True
@@ -7181,6 +7198,7 @@ def sources(action=None):
                 break
         else:
             failed = True
+        refused += kind_refused
     state = "degraded" if failed or refused else "complete"
     print(f"source catalog: {state}; {processed} candidate(s) inspected; "
           f"{refused} refused; {gone} gone")

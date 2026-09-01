@@ -5,6 +5,7 @@ import antiphon
 import contextlib
 import errno
 import fcntl
+import glob
 import hashlib
 import io
 import json
@@ -5032,6 +5033,35 @@ class SourceCatalogStateTest(unittest.TestCase):
             state["generation"], "base")
         self.assertIn(os.path.relpath(added, self.host), manifest["paths"])
 
+    def test_changed_reconciliation_retry_retains_a_deleted_base_candidate(self):
+        _sid, path = self._source(3)
+        self.assertEqual(
+            antiphon._catalog_scan_step(self.project, "claude").state,
+            "building")
+        relative = os.path.relpath(path, self.host)
+        before = antiphon._enumerate_catalog_candidates(
+            self.project, "claude")
+        with patch.object(antiphon, "_write_catalog_state",
+                          return_value=False):
+            with antiphon.catalog_lock(self.project) as held:
+                self.assertTrue(held)
+                self.assertFalse(antiphon._install_reconciliation(
+                    self.project, "claude", before))
+        os.unlink(path)
+        os.unlink(antiphon._catalog_record_path(
+            self.project, "claude", relative))
+        after = antiphon._enumerate_catalog_candidates(
+            self.project, "claude")
+        with antiphon.catalog_lock(self.project) as held:
+            self.assertTrue(held)
+            self.assertTrue(antiphon._install_reconciliation(
+                self.project, "claude", after))
+        state = self._state()["kinds"]["claude"]
+        manifest = antiphon._read_catalog_manifest(
+            self.project, state["base_manifest"], "claude",
+            state["generation"], "base")
+        self.assertIn(relative, manifest["paths"])
+
     def test_a_reserved_batch_repeats_after_interruption_instead_of_skipping(self):
         for number in range(3):
             self._source(number)
@@ -5252,7 +5282,7 @@ class SourceCatalogStateTest(unittest.TestCase):
             entry["base_manifest"])
         with open(path, encoding="utf-8") as f:
             original = json.load(f)
-        for unsafe in ("bad\0.jsonl", "bad\ud800.jsonl"):
+        for unsafe in ("bad\0.jsonl", "bad\ud800.jsonl", "bad\udcff.jsonl"):
             manifest = json.loads(json.dumps(original))
             manifest["paths"] = [unsafe]
             with open(path, "w", encoding="utf-8") as f:
@@ -5267,6 +5297,20 @@ class SourceCatalogStateTest(unittest.TestCase):
             opened = antiphon._open_safe_source(
                 self.host, candidate, self.project)
             self.assertIsInstance(opened, antiphon.SourceRefusal)
+
+    def test_surrogate_escape_enumeration_degrades_without_writing_state(self):
+        enumeration = antiphon.CatalogEnumeration(
+            "claude", ("bad\udcff.jsonl",), None)
+        self.assertFalse(antiphon._start_catalog_generation(
+            self.project, "claude", enumeration))
+        self.assertFalse(os.path.exists(
+            antiphon._catalog_state_path(self.project)))
+
+    def test_atomic_json_classifies_an_unencodable_value_as_write_failure(self):
+        path = os.path.join(self.project, ".antiphon", "state.json")
+        self.assertFalse(antiphon._atomic_json(path, {"bad": "\udcff"}))
+        self.assertFalse(os.path.exists(path))
+        self.assertEqual(glob.glob(path + ".*.tmp"), [])
 
     def test_record_observation_times_are_real_and_finite(self):
         _sid, path = self._source(2)
@@ -5543,6 +5587,28 @@ class CatalogDiscoveryTest(unittest.TestCase):
             os.path.relpath(path, self.claude_root))
         self.assertEqual(record["status"], "ready")
         self.assertIsNotNone(record["generation"])
+
+    def test_sources_scan_reports_success_after_a_retry_resolves(self):
+        sid = "bbbbbbbb-4444-4444-8444-bbbbbbbbbbbc"
+        path = os.path.join(self.claude_dir, sid + ".jsonl")
+        with open(path, "w", encoding="utf-8") as f:
+            f.write('{"type":"assistant"')
+        self.assertEqual(
+            antiphon._catalog_scan_step(self.project, "claude").state,
+            "degraded")
+
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(json.dumps({
+                "type": "assistant", "timestamp": "2026-09-01T00:00:00Z",
+                "message": {"content": [{"type": "text",
+                                            "text": "now complete"}]},
+            }) + "\n")
+        with patch.object(antiphon, "project_dir",
+                          return_value=self.project), \
+             contextlib.redirect_stdout(io.StringIO()) as out:
+            self.assertEqual(antiphon.sources("scan"), 0)
+        self.assertIn("source catalog: complete", out.getvalue())
+        self.assertIn("0 refused", out.getvalue())
 
     def test_two_distinct_codex_files_claiming_one_source_are_both_refused(self):
         sid = "eeeeeeee-4444-4444-8444-eeeeeeeeeeee"

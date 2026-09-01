@@ -56,9 +56,11 @@ the write-and-flush-before-advance transaction.
   Claude median/p95 0.171/0.175 ms and Codex 1.192/3.896 ms. The resumed-hook
   write harness then compared 8 versus 563 synthetic candidates: both inspected
   8 and made exactly 11 atomic writes, totalling 5,164 versus 5,155 bytes (the
-  largest single write was 1,284 bytes in both). Initial immutable manifest
-  publication is one-time; subsequent hook write count and volume are therefore
-  independent of catalog size. Hooks record their current source first, then
+  largest single write was 1,284 bytes in both). Resumed batch turns use a
+  fixed number of writes and bytes independent of catalog size. Starting or
+  refreshing a generation still publishes one full immutable manifest and is
+  O(retained candidates); monotone retention makes that transition grow until
+  cursor-aware v4 retirement. Hooks record their current source first, then
   inspect one bounded batch through finite base/reconcile/delta generations;
   `antiphon sources scan` completes or refreshes the same catalog without
   moving a page cursor. Status and doctor report aggregate complete/building/
