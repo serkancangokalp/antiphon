@@ -2025,8 +2025,14 @@ peers.write_session(${JSON.stringify(dir)}, "claude", "${STALE_A_ALIAS}",
                     ${JSON.stringify(STALE_A)}, "/t/a.jsonl", owner,
                     ${JSON.stringify(STALE_A_DIGEST)}, True)
 peers.write_identity_proof(${JSON.stringify(dir)}, owner,
-                           ${JSON.stringify(STALE_B)},
-                           peers.auto_identity(${JSON.stringify(STALE_B)})[1])
+                           ${JSON.stringify(STALE_A)},
+                           ${JSON.stringify(STALE_A_DIGEST)})
+# The production rotation, not a hand-built state: it withdraws this peer's
+# half and leaves the tombstone behind. Writing the proof directly would have
+# skipped the withdrawal and measured a state no hook can produce.
+peers.rotate_identity_proof(${JSON.stringify(dir)}, owner,
+                            ${JSON.stringify(STALE_B)},
+                            peers.auto_identity(${JSON.stringify(STALE_B)})[1])
 `);
     const reply = await sendToSocketAt(socket, { content: "hi" });
     assert.equal(reply?.ok, false, "a proved-stale identity refuses");
@@ -2043,6 +2049,16 @@ peers.write_identity_proof(${JSON.stringify(dir)}, owner,
       "the digest is not public");
     assert.doesNotMatch(String(reply?.error), new RegExp(STALE_A),
       "nor is the host session id");
+    // The spec's guarantee, end to end: the delivery attempt is its own
+    // wakeup, so cleanup does not depend on a control that may never arrive.
+    // The response is flushed first — a listener that withdrew before
+    // answering would leave the sender with a closed socket and no reason.
+    const endpoint = join(dir, ".antiphon", "peers",
+      `claude-${STALE_A_ALIAS}`, "endpoint.json");
+    assert.ok(await waitFor(() => !existsSync(endpoint)),
+      "a proved-stale listener withdraws its own endpoint");
+    assert.ok(await waitFor(() => !existsSync(socket)),
+      "and unlinks the socket nothing should reach any more");
   } finally {
     session.child.kill("SIGKILL");
     await waitForExit(session.child, 2_000);
@@ -2111,6 +2127,37 @@ async function theRetireControlIsRecognisedAndNonDestructive() {
     });
     assert.equal(other?.ok, false, "an alias this listener does not hold is refused");
     assert.ok(existsSync(endpoint), "and nothing was withdrawn");
+
+    // Now the state a real rotation leaves. The control is an optimisation —
+    // the first stale delivery would do this too — but it is the one that
+    // stops an outgrown socket lingering until its process exits.
+    runPeers(dir, `
+import json, os
+root = os.path.join(${JSON.stringify(dir)}, ".antiphon", "peers",
+                    "claude-${STALE_A_ALIAS}")
+owner = json.load(open(os.path.join(root, "endpoint.json")))["owner"]
+peers.write_session(${JSON.stringify(dir)}, "claude", "${STALE_A_ALIAS}",
+                    ${JSON.stringify(STALE_A)}, "/t/a.jsonl", owner,
+                    ${JSON.stringify(STALE_A_DIGEST)}, True)
+peers.write_identity_proof(${JSON.stringify(dir)}, owner,
+                           ${JSON.stringify(STALE_A)},
+                           ${JSON.stringify(STALE_A_DIGEST)})
+peers.rotate_identity_proof(${JSON.stringify(dir)}, owner,
+                            ${JSON.stringify(STALE_B)},
+                            peers.auto_identity(${JSON.stringify(STALE_B)})[1])
+`);
+    const stale = await sendToSocketAt(socket, {
+      control: "antiphon.channel",
+      version: 1,
+      action: "identity-retire",
+      alias: STALE_A_ALIAS,
+      nonce: "n0nce_test-3",
+    });
+    assert.equal(stale?.ok, true, `answered: ${JSON.stringify(stale)}`);
+    assert.equal(stale?.verdict, "PROVED_STALE",
+      "the listener reached the verdict by reading the proof itself");
+    assert.ok(await waitFor(() => !existsSync(endpoint)),
+      "and only then withdrew, after its answer was flushed");
   } finally {
     session.child.kill("SIGKILL");
     await waitForExit(session.child, 2_000);

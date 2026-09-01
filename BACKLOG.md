@@ -387,6 +387,19 @@ readiness, never an address, never a session id.
   The degradation is bounded and named here rather than detected, because
   detecting it would mean a surface that reports a housekeeping fault the
   operator cannot act on.
+- **A withdrawn session half leaves a tombstone, and that is why cleanup
+  happens at all.** The rotation withdraws every same-owner stale automatic
+  half so nothing can route through it. Deleting the half outright made the
+  outgrown endpoint read `UNREADY` — the same answer a listener gives before
+  its first hook — and those two call for opposite actions: one must wait, the
+  other must retire. So the guaranteed cleanup never happened and an outgrown
+  socket lived until its process exited. Withdrawal now writes a small
+  `retired.json` beside the halves: not joinable by anything, carrying only the
+  owner key and identity digest it belongs to, and validated in full before it
+  may authorise the one destructive action in this contract. Writing a half
+  again clears it, because a host can resume a session id; a tombstone whose
+  endpoint is gone has no reader left and is collected on the same locked pass
+  that writes them.
 - **A rotation costs a reconnect, and that price is accepted.** There is no
   dynamic rename of a live listener: a process serving under one identity must
   not silently become another, because a sender that addressed the old name

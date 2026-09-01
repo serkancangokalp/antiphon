@@ -545,6 +545,14 @@ def automatic_verdict(cwd, kind, peer, proof):
         return "STRUCTURAL_INVALID"
     bound = peers._session_address(cwd, peer)
     if bound is None:
+        # Withdrawn and never joined are two different facts that both leave no
+        # half behind, and they call for opposite actions: one listener must
+        # wait for its first hook, the other must retire. Without the tombstone
+        # the rotation's own withdrawal made every outgrown peer read UNREADY,
+        # so the self-retirement this contract guarantees never happened.
+        if peers.retired_half(cwd, "claude", peer.get("name"),
+                              peer.get("owner"), digest):
+            return "PROVED_STALE"
         return "UNREADY"
     if (record.get("session_id") == bound
             and record.get("identity_digest") == digest):

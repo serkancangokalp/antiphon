@@ -2339,3 +2339,128 @@ class ProofDecodeTest(unittest.TestCase):
         Unproved is the only safe answer, and it must not escape the sweep."""
         self.assertFalse(peers._proved_dead(
             "2147483653:v1:Mon Sep  1 00:00:00 2026"))
+
+
+class RetiredHalfTombstoneTest(unittest.TestCase):
+    """Withdrawal must supersede a half without erasing that it existed.
+
+    The contract asks for two things that its first implementation could not
+    both keep. Rotation withdraws every same-owner stale automatic session
+    half; the listener self-retires only on `PROVED_STALE`; and cleanup is
+    "already guaranteed by the first stale delivery attempt". Deleting the half
+    outright makes the verdict `UNREADY` — indistinguishable from a listener
+    whose first hook has not run yet — so the guaranteed cleanup never happens
+    and the outgrown socket lives until its process exits.
+
+    A tombstone keeps both. The half is gone, so nothing can join it; the
+    evidence that it was once joined stays, so "never joined" and "joined, then
+    outgrown" remain two different facts.
+    """
+
+    A = "8261c119-2c20-4bf4-87ab-f152ac87dbda"
+    B = "0199a1b2-2222-7000-8000-00000000000b"
+
+    def _owner(self):
+        owner = peers.owner_key()
+        self.assertIsNotNone(owner)
+        return owner
+
+    def _joined(self, project, owner, session_id):
+        alias, digest = peers.auto_identity(session_id)
+        peers.register(project, "claude", alias,
+                       os.path.join(project, alias + ".sock"),
+                       pid=os.getpid(), owner_key=owner,
+                       identity_digest=digest, mode="initial")
+        peers.write_session(project, "claude", alias, session_id,
+                            f"/t/{alias}.jsonl", owner, digest, True)
+        return alias, digest
+
+    def _verdict(self, project, alias):
+        sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "lib"))
+        import antiphon
+        peer = next((p for p in peers.read_peers(project, "claude")
+                     if p.get("name") == alias), None)
+        if peer is None:
+            return "NO-RECORD"
+        return antiphon.automatic_verdict(
+            project, "claude", peer,
+            peers.read_identity_proof(project, peer.get("owner")))
+
+    def test_retired_half_a_rotation_leaves_the_outgrown_peer_proved_stale(self):
+        with tempfile.TemporaryDirectory() as project:
+            owner = self._owner()
+            alias_a, _digest_a = self._joined(project, owner, self.A)
+            peers.write_identity_proof(project, owner, self.A,
+                                       peers.auto_identity(self.A)[1])
+            self.assertEqual(self._verdict(project, alias_a), "READY")
+            peers.rotate_identity_proof(project, owner, self.B,
+                                        peers.auto_identity(self.B)[1])
+            self.assertFalse(
+                os.path.exists(peers._session_file(project, "claude", alias_a)),
+                "the half is still withdrawn: nothing may join it")
+            self.assertEqual(
+                self._verdict(project, alias_a), "PROVED_STALE",
+                "and the listener can now tell that it was outgrown rather "
+                "than never joined")
+
+    def test_retired_half_a_peer_that_never_joined_stays_unready(self):
+        """The bootstrap case the verdict exists to keep apart. A fresh
+        endpoint with no half and no tombstone must not read stale, or the
+        listener kills itself before its first hook ever runs."""
+        with tempfile.TemporaryDirectory() as project:
+            owner = self._owner()
+            alias, digest = peers.auto_identity(self.B)
+            peers.register(project, "claude", alias,
+                           os.path.join(project, alias + ".sock"),
+                           pid=os.getpid(), owner_key=owner,
+                           identity_digest=digest, mode="initial")
+            peers.write_identity_proof(project, owner, self.B, digest)
+            self.assertEqual(self._verdict(project, alias), "UNREADY")
+
+    def test_retired_half_rejoining_clears_the_tombstone(self):
+        """A host can resume a session id. The evidence is about the current
+        state, not a permanent mark."""
+        with tempfile.TemporaryDirectory() as project:
+            owner = self._owner()
+            alias_a, digest_a = self._joined(project, owner, self.A)
+            peers.write_identity_proof(project, owner, self.A, digest_a)
+            peers.rotate_identity_proof(project, owner, self.B,
+                                        peers.auto_identity(self.B)[1])
+            self.assertEqual(self._verdict(project, alias_a), "PROVED_STALE")
+            peers.rotate_identity_proof(project, owner, self.A, digest_a)
+            peers.write_session(project, "claude", alias_a, self.A,
+                                f"/t/{alias_a}.jsonl", owner, digest_a, True)
+            self.assertEqual(self._verdict(project, alias_a), "READY",
+                             "a rejoined peer is not haunted by its tombstone")
+
+    def test_retired_half_a_tombstone_without_an_endpoint_is_collected(self):
+        """Once the listener has withdrawn its endpoint the tombstone has no
+        reader left. Collected on the same locked pass that writes them, so it
+        costs no new traversal and cannot grow without bound."""
+        with tempfile.TemporaryDirectory() as project:
+            owner = self._owner()
+            alias_a, digest_a = self._joined(project, owner, self.A)
+            peers.write_identity_proof(project, owner, self.A, digest_a)
+            peers.rotate_identity_proof(project, owner, self.B,
+                                        peers.auto_identity(self.B)[1])
+            tombstone = peers.retired_half_path(project, "claude", alias_a)
+            self.assertTrue(os.path.exists(tombstone))
+            peers.unregister(project, "claude", alias_a, pid=os.getpid())
+            peers.rotate_identity_proof(project, owner, self.B,
+                                        peers.auto_identity(self.B)[1])
+            self.assertFalse(os.path.exists(tombstone),
+                             "an endpointless tombstone has no reader")
+
+    def test_retired_half_another_owner_s_peer_is_never_marked(self):
+        """Withdrawal is scoped to one owner, and so is its evidence."""
+        with tempfile.TemporaryDirectory() as project:
+            owner = self._owner()
+            other = f"{os.getppid()}:v1:Mon Sep  1 00:00:00 2026"
+            alias_a, digest_a = self._joined(project, other, self.A)
+            peers.write_identity_proof(project, owner, self.A, digest_a)
+            peers.rotate_identity_proof(project, owner, self.B,
+                                        peers.auto_identity(self.B)[1])
+            self.assertFalse(
+                os.path.exists(
+                    peers.retired_half_path(project, "claude", alias_a)),
+                "another owner's peer is not this rotation's business")

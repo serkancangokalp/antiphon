@@ -253,6 +253,46 @@ def _peer_file(cwd, kind, name):
     return os.path.join(peer_dir(cwd, kind, name), "endpoint.json")
 
 
+RETIRED_HALF_VERSION = 1
+
+
+def retired_half_path(cwd, kind, name):
+    """Evidence that this peer's session half was withdrawn, not never written.
+
+    Beside the two halves, and never joinable by anything. Withdrawal deletes
+    the half so nothing can route through it; without this record the deletion
+    is indistinguishable from a peer whose first hook has not run, and the two
+    call for opposite actions — one listener must wait, the other must retire.
+    """
+    return os.path.join(peer_dir(cwd, kind, name), "retired.json")
+
+
+def _valid_retired_half(record, owner, identity_digest):
+    """Whether a tombstone belongs to this endpoint, exactly.
+
+    Total, like every other record read here. A tombstone from another owner or
+    another identity says nothing about this one, and a record that cannot be
+    trusted must never authorise the one destructive action in this contract.
+    """
+    if not isinstance(record, dict):
+        return False
+    version = record.get("version")
+    return (version == RETIRED_HALF_VERSION and not isinstance(version, bool)
+            and record.get("kind") == "claude"
+            and record.get("owner") == owner
+            and valid_owner_key(owner)
+            and record.get("identity_digest") == identity_digest
+            and valid_identity_digest(identity_digest))
+
+
+def retired_half(cwd, kind, name, owner, identity_digest):
+    """True when this exact endpoint's half was withdrawn by a rotation."""
+    if not (valid_kind(kind) and valid_key(kind, name)):
+        return False
+    record = _read_record(retired_half_path(cwd, kind, name))
+    return bool(record) and _valid_retired_half(record, owner, identity_digest)
+
+
 def _session_file(cwd, kind, name):
     """The hook's record, beside the server's.
 
@@ -627,8 +667,48 @@ def _withdraw_stale_automatic_sessions_locked(cwd, owner_key, current_digest):
             continue
         with contextlib.suppress(OSError):
             os.unlink(path)
+            _write_retired_half_locked(cwd, name, owner_key, digest)
             removed.append(name)
+    _collect_retired_halves_locked(cwd, entries)
     return removed
+
+
+def _write_retired_half_locked(cwd, name, owner_key, identity_digest):
+    """Record that this peer was joined and is no longer. Lock held."""
+    path = retired_half_path(cwd, "claude", name)
+    record = {"version": RETIRED_HALF_VERSION, "kind": "claude",
+              "owner": owner_key, "identity_digest": identity_digest}
+    tmp = f"{path}.{os.getpid()}.tmp"
+    try:
+        with open(tmp, "w", encoding="utf-8") as stream:
+            json.dump(record, stream, ensure_ascii=False)
+        os.replace(tmp, path)
+    except OSError:
+        with contextlib.suppress(OSError):
+            os.unlink(tmp)
+
+
+def _collect_retired_halves_locked(cwd, entries):
+    """Drop tombstones whose endpoint is gone. Lock held; best effort.
+
+    Once the listener has withdrawn its own endpoint the tombstone has no
+    reader left — nothing enumerates a peer without one. Collected on the pass
+    that writes them, so it costs no extra traversal and cannot grow without
+    bound. A live endpoint's tombstone is never touched: that is exactly the
+    record the listener has not acted on yet.
+    """
+    prefix = "claude-"
+    for entry in entries:
+        if not entry.startswith(prefix):
+            continue
+        name = entry[len(prefix):]
+        path = retired_half_path(cwd, "claude", name)
+        if not os.path.exists(path):
+            continue
+        if os.path.exists(_peer_file(cwd, "claude", name)):
+            continue
+        with contextlib.suppress(OSError):
+            os.unlink(path)
 
 
 def rotate_identity_proof(cwd, owner_key, session_id, identity_digest):
@@ -1389,6 +1469,12 @@ def write_session(cwd, kind, name, session_id, transcript, owner,
         with open(tmp, "w", encoding="utf-8") as f:
             json.dump(record, f, ensure_ascii=False)
         os.replace(tmp, path)
+        # A host can resume a session id, and the tombstone is about the
+        # current state rather than a permanent mark. Writing a half is the
+        # event that ends "withdrawn"; leaving it would make a rejoined peer
+        # read stale forever.
+        with contextlib.suppress(OSError):
+            os.unlink(retired_half_path(cwd, kind, name))
     return True, ""
 
 

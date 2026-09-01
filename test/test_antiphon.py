@@ -17100,6 +17100,17 @@ class ReadinessParityTest(unittest.TestCase):
         with open(path, "w", encoding="utf-8") as stream:
             json.dump(record, stream)
 
+    def _withdrawn(self, project, alias, owner=None, digest=None):
+        """The state a rotation actually leaves: no half, one tombstone."""
+        os.unlink(os.path.join(
+            antiphon.peers.peer_dir(project, "claude", alias), "session.json"))
+        _name, own_digest = antiphon.peers.auto_identity(self.A)
+        self._write(
+            antiphon.peers.retired_half_path(project, "claude", alias),
+            json.dumps({"version": 1, "kind": "claude",
+                        "owner": owner or self.OWNER,
+                        "identity_digest": digest or own_digest}))
+
     def _patch_endpoint(self, project, alias, drop=None, **over):
         self._patch(os.path.join(
             antiphon.peers.peer_dir(project, "claude", alias),
@@ -17183,6 +17194,18 @@ class ReadinessParityTest(unittest.TestCase):
             "endpoint owner is another owner's": lambda p, a: (
                 self._proof(p, self.A),
                 self._patch_endpoint(p, a, owner=self.OTHER_OWNER)),
+            "half withdrawn by a rotation": lambda p, a: (
+                self._proof(p, self.A),
+                self._withdrawn(p, a)),
+            "tombstone from another owner": lambda p, a: (
+                self._proof(p, self.A),
+                self._withdrawn(p, a, owner=self.OTHER_OWNER)),
+            "tombstone torn": lambda p, a: (
+                self._proof(p, self.A),
+                os.unlink(os.path.join(
+                    antiphon.peers.peer_dir(p, "claude", a), "session.json")),
+                self._write(antiphon.peers.retired_half_path(
+                    p, "claude", a), "{")),
             "session half from another owner": lambda p, a: (
                 self._proof(p, self.A),
                 self._patch_session(p, a, owner=self.OTHER_OWNER)),
