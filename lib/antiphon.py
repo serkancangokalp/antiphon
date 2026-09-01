@@ -3755,9 +3755,9 @@ def _render_page(side, records, has_more, replay_reason, join=None,
         if join.unnamed and sources - labelled:
             # Only a Claude endpoint can hold the reserved key —
             # `valid_key("codex", UNNAMED)` is False — so this can only ever
-            # appear on a page Codex reads. An unnamed Codex session leaves no
-            # record at all, so its concurrency is undetectable rather than
-            # unmentioned, and the page says nothing instead of guessing.
+            # appear on a page Codex reads. An unnamed Codex observation is not
+            # an endpoint/session claim and therefore cannot label transcript
+            # blocks; the page says nothing instead of joining on timing.
             text = _append_page_section(text, (
                 "A {name} session is running now with no name; name each "
                 "terminal (ANTIPHON_NAME) to tell them apart.".format(name=name)))
@@ -4286,6 +4286,34 @@ def codex_thread_alive(session):
         os.close(fd)
 
 
+CodexObservationSnapshot = collections.namedtuple(
+    "CodexObservationSnapshot", "live unknown")
+
+
+def _codex_observation_snapshot(cwd, registered):
+    """Unnamed host ids, classified only by positive writer-lock evidence.
+
+    Branch U deliberately cannot prove when the first hook runs. A held exact
+    lock proves an observed id is live; every other result is unknown, never a
+    corpse or proof of absence. A live named endpoint/session join suppresses
+    its older unnamed sighting without deleting another writer's file.
+    """
+    named = {
+        peer.get("address") for peer in registered
+        if peer.get("kind") == "codex"
+        and peers.valid_name(peer.get("name"))
+        and peers.valid_session_id(peer.get("address"))
+    }
+    live, unknown = [], []
+    for record in peers.read_observations(cwd):
+        session_id = record.get("session_id")
+        if session_id in named:
+            continue
+        target = live if codex_thread_alive(session_id) is True else unknown
+        target.append(session_id)
+    return CodexObservationSnapshot(tuple(live), tuple(unknown))
+
+
 def codex_session_id(cwd):
     """The Codex session a bare message goes to.
 
@@ -4739,6 +4767,12 @@ def _resolve_target(cwd, kind, alias=None):
 
     if alias is not None:
         if not peers.valid_name(alias):
+            if peers.valid_session_id(alias):
+                return ResolvedTarget(
+                    None, ("not delivered: a host session id is diagnostic "
+                           "identity, not a usable peer name; restart the "
+                           "intended terminal with ANTIPHON_NAME set"),
+                    "refusal")
             return ResolvedTarget(
                 None, (f"not delivered: {alias!r} is not a usable peer name"
                        + (f"; live {kind} peers: {names}" if names else "")),
@@ -4756,6 +4790,35 @@ def _resolve_target(cwd, kind, alias=None):
                        "— it has not run a turn yet"), "refusal")
         return ResolvedTarget(match[0]["address"], "", "registered")
 
+    # Preserve the established addressing-refusal class and byte-for-byte
+    # wording when the registry alone already proves ambiguity. The new
+    # observation road exists for candidates the peer registry cannot see; it
+    # must not reclassify an old refusal and accidentally add passive-page
+    # fallback guidance downstream.
+    if len(live) > 1:
+        return ResolvedTarget(
+            None, (f"not delivered: {len(live)} {kind} peers are live "
+                   f"({_peer_states(live)}); address one by name"), "refusal")
+
+    observations = (_codex_observation_snapshot(cwd, live)
+                    if kind == "codex"
+                    else CodexObservationSnapshot((), ()))
+    candidate_count = len(live) + len(observations.live)
+    if kind == "codex" and candidate_count > 1:
+        registered = len(live)
+        unnamed = len(observations.live)
+        states = f"; registered peers: {_peer_states(live)}" if live else ""
+        return ResolvedTarget(
+            None,
+            _ClassifiedRefusal(
+                f"not delivered: at least {candidate_count} Codex sessions are "
+                f"live ({registered} registered, {unnamed} unnamed and not "
+                f"addressable{states}); additional sessions before their first "
+                "hook may be invisible — restart each intended terminal with "
+                "a distinct ANTIPHON_NAME, then address one by name",
+                "no-peer"),
+            "refusal")
+
     if not live:
         # Nothing registered at all: the unnamed single pair, exactly as it was
         # before any of this. Not provably unique either, but it is the shipped
@@ -4763,21 +4826,17 @@ def _resolve_target(cwd, kind, alias=None):
         # more than the guess it makes.
         address, detail = _legacy_target(cwd, kind)
         return ResolvedTarget(address, detail, "legacy")
-    if len(live) > 1:
-        return ResolvedTarget(
-            None, (f"not delivered: {len(live)} {kind} peers are live "
-                   f"({_peer_states(live)}); address one by name"), "refusal")
     if kind == "codex":
-        # One record is not one session. A Codex session registers only when it
-        # was given a name, so any number of unnamed ones can be running beside
-        # this one and none of them appears here — delivering to the visible one
-        # would be a guess wearing a certainty. The asymmetry stops here: a
-        # Claude channel server always registers, named or not, so one live
-        # record on that side really is one live peer.
+        # One named record is not proof of one session. An unnamed session has
+        # no routable peer record, and one before its first hook may have no
+        # observation either — delivering to the visible peer would be a guess
+        # wearing a certainty. The asymmetry stops here: a Claude channel server
+        # always registers, named or not, so one live record on that side really
+        # is one live peer.
         return ResolvedTarget(
             None, (f"not delivered: {_peer_states(live)} is the only "
                    "registered Codex peer, but unnamed Codex sessions are "
-                   "not discoverable and cannot be ruled out — address a "
+                   "not all observable and cannot be ruled out — address a "
                    "peer by name"), "refusal")
     # Reached only for Claude, whose live records always carry a usable address:
     # the addressless shape is Codex-only and `read_peers` skips every other
@@ -5420,9 +5479,9 @@ def drop_attachment(cwd, path):
 def attachment_report(cwd, now=None):
     """The `status` line for the parked store. A reader, never a sweeper.
 
-    Never a filename: `status` prints no path, address or session id anywhere
-    else either, and a parked file's name is the one thing in this feature a
-    person cannot be shown by accident. The oldest age renders in whole days
+    Never a filename: `status` prints no path or address. A host session id is
+    permitted only on its labelled unnamed-observation row; this attachment
+    line is not that carve-out. The oldest age renders in whole days
     because two consecutive `status` runs are pinned equal, and a duration
     derived from `now` at any finer grain would make that pin flake.
     """
@@ -5955,16 +6014,27 @@ def register_codex_peer(cwd):
 
 
 def record_codex_session(cwd, session_id, transcript):
-    """Writes the hook's half: which session is behind this alias.
+    """Record the hook's named-session join or unnamed-session observation.
 
-    Returns whether it wrote. Silent when this session has no usable alias or
-    cannot identify itself — the server already said so once at start-up, which
-    is the right number of times to say it, and repeating it on every turn would
-    be noise. A refusal is different: it means somebody else holds the alias
-    right now, and that stays true and stays worth saying.
+    A usable alias writes the hook's half of the peer record: which session is
+    behind that alias. Without one, a canonical host id writes only diagnostic
+    observation evidence — never an alias, address or transcript. Returns
+    whether either record was written. An unusable id is silent; an observation
+    write failure is reported without its id or path, while a named claim
+    refusal remains visible because somebody else holds the alias right now.
     """
     alias = peers.explicit_name()
-    if not (peers.valid_name(alias) and session_id):
+    if not peers.valid_name(alias):
+        if not peers.valid_session_id(session_id):
+            return False
+        try:
+            return peers.write_observation(cwd, session_id)
+        except Exception as error:
+            print("antiphon: unnamed Codex observation could not be recorded "
+                  f"({type(error).__name__}: {error}); live-session counts "
+                  "remain a lower bound.", file=sys.stderr)
+            return False
+    if not session_id:
         return False
     try:
         owner = peers.owner_key()
@@ -6347,6 +6417,15 @@ LONG_MARKER_RULE = (
     "parked as an attachment, while an oversized Stop-marker block is refused "
     "and not parked.")
 
+UNNAMED_CODEX_OBSERVATION_RULE = (
+    "An unnamed Codex hook may leave an unnamed Codex observation for local "
+    "diagnostics. Every census says `at least N` because additional sessions "
+    "before their first hook may be invisible. Its full host session id is "
+    "diagnostic identity, not a recipient alias, and is not addressable. Two or "
+    "more positively live candidates make a bare send refused; restart each "
+    "intended terminal with a distinct `ANTIPHON_NAME` and address it by that "
+    "name.")
+
 AGENTS_RULE = ("\n## The Antiphon bridge\n\n"
                "You are working alongside Claude Code on this project. What happens on the "
                "other side is injected into your context automatically at the start of each "
@@ -6410,7 +6489,8 @@ AGENTS_RULE = ("\n## The Antiphon bridge\n\n"
                "unaddressed send is refused rather than delivered to a guess. For the same "
                "reason every terminal in a project with more than one session per side has to "
                "be started with `ANTIPHON_NAME` set — a session without a name is live but "
-               "unaddressable, and nothing can be sent back to it.\n\n"
+               "unaddressable, and nothing can be sent back to it. "
+               + UNNAMED_CODEX_OBSERVATION_RULE + "\n\n"
                "A message too large for the channel arrives as an envelope instead of the "
                "words: a line starting with `[Antiphon attachment]` naming an absolute path "
                "under `.antiphon/messages/`, the content's size and its SHA-256. Read that "
@@ -6454,7 +6534,7 @@ CLAUDE_RULE = ("\n## The Antiphon bridge\n\n"
                "as `to` whenever it is a name rather than the literal `<unnamed>`: "
                "a bare reply is refused as soon "
                "as any named Codex peer is live, because unnamed sessions leave "
-               "no registry record and cannot be ruled out. A `sender_alias` of "
+               "no routable peer record and cannot be ruled out. A `sender_alias` of "
                "`<unnamed>` means that peer has no name: it cannot be answered by "
                "name, and a bare reply reaches it only where nothing is registered "
                "— passing `<unnamed>` as `to` is the same as leaving it out. Your "
@@ -6476,8 +6556,9 @@ CLAUDE_RULE = ("\n## The Antiphon bridge\n\n"
                "and an unaddressed line is refused rather than delivered to a guess. For the "
                "same reason every terminal in a project with more than one session per side "
                "has to be started with `ANTIPHON_NAME` set — Codex terminals above all, "
-               "because an unnamed Codex session leaves no record at all, and one that exists "
-               "unseen is why a bare message to Codex is refused. "
+               "because an unnamed Codex session leaves no routable peer record, and one that "
+               "exists unseen is why a bare message to Codex is refused. "
+               + UNNAMED_CODEX_OBSERVATION_RULE + " "
                + MULTILINE_MARKER_RULE + " "
                + LONG_MARKER_RULE.format(tool="reply_to_codex") + "\n\n"
                "A message too large for the transport arrives as an envelope instead of the "
@@ -6972,7 +7053,7 @@ def setup():
     print("  ANTIPHON_NAME=ui claude --dangerously-load-development-channels server:antiphon")
     print("  ANTIPHON_NAME=build codex")
     print("  An unnamed session still runs, but it cannot be addressed by name. Name the")
-    print("  Codex terminals above all: an unnamed Codex session leaves no record at all,")
+    print("  Codex terminals above all: an unnamed observation is diagnostic only,")
     print("  so once any Codex peer is named, an unaddressed message to Codex is refused")
     print("  rather than sent to a guess.")
     if failures:
@@ -7014,13 +7095,28 @@ def _live_by_kind(cwd):
             for kind, found in grouped.items()}
 
 
-def _peer_report(live):
+def _codex_census_line(registered, observations):
+    """One honest lower-bound census; branch U can never print an exact zero."""
+    total = len(registered) + len(observations.live)
+    line = (f"Codex session census: at least {total} live observed; additional "
+            "sessions before their first hook may be invisible")
+    unknown = len(observations.unknown)
+    if unknown:
+        noun = "observation" if unknown == 1 else "observations"
+        verb = "has" if unknown == 1 else "have"
+        line += f"; {unknown} stored {noun} {verb} unknown liveness"
+    return line
+
+
+def _peer_report(live, observations=None):
     """The `Peers:` block and the addressing hints under it, as lines.
 
-    Empty when nothing is registered, which is the unnamed single pair: there
-    is nobody to choose between, so there is nothing to say.
+    Empty when neither a registered peer nor a positively live unnamed
+    observation exists. The lower-bound census is printed separately even in
+    that case; zero observations never proves zero sessions.
     """
-    if not (live["claude"] or live["codex"]):
+    observations = observations or CodexObservationSnapshot((), ())
+    if not (live["claude"] or live["codex"] or observations.live):
         return []
 
     lines = ["", "Peers:"]
@@ -7033,6 +7129,9 @@ def _peer_report(live):
             state = ("ready" if peer.get("address") is not None
                      else "waiting for first turn")
             lines.append(f"  {kind.title()} {peer.get('name')} — {state}")
+    for session_id in observations.live:
+        lines.append(f"  Codex unnamed observation {session_id} — live, not "
+                     "addressable")
 
     def addressable(kind):
         return [p.get("name") for p in live[kind]
@@ -7049,12 +7148,22 @@ def _peer_report(live):
             lines.append("  → one Claude peer has no name and cannot be "
                          "addressed; restart it with ANTIPHON_NAME set to "
                          "reach it while others are live")
-    if live["codex"]:
-        # Even one. A Codex session registers only when it was given a name, so
-        # a single record cannot rule out the unnamed ones that leave none.
+    if live["codex"] or len(observations.live) > 1:
         named = ", ".join(f"@codex:{name}" for name in addressable("codex"))
-        lines.append(f"  → a bare @codex line is refused, because unnamed Codex "
-                     f"sessions leave no record; address one: {named}")
+        if named:
+            lines.append(f"  → a bare @codex line is refused; address a named "
+                         f"peer: {named}")
+        else:
+            lines.append("  → a bare @codex line is refused; no observed "
+                         "session has a name")
+    if observations.live:
+        if len(observations.live) == 1:
+            lines.append("  → the observed unnamed Codex session cannot be "
+                         "addressed; restart it with ANTIPHON_NAME set")
+        else:
+            lines.append("  → observed unnamed Codex sessions cannot be "
+                         "addressed; restart each intended terminal with a "
+                         "distinct ANTIPHON_NAME")
     return lines
 
 
@@ -7180,11 +7289,13 @@ def status():
     # socket-file-shaped pathname. Registered peers get the same startup
     # patience doctor gives them; the ordinary idle-project path is tried once.
     live = _live_by_kind(cwd)
+    observations = _codex_observation_snapshot(cwd, live["codex"])
     channel = ("live" if _channel_answering(cwd, live["claude"])
                else "down")
     print(f"Claude channel:     {channel}")
     print(attachment_report(cwd))
-    for line in _peer_report(live):
+    print(_codex_census_line(live["codex"], observations))
+    for line in _peer_report(live, observations):
         print(line)
     snapshots = {}
     by_path = {}
@@ -7915,6 +8026,7 @@ def _doctor_peers(report, cwd):
             report.note(f"peer {who}: stale record; a live session cleans this "
                         "up on its next pass")
             continue
+        live.append(record)
         owner = peers._owner_of(record)
         session = peers.read_session(cwd, record.get("kind"), record.get("name"))
         session_owner = peers._owner_of(session) if session else None
@@ -7935,9 +8047,20 @@ def _doctor_peers(report, cwd):
             if not mixed_owner_generation:
                 report.note(f"peer {who}: live, waiting for its first turn")
         else:
-            live.append(record)
             report.ok(f"peer {who}: live and addressed")
     return live
+
+
+def _doctor_codex_observations(report, cwd, registered):
+    """Report one read-only lower-bound snapshot and its live unnamed ids."""
+    codex = [record for record in registered
+             if record.get("kind") == "codex"]
+    observations = _codex_observation_snapshot(cwd, codex)
+    report.note(_codex_census_line(codex, observations))
+    for session_id in observations.live:
+        report.note(f"Codex unnamed observation {session_id} — live, not "
+                    "addressable — restart it with ANTIPHON_NAME set")
+    return observations
 
 
 def _doctor_channel(report, cwd, live):
@@ -8069,7 +8192,9 @@ def _doctor_readonly():
     _doctor_interpreters(report)
     _doctor_config(report, cwd, states)
     _doctor_alias(report)
-    _doctor_channel(report, cwd, _doctor_peers(report, cwd))
+    live = _doctor_peers(report, cwd)
+    _doctor_codex_observations(report, cwd, live)
+    _doctor_channel(report, cwd, live)
     _doctor_codex(report, cwd)
     _doctor_sources(report, cwd)
     _doctor_codex_tool_shapes(report, cwd)

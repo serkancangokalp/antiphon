@@ -3931,6 +3931,59 @@ class LiveCodexTargetTest(unittest.TestCase):
                           "the reader learns why a session it can see is not addressable")
 
 
+class CodexObservationLivenessTest(unittest.TestCase):
+    """An observation becomes a candidate only through positive lock proof."""
+
+    UUID = "1d5a03e0-0548-4339-87c3-45c5dbf7e9d7"
+    OTHER = "2e6b14f1-1659-544a-98d4-56d6eca8fa48"
+
+    @staticmethod
+    def _observe(project, *ids):
+        for session_id in ids:
+            antiphon.peers.write_observation(project, session_id)
+
+    def test_only_a_held_exact_writer_lock_is_positive_liveness(self):
+        with tempfile.TemporaryDirectory() as project:
+            self._observe(project, self.UUID, self.OTHER)
+            states = {self.UUID: True, self.OTHER: False}
+            with patch.object(antiphon, "codex_thread_alive",
+                              side_effect=lambda sid: states[sid]) as checked:
+                snapshot = antiphon._codex_observation_snapshot(project, [])
+        self.assertEqual(snapshot.live, (self.UUID,))
+        self.assertEqual(snapshot.unknown, (self.OTHER,))
+        self.assertEqual(checked.call_count, 2)
+
+    def test_missing_lock_feature_is_unknown_not_dead(self):
+        with tempfile.TemporaryDirectory() as project:
+            self._observe(project, self.UUID)
+            with patch.object(antiphon, "codex_thread_alive", return_value=None):
+                snapshot = antiphon._codex_observation_snapshot(project, [])
+        self.assertEqual(snapshot.live, ())
+        self.assertEqual(snapshot.unknown, (self.UUID,))
+
+    def test_a_named_join_suppresses_the_same_host_id_without_probing_it(self):
+        peer = {"kind": "codex", "name": "build", "address": self.UUID}
+        with tempfile.TemporaryDirectory() as project:
+            self._observe(project, self.UUID, self.OTHER)
+            with patch.object(antiphon, "codex_thread_alive",
+                              return_value=True) as checked:
+                snapshot = antiphon._codex_observation_snapshot(project, [peer])
+        self.assertEqual(snapshot.live, (self.OTHER,))
+        checked.assert_called_once_with(self.OTHER)
+
+    def test_an_unjoined_or_unaddressable_named_record_suppresses_nothing(self):
+        records = [
+            {"kind": "codex", "name": "build", "address": None},
+            {"kind": "codex", "name": antiphon.peers.UNNAMED,
+             "address": self.UUID},
+        ]
+        with tempfile.TemporaryDirectory() as project:
+            self._observe(project, self.UUID)
+            with patch.object(antiphon, "codex_thread_alive", return_value=True):
+                snapshot = antiphon._codex_observation_snapshot(project, records)
+        self.assertEqual(snapshot.live, (self.UUID,))
+
+
 class CatchUpTest(unittest.TestCase):
     """`antiphon catch-up`: the page cursors jump to the live edge.
 
@@ -4327,6 +4380,8 @@ class DoctorTest(unittest.TestCase):
 
     HEALTHY_VERSIONS = {"/usr/bin/python3": "Python 3.9.6",
                         "/usr/bin/node": "v20.11.0"}
+    OBSERVED = "1d5a03e0-0548-4339-87c3-45c5dbf7e9d7"
+    UNKNOWN = "2e6b14f1-1659-544a-98d4-56d6eca8fa48"
 
     @contextlib.contextmanager
     def hermetic(self, project, tools=None, versions=None, processes=()):
@@ -4488,6 +4543,41 @@ class DoctorTest(unittest.TestCase):
             self.assertTrue(self.line_for(printed, name).startswith("✓"),
                             f"{name}: {self.line_for(printed, name)!r}")
         self.assertEqual(code, 0, printed)
+
+    def test_doctor_names_only_live_unnamed_observations_and_stays_read_only(self):
+        project = self.project()
+        self.set_up(project)
+        antiphon.peers.write_observation(project, self.OBSERVED)
+        antiphon.peers.write_observation(project, self.UNKNOWN)
+        before = self.snapshot(project)
+        states = {self.OBSERVED: True, self.UNKNOWN: False}
+        with patch.object(antiphon, "codex_thread_alive",
+                          side_effect=lambda sid: states[sid]):
+            code, printed = self.run_doctor(project)
+        after = self.snapshot(project)
+        self.assertEqual(code, 0, printed)
+        self.assertEqual(after, before)
+        self.assertIn("at least 1 live observed", printed)
+        self.assertIn("additional sessions before their first hook may be invisible",
+                      printed)
+        self.assertIn("1 stored observation has unknown liveness", printed)
+        carrying_id = [line for line in printed.splitlines()
+                       if self.OBSERVED in line]
+        self.assertEqual(carrying_id, [
+            f"· Codex unnamed observation {self.OBSERVED} — live, not addressable"
+            " — restart it with ANTIPHON_NAME set",
+        ])
+        self.assertNotIn(self.UNKNOWN, printed,
+                         "unknown historical observations expose only a count")
+
+    def test_doctor_takes_one_observation_snapshot_for_one_report(self):
+        project = self.project()
+        self.set_up(project)
+        real = antiphon._codex_observation_snapshot
+        with patch.object(antiphon, "_codex_observation_snapshot",
+                          wraps=real) as snapshot:
+            self.run_doctor(project)
+        snapshot.assert_called_once()
 
     def test_doctor_counts_rejected_codex_call_shapes_privately_and_read_only(self):
         source = "17efb035-5650-4c4a-a363-026420ece317"
@@ -5532,8 +5622,8 @@ class SetupShapeCharacterizationTest(unittest.TestCase):
             "  ANTIPHON_NAME=build codex",
             "  An unnamed session still runs, but it cannot be addressed by "
             "name. Name the",
-            "  Codex terminals above all: an unnamed Codex session leaves no "
-            "record at all,",
+            "  Codex terminals above all: an unnamed observation is diagnostic "
+            "only,",
             "  so once any Codex peer is named, an unaddressed message to "
             "Codex is refused",
             "  rather than sent to a guess.",
@@ -11689,6 +11779,43 @@ class CodexPeerWiringTest(unittest.TestCase):
             self.assertIsNone(antiphon.peers.read_peers(project, "codex")[0]["address"])
         self.assertIn("news", out)
 
+    def test_an_unnamed_hook_observes_its_host_id_on_every_event(self):
+        for event in ("SessionStart", "UserPromptSubmit", None):
+            with self.subTest(event=event), tempfile.TemporaryDirectory() as project:
+                self._hook(project, event=event, session_id=self.UUID, name="")
+                observed = antiphon.peers.read_observations(project)
+            self.assertEqual([record["session_id"] for record in observed],
+                             [self.UUID])
+            self.assertNotIn("transcript", observed[0])
+
+    def test_an_invalid_explicit_alias_is_observed_but_never_becomes_a_name(self):
+        with tempfile.TemporaryDirectory() as project:
+            self._hook(project, event="SessionStart", session_id=self.UUID,
+                       name="NOT VALID")
+            observed = antiphon.peers.read_observations(project)
+        self.assertEqual([record["session_id"] for record in observed], [self.UUID])
+        self.assertEqual(antiphon.peers.read_peers(project), [])
+
+    def test_a_named_hook_does_not_create_a_new_unnamed_observation(self):
+        with tempfile.TemporaryDirectory() as project:
+            self._hook(project, event="SessionStart", session_id=self.UUID,
+                       name="build")
+            self.assertEqual(antiphon.peers.read_observations(project), [])
+
+    def test_an_observation_failure_never_costs_context_or_leaks_the_id(self):
+        with tempfile.TemporaryDirectory() as project, \
+             patch.object(antiphon.peers, "write_observation",
+                          side_effect=OSError("disk gone")):
+            _, out, err, _ = self._hook(
+                project, event="UserPromptSubmit", session_id=self.UUID, name="",
+                summary=("news", page_advance({
+                    "s1": {"gen": "g", "offset": 5}}), 1))
+        self.assertIn("news", out)
+        self.assertIn("observation", err)
+        self.assertIn("lower bound", err)
+        self.assertNotIn(self.UUID, err)
+        self.assertNotIn(project, err)
+
     def test_a_second_owners_hook_cannot_repoint_a_live_alias(self):
         """The first session keeps working and the second one is told."""
         with tempfile.TemporaryDirectory() as project:
@@ -12273,10 +12400,10 @@ class SourceAwarePullTest(unittest.TestCase):
 
     def test_the_remedy_needs_a_live_unnamed_endpoint(self):
         """The remedy is a kind fact, not a reader-side one.
-        `valid_key("codex", UNNAMED)` is False — an unnamed Codex session leaves
-        no record at all — so the only nameless endpoint that can exist is a
-        Claude one, and the only page that can raise the remedy is one Codex
-        reads."""
+        `valid_key("codex", UNNAMED)` is False — an unnamed Codex session has no
+        peer record even when it has a diagnostic observation — so the only
+        nameless endpoint that can exist is a Claude one, and the only page that
+        can raise the remedy is one Codex reads."""
         events = (self._record(self.A, 0, ("claude", "named"))
                   + self._record(self.B, 0, ("claude", "nameless"), when=50))
 
@@ -12669,6 +12796,80 @@ class RoutingTest(unittest.TestCase):
         self.assertIn("waiting", detail)
         self.assertNotIn("broadcast", detail.lower())
 
+    def test_two_live_unnamed_observations_refuse_before_legacy_selection(self):
+        touched = AssertionError("proved ambiguity must not choose a rollout")
+        with tempfile.TemporaryDirectory() as project:
+            antiphon.peers.write_observation(project, self.UUID)
+            antiphon.peers.write_observation(project, self.OTHER)
+            with patch.object(antiphon, "codex_thread_alive", return_value=True), \
+                 patch.object(antiphon, "codex_session_id",
+                              side_effect=touched) as legacy:
+                address, detail = antiphon.resolve_target(project, "codex")
+            legacy.assert_not_called()
+        self.assertIsNone(address)
+        self.assertEqual(detail.refusal_class, "no-peer")
+        self.assertIn("at least 2", detail)
+        self.assertIn("unnamed", detail)
+        self.assertIn("not addressable", detail)
+        self.assertIn("ANTIPHON_NAME", detail)
+        self.assertIn("additional", detail)
+        self.assertNotIn(self.UUID, detail)
+        self.assertNotIn(self.OTHER, detail)
+        self.assertNotIn(project, detail)
+
+    def test_a_named_and_a_live_unnamed_candidate_refuse_only_when_bare(self):
+        with tempfile.TemporaryDirectory() as project:
+            self._codex_peer(project, "build", "300:build", self.UUID)
+            antiphon.peers.write_observation(project, self.OTHER)
+            with patch.object(antiphon, "codex_thread_alive",
+                              side_effect=AssertionError(
+                                  "an exact alias ignores observations")):
+                self.assertEqual(
+                    antiphon.resolve_target(project, "codex", "build"),
+                    (self.UUID, ""))
+            with patch.object(antiphon, "codex_thread_alive", return_value=True):
+                address, detail = antiphon.resolve_target(project, "codex")
+        self.assertIsNone(address)
+        self.assertIn("at least 2", detail)
+        self.assertIn("1 registered", detail)
+        self.assertIn("1 unnamed", detail)
+        self.assertNotIn(self.UUID, detail)
+        self.assertNotIn(self.OTHER, detail)
+
+    def test_one_live_unnamed_observation_preserves_the_legacy_single_peer_road(self):
+        with tempfile.TemporaryDirectory() as project:
+            antiphon.peers.write_observation(project, self.UUID)
+            with patch.object(antiphon, "codex_thread_alive", return_value=True), \
+                 patch.object(antiphon, "codex_session_id",
+                              return_value=self.UUID) as legacy:
+                target = antiphon.resolve_target(project, "codex")
+        self.assertEqual(target, (self.UUID, ""))
+        legacy.assert_called_once_with(project)
+
+    def test_unknown_observation_liveness_cannot_create_an_ambiguity(self):
+        for state in (False, None):
+            with self.subTest(state=state), tempfile.TemporaryDirectory() as project:
+                antiphon.peers.write_observation(project, self.UUID)
+                with patch.object(antiphon, "codex_thread_alive",
+                                  return_value=state), \
+                     patch.object(antiphon, "codex_session_id",
+                                  return_value="legacy"):
+                    self.assertEqual(antiphon.resolve_target(project, "codex"),
+                                     ("legacy", ""))
+
+    def test_a_host_session_id_is_diagnostic_identity_never_an_alias(self):
+        with tempfile.TemporaryDirectory() as project:
+            antiphon.peers.write_observation(project, self.UUID)
+            with patch.object(antiphon, "_codex_observation_snapshot",
+                              side_effect=AssertionError(
+                                  "an invalid alias refuses before census")):
+                address, detail = antiphon.resolve_target(
+                    project, "codex", self.UUID)
+        self.assertIsNone(address)
+        self.assertIn("not a usable peer name", detail)
+        self.assertNotIn(self.UUID, detail,
+                         "the invalid value is not echoed into an agent-facing refusal")
+
     def test_several_peers_and_no_alias_is_refused_with_their_names(self):
         with tempfile.TemporaryDirectory() as project:
             antiphon.peers.register(project, "claude", "ui", "/tmp/ui.sock")
@@ -12766,7 +12967,7 @@ class RoutingTest(unittest.TestCase):
         self.assertIsNone(address)
         self.assertIn("build", detail)
         self.assertIn("ready", detail)
-        self.assertIn("not discoverable", detail)
+        self.assertIn("not all observable", detail)
         self.assertIn("by name", detail)
 
     def test_the_refusal_says_what_state_that_one_peer_is_in(self):
@@ -12807,7 +13008,7 @@ class RoutingTest(unittest.TestCase):
                               io.StringIO(json.dumps({"text": "hi"}))), \
                  contextlib.redirect_stderr(io.StringIO()) as err:
                 self.assertEqual(antiphon.reply(), 1)
-        self.assertIn("not discoverable", err.getvalue())
+        self.assertIn("not all observable", err.getvalue())
 
     def test_a_bare_stop_marker_is_refused_when_a_named_peer_is_live(self):
         with tempfile.TemporaryDirectory() as project:
@@ -12825,7 +13026,7 @@ class RoutingTest(unittest.TestCase):
                 self.assertEqual(antiphon.push("codex"), 0)
             queued.assert_not_called()
             write.assert_not_called()
-        self.assertIn("not discoverable", err.getvalue())
+        self.assertIn("not all observable", err.getvalue())
 
     # ---- nothing registered: the unnamed pair, exactly as before ----
 
@@ -14261,6 +14462,7 @@ class StatusTest(unittest.TestCase):
     """
 
     UUID = "1d5a03e0-0548-4339-87c3-45c5dbf7e9d7"
+    OTHER = "2e6b14f1-1659-544a-98d4-56d6eca8fa48"
 
     def _status(self, project, summary=("", None, 0)):
         out = io.StringIO()
@@ -14294,8 +14496,62 @@ class StatusTest(unittest.TestCase):
         self.assertIn("Claude ui — ready", text)
         self.assertIn("Codex build — waiting for first turn", text)
 
-    def test_status_never_prints_an_address_a_path_or_a_session_id(self):
-        """None of it helps choose a recipient, and all of it leaks."""
+    def test_status_lists_live_unnamed_observations_in_stable_full_id_order(self):
+        with tempfile.TemporaryDirectory() as project:
+            # Reverse write order: presentation is host-id order, never recency.
+            antiphon.peers.write_observation(project, self.OTHER)
+            antiphon.peers.write_observation(project, self.UUID)
+            with patch.object(antiphon, "codex_thread_alive", return_value=True):
+                _, text = self._formatting_status(project)
+        rows = [line for line in text.splitlines()
+                if line.startswith("  Codex unnamed observation ")]
+        self.assertEqual(rows, [
+            f"  Codex unnamed observation {self.UUID} — live, not addressable",
+            f"  Codex unnamed observation {self.OTHER} — live, not addressable",
+        ])
+        self.assertIn("Codex session census: at least 2 live observed", text)
+        self.assertIn("additional sessions before their first hook may be invisible",
+                      text)
+        self.assertIn("restart each intended terminal with a distinct "
+                      "ANTIPHON_NAME", text)
+        self.assertNotIn(f"@codex:{self.UUID}", text)
+        self.assertNotIn(f"@codex:{self.OTHER}", text)
+
+    def test_status_reports_unknown_observations_as_a_count_without_ids(self):
+        with tempfile.TemporaryDirectory() as project:
+            antiphon.peers.write_observation(project, self.UUID)
+            antiphon.peers.write_observation(project, self.OTHER)
+            with patch.object(antiphon, "codex_thread_alive", return_value=None):
+                _, text = self._formatting_status(project)
+        self.assertIn("Codex session census: at least 0 live observed", text)
+        self.assertIn("2 stored observations have unknown liveness", text)
+        self.assertNotIn(self.UUID, text)
+        self.assertNotIn(self.OTHER, text)
+        self.assertNotIn("Peers:", text)
+
+    def test_status_suppresses_an_observation_joined_to_a_named_peer(self):
+        with tempfile.TemporaryDirectory() as project:
+            self._codex_peer(project, "build", "300:build", self.UUID)
+            antiphon.peers.write_observation(project, self.UUID)
+            antiphon.peers.write_observation(project, self.OTHER)
+            with patch.object(antiphon, "codex_thread_alive",
+                              side_effect=lambda sid: sid == self.OTHER) as checked:
+                _, text = self._formatting_status(project)
+        self.assertIn("Codex build — ready", text)
+        self.assertIn(f"Codex unnamed observation {self.OTHER}", text)
+        self.assertNotIn(f"Codex unnamed observation {self.UUID}", text)
+        checked.assert_called_once_with(self.OTHER)
+
+    def test_status_takes_one_observation_snapshot_for_one_report(self):
+        with tempfile.TemporaryDirectory() as project:
+            real = antiphon._codex_observation_snapshot
+            with patch.object(antiphon, "_codex_observation_snapshot",
+                              wraps=real) as snapshot:
+                self._formatting_status(project)
+        snapshot.assert_called_once()
+
+    def test_status_keeps_addresses_paths_and_non_observation_ids_private(self):
+        """The one full-id carve-out cannot expose an id from another source."""
         with tempfile.TemporaryDirectory() as project:
             antiphon.peers.register(project, "claude", "ui",
                                     "/tmp/antiphon-secret-ui.sock",
@@ -14324,6 +14580,20 @@ class StatusTest(unittest.TestCase):
         self.assertNotIn("1 files", text, "and one of something is not plural")
         self.assertIn("1 source, at 42", text,
                       "the cursor's own progress is still shown, and singular")
+
+    def test_a_session_id_appears_only_on_its_labelled_observation_row(self):
+        with tempfile.TemporaryDirectory() as project:
+            self._codex_peer(project, "build", "300:build", self.OTHER)
+            antiphon.peers.write_observation(project, self.UUID)
+            with patch.object(antiphon, "codex_thread_alive", return_value=True):
+                _, text = self._formatting_status(project)
+        carrying_observation = [line for line in text.splitlines()
+                                if self.UUID in line]
+        self.assertEqual(carrying_observation, [
+            f"  Codex unnamed observation {self.UUID} — live, not addressable",
+        ])
+        self.assertNotIn(self.OTHER, text,
+                         "a named peer's address remains private everywhere")
 
     def test_status_keeps_non_page_cursor_state_opaque_and_untouched(self):
         """Unknown siblings and push dedupe state are private implementation
@@ -14959,7 +15229,7 @@ class RefusedSendHonestyTest(unittest.TestCase):
             lone = self._reply(project, {"text": "hi"})
         self.assertEqual(lone, (1, "", (
             "reply: not delivered: build: ready is the only registered Codex "
-            "peer, but unnamed Codex sessions are not discoverable and cannot "
+            "peer, but unnamed Codex sessions are not all observable and cannot "
             "be ruled out — address a peer by name\n")))
 
         # The Claude direction. `not yet routable` has no representative here:

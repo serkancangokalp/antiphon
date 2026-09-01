@@ -916,7 +916,9 @@ and measured on one version, not a contract. A running thread that has not
 taken its first turn is still unaddressable from here — the Codex hook does
 receive its `session_id` and `cwd` at `SessionStart`, and recording that as a
 delivery hint would close the gap, but it changes the rule that an unnamed
-Codex leaves no record, and belongs with the automatic-peer-identity entry.
+Codex leaves no routable peer record. The later visibility fix records only a
+diagnostic observation; automatic addressability still belongs with the
+automatic-peer-identity entry.
 
 ## Shipped — the channel never hands Claude Code a null sender
 
@@ -1401,9 +1403,9 @@ would not see another Claude session's work at all.
   The relayed-words work keeps provenance readable, but nothing today bounds a
   hop count, and the cross-vendor entry below wants the same budget.
 - *The unnamed default.* Two same-kind peers are exactly the case where names
-  stop being optional. See the entry below on unnamed addressability: on the
-  Codex side an unnamed session leaves no record at all, so two unnamed Codex
-  terminals cannot be told apart, let alone addressed.
+  stop being optional. See the fixed visibility entry below: an unnamed Codex
+  session leaves no routable peer record. Its hook-owned observation can prove
+  ambiguity, but cannot tell two terminals apart or make either addressable.
 - *Scope.* Whether the passive page should carry same-kind activity too, or
   whether same-vendor stays a direct-message-only road. Carrying it doubles
   what a page can hold and re-opens the discovery window question.
@@ -1411,22 +1413,21 @@ would not see another Claude session's work at all.
 The honest order is: unnamed addressability first (below), because same-vendor
 routing is unusable without it, then the surfaces, then loop bounds.
 
-## P1 — An unnamed peer is invisible, and two of them are indistinguishable
+## P1 — An unnamed peer is invisible, and two of them are indistinguishable (fixed)
 
 Measured on 2026-08-31, from a real session on a second machine: with two
 unnamed Codex terminals and one Claude, Claude could only answer whichever
 Codex it had last exchanged with, and could not reach the other at all. A Codex
 terminal that had not been typed into could not be reached either.
 
-**The mechanism, read out of the code.** `record_codex_session`
-(`lib/antiphon.py`) returns False before writing anything unless
-`peers.valid_name(peers.explicit_name())` — so an unnamed Codex session writes
-*no registry record whatsoever*. `register_codex_peer` returns None on the same
-condition. `resolve_target` therefore cannot see it, cannot name it in an
-ambiguity refusal, and falls back to `_legacy_target`, which picks the newest
-*running* rollout — one session, chosen by recency, with no way to ask for the
-other. This is deliberate: the project refuses to guess a recipient. But the
-cost lands on the default install, where naming is the thing nobody did yet.
+**The shipped defect, read out of the old code.** `record_codex_session`
+(`lib/antiphon.py`) returned False before writing anything unless
+`peers.valid_name(peers.explicit_name())`, so an unnamed Codex session wrote no
+registry or diagnostic record. `resolve_target` could not see it and fell back
+to `_legacy_target`, which picked the newest *running* rollout — one session,
+chosen by recency, with no way to ask for the other. Refusing to invent a name
+was right; being unable to prove that two unnamed sessions were live was the
+gap.
 
 **What was measured today, and what was not.**
 
@@ -1464,24 +1465,34 @@ item, not an Antiphon product migration: tell the user and remove or re-evaluate
 the stale entries only with their direct participation; do not silently edit
 their global Codex configuration.
 
-**The option, and why it is not the guess the project refuses.** The Codex hook
-receives `session_id` at `SessionStart`, before any turn — the same id
-`codex queue --thread` needs. Registering an unnamed session under that id
-(displayed as a short prefix) would make two unnamed terminals distinguishable
-and addressable, and would make a terminal addressable the moment it opens.
-That is the host's own identity arriving in the host's own payload, not a
-choice the bridge invents. The reason it was not done is recorded in the
-automatic-peer-identity entry below, and most of that caution is about the
-*Claude* side, where identity needs `claude agents --json`.
+**The fixed contract.** Every unnamed Codex hook event with a canonical host
+UUID atomically refreshes one project-local observation file under
+`.antiphon/observations/codex/`. It contains only a schema version, the side,
+the full host session id and the observation time — never a name, transcript or
+route. A named peer joined to that same id suppresses the older unnamed
+observation in one read snapshot without deleting another writer's evidence.
 
-**The decisions this needs, and they are product decisions.** Whether an
-id-shaped peer should be addressable at all or only *visible* (so a refusal can
-say "two Codex sessions are live, name them"); whether the display is the id, a
-short prefix, or a generated word; whether an unnamed peer may receive a bare
-message when it is provably the only one; and whether the Claude side stays
-asymmetric until its own identity source is proven. A visible-but-unaddressable
-peer is the smallest step that fixes the worst symptom — a refusal that says
-*why* rather than a silent delivery to the wrong terminal.
+The exact writer lock is the only positive liveness proof. A held lock makes an
+observation live; an unlocked, missing or unsupported lock makes it unknown,
+never dead. Unknown records are retained because their absence of a lock is not
+proof of death, and `status`/`doctor` show only their count. Positively live
+observations appear only on a labelled local diagnostic row carrying the full
+UUID. Refusals, errors and every other line expose neither that id nor paths.
+The UUID is explicitly not an alias and cannot be addressed.
+
+Every Codex census is a lower bound and says that sessions before their first
+hook may be invisible. Two or more positively live candidates — registered
+peers plus unjoined unnamed observations — make a bare Codex send refuse before
+rollout discovery. An exact valid alias bypasses the observation census. Zero
+or one live observation preserves the pre-existing legacy single-peer route;
+unknown observations cannot manufacture an ambiguity. This deliberately keeps
+the default one-pair workflow compatible while preventing delivery once the
+bridge has positive evidence that it would be guessing.
+
+The four agent-facing surfaces agree on the remedy: restart each intended
+terminal with a distinct `ANTIPHON_NAME`, then address it by name. This closes
+visibility and honest ambiguity, not automatic identity or unnamed
+addressability; those remain the next entry's work.
 
 ## P2 — Automatic peer identity
 

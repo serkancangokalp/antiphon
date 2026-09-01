@@ -76,7 +76,7 @@ A Codex → Claude message never pastes text into the terminal and never imperso
 <channel source="antiphon" sender="codex" sender_kind="agent" sender_alias="build" message_id="...">
 ```
 
-Claude Code's interface shows this as an incoming channel event, and Claude treats the message as the words of the Codex agent, not of the human user. It sends its reply back with the `reply_to_codex` MCP tool, passing `sender_alias` as `to` whenever it is a name rather than the literal `<unnamed>`. A bare reply is refused as soon as any named Codex peer is registered: an unnamed Codex session leaves no registry record, so one visible peer cannot be shown to be the only one running. A `sender_alias` of `<unnamed>` is a peer with no name — it cannot be addressed by name, and a bare reply reaches it only in a project where nothing is registered; passing `<unnamed>` as `to` is the same as leaving it out.
+Claude Code's interface shows this as an incoming channel event, and Claude treats the message as the words of the Codex agent, not of the human user. It sends its reply back with the `reply_to_codex` MCP tool, passing `sender_alias` as `to` whenever it is a name rather than the literal `<unnamed>`. A bare reply is refused as soon as any named Codex peer is registered: an unnamed Codex session leaves no routable peer record, so one visible peer cannot be shown to be the only one running. It is also refused when two or more unnamed sessions are positively observed live. A `sender_alias` of `<unnamed>` is a peer with no name — it cannot be addressed by name, and a bare reply reaches it only in a project where nothing is registered; passing `<unnamed>` as `to` is the same as leaving it out.
 
 Nothing pairs peers up. There is no automatic Claude↔Codex partnership, and no reply correlation: a message is routed only by the name written on it.
 
@@ -113,9 +113,10 @@ traces:
 - **To Claude.** A bare `@claude` works while exactly one Claude peer is live.
   From the second one on, it is refused and you must name one.
 - **To Codex.** A bare `@codex` is refused as soon as *any* named Codex peer is
-  registered — even if it is the only one you can see. A Codex session started
-  without a name leaves no registry record at all, so a second, unnamed one
-  cannot be ruled out, and the bridge will not guess between a peer it can see
+  registered — even if it is the only one you can see — or when two or more
+  unnamed sessions are positively observed live. A Codex session started
+  without a name leaves no routable peer record, so another unnamed one may
+  still be invisible and the bridge will not guess between a peer it can see
   and one it cannot.
 
 That asymmetry is why **every terminal in a multi-peer project must be named,
@@ -133,19 +134,31 @@ address to receive on, or `waiting for first turn` before that. Under the list
 it prints the addressing rule that currently applies:
 
 ```
+Codex session census: at least 2 live observed; additional sessions before their first hook may be invisible
+
 Peers:
   Claude ui — ready
   Claude api — ready
   Codex build — ready
-  Codex review — waiting for first turn
+  Codex unnamed observation 2e6b14f1-1659-544a-98d4-56d6eca8fa48 — live, not addressable
   → a bare @claude line is refused; address one: @claude:ui, @claude:api
-  → a bare @codex line is refused, because unnamed Codex sessions leave no record; address one: @codex:build, @codex:review
+  → a bare @codex line is refused; address a named peer: @codex:build
+  → the observed unnamed Codex session cannot be addressed; restart it with ANTIPHON_NAME set
 ```
 
 A peer that is `waiting for first turn` is still a candidate: readiness never
 decides who a message goes to, so it cannot silently hand routing to whichever
-session happened to start first. With nothing registered — the unnamed single
-pair — the block is empty, because there is nobody to choose between.
+session happened to start first. An unnamed Codex observation is local
+diagnostic evidence, not a peer record. Every census says `at least N` because
+additional sessions before their first hook may be invisible. The full host
+session id is diagnostic identity, not a recipient alias, and the observation
+is not addressable. Two or more positively live candidates make a bare send
+refused; restart each intended terminal with a distinct `ANTIPHON_NAME` and
+address it by that name. With no peer or live observation, the `Peers:` block is
+empty while the census still says `at least 0`; zero observations never proves
+that zero sessions exist. Stored observations whose writer lock no longer gives
+positive liveness are retained and shown only as a count: a missing or unlocked
+lock is insufficient evidence that the host session is dead.
 
 ## Install
 

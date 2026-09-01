@@ -848,6 +848,27 @@ class ShippedContractTest(unittest.TestCase):
                             ("CLAUDE.md rule", antiphon.CLAUDE_RULE)):
             self.assertIn("ANTIPHON_NAME", text, where)
 
+    def test_every_agent_surface_teaches_unnamed_codex_observation_limits(self):
+        """Visibility is diagnostic identity, never an accidental third alias
+        grammar. Branch U also makes every count a lower bound; omitting that
+        qualifier turns an unmeasured pre-hook window into confident fiction."""
+        channel = re.sub(r'"\s*\+\s*\n\s*"', "",
+                         read("lib", "channel.mjs"))
+        surfaces = {
+            "README": read("README.md"),
+            "AGENTS rule": antiphon.AGENTS_RULE,
+            "CLAUDE rule": antiphon.CLAUDE_RULE,
+            "channel instructions": channel,
+        }
+        for where, text in surfaces.items():
+            self.assertRegex(text, r"(?i)unnamed (Codex )?observation", where)
+            self.assertRegex(text, r"(?i)at least[^.]*first hook", where)
+            self.assertRegex(text, r"(?i)session id[^.]*diagnostic", where)
+            self.assertRegex(text, r"(?i)not (a )?(recipient )?alias", where)
+            self.assertRegex(text, r"(?i)not addressable", where)
+            self.assertIn("ANTIPHON_NAME", text, where)
+            self.assertRegex(text, r"(?i)(two or more|multiple)[^.]*refus", where)
+
     def test_both_generated_rules_keep_the_ambient_pull_apart_from_a_direct_send(self):
         """One is addressed and reaches one peer; the other is project-wide
         awareness that today may merge several transcripts under a generic label. An

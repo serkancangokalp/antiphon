@@ -1276,11 +1276,11 @@ try {
     "and the message must be queued against that peer's session");
 
   // A bare reply is refused as soon as a named Codex peer is registered: an
-  // unnamed session leaves no record, so `review` cannot be shown to be the
-  // only one there. Nothing is queued for it.
+  // unnamed session leaves no routable peer record, so `review` cannot be shown
+  // to be the only one there. Nothing is queued for it.
   await assert.rejects(
     () => client.callTool({ name: "reply_to_codex", arguments: { text: "bare" } }),
-    /not discoverable/,
+    /not all observable/,
     "one registered peer is not proof of one session",
   );
   assert.ok(!readFileSync(queueLog, "utf8").includes("bare"),

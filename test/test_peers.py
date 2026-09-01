@@ -1423,6 +1423,104 @@ class SessionRecordTest(unittest.TestCase):
             self.assertFalse(peers.valid_session_id(bad), repr(bad))
 
 
+class CodexObservationTest(unittest.TestCase):
+    """Hook-owned evidence that a host session id was observed.
+
+    It is deliberately not a peer record: no alias, endpoint, address or
+    transcript is present, and nothing in this module calls it live.
+    """
+
+    UUID = "1d5a03e0-0548-4339-87c3-45c5dbf7e9d7"
+    OTHER = "2e6b14f1-1659-544a-98d4-56d6eca8fa48"
+
+    @staticmethod
+    def _root(project):
+        return os.path.join(project, ".antiphon", "observations", "codex")
+
+    def test_one_canonical_id_is_written_atomically_without_transcript_data(self):
+        with tempfile.TemporaryDirectory() as project, \
+             patch.object(peers.time, "time", return_value=123.5):
+            self.assertTrue(peers.write_observation(project, self.UUID))
+            root = self._root(project)
+            names = os.listdir(root)
+            self.assertEqual(names, [self.UUID + ".json"])
+            with open(os.path.join(root, names[0]), encoding="utf-8") as stream:
+                record = json.load(stream)
+        self.assertEqual(record, {
+            "version": 1,
+            "kind": "codex",
+            "session_id": self.UUID,
+            "observed_at": 123.5,
+        })
+        self.assertFalse(any(name.endswith(".tmp") for name in names))
+        self.assertNotIn("transcript", record)
+        self.assertNotIn("address", record)
+        self.assertNotIn("name", record)
+
+    def test_each_session_owns_one_file_and_refresh_is_idempotent(self):
+        with tempfile.TemporaryDirectory() as project:
+            with patch.object(peers.time, "time", return_value=10.0):
+                self.assertTrue(peers.write_observation(project, self.UUID))
+                self.assertTrue(peers.write_observation(project, self.OTHER))
+            with patch.object(peers.time, "time", return_value=20.0):
+                self.assertTrue(peers.write_observation(project, self.UUID))
+            records = {record["session_id"]: record
+                       for record in peers.read_observations(project)}
+        self.assertEqual(sorted(records), [self.UUID, self.OTHER])
+        self.assertEqual(records[self.UUID]["observed_at"], 20.0)
+        self.assertEqual(records[self.OTHER]["observed_at"], 10.0)
+
+    def test_invalid_ids_write_nothing_and_cannot_escape(self):
+        with tempfile.TemporaryDirectory() as project:
+            for bad in (None, 12, "", self.UUID.upper(), self.UUID + "\n",
+                        "../../escape", self.UUID.replace("-", "")):
+                self.assertFalse(peers.write_observation(project, bad), repr(bad))
+            self.assertFalse(os.path.exists(os.path.join(project, ".antiphon")))
+
+    def test_reader_accepts_only_matching_versioned_records(self):
+        with tempfile.TemporaryDirectory() as project:
+            root = self._root(project)
+            os.makedirs(root)
+            bad = {
+                "broken.json": "{not json",
+                self.UUID + ".tmp": json.dumps({
+                    "version": 1, "kind": "codex",
+                    "session_id": self.UUID, "observed_at": 1.0}),
+                self.UUID + ".json": json.dumps({
+                    "version": 2, "kind": "codex",
+                    "session_id": self.UUID, "observed_at": 1.0}),
+                self.OTHER + ".json": json.dumps({
+                    "version": 1, "kind": "claude",
+                    "session_id": self.OTHER, "observed_at": 1.0}),
+            }
+            for name, content in bad.items():
+                with open(os.path.join(root, name), "w", encoding="utf-8") as stream:
+                    stream.write(content)
+            self.assertEqual(peers.read_observations(project), [])
+
+            with open(os.path.join(root, self.UUID + ".json"), "w",
+                      encoding="utf-8") as stream:
+                json.dump({"version": 1, "kind": "codex",
+                           "session_id": self.OTHER,
+                           "observed_at": 1.0}, stream)
+            self.assertEqual(peers.read_observations(project), [],
+                             "a record cannot claim another file's identity")
+
+    def test_reader_rejects_non_finite_and_negative_observation_times(self):
+        with tempfile.TemporaryDirectory() as project:
+            root = self._root(project)
+            os.makedirs(root)
+            for observed_at in (float("nan"), float("inf"),
+                                float("-inf"), -1.0):
+                with self.subTest(observed_at=observed_at), \
+                     open(os.path.join(root, self.UUID + ".json"), "w",
+                          encoding="utf-8") as stream:
+                    json.dump({"version": 1, "kind": "codex",
+                               "session_id": self.UUID,
+                               "observed_at": observed_at}, stream)
+                self.assertEqual(peers.read_observations(project), [])
+
+
 class UnnamedKeyTest(unittest.TestCase):
     """The registry key an unnamed peer occupies, which is not a name.
 
@@ -1446,10 +1544,9 @@ class UnnamedKeyTest(unittest.TestCase):
 
     def test_the_reserved_key_belongs_to_the_Claude_side_only(self):
         """It is how an unnamed Claude *endpoint* is represented, and that is
-        all it is. An unnamed Codex session deliberately has no record at all:
-        it never registers, which is precisely why one visible Codex peer
-        cannot be shown to be the only one. A record under this key on that
-        side would be a live peer nobody could ever name."""
+        all it is. An unnamed Codex session deliberately has no peer record: a
+        hook observation carries neither this key nor a route. A peer record
+        under this key on that side would be live but impossible to name."""
         self.assertFalse(peers.valid_key("codex", peers.UNNAMED))
         self.assertTrue(peers.valid_key("claude", peers.UNNAMED))
 

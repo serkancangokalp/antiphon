@@ -5,12 +5,12 @@ exactly one per side and never said so; this module is the part that lets
 several coexist without taking each other's sockets and cursors.
 
 An explicit name is what buys isolation, and it is the only thing that does. A
-session started without one occupies the reserved `UNNAMED` key below: it is
-counted, it is served, and it cannot be addressed by name — which is exactly
-what having no name means. There is one such peer per side per project, and a
-second session that wants one finds the key taken. Nothing is ever invented on
-a session's behalf; a name it did not choose is a name the other side could
-address without the session having agreed to answer to it.
+Claude session started without one occupies the reserved `UNNAMED` key below:
+it is counted, it is served, and it cannot be addressed by name — which is
+exactly what having no name means. An unnamed Codex hook instead records only a
+non-routable observation. Nothing is ever invented on a session's behalf; a
+name it did not choose is a name the other side could address without the
+session having agreed to answer to it.
 
 A Codex peer is written by two processes that never meet. The MCP server owns
 `endpoint.json` and knows the pid; the hook owns `session.json` and knows the
@@ -24,6 +24,7 @@ import contextlib
 import fcntl
 import hashlib
 import json
+import math
 import os
 import re
 import subprocess
@@ -42,6 +43,7 @@ VERSIONED_OWNER_PATTERN = re.compile(
     r"([1-9][0-9]*):v([1-9][0-9]*):\S(?:.*\S)?")
 PROCESS_FINGERPRINT_VERSION = 1
 OWNER_KEY_VERSION = f"v{PROCESS_FINGERPRINT_VERSION}"
+OBSERVATION_VERSION = 1
 # The canonical UUID a Codex session is named by, lowercase as the CLI writes it
 # and as `antiphon.SESSION_ID` reads it back off a rollout file name. A contract
 # test keeps the two spellings from drifting apart.
@@ -85,11 +87,10 @@ def valid_key(kind, name):
     Every public alias may, on either side. The reserved key may only on the
     Claude side, because that is the only thing it represents: an unnamed
     channel server, which registers because it serves a socket somebody has to
-    be able to find. An unnamed Codex session deliberately has no record at all
-    — that is exactly why one visible Codex peer cannot be shown to be the only
-    one running — so a record under this key there would be a live peer nobody
-    could ever name, and it would make every bare message ambiguous while being
-    unreachable itself.
+    be able to find. An unnamed Codex session deliberately has no **peer**
+    record; its separate hook-owned observation carries no key or address. A
+    peer record under this reserved key would be live but impossible to name,
+    making every bare message ambiguous while remaining unreachable itself.
 
     Directory names and record fields are checked with this; addressing is
     checked with `valid_name`, which is narrower still.
@@ -185,6 +186,64 @@ def _session_file(cwd, kind, name):
     anyone reads it. Two files, one writer each.
     """
     return os.path.join(peer_dir(cwd, kind, name), "session.json")
+
+
+def observations_dir(cwd):
+    """Hook-owned Codex sightings, separate from the routable peer registry."""
+    return os.path.join(cwd, ".antiphon", "observations", "codex")
+
+
+def _observation_file(cwd, session_id):
+    return os.path.join(observations_dir(cwd), session_id + ".json")
+
+
+def write_observation(cwd, session_id):
+    """Record that a Codex hook supplied one canonical host session id.
+
+    This does not claim an alias, address or liveness. Each host id owns one
+    atomically replaced file, so concurrent hooks for different sessions never
+    read-modify-write shared state and a reader never sees a partial record.
+    """
+    if not valid_session_id(session_id):
+        return False
+    path = _observation_file(cwd, session_id)
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    record = {"version": OBSERVATION_VERSION, "kind": "codex",
+              "session_id": session_id, "observed_at": time.time()}
+    tmp = f"{path}.{os.getpid()}.tmp"
+    with open(tmp, "w", encoding="utf-8") as stream:
+        json.dump(record, stream, ensure_ascii=False)
+    os.replace(tmp, path)
+    return True
+
+
+def read_observations(cwd):
+    """Validated Codex sightings in deterministic host-id order, read-only."""
+    try:
+        names = sorted(os.listdir(observations_dir(cwd)))
+    except OSError:
+        return []
+    found = []
+    for name in names:
+        if not name.endswith(".json"):
+            continue
+        session_id = name[:-5]
+        if not valid_session_id(session_id):
+            continue
+        record = _read_record(os.path.join(observations_dir(cwd), name))
+        if not record:
+            continue
+        observed_at = record.get("observed_at")
+        if (record.get("version") != OBSERVATION_VERSION
+                or record.get("kind") != "codex"
+                or record.get("session_id") != session_id
+                or isinstance(observed_at, bool)
+                or not isinstance(observed_at, (int, float))
+                or not math.isfinite(observed_at)
+                or observed_at < 0):
+            continue
+        found.append(record)
+    return found
 
 
 @contextlib.contextmanager
