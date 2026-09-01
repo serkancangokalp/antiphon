@@ -637,6 +637,57 @@ class ShippedContractTest(unittest.TestCase):
         README told them to."""
         self.assertIn("BACKLOG.md", json.loads(read("package.json"))["files"])
 
+    def test_the_operational_ledger_matches_the_candidate_not_a_past_release(self):
+        """Operational prose is itself a diagnostic contract.
+
+        The old ledger simultaneously called delivered work future, gave
+        status a weaker definition than doctor, and narrated a candidate fix
+        as though it were present in published 0.3.3. Pin the distinctions a
+        release reader needs rather than allowing another chronology rewrite.
+        """
+        backlog = read("BACKLOG.md")
+        doctor = section(backlog, "Shipped — `antiphon doctor`")
+        self.assertIsNotNone(doctor)
+        self.assertRegex(doctor, r"(?i)default `antiphon doctor`[^.]*read-only")
+        self.assertRegex(
+            doctor,
+            r"(?i)`antiphon doctor --fix`[^.]*project\s+configuration only")
+        self.assertRegex(
+            doctor,
+            r"(?i)`status`[^.]*same[^.]*content-free[^.]*probe")
+        self.assertNotIn("Doctor is authoritative over `status`", doctor)
+        self.assertRegex(
+            doctor,
+            r"(?is)thread-writer lock.*queue.*read-only.*supported")
+        self.assertRegex(
+            doctor,
+            r"(?is)active Codex reachability.*declined.*bounded.*non-spawning")
+        self.assertNotIn("Whether Codex actually *forwards*", doctor)
+
+        identity = section(
+            backlog,
+            "P0 — A named Claude session can identify itself as `<unnamed>` (fixed)")
+        self.assertIsNotNone(identity)
+        self.assertRegex(identity, r"Published 0\.3\.3 still")
+        self.assertRegex(
+            identity, r"candidate\s+branch[^.]*a4533d1[^.]*6902546")
+        self.assertRegex(identity, r"(?i)doctor[^.]*dead-pid endpoint")
+        self.assertRegex(
+            identity,
+            r"(?is)stdin close.*wrapper-forwarded signals.*fixed.*"
+            r"abrupt.*SIGKILL.*remain")
+
+        source_labels = section(
+            backlog, "P1 — Source-aware multi-peer pull context (fixed)")
+        self.assertIsNotNone(source_labels)
+        self.assertIn("record_claude_session", source_labels)
+        self.assertIn("Labels are per record block", source_labels)
+
+        wrapper = section(backlog, "P1 — Re-run the host wrapper census before release")
+        self.assertIsNotNone(wrapper)
+        self.assertIn("test/host_wrapper_census.py", wrapper)
+        self.assertRegex(wrapper, r"(?i)aggregate counts only")
+
     def test_the_readme_shows_how_to_start_each_kind_of_named_peer(self):
         """Naming is not a flag on a command, it is an environment variable read
         at startup, and getting it wrong is invisible: the session comes up fine

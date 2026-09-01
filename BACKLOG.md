@@ -1,6 +1,6 @@
 # Antiphon product backlog
 
-Last reviewed: 2026-08-30
+Last reviewed: 2026-09-01
 
 Priorities here describe product risk, not release promises. The bridge keeps
 two invariants across every item: it preserves who said something, and it
@@ -915,9 +915,11 @@ Seven checks, in print order:
    is `✗` with both times and "restart that session" — measured 2026-08-31,
    four servers were answering with pre-merge code while doctor said 13/13 ✓.
    A server whose root is gone is `✗` as an orphan (measured: a two-day-old
-   channel under `launchd` from a renamed directory). Machine-wide like the
-   install check; another copy's root is named. The registry lends a pid its
-   alias, scanned without pruning. Nothing running is `·`.
+   channel under `launchd` from a renamed directory). The verdict is scoped to
+   the copy this project's hooks run plus pids registered in this project;
+   other installs are one path-free `·` count, not this project's failures.
+   The registry lends an in-scope pid its alias, scanned without pruning.
+   Nothing running is `·`.
 2. **Interpreters** — this run's Python against a `PYTHON_FLOOR` constant bound
    to the README by contract test; what the wrapper's bare `python3` actually
    resolves to on `PATH`, which is a different question (measured on the
@@ -930,7 +932,8 @@ Seven checks, in print order:
    `.codex/config.toml` (the table, its `env_vars` line, and the `ANTIPHON_CWD`
    **value** — a table pointing at a renamed directory reads another project's
    registry with every key present), `.mcp.json` (the channel entry). Missing
-   pieces are named; the repair is `antiphon setup`.
+   pieces are named; the repair is `antiphon setup` or the explicit
+   configuration-only `antiphon doctor --fix` mode described below.
 4. **Alias** — through `peers.explicit_name()`, the exact function production
    routing uses, never the raw environment. Measured: it lower-cases, so
    `ANTIPHON_NAME=UI` is a working named session a raw read calls invalid.
@@ -944,7 +947,8 @@ broken; only `✗` makes the command exit 1. A set-up project with no session
 running prints only `✓` and `·` and exits 0 — pinned by test. A diagnostic
 that warns about the normal resting state is one people learn to ignore.
 
-**Zero writes, enforced.** Doctor never opens a file for writing, never takes
+**The default is zero writes, enforced.** The default `antiphon doctor` remains
+read-only: it never opens a file for writing, never takes
 the registry lock, and calls none of the three readers that prune —
 `peers.read_peers` (`peers.py:425`), `_live_by_kind` (`antiphon.py`, what
 `status` uses) and `resolve_target`. All three delete a dead peer's record on
@@ -952,6 +956,13 @@ the way past, which would remove exactly the stale record somebody ran the
 command to ask about. A test snapshots bytes, sizes and mtimes under two roots
 — the project fixture and the external socket directory — before and after, on
 a broken fixture and a healthy one, each with a corpse armed.
+
+**Configuration repair is explicit.** `antiphon doctor --fix` writes project
+configuration only, through the same idempotent `setup()` path, and then marks
+and runs a fresh read-only doctor pass. It does not delete or repair sockets,
+peer records, cursors, queues, transcripts or attachments and does not start a
+host process. Setup's own stdout/stderr is not hidden; a file it refuses keeps
+the combined command nonzero even if the re-check can read everything else.
 
 **The socket `✓` is falsifiable.** Connect → `shutdown(SHUT_WR)` → read one
 reply → close; nothing is ever sent. The half-close is load-bearing: the
@@ -969,10 +980,14 @@ the perfectly normal no-socket state. That split cannot reintroduce the race
 the patience exists for — the channel server claims the registry before it
 binds, and a contract test pins that ordering.
 
-**Doctor is authoritative over `status` on reachability.** `status` prints
-`Claude channel: live` when the socket *file* exists; doctor means somebody
-answered. On a stale socket the two disagree, and doctor is right. `status` is
-unchanged here on purpose; aligning it is a separate change.
+**`status` uses the same content-free channel probe.** Both commands select the
+same relevant registered, configured-name or legacy target. `Claude channel: live`
+now means at least one listener answered with the Antiphon JSON shape;
+neither a registry record nor a socket pathname earns it. Registered targets
+receive bounded startup patience. An unregistered configured alias and the
+ordinary no-peer legacy path are tried once, so an idle `status` does not spend
+roughly 1.5 seconds retrying an absent socket. `status` stays informational and
+exit 0; doctor alone explains the failure class.
 
 **Privacy.** No session ids, no cursor contents, no addresses in the peer
 list. One deliberate exception: the stale-socket and not-a-socket repair lines
@@ -980,30 +995,30 @@ print the socket path, because that is the file the person may need to remove
 (five repair lines in total print it — every not-listening/not-a-socket/
 cannot-connect arm, per probed address).
 
-Known incompleteness, deliberately parked: the config *envelope keys*
-(`permissions`/`allow`, `mcpServers`, `enabledMcpjsonServers` as a key, the
-hook envelope fields) are still spelled once in setup and once in doctor.
-Latent, not live — those keys are owned by Claude Code and Codex and never
-change unilaterally — but a future extraction pass could move them into the
-shared shapes too. Note also that `status` may say `live` purely from the
-registry, not only from the socket file; doctor's answered/unanswered remains
-the authoritative reachability verdict either way.
+The configuration envelope is shared too: immutable `CONFIG_KEYS` supplies
+`permissions`/`allow`, `mcpServers`, `enabledMcpjsonServers` and the hook entry
+fields to both setup's writer helpers and doctor's readers. A fixture replaces
+that vocabulary and proves both halves move together; real on-disk keys remain
+byte-compatible.
 
 **Also fixed:** `antiphon --help`, `-h` and `help` print the usage and exit 0.
 They exited 1 on all three spellings, and the check runs before the command
 table so `antiphon help doctor` is not an arity error.
 
-### Still future
+### Supported and explicitly declined
 
-- `--fix`. The default command must keep editing nothing; a repair mode would
-  call the existing idempotent `setup` path.
-- Executing `codex` to prove queue liveness. Check 7 is presence on `PATH`
-  only: running it from a diagnostic can block on authentication or spawn a
-  session, and a command run because things are broken must do neither.
-- Per-peer Codex reachability, for the same reason.
-- Whether Codex actually *forwards* `ANTIPHON_NAME`. Doctor verifies the
-  `env_vars` line that asks for the forward; only a live Codex process can
-  show that it happened.
+The thread-writer lock and the queue's read-only inspection remain supported
+Codex evidence: the former distinguishes a stopped known thread without
+executing it, and the latter names this project's stranded queue rows without
+creating or changing Codex's database. `codex` on `PATH` remains a presence
+check.
+
+Active Codex reachability is declined until Codex exposes a bounded,
+non-spawning, version-detectable API. Executing `codex` from a diagnostic can
+block on authentication or start a session, so it cannot truthfully be a
+read-only health probe. `ANTIPHON_NAME` forwarding is no longer an open
+question: a live `ANTIPHON_NAME=probe codex exec` measurement found the same
+value in the MCP child's environment, recorded under the unnamed-peer entry.
 
 ## P2 — Reply correlation
 
@@ -1105,8 +1120,17 @@ channel ownership, and today one answers the other.
    is not proof; routing must see the listener's matching pid and socket in the
    registry before the original message can be sent.
 
-**What landed.** A valid Claude `ANTIPHON_NAME` now signs both of its outgoing
-roads — the channel's `reply_to_codex` subprocess and the Stop-hook push —
+**Release boundary.** Published 0.3.3 still contains the inherited-timezone,
+inherited-locale `ps lstart` fingerprint defect reproduced above. The candidate
+branch beginning at `a4533d1` and completed for migration by `6902546`
+canonicalises new observations under `LC_ALL=C` and `TZ=UTC`, versions both
+endpoint births and owner keys, and treats an unversioned fingerprint as
+unverifiable rather than dead. This wording remains candidate-only until a
+later release actually contains those commits.
+
+**What landed on the candidate branch.** A valid Claude `ANTIPHON_NAME` now
+signs both of its outgoing roads — the channel's `reply_to_codex` subprocess
+and the Stop-hook push —
 without treating ownership of the return socket as identity. Codex keeps the
 stricter owner-key rule because its MCP server is not the session it names.
 The duplicate-name loser is still refused the channel and the startup warning
@@ -1165,13 +1189,17 @@ original serving process had no registration remains unproven from their
 artifact, exactly as above; the deterministic product reproduction is the
 evidence for this fix, not an attribution to logs we do not have.
 
-**Also reported, filed rather than fixed here.** A stale pid left in
-`endpoint.json` by a writer that exited without unregistering, which works
-only because the socket path is derived from a hash rather than read from the
-record — `doctor`'s `running:` check now names servers whose code is older
-than the install, but not endpoints whose pid is gone. Orphaned `channel.mjs`
-processes accumulating across reconnects (seen on the maintainer's machine
-too). And the passive fallback's own arithmetic: with a real backlog the
+**Operational follow-up.** Read-only doctor now reports a dead-pid endpoint as
+a stale record without pruning it; that is separate from `running:`, which
+judges in-scope server processes against the code they loaded. Ordinary
+channel shutdown through stdin close and wrapper-forwarded signals is fixed:
+the wrapper forwards SIGINT/SIGTERM, and the server's idempotent shutdown waits
+for startup/reassert work, unregisters its own claim and closes only its own
+socket. Abrupt host death or SIGKILL can still leave a stale record or socket
+and remain a doctor-guided recovery case; Antiphon does not broadly reap paths
+it cannot prove it owns.
+
+The passive fallback's own arithmetic remains open: with a real backlog the
 reader advances roughly one page per turn and iterates dead sources ahead of
 live ones — measured by the reporter at ~940 KB across four sources, two of
 them sessions that had already exited, putting a reply 15-20 turns away.
@@ -1456,7 +1484,8 @@ python3 test/host_wrapper_census.py \
 The utility prints aggregate counts only — never transcript text or individual
 paths. Review its tag keys, then:
 
-- count every `role: user` text record whose text opens with `<`, split by
+- count every Claude `type=user` text block and Codex
+  `response_item/message/role=user` message whose text opens with `<`, split by
   side, each one carrying its `promptSource` value (or its absence);
 - for every opening tag that turns up, decide host bookkeeping or a person's
   own words before touching either set — a tag seen on only one side stays out
