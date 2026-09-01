@@ -563,6 +563,29 @@ class ShippedContractTest(unittest.TestCase):
         self.assertIn("reply_to_codex", antiphon.CLAUDE_RULE)
         self.assertIn("@codex` line is not parked", antiphon.CLAUDE_RULE)
 
+    def test_every_agent_surface_teaches_the_same_multiline_marker_contract(self):
+        channel = re.sub(r'"\s*\+\s*\n\s*"', "", read("lib", "channel.mjs"))
+        surfaces = {
+            "README": read("README.md"),
+            "AGENTS rule": antiphon.AGENTS_RULE,
+            "CLAUDE rule": antiphon.CLAUDE_RULE,
+            "channel instructions": channel,
+        }
+        for where, text in surfaces.items():
+            self.assertIn("<<TOKEN", text, where)
+            self.assertIn("[A-Z][A-Z0-9_]{0,31}", text, where)
+            self.assertRegex(text, r"(?i)exact[^.]*TOKEN[^.]*line[^.]*close", where)
+            self.assertRegex(text, r"(?i)do not nest|not nestable", where)
+            self.assertRegex(text, r"(?i)not[^.]*fence-aware", where)
+            self.assertRegex(text, r"(?i)token absent from the body", where)
+            self.assertRegex(
+                text, r"(?i)malformed or unclosed[^.]*nothing[^.]*turn", where)
+            self.assertRegex(
+                text, r"(?i)literal text beginning with `?<<`?[^.]*block\s+body",
+                where)
+        self.assertIn("@claude[:name]", surfaces["README"])
+        self.assertIn("@codex[:name]", surfaces["README"])
+
     def test_paged_context_surfaces_teach_has_more(self):
         """An agent that has not been told a page is one of several will treat
         the first page as the whole answer. Both the tool description and the

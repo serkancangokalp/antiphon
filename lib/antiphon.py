@@ -107,32 +107,100 @@ MARKER_ALIAS = re.compile(r"^:(?P<claim>\S+)")
 # claimed. Stripping a *set* of characters here ate the message's own
 # punctuation: `@claude:api .NET issue` arrived as "NET issue".
 MARKER_DELIMITER = re.compile(r"^[:,]?[ \t]*")
+MARKER_BLOCK = re.compile(r"^<<(?P<token>[A-Z][A-Z0-9_]{0,31})$")
+
+
+class MarkerSyntaxError(ValueError):
+    """A bounded Stop-marker refusal that carries no sender-authored body.
+
+    The only value retained from an unclosed block is its grammar-limited
+    token. An invalid delimiter may contain arbitrary text, so not even the
+    attempted token is kept on the exception a caller will print.
+    """
+
+    def __init__(self, reason, token=None):
+        self.reason = reason
+        self.token = token if reason == "unclosed" else None
+        if self.token is None:
+            message = "invalid multi-line marker delimiter"
+        else:
+            message = f"unclosed multi-line marker token {self.token}"
+        super().__init__(message)
+
+
+def _marker_line(target, line):
+    """Decode one physical line with the pre-block marker grammar."""
+    match = PUSH_MARKERS.match(line)
+    if not match or match.group("side") != target:
+        return None
+    rest, alias = match.group("rest"), None
+    claim = MARKER_ALIAS.match(rest)
+    if claim:
+        # The claim already swallowed any delimiter attached to the name, so
+        # only whitespace separates it from the message. Anything else here
+        # belongs to the message.
+        alias = claim.group("claim").rstrip(",;:.")
+        rest = rest[claim.end():].lstrip(" \t")
+    else:
+        rest = MARKER_DELIMITER.sub("", rest, count=1)
+    return alias, rest.rstrip()
+
+
+def _marker_physical_lines(text):
+    """Physical lines with their exact LF/CRLF terminators preserved."""
+    start = 0
+    while start < len(text):
+        end = text.find("\n", start)
+        if end < 0:
+            yield text[start:], text[start:]
+            return
+        piece = text[start:end + 1]
+        content = piece[:-2] if piece.endswith("\r\n") else piece[:-1]
+        yield piece, content
+        start = end + 1
+
+
+def _marker_records(target, text):
+    """Parse one-line and explicit delimited marker records atomically."""
+    lines = list(_marker_physical_lines(text or ""))
+    found, index = [], 0
+    while index < len(lines):
+        _piece, content = lines[index]
+        marker = _marker_line(target, content)
+        if marker is None:
+            index += 1
+            continue
+        alias, message = marker
+        if not message.startswith("<<"):
+            found.append((alias, message))
+            index += 1
+            continue
+        opener = MARKER_BLOCK.fullmatch(message)
+        if opener is None:
+            raise MarkerSyntaxError("invalid-delimiter")
+        token = opener.group("token")
+        body, closing = [], index + 1
+        while closing < len(lines) and lines[closing][1] != token:
+            body.append(lines[closing][0])
+            closing += 1
+        if closing == len(lines):
+            raise MarkerSyntaxError("unclosed", token)
+        found.append((alias, "".join(body)))
+        index = closing + 1
+    return found
 
 
 def parse_markers(target, text):
-    """[(alias, message)] for every marker line addressed at `target`.
+    """[(alias, message)] for every marker addressed at `target`.
 
     `alias` is None when no name was claimed, `""` when one was claimed and is
     empty, and the raw string otherwise. `message` may be empty. Nothing is
     filtered here: whether a name exists is routing's decision, and a line the
     human wrote and the bridge swallowed without a word is the thing to avoid.
+    An explicit `<<TOKEN` message consumes a delimited body atomically; invalid
+    or unclosed block syntax raises MarkerSyntaxError before anything is sent.
     """
-    found = []
-    for match in PUSH_MARKERS.finditer(text or ""):
-        if match.group("side") != target:
-            continue
-        rest, alias = match.group("rest"), None
-        claim = MARKER_ALIAS.match(rest)
-        if claim:
-            # The claim already swallowed any delimiter attached to the name, so
-            # only whitespace separates it from the message. Anything else here
-            # belongs to the message.
-            alias = claim.group("claim").rstrip(",;:.")
-            rest = rest[claim.end():].lstrip(" \t")
-        else:
-            rest = MARKER_DELIMITER.sub("", rest, count=1)
-        found.append((alias, rest.rstrip()))
-    return found
+    return _marker_records(target, text)
 
 
 def group_by_recipient(target, text):
@@ -4280,12 +4348,13 @@ def _retire_park(cwd, side, key, observed):
 
 
 def push(target="codex"):
-    """Stop hook: pushes explicit target lines in the latest reply to the other side.
+    """Stop hook: pushes explicit target markers in the latest reply.
 
     `target=codex` is called from Claude's Stop hook, `target=claude` from
     Codex's Stop hook. Addressing is never inferred from free text — only an
     explicit `@codex` or `@claude` marker at the start of a line triggers a
-    push.
+    push. A marker whose message is `<<TOKEN` carries the explicitly delimited
+    multi-line body that follows it; arbitrary prose is never continuation.
     """
     if target not in MARKER_SIDES:
         print(f"push: unknown target {target!r} (claude | codex)", file=sys.stderr)
@@ -4324,8 +4393,26 @@ def push(target="codex"):
         # to that turn. Where it was not, there is no key.
         reply_text, turn_key = _codex_turn(transcript,
                                            input_data.get("turn_id"))
+    # Every Stop consumes any mid-turn park written for it, including one whose
+    # marker syntax is refused before transport. Hoisted so that syntax failure
+    # can retire through the same compare-and-clear helper as a markerless Stop
+    # without creating a second cursor mutation rule.
+    side = sender_side(target)
+    key = f"last_pushed_{target}"
+    try:
+        grouped = group_by_recipient(target, reply_text)
+    except MarkerSyntaxError as failure:
+        if failure.reason == "unclosed":
+            print(f"antiphon: unclosed @{target} block token {failure.token}; "
+                  "nothing sent for this turn", file=sys.stderr)
+        else:
+            print(f"antiphon: invalid multi-line @{target} marker delimiter; "
+                  "nothing sent for this turn", file=sys.stderr)
+        held = read_cursor(cwd, side).get(key)
+        return _retire_park(cwd, side, key, parked_deliveries(held))
+
     batches = {}
-    for recipient, messages in group_by_recipient(target, reply_text).items():
+    for recipient, messages in grouped.items():
         # Reported per line, not per recipient: a batch holding one empty marker
         # and one real message is not empty, so a per-batch check would let the
         # empty line disappear without a word.
@@ -4340,9 +4427,6 @@ def push(target="codex"):
     # Hoisted above the markerless return: that return is a cursor-reaching
     # exit now, because a turn that addresses nobody is still the Stop the
     # mid-turn park was written for.
-    side = sender_side(target)
-    key = f"last_pushed_{target}"
-
     if not batches:
         return _retire_park(cwd, side, key,
                             parked_deliveries(read_cursor(cwd, side).get(key)))
@@ -6249,6 +6333,15 @@ TOOL_RETRIEVAL_RULE = (
     "honestly collapse to `unavailable`; binding invocation content into the id "
     "prevents changed bytes from being returned under the old id.")
 
+MULTILINE_MARKER_RULE = (
+    "A Stop marker can carry a block: make its one-line message exactly "
+    "`<<TOKEN`, where TOKEN matches `[A-Z][A-Z0-9_]{0,31}`, put the body on "
+    "following lines, and use an exact `TOKEN` line to close it. Blocks do not "
+    "nest and the closer is not Markdown-fence-aware, so choose a token absent "
+    "from the body. Marker-looking lines inside the body are content. A malformed "
+    "or unclosed block sends nothing from that turn. To send literal text "
+    "beginning with `<<`, put it inside a block body.")
+
 AGENTS_RULE = ("\n## The Antiphon bridge\n\n"
                "You are working alongside Claude Code on this project. What happens on the "
                "other side is injected into your context automatically at the start of each "
@@ -6305,7 +6398,7 @@ AGENTS_RULE = ("\n## The Antiphon bridge\n\n"
                "Channel event. To reach Claude without ending your turn, call the "
                "`antiphon_send` tool instead: it delivers immediately, so Claude can start "
                "working while you carry on, and `antiphon_read` picks up the answer later in "
-               "the same turn.\n\n"
+               "the same turn. " + MULTILINE_MARKER_RULE + "\n\n"
                "A direct send reaches one peer and is never broadcast. Write `@claude:name`, "
                "or `antiphon_send(to=name)`, whenever more than one Claude peer is live: an "
                "unaddressed send is refused rather than delivered to a guess. For the same "
@@ -6378,7 +6471,8 @@ CLAUDE_RULE = ("\n## The Antiphon bridge\n\n"
                "same reason every terminal in a project with more than one session per side "
                "has to be started with `ANTIPHON_NAME` set — Codex terminals above all, "
                "because an unnamed Codex session leaves no record at all, and one that exists "
-               "unseen is why a bare message to Codex is refused.\n\n"
+               "unseen is why a bare message to Codex is refused. "
+               + MULTILINE_MARKER_RULE + "\n\n"
                "A message too large for the transport arrives as an envelope instead of the "
                "words: a line starting with `[Antiphon attachment]` naming an absolute path "
                "under `.antiphon/messages/`, the content's size and its SHA-256. Read that "

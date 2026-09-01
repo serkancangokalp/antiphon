@@ -1569,13 +1569,36 @@ moved it, and the failure would look like the bridge going quiet.
 If a first-party, documented agent-to-agent transport ever ships on both sides,
 this is the entry to revisit. Until then Antiphon owns its own sockets.
 
-## P2 — Multi-line Stop markers
+## Shipped — explicit multi-line Stop markers
 
-Stop markers currently carry one line. Channel tools preserve multi-line text
-and are the recommended route for long content. If users need natural-language
-Stop blocks, add an explicit delimited syntax with tests for fenced code,
-embedded marker text, empty blocks and deduplication; never guess continuation
-from arbitrary following prose.
+Stop markers still never guess continuation from following prose. A sender who
+needs a natural multi-line handoff opts in with a message exactly `<<TOKEN`,
+where `TOKEN` matches `[A-Z][A-Z0-9_]{0,31}`, and closes it with the first later
+exact `TOKEN` line. The body between those structural lines is preserved,
+including whitespace and line endings.
+
+The parser is deliberately fence-unaware and non-nesting. A marker-looking
+line inside the body is content; the first exact current token closes even in a
+Markdown fence, so the sender chooses a token absent from the body. A message
+beginning `<<` but not matching the grammar is reserved and refused rather than
+silently sent as a one-line message. Literal text beginning with `<<` remains
+possible inside a block body.
+
+Invalid or unclosed syntax rejects every marker for that target in the turn
+before transport. The unclosed refusal names only its bounded token; the
+invalid refusal echoes no sender text, and neither leaks the body. An empty
+block uses the existing empty-message refusal without invalidating valid
+siblings. Syntax refusal records no delivery fingerprint and consumes only the
+mid-turn park that this Stop already owned.
+
+Recipient grouping, source order within a recipient, whole-body size checks,
+turn-scoped dedupe and the marker/direct-tool attachment asymmetry are
+unchanged. Compatibility tests pin existing one-line parse tuples and both
+directions' outgoing transport strings exactly. Real throwaway Claude and
+Codex transcripts drive block parsing through the Stop readers and cursor
+dedupe; malformed turns, CRLF, fences, nested-looking text, empty bodies and
+oversize refusal have focused coverage. README, both generated rules and the
+channel instructions state the same syntax and literal-`<<` escape.
 
 ## Shipped — a fresh-user end-to-end run, and doctor scoped to this project
 

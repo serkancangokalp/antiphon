@@ -36,6 +36,15 @@ between two particular peers.
 A line starting with `@codex` or `@claude` in a reply reaches the other
 agent immediately, even if nobody is typing.
 
+A Stop marker can carry a block. Make its one-line message
+`@claude[:name] <<TOKEN` or `@codex[:name] <<TOKEN`, where `TOKEN` matches
+`[A-Z][A-Z0-9_]{0,31}`; put the body on following lines and use an exact
+`TOKEN` line to close it. Blocks do not nest and the closer is not
+Markdown-fence-aware, so choose a token absent from the body. Marker-looking
+lines inside the body are content. A malformed or unclosed block sends nothing
+from that turn. To send literal text beginning with `<<`, put it inside a block
+body. Direct tools remain the better road for long content.
+
 Every push is addressed to exactly one peer and is never broadcast. When the
 recipient cannot be shown to be the only candidate, the send is refused rather
 than guessed.

@@ -172,6 +172,110 @@ class AntiphonTest(unittest.TestCase):
     def test_a_marker_for_the_other_side_is_not_ours(self):
         self.assertEqual(antiphon.parse_markers("claude", "@codex:build run"), [])
 
+    def test_a_multiline_marker_preserves_the_exact_body_and_source_order(self):
+        text = (
+            "@claude:review <<HANDOFF\r\n"
+            " first line  \r\n"
+            "\r\n"
+            "@codex marker-looking body text\r\n"
+            "HANDOFF\r\n"
+            "@claude after"
+        )
+        self.assertEqual(
+            antiphon.parse_markers("claude", text),
+            [("review",
+              " first line  \r\n\r\n@codex marker-looking body text\r\n"),
+             (None, "after")],
+        )
+
+    def test_multiline_markers_work_for_both_targets_and_named_recipients(self):
+        for target in ("claude", "codex"):
+            text = f"@{target}:worker <<BODY\nline one\nline two\nBODY"
+            self.assertEqual(
+                antiphon.parse_markers(target, text),
+                [("worker", "line one\nline two\n")],
+                target,
+            )
+
+    def test_a_multiline_closer_is_exact_and_fence_unaware(self):
+        text = (
+            "@claude <<END\n"
+            "```text\n"
+            " END\n"
+            "END \n"
+            "END\n"
+            "```\n"
+            "@claude after"
+        )
+        self.assertEqual(
+            antiphon.parse_markers("claude", text),
+            [(None, "```text\n END\nEND \n"), (None, "after")],
+            "the first exact token closes even inside an unbalanced fence",
+        )
+
+    def test_a_multiline_block_does_not_nest_and_body_markers_are_inert(self):
+        text = (
+            "@claude <<OUTER\n"
+            "@claude:api <<INNER\n"
+            "INNER\n"
+            "OUTER\n"
+            "@claude done"
+        )
+        self.assertEqual(
+            antiphon.parse_markers("claude", text),
+            [(None, "@claude:api <<INNER\nINNER\n"), (None, "done")],
+        )
+
+    def test_an_empty_multiline_block_is_an_empty_message_not_a_syntax_error(self):
+        self.assertEqual(
+            antiphon.parse_markers(
+                "claude", "@claude <<EMPTY\nEMPTY\n@claude still-valid"),
+            [(None, ""), (None, "still-valid")],
+        )
+
+    def test_invalid_multiline_delimiters_fail_without_echoing_sender_text(self):
+        for opener in ("<<lower", "<<_BAD", "<<A-B", "<<TOKEN extra",
+                       "<<" + "A" * 33):
+            secret = "PRIVATE-BODY-MUST-NOT-LEAK"
+            with self.subTest(opener=opener), \
+                 self.assertRaises(antiphon.MarkerSyntaxError) as raised:
+                antiphon.parse_markers(
+                    "claude", f"@claude:private {opener}\n{secret}\n")
+            self.assertEqual(raised.exception.reason, "invalid-delimiter")
+            self.assertIsNone(raised.exception.token)
+            self.assertNotIn(secret, str(raised.exception))
+            self.assertNotIn("private", str(raised.exception))
+
+    def test_an_unclosed_multiline_block_names_only_its_safe_token(self):
+        secret = "PRIVATE-BODY-MUST-NOT-LEAK"
+        with self.assertRaises(antiphon.MarkerSyntaxError) as raised:
+            antiphon.parse_markers(
+                "claude", f"@claude:private <<SAFE_TOKEN\n{secret}\n")
+        self.assertEqual(raised.exception.reason, "unclosed")
+        self.assertEqual(raised.exception.token, "SAFE_TOKEN")
+        self.assertIn("SAFE_TOKEN", str(raised.exception))
+        self.assertNotIn(secret, str(raised.exception))
+        self.assertNotIn("private", str(raised.exception))
+
+    def test_a_bad_block_for_the_other_target_cannot_invalidate_this_push(self):
+        text = "@codex <<lower\nsecret\n@claude still mine"
+        self.assertEqual(antiphon.parse_markers("claude", text),
+                         [(None, "still mine")])
+
+    def test_multiline_syntax_preserves_the_one_line_parser_contract_exactly(self):
+        cases = (
+            ("@claude one", [(None, "one")]),
+            ("  @claude: two  ", [(None, "two")]),
+            ("@claude:api, run it", [("api", "run it")]),
+            ("@claude:api .NET issue", [("api", ".NET issue")]),
+            ("@claude:: fix", [("", "fix")]),
+            ("@claude", [(None, "")]),
+            ("prose @claude hidden", []),
+        )
+        for text, expected in cases:
+            with self.subTest(text=text):
+                self.assertEqual(antiphon.parse_markers("claude", text), expected)
+
     # ---- grouping, fingerprinting and dedupe, as pure helpers ----
 
     def test_messages_group_by_recipient_in_order(self):
@@ -732,6 +836,174 @@ class AntiphonTest(unittest.TestCase):
                 second_payload = send.call_args.args[1]
                 self.assertIn("do NEW", second_payload)
                 self.assertNotIn("do OLD", second_payload)
+
+    def test_a_codex_multiline_stop_uses_the_real_reader_and_dedupes_exactly(self):
+        with tempfile.TemporaryDirectory() as project:
+            rollout = os.path.join(project, "rollout.jsonl")
+            reply = (
+                "@claude:review before\n"
+                "@claude:review <<HANDOFF\n"
+                " first line  \n"
+                "@claude:api inert body marker\n"
+                "HANDOFF\n"
+                "@claude:review after"
+            )
+            with open(rollout, "w", encoding="utf-8") as stream:
+                stream.write("\n".join([
+                    codex_task_started("MULTI"), codex_msg(reply),
+                ]) + "\n")
+
+            def run():
+                payload = {"cwd": project, "transcript_path": rollout,
+                           "turn_id": "MULTI"}
+                with patch.object(antiphon.sys, "stdin",
+                                  io.StringIO(json.dumps(payload))), \
+                     contextlib.redirect_stderr(io.StringIO()):
+                    return antiphon.push("claude")
+
+            with patch.object(antiphon, "send_to_claude",
+                              return_value=(True, "")) as send:
+                self.assertEqual(run(), 0)
+                self.assertEqual(run(), 0)
+
+        send.assert_called_once()
+        self.assertEqual(send.call_args.args[1],
+                         "before\n first line  \n"
+                         "@claude:api inert body marker\n\nafter")
+        self.assertEqual(send.call_args.args[2], "review")
+
+    def test_a_claude_multiline_stop_uses_the_real_reader_and_dedupes_exactly(self):
+        with tempfile.TemporaryDirectory() as project:
+            transcript = os.path.join(project, "transcript.jsonl")
+            reply = "@codex:build <<HANDOFF\nline one\nline two\nHANDOFF"
+            with open(transcript, "w", encoding="utf-8") as stream:
+                stream.write("\n".join([
+                    claude_prompt("handoff", uuid="MULTI"),
+                    claude_assistant(reply),
+                ]) + "\n")
+
+            def run():
+                payload = {"cwd": project, "transcript_path": transcript}
+                with patch.object(antiphon.sys, "stdin",
+                                  io.StringIO(json.dumps(payload))), \
+                     contextlib.redirect_stderr(io.StringIO()):
+                    return antiphon.push("codex")
+
+            with patch.object(antiphon, "send_to_codex",
+                              return_value=(True, "")) as send:
+                self.assertEqual(run(), 0)
+                self.assertEqual(run(), 0)
+
+        send.assert_called_once()
+        self.assertEqual(send.call_args.args[2], "build")
+        self.assertTrue(send.call_args.args[1].endswith(
+            "line one\nline two\n"), send.call_args.args[1])
+
+    def test_existing_one_line_stops_keep_their_exact_transport_bytes(self):
+        with tempfile.TemporaryDirectory() as project:
+            rollout = os.path.join(project, "rollout.jsonl")
+            reply = "@claude:ui .NET issue\n@claude:ui :keep punctuation"
+            with open(rollout, "w", encoding="utf-8") as stream:
+                stream.write("\n".join([
+                    codex_task_started("ONE"), codex_msg(reply),
+                ]) + "\n")
+            payload = {"cwd": project, "transcript_path": rollout,
+                       "turn_id": "ONE"}
+            with patch.object(antiphon, "send_to_claude",
+                              return_value=(True, "")) as send, \
+                 patch.object(antiphon.sys, "stdin",
+                              io.StringIO(json.dumps(payload))), \
+                 contextlib.redirect_stderr(io.StringIO()):
+                self.assertEqual(antiphon.push("claude"), 0)
+            self.assertEqual(send.call_args.args[:3],
+                             (project, ".NET issue\n:keep punctuation", "ui"))
+
+        with tempfile.TemporaryDirectory() as project:
+            transcript = os.path.join(project, "transcript.jsonl")
+            with open(transcript, "w", encoding="utf-8") as stream:
+                stream.write("\n".join([
+                    claude_prompt("one-line", uuid="ONE"),
+                    claude_assistant("@codex:build run exactly"),
+                ]) + "\n")
+            payload = {"cwd": project, "transcript_path": transcript}
+            with patch.object(antiphon, "send_to_codex",
+                              return_value=(True, "")) as send, \
+                 patch.object(antiphon, "delivery_id", return_value="ATTEMPT"), \
+                 patch.object(antiphon, "claimed_alias", return_value=None), \
+                 patch.object(antiphon.sys, "stdin",
+                              io.StringIO(json.dumps(payload))), \
+                 contextlib.redirect_stderr(io.StringIO()):
+                self.assertEqual(antiphon.push("codex"), 0)
+            self.assertEqual(
+                send.call_args.args[:3],
+                (project,
+                 f"{antiphon.PUSH_LABEL} "
+                 f"{antiphon.queue_label(None, 'ATTEMPT')} run exactly",
+                 "build"),
+            )
+
+    def test_a_multiline_syntax_error_refuses_the_whole_stop_without_leaking(self):
+        for broken, expected in (("<<SAFE_TOKEN\nPRIVATE BODY\n", "SAFE_TOKEN"),
+                                 ("<<lower\nPRIVATE BODY\n", None)):
+            with self.subTest(broken=broken), \
+                 tempfile.TemporaryDirectory() as project:
+                rollout = os.path.join(project, "rollout.jsonl")
+                reply = "@claude valid-before\n@claude:private " + broken
+                with open(rollout, "w", encoding="utf-8") as stream:
+                    stream.write("\n".join([
+                        codex_task_started("BROKEN"), codex_msg(reply),
+                    ]) + "\n")
+                stable = antiphon.batch_fingerprint(["older delivery"])
+                park = antiphon.batch_fingerprint(["mid-turn delivery"])
+                antiphon.write_cursor(project, {"last_pushed_claude": {
+                    "@stable": stable,
+                    antiphon.MID_TURN_SLOT: {"": park},
+                }}, "codex")
+                payload = {"cwd": project, "transcript_path": rollout,
+                           "turn_id": "BROKEN"}
+                err = io.StringIO()
+                with patch.object(antiphon, "send_to_claude") as send, \
+                     patch.object(antiphon.sys, "stdin",
+                                  io.StringIO(json.dumps(payload))), \
+                     contextlib.redirect_stderr(err):
+                    self.assertEqual(antiphon.push("claude"), 0)
+                send.assert_not_called()
+                record = antiphon.read_cursor(
+                    project, "codex")["last_pushed_claude"]
+                self.assertEqual(record, {"@stable": stable},
+                                 "the Stop retires only its observed park")
+                refusal = err.getvalue()
+                self.assertIn("nothing sent for this turn", refusal)
+                self.assertNotIn("PRIVATE BODY", refusal)
+                self.assertNotIn("private", refusal)
+                if expected is None:
+                    self.assertIn("invalid multi-line @claude", refusal)
+                    self.assertNotIn("lower", refusal)
+                else:
+                    self.assertIn(expected, refusal)
+
+    def test_an_empty_multiline_stop_uses_the_existing_empty_message_refusal(self):
+        sent, err = [], io.StringIO()
+        with tempfile.TemporaryDirectory() as project:
+            rollout = os.path.join(project, "rollout.jsonl")
+            reply = "@claude <<EMPTY\nEMPTY\n@claude still valid"
+            with open(rollout, "w", encoding="utf-8") as stream:
+                stream.write("\n".join([
+                    codex_task_started("EMPTY"), codex_msg(reply),
+                ]) + "\n")
+            payload = {"cwd": project, "transcript_path": rollout,
+                       "turn_id": "EMPTY"}
+            with patch.object(
+                    antiphon, "send_to_claude",
+                    side_effect=lambda _cwd, message, _to=None, **_:
+                        sent.append(message) or (True, "")), \
+                 patch.object(antiphon.sys, "stdin",
+                              io.StringIO(json.dumps(payload))), \
+                 contextlib.redirect_stderr(err):
+                self.assertEqual(antiphon.push("claude"), 0)
+        self.assertEqual(sent, ["still valid"])
+        self.assertEqual(err.getvalue().count("carried no message"), 1)
+        self.assertNotIn("invalid multi-line", err.getvalue())
 
     # ---- push, end to end: the SAME marker in a NEW turn is not deduped away ----
     #
@@ -14799,6 +15071,20 @@ class RefusedSendHonestyTest(unittest.TestCase):
                 bare = antiphon._send_tool(project, "hi")
         self.assertEqual(bare, {"content": [
             {"type": "text", "text": "Delivered to the Claude Code channel."}]})
+
+    def test_an_oversized_multiline_stop_is_refused_and_never_parked(self):
+        body = self._oversized()
+        with tempfile.TemporaryDirectory() as project:
+            antiphon.peers.register(project, "claude", "ui", "/tmp/ui.sock")
+            code, printed = self._push(
+                project, "claude", "@claude:ui <<BIG\n" + body + "\nBIG")
+            store = os.path.join(project, ".antiphon", "messages")
+            self.assertFalse(os.path.exists(store),
+                             "the marker road must not create an attachment")
+        self.assertEqual(code, 0)
+        self.assertIn("delivery failed — message is", printed)
+        self.assertIn(str(antiphon.MAX_CHANNEL_BYTES), printed)
+        self.assertNotIn(antiphon.ATTACHMENT_LABEL, printed)
 
     def test_the_guidance_fits_the_channel_slice(self):
         """`channel.mjs` hands the calling agent `detail.slice(0, 500)` of
