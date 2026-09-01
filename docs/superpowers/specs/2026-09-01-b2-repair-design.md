@@ -39,9 +39,11 @@ validation. With it the invariant holds even if cleanup never runs and the
 wakeup never arrives: a connection arriving after the proof moved is refused at
 the moment of delivery and emits no notification.
 
-That refusal is **classified**, not a transport error. The listener replies
-`ok:false` carrying a stable non-transport `refusal_class` and an actionable
-remedy, flushes that response, and only then self-retires. The delivery attempt
+That refusal is **classified**, not a transport error. The class is literally
+`no-peer` — the existing one, not a new spelling. It is the true statement: the
+peer that alias named is no longer this session, so there is no such peer to
+reach. The listener replies `ok:false` carrying `refusal_class="no-peer"` and an
+actionable reconnect remedy, flushes that response, and only then self-retires. The delivery attempt
 is therefore its own wakeup, and cleanup stops depending on a control that may
 never arrive. Python preserves that class through `_ClassifiedRefusal` rather
 than recasting every negative reply as `transport`, so a sender learns the
@@ -57,21 +59,48 @@ refuses with the classified reason, that zero channel notifications are emitted,
 that the response is flushed before the socket closes, and that A has
 self-retired afterwards.
 
+## 2a. Startup lifecycle
+
+The first automatic endpoint may register with **no proof at all**, as an
+UNREADY candidate: at startup no hook has run yet, so no proof can exist. It is
+a candidate, never a ready peer.
+
+If a proof does exist, the registration must match it. Every automatic
+**reassert** requires the matching current proof, so a stale A can never
+republish after proof B lands — which is the whole point of putting the check
+on register and reassert rather than on delivery alone.
+
+When a hook replaces the proof it captures the prior one first, then under the
+same lock withdraws every same-owner stale automatic session half. It sends at
+most **one** wakeup, to the previous current alias, and that one is bounded at
+250 ms. Waking every stale half would make hook latency grow with history; the
+previous current alias is the only one with a live listener worth waking, and
+the others are already inert because routing consults the proof.
+
 ## 3. The proof record
 
 - One file per owner under the project's registry area, named from a digest of
   the owner key, never from the raw key.
-- Fields: version, kind, the validated canonical owner key, the owner-key
-  digest that names the path, the current canonical session id, the identity
-  digest, and the written time. The owner key is stored because liveness is a
+- Fields: a strict integer version, kind, the validated canonical owner key,
+  the owner-key digest that names the path, the current canonical session id
+  and its identity digest. Nothing else — in particular no written time, which
+  nothing reads: retention is by proved death, not by age, and an unread field
+  that must still be validated is pure cost. The owner key is stored because liveness is a
   fact about a pid and a start time, and a digest is one-way: without the key,
   an owner's death can never be proved, only assumed. It is private and is
   never rendered on any surface.
 - Written in full then atomically replaced, under the existing registry lock.
   Never rendered on any surface.
-- Read validation is strict and total. Wrong version, wrong kind, missing or
-  non-canonical session id, malformed digest, and a torn or empty record all
-  read as **no proof**.
+- Read validation is strict and total. Every one of these reads as **no
+  proof**: a version that is not exactly the current integer (a bool is not an
+  int); wrong kind; a missing or non-canonical session id; a malformed digest;
+  an owner key that is not canonical under the versioned fingerprint; a
+  filename that is not the digest of the stored owner key; an identity digest
+  that is not the one derived from the stored session id; a torn record; an
+  empty file.
+- The **filename-to-owner binding** is not decoration. Without it a record
+  could be planted or renamed under another owner's digest and read as that
+  owner's proof.
 - **No proof is not agreement.** An automatic peer without a valid current
   proof is neither routable nor deliverable. Pre-upgrade records fail closed
   rather than inheriting trust, and old writers are never rewritten or guessed.
@@ -83,8 +112,20 @@ self-retired afterwards.
   §6, where B is the current identity and has no endpoint yet. Deleting the
   proof there would erase the only evidence that B exists, and `status` and
   `doctor` would have nothing to name.
+- Discovery is by inventory, not by lookup. `status` and `doctor` cannot start
+  from an owner they do not know, and in the reconnect window B has no peer
+  record to enumerate — so a read-only validated inventory is what makes §6
+  implementable at all.
+- **Liveness governs rendering.** Only a proof whose owner is positively live
+  renders as an alias with a reconnect remedy. Unknown and dead owners never
+  render as live; at most they are counted. The same rule as everywhere else on
+  this bridge: positive proof or nothing.
 - It is removed only when its owner is **positively proved dead**, and only on
-  a mutation path that is already writing the registry. A read-only surface —
+  a mutation path that is already writing the registry. That path is named, not
+  implied: each `write_identity_proof` sweeps at most eight proofs under the
+  lock it already holds and reclaims only those whose owner death is proved.
+  A reclamation function with no real caller would let a unit test pass while
+  production never reclaimed anything. A read-only surface —
   `status`, `doctor`, any resolver — never prunes it. Unproved or unknown
   liveness leaves it alone: an unreclaimed record costs a file, and a wrongly
   reclaimed one costs a live session its identity.
@@ -164,9 +205,9 @@ completion. The bounds are literal, not adjectival:
 | bound | value | why |
 | --- | --- | --- |
 | deadline | 2.0 s | the existing `CLAUDE_IDENTITY_TIMEOUT`, unchanged |
-| stdout ceiling | 32,768 bytes | the same number `channel.mjs` already uses as `maxBuffer` on this probe, so the two sides cannot disagree about what is too large |
+| stdout ceiling | 32,768 bytes | a fail-closed policy limit. The earlier rationale here was wrong and is corrected: `channel.mjs`'s `maxBuffer: 32 * 1024` bounds the **Python bridge's** JSON output, not raw `claude agents`, which Node never sees. The two numbers coincide by choice, not because they bound the same stream |
 | stderr ceiling | 8,192 bytes | room for a real diagnostic and no more |
-| total retained | 40,960 bytes | their sum, and nothing else is held |
+| total retained | captured pipe bytes <= 40,960 | their sum. Decoding and JSON parsing allocate beyond it, so the honest claim is that captured bytes are bounded and every allocation stays O(bound) — not that 40,960 is all the memory used |
 | overflow boundary | the byte that would exceed a ceiling | a limit on what is retained triggers at the first byte past it, not after the read completes |
 | terminate to kill | 250 ms, then `SIGKILL` | bounded |
 | reap wait | 250 ms | a child that cannot be reaped is reported, never awaited forever |
