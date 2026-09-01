@@ -1992,3 +1992,58 @@ async function anExplicitSessionKeepsTheRouteItCanActOn() {
 
 await anAutomaticSessionNeverPrintsItsOwnRoute();
 await anExplicitSessionKeepsTheRouteItCanActOn();
+
+// --- Task 10: the retiring listener says which alias stopped answering ------
+// "The identity moved" is true and unusable. Whoever reads this terminal, and
+// whoever addressed the peer, both need the name that stopped resolving and the
+// one remedy that fixes it — and the alias is the public half, so naming it
+// costs nothing the privacy contract protects.
+async function aRetiringListenerNamesItsAliasAndTheRemedy() {
+  const dir = await mkdtemp(join(tmpdir(), "antiphon-retire-notice-"));
+  const { session, stub } = await staleInboundSession(dir);
+  let socket = null;
+  try {
+    socket = await boundSocketOf(session);
+    assert.ok(socket && existsSync(socket),
+      `channel never bound; stderr=${session.stderr()}`);
+    // PROVED_STALE, not UNREADY: the hook half has to exist and agree with the
+    // endpoint before a proof naming another session can outgrow it. The owner
+    // comes from the endpoint the channel itself wrote, because this test
+    // process and the channel need not walk to the same CLI root.
+    runPeers(dir, `
+import json, os
+root = os.path.join(${JSON.stringify(dir)}, ".antiphon", "peers",
+                    "claude-${STALE_A_ALIAS}")
+owner = json.load(open(os.path.join(root, "endpoint.json")))["owner"]
+peers.write_session(${JSON.stringify(dir)}, "claude", "${STALE_A_ALIAS}",
+                    ${JSON.stringify(STALE_A)}, "/t/a.jsonl", owner,
+                    ${JSON.stringify(STALE_A_DIGEST)}, True)
+peers.write_identity_proof(${JSON.stringify(dir)}, owner,
+                           ${JSON.stringify(STALE_B)},
+                           peers.auto_identity(${JSON.stringify(STALE_B)})[1])
+`);
+    const reply = await sendToSocketAt(socket, { content: "hi" });
+    assert.equal(reply?.ok, false, "a proved-stale identity refuses");
+    assert.match(String(reply?.error), new RegExp(STALE_A_ALIAS),
+      `the sender is told which alias stopped answering: ${reply?.error}`);
+    assert.match(String(reply?.error), /reconnect/i,
+      "and the remedy travels with it");
+    assert.ok(await waitFor(() => new RegExp(STALE_A_ALIAS).test(session.stderr())),
+      `the terminal is told too: ${session.stderr()}`);
+    assert.match(session.stderr(), /reconnect/i,
+      "the terminal gets the same remedy");
+    // The alias is public; nothing else about the identity is.
+    assert.doesNotMatch(session.stderr(), new RegExp(STALE_A_DIGEST),
+      "the digest is not public");
+    assert.doesNotMatch(String(reply?.error), new RegExp(STALE_A),
+      "nor is the host session id");
+  } finally {
+    session.child.kill("SIGKILL");
+    await waitForExit(session.child, 2_000);
+    if (socket) await rm(socket, { force: true }).catch(() => {});
+    await rm(dir, { recursive: true, force: true }).catch(() => {});
+    await rm(stub.dir, { recursive: true, force: true }).catch(() => {});
+  }
+}
+
+await aRetiringListenerNamesItsAliasAndTheRemedy();

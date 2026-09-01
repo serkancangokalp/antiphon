@@ -552,6 +552,80 @@ def automatic_verdict(cwd, kind, peer, proof):
     return "PROVED_STALE"
 
 
+# The remedy, in one place. There is no dynamic rename of a live listener: a
+# process serving under one identity must not silently become another. So after
+# a session rotates A→B its terminal is unreachable by automatic identity until
+# a fresh endpoint exists, which in practice means an MCP reconnect. That cost
+# is accepted deliberately, and every surface says it with the same words.
+RECONNECT_REMEDY = "reconnect that Claude session to be reachable"
+
+ReconnectWindow = collections.namedtuple(
+    "ReconnectWindow", "aliases counted completeness")
+
+
+def reconnect_window(cwd, served=()):
+    """Current automatic Claude identities that have no channel yet.
+
+    The proof deliberately outlives endpoints, and this is the reason: in the
+    window after a rotation the current identity owns no peer record at all, so
+    a lookup finds nothing and only the read-only inventory can answer. What
+    comes back is the public alias and a count — never a host session id, an
+    identity digest, an owner key or a route.
+
+    Liveness governs rendering, and only positively. An owner whose key belongs
+    to a legacy or future generation has no reproducible fingerprint here, so it
+    reads `unknown`, and unknown is not live: it is counted, never rendered as
+    something a message could be addressed to, and never rewritten into the
+    current generation to make it renderable. The same rule as everywhere else
+    on this bridge — positive proof or nothing.
+
+    Reading mutates nothing.
+    """
+    inventory = peers.identity_proofs(cwd)
+    served = set(served)
+    cache = {}
+    aliases, counted = [], 0
+    for proof in inventory.proofs:
+        if peers._owner_liveness(proof.get("owner_key"), cache) != "live":
+            counted += 1
+            continue
+        alias = peers.auto_name_from_digest(proof.get("identity_digest"))
+        if alias is None:
+            counted += 1
+            continue
+        # Already serving: this owner reconnected, and there is nothing to say.
+        if alias in served:
+            continue
+        aliases.append(alias)
+    return ReconnectWindow(tuple(sorted(set(aliases))), counted,
+                           inventory.completeness)
+
+
+def _reconnect_lines(window):
+    """What `status` and `doctor` both say about that window, in one voice.
+
+    Both are notes rather than faults. A terminal waiting for its reconnect is
+    a state, not a breakage, and an owner that cannot be proved live is evidence
+    of nothing — a `✗` on either would be one people learn to ignore.
+    """
+    lines = []
+    for alias in window.aliases:
+        lines.append(f"claude {alias}: current automatic identity with no "
+                     f"channel yet — {RECONNECT_REMEDY}")
+    if window.counted:
+        noun = "identity" if window.counted == 1 else "identities"
+        lines.append(f"identity proofs: {window.counted} automatic Claude "
+                     f"{noun} could not be proved live; counted, never "
+                     "addressed")
+    if window.completeness == "lower-bound":
+        lines.append("identity proofs: some records could not be read, so the "
+                     "identities above are a lower bound, never a complete list")
+    elif window.completeness == "unknown":
+        lines.append("identity proofs: unreadable, so the number of automatic "
+                     "Claude identities is unknown rather than zero")
+    return lines
+
+
 def _automatic_ready(cwd, kind, peer):
     """Whether this record may be used. Ungoverned records always may.
 
@@ -6945,7 +7019,12 @@ AUTOMATIC_PEER_IDENTITY_RULE = (
     "Older or mixed-version peers are never guessed into automatic identity. The "
     "full host session id, identity digest, owner key and socket route stay "
     "private; status, doctor, labels, refusals and errors expose only the "
-    "public alias and the remedy beside it.")
+    "public alias and the remedy beside it. "
+    "After a session rotates to a new host session, its old automatic alias "
+    "stops resolving at once and its new one is unreachable until a fresh "
+    "endpoint exists \u2014 in practice an MCP reconnect. `status` and `doctor` "
+    "name the current alias beside that remedy; an identity whose owner cannot "
+    "be proved live is counted, never addressed.")
 
 AGENTS_RULE = ("\n## The Antiphon bridge\n\n"
                "You are working alongside Claude Code on this project. What happens on the "
@@ -7821,6 +7900,11 @@ def status():
     print(_codex_census_line(live["codex"], identities))
     for line in _peer_report(displayed, identities):
         print(line)
+    # Printed outside the peers block on purpose: the window this names is
+    # precisely the one where that block is empty.
+    for line in _reconnect_lines(reconnect_window(
+            cwd, [peer.get("name") for peer in live["claude"]])):
+        print(line)
     snapshots = {}
     by_path = {}
     for side in ("claude", "codex"):
@@ -8580,6 +8664,14 @@ def _doctor_peers(report, cwd):
     return live
 
 
+def _doctor_identity_window(report, cwd, registered):
+    """Name the terminal that is current but has no channel yet."""
+    served = [record.get("name") for record in registered
+              if record.get("kind") == "claude"]
+    for line in _reconnect_lines(reconnect_window(cwd, served)):
+        report.note(line)
+
+
 def _doctor_codex_observations(report, cwd, registered):
     """Report one read-only lower-bound automatic-identity snapshot."""
     codex = [record for record in registered
@@ -8746,6 +8838,7 @@ def _doctor_readonly():
     _doctor_config(report, cwd, states)
     _doctor_alias(report)
     live = _doctor_peers(report, cwd)
+    _doctor_identity_window(report, cwd, live)
     _doctor_codex_observations(report, cwd, live)
     _doctor_channel(report, cwd, live)
     _doctor_codex(report, cwd)

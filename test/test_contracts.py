@@ -932,6 +932,31 @@ class IdentityPrivacyContractTest(unittest.TestCase):
                     words, r"(?i)refusals[^.]*errors|errors[^.]*refusals",
                     f"{where}: error paths are covered, not only refusals")
 
+    def test_reconnect_notice_every_written_surface_states_the_cost(self):
+        """There is no dynamic rename of a live listener, so a rotation costs a
+        person a reconnect. An agent that reads only "the alias moved" will keep
+        addressing a name nothing answers; the remedy has to travel with it, in
+        the same words `status` and `doctor` use."""
+        node = read("lib", "channel.mjs")
+        start = node.index("    instructions:")
+        end = node.index("\n  },\n);", start)
+        channel = re.sub(r'"\s*\+\s*\n\s*"', "", node[start:end])
+        surfaces = {
+            "README": read("README.md"),
+            "AGENTS rule": antiphon.AGENTS_RULE,
+            "CLAUDE rule": antiphon.CLAUDE_RULE,
+            "channel instructions": channel,
+        }
+        for where, text in surfaces.items():
+            with self.subTest(surface=where):
+                words = " ".join(text.split())
+                self.assertRegex(words, r"(?i)until a fresh endpoint exists",
+                                 f"{where}: the window has a stated end")
+                self.assertRegex(words, r"(?i)reconnect",
+                                 f"{where}: the remedy is named")
+                self.assertRegex(words, r"(?i)counted, never addressed",
+                                 f"{where}: an unprovable owner fails closed")
+
     def test_identity_privacy_backlog_names_what_is_deliberately_not_redacted(self):
         """A blanket promise would be the wrong one, and an unwritten exception
         reads as an oversight later. Two shapes stay visible on purpose: an
@@ -944,3 +969,13 @@ class IdentityPrivacyContractTest(unittest.TestCase):
         self.assertRegex(words, r"(?i)explicitly named peer keeps its socket "
                                 r"path")
         self.assertRegex(words, r"(?i)`antiphon channel ready:` line")
+
+    def test_reconnect_notice_backlog_records_the_accepted_cost(self):
+        """A live listener is never renamed, so a rotation costs a person a
+        reconnect. That is a decision with a price, not an oversight, and the
+        ledger has to carry the price beside the decision or the next reader
+        will file it as a bug to fix."""
+        words = " ".join(read("BACKLOG.md").split())
+        self.assertIn("There is no dynamic rename of a live listener", words)
+        self.assertRegex(words, r"(?i)until a fresh endpoint exists")
+        self.assertRegex(words, r"(?i)counted, never addressed")

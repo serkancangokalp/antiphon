@@ -372,6 +372,21 @@ readiness, never an address, never a session id.
   extra `HookShape` row is declined as out of scope here — both `setup` and
   `doctor` read that table — and nothing false ships: the label is absent, not
   wrong.
+- **A rotation costs a reconnect, and that price is accepted.** There is no
+  dynamic rename of a live listener: a process serving under one identity must
+  not silently become another, because a sender that addressed the old name
+  would reach the new session without either side having said so. The
+  consequence is real and falls on a person. After a session rotates to a new
+  host session, its old automatic alias stops resolving at once and its new one
+  is unreachable until a fresh endpoint exists — in practice an MCP reconnect.
+  The proof outlives endpoints precisely so that window has a name to show:
+  `status` and `doctor` read the read-only inventory and print the current
+  alias beside the remedy, while an identity whose owner cannot be proved live
+  — a legacy or future owner-key generation has no reproducible fingerprint
+  here — is counted, never addressed, and never rewritten to make it
+  renderable. The window before the new session's first hook is separate and
+  narrower: until that hook commits, Antiphon holds no project-scoped evidence
+  the new session exists at all, so nothing here should be read as closing it.
 - **Redaction is scoped, and its two exceptions are deliberate.** One central
   redactor per language removes unanchored UUIDs, full identity digests, raw
   owner keys and automatic socket routes from every status, doctor, label,

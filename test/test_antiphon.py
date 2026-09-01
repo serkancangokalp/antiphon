@@ -17505,3 +17505,113 @@ class IdentityPrivacyTest(unittest.TestCase):
         self.assertNotIn(self.UUID[:8], words, words)
         self.assertNotIn(second[:8], words, words)
         self.assertRegex(words, r"3 message\(s\).*2 non-running")
+
+
+class ReconnectNoticeTest(unittest.TestCase):
+    """After a rotation the terminal is unreachable by automatic identity until
+    a fresh endpoint exists, and every surface has to say so.
+
+    The proof deliberately outlives endpoints, which is the only reason there is
+    anything to name here: in the reconnect window B is the current identity and
+    owns no peer record at all, so a lookup finds nothing and only the read-only
+    inventory can answer. What it renders is the public alias and the remedy —
+    never the host session id, the digest or the route.
+    """
+
+    A = "8261c119-2c20-4bf4-87ab-f152ac87dbda"
+    B = "0199a1b2-2222-7000-8000-00000000000b"
+
+    def _owner(self):
+        """This process's own current-generation key, so liveness is positive."""
+        owner = antiphon.peers.owner_key()
+        self.assertIsNotNone(owner, "the test needs a real current owner key")
+        return owner
+
+    def _rotated(self, project):
+        """The window itself: A served, B is current, and B has no endpoint."""
+        owner = self._owner()
+        alias_a, digest_a = antiphon.peers.auto_identity(self.A)
+        antiphon.peers.register(project, "claude", alias_a,
+                                os.path.join(project, alias_a + ".sock"),
+                                pid=os.getpid(), owner_key=owner,
+                                identity_digest=digest_a, mode="initial")
+        antiphon.peers.write_session(project, "claude", alias_a, self.A,
+                                     f"/t/{alias_a}.jsonl", owner,
+                                     digest_a, True)
+        antiphon.peers.write_identity_proof(project, owner, self.A, digest_a)
+        # The host rotates and B's first hook commits. The listener serving A
+        # then withdraws its own endpoint, which is what leaves zero automatic
+        # peers behind.
+        alias_b, digest_b = antiphon.peers.auto_identity(self.B)
+        antiphon.peers.rotate_identity_proof(project, owner, self.B, digest_b)
+        antiphon.peers.unregister(project, "claude", alias_a, pid=os.getpid())
+        return owner, alias_a, alias_b, digest_b
+
+    def test_reconnect_notice_names_the_alias_and_remedy_after_rotation(self):
+        with tempfile.TemporaryDirectory() as project:
+            _owner, alias_a, alias_b, digest_b = self._rotated(project)
+            self.assertEqual(
+                [p for p in antiphon.peers.read_peers(project, "claude")], [],
+                "the window under test is the one with zero automatic peers")
+            with patch.object(antiphon, "project_dir", return_value=project):
+                out = io.StringIO()
+                with contextlib.redirect_stdout(out):
+                    antiphon.status()
+                status = out.getvalue()
+                out = io.StringIO()
+                with contextlib.redirect_stdout(out):
+                    antiphon.doctor()
+                doctor = out.getvalue()
+        for where, words in (("status", status), ("doctor", doctor)):
+            with self.subTest(surface=where):
+                self.assertIn(alias_b, words,
+                              "the current identity is named by its alias")
+                self.assertRegex(words, r"(?i)reconnect",
+                                 "the remedy is actionable, not a diagnosis")
+                self.assertNotIn(alias_a, words,
+                                 "the outgrown alias is not a peer any more")
+                self.assertNotIn(self.B, words, "no host session id")
+                self.assertNotIn(digest_b, words, "no identity digest")
+                self.assertNotIn("antiphon-channel-", words, "no route")
+
+    def test_reconnect_notice_mixed_version_record_fails_closed(self):
+        """A proof written under a legacy or future owner-key generation has no
+        reproducible fingerprint here, so its owner is `unknown` — never live.
+        It is counted, never rendered as an addressable alias, and never
+        rewritten into the current generation to make it renderable."""
+        legacy = "4242:Mon Sep  1 00:00:00 2026"      # no generation at all
+        with tempfile.TemporaryDirectory() as project:
+            alias, digest = antiphon.peers.auto_identity(self.B)
+            antiphon.peers.write_identity_proof(project, legacy, self.B, digest)
+            path = antiphon.peers.identity_proof_path(project, legacy)
+            before = open(path, "rb").read()
+            with patch.object(antiphon, "project_dir", return_value=project):
+                out = io.StringIO()
+                with contextlib.redirect_stdout(out):
+                    antiphon.status()
+                status = out.getvalue()
+                out = io.StringIO()
+                with contextlib.redirect_stdout(out):
+                    antiphon.doctor()
+                doctor = out.getvalue()
+            after = open(path, "rb").read()
+        self.assertEqual(before, after,
+                         "a read-only surface never rewrites a proof")
+        for where, words in (("status", status), ("doctor", doctor)):
+            with self.subTest(surface=where):
+                self.assertNotIn(alias, words,
+                                 "an owner that cannot be proved live is never "
+                                 "rendered as an addressable alias")
+                self.assertRegex(
+                    words, r"(?i)1 automatic Claude identity",
+                    "it is counted, so a reader is not told a confident zero")
+        # An owner that cannot be proved live is evidence of nothing, so the
+        # line is a note. A `✗` here would move doctor's exit code on a state
+        # nobody can act on, which is the kind people learn to ignore. The
+        # unrelated ✗ lines a bare temp project earns are not this assertion's
+        # business, so the prefix is checked rather than the exit code.
+        counted = [line for line in doctor.splitlines()
+                   if "could not be proved live" in line]
+        self.assertTrue(counted, doctor)
+        for line in counted:
+            self.assertTrue(line.startswith("·"), line)
