@@ -81,7 +81,11 @@ their channel.
 
 There are therefore exactly two triggers, both verified before anything is
 destroyed: the explicit retire control, content-free but not empty and
-authenticated as its own control action; and a real delivery, where the proof is
+*recognised* as its own control action — shape-validated on magic, version,
+action, alias and nonce, which is not authentication and must not be written as
+if it were: there is no shared secret and no peer identity behind it. Its safety
+comes from the listener re-reading the proof for itself, never from trusting who
+sent the control; and a real delivery, where the proof is
 checked against a valid delivery payload. `doctor`'s empty half-close probe is
 neither, and answers without touching registry or socket state.
 
@@ -172,6 +176,16 @@ the others are already inert because routing consults the proof.
   §6, where B is the current identity and has no endpoint yet. Deleting the
   proof there would erase the only evidence that B exists, and `status` and
   `doctor` would have nothing to name.
+- **The inventory carries completeness, not just contents.** A bare list would
+  make a genuinely empty directory and an `EIO` or `EACCES` during enumeration
+  both return `[]`, and `status` and `doctor` would report a confident zero
+  from a state they could not read. The result carries its own state: when
+  every entry was read the count is exact; when enumeration or any single read
+  failed, the aliases are a **lower bound** and the diagnostic is unknown or
+  degraded, never "none". Valid entries still render — one unreadable neighbour
+  does not hide a live peer — but the total is never claimed as complete, and
+  with no valid entry at all the answer is unknown rather than zero. Paths and
+  ids stay private throughout, and the read mutates nothing.
 - Discovery is by inventory, not by lookup. `status` and `doctor` cannot start
   from an owner they do not know, and in the reconnect window B has no peer
   record to enumerate — so a read-only validated inventory is what makes §6
