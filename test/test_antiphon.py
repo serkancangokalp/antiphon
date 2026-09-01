@@ -11844,13 +11844,17 @@ class CodexPeerWiringTest(unittest.TestCase):
             self.assertEqual(antiphon.peers.read_observations(project), [])
 
     def test_a_named_codex_hook_does_not_echo_a_uuid_shaped_invalid_host_id(self):
-        supplied = self.UUID.upper()
-        with tempfile.TemporaryDirectory() as project:
-            _, _, err, _ = self._hook(
-                project, event="SessionStart", session_id=supplied,
-                name="build")
-        self.assertIn("canonical UUID", err)
-        self.assertNotIn(self.UUID, err.lower())
+        variants = (self.UUID.upper(), "{" + self.UUID + "}",
+                    "urn:uuid:" + self.UUID, "uuid:" + self.UUID,
+                    "<" + self.UUID + ">", self.UUID + ".")
+        for supplied in variants:
+            with self.subTest(supplied=supplied), \
+                 tempfile.TemporaryDirectory() as project:
+                _, _, err, _ = self._hook(
+                    project, event="SessionStart", session_id=supplied,
+                    name="build")
+            self.assertIn("canonical UUID", err)
+            self.assertNotIn(self.UUID, err.lower())
 
     def test_an_observation_failure_never_costs_context_or_leaks_the_id(self):
         with tempfile.TemporaryDirectory() as project:
@@ -12010,15 +12014,19 @@ class ClaudeSessionWiringTest(unittest.TestCase):
         self.assertEqual(record["owner"], "300:x")
 
     def test_a_named_claude_hook_does_not_echo_a_uuid_shaped_invalid_host_id(self):
-        supplied = self.UUID.upper()
-        with tempfile.TemporaryDirectory() as project:
-            ok, detail = antiphon.peers.register(
-                project, "claude", "ui", "/t/ui.sock", pid=os.getpid(),
-                owner_key="300:x")
-            self.assertTrue(ok, detail)
-            _, _, err, _ = self._hook(project, session_id=supplied)
-        self.assertIn("canonical UUID", err)
-        self.assertNotIn(self.UUID, err.lower())
+        variants = (self.UUID.upper(), "{" + self.UUID + "}",
+                    "urn:uuid:" + self.UUID, "uuid:" + self.UUID,
+                    "<" + self.UUID + ">", self.UUID + ".")
+        for supplied in variants:
+            with self.subTest(supplied=supplied), \
+                 tempfile.TemporaryDirectory() as project:
+                ok, detail = antiphon.peers.register(
+                    project, "claude", "ui", "/t/ui.sock", pid=os.getpid(),
+                    owner_key="300:x")
+                self.assertTrue(ok, detail)
+                _, _, err, _ = self._hook(project, session_id=supplied)
+            self.assertIn("canonical UUID", err)
+            self.assertNotIn(self.UUID, err.lower())
 
     def test_an_unnamed_claude_turn_records_nothing(self):
         """Measured before this change and pinned after it: an unnamed session
@@ -12923,7 +12931,11 @@ class RoutingTest(unittest.TestCase):
                                      ("legacy", ""))
 
     def test_a_host_session_id_is_diagnostic_identity_never_an_alias(self):
-        for supplied in (self.UUID, self.UUID.upper(), f" {self.UUID}\n"):
+        variants = (self.UUID, self.UUID.upper(), f" {self.UUID}\n",
+                    "{" + self.UUID + "}", "urn:uuid:" + self.UUID,
+                    "uuid:" + self.UUID, "<" + self.UUID + ">",
+                    self.UUID + ".")
+        for supplied in variants:
             with self.subTest(supplied=supplied), \
                  tempfile.TemporaryDirectory() as project:
                 antiphon.peers.write_observation(project, self.UUID)
@@ -15263,12 +15275,9 @@ class RefusedSendHonestyTest(unittest.TestCase):
             ambiguous = self._reply(project, {"text": "hi"})
             unknown = self._reply(project, {"text": "hi", "to": "nobody-here"})
             unusable = self._reply(project, {"text": "hi", "to": "not a name"})
-            # The one route by which caller-supplied text reaches a would-be
-            # classifier's input: `resolve_target` interpolates the alias into
-            # its own message. A classifier reading prose instead of a class
-            # would file this addressing refusal under `no-peer` and append the
-            # guidance to it. The message body cannot do this — on the
-            # `address is None` branch it never reaches the detail at all.
+            # Caller-supplied recipient text is never reproduced in the
+            # refusal. A classifier still receives an explicit refusal class,
+            # rather than inferring one from either user text or prose.
             impostor = self._reply(project, {
                 "text": "hi", "to": self.NO_SESSION.split(": ", 1)[1]})
         self.assertEqual(ambiguous, (1, "", (
@@ -15278,11 +15287,11 @@ class RefusedSendHonestyTest(unittest.TestCase):
             "reply: not delivered: no live codex peer named 'nobody-here'; "
             "live peers: build, review\n")))
         self.assertEqual(unusable, (1, "", (
-            "reply: not delivered: 'not a name' is not a usable peer name; "
+            "reply: not delivered: the supplied recipient is not a usable peer name; "
             "live codex peers: build, review\n")))
         self.assertEqual(impostor, (1, "", (
-            "reply: not delivered: 'no Codex session found in this directory' "
-            "is not a usable peer name; live codex peers: build, review\n")))
+            "reply: not delivered: the supplied recipient is not a usable peer "
+            "name; live codex peers: build, review\n")))
 
         with tempfile.TemporaryDirectory() as project:
             self._codex_peer(project, "build", "300:build")     # no session yet
@@ -15318,8 +15327,8 @@ class RefusedSendHonestyTest(unittest.TestCase):
             "(api: ready, ui: ready); address one by name",
             "Not delivered to Claude: not delivered: no live claude peer named "
             "'nobody-here'; live peers: api, ui",
-            "Not delivered to Claude: not delivered: 'not a name' is not a "
-            "usable peer name; live claude peers: api, ui",
+            "Not delivered to Claude: not delivered: the supplied recipient is "
+            "not a usable peer name; live claude peers: api, ui",
         ])
         self.assertTrue(all(r.get("isError") for r in said))
 

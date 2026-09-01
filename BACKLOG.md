@@ -1478,10 +1478,11 @@ never dead. Unknown records are retained because their absence of a lock is not
 proof of death, and `status`/`doctor` show only their count. Positively live
 observations appear only on a labelled local diagnostic row carrying the full
 UUID. Refusals, errors and every other line expose neither that id nor paths.
-The UUID is explicitly not an alias and cannot be addressed. UUID-shaped
-routing, configured-name or malformed hook-session values are described without
-being echoed, including case and surrounding-whitespace variants; a failed
-observation write reports only its exception class and numeric errno.
+The UUID is explicitly not an alias and cannot be addressed. Invalid routing
+and malformed hook-session values are never echoed, so wrapping or decorating a
+UUID cannot bypass the rule; UUID-shaped configured-name values are described
+without their value. A failed observation write reports only its exception
+class and numeric errno.
 
 Observation reads are fail-closed: the schema version is an exact JSON integer,
 the time is finite and representable, and malformed or overflow-sized records

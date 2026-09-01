@@ -4774,7 +4774,8 @@ def _resolve_target(cwd, kind, alias=None):
                            "intended terminal with ANTIPHON_NAME set"),
                     "refusal")
             return ResolvedTarget(
-                None, (f"not delivered: {alias!r} is not a usable peer name"
+                None, ("not delivered: the supplied recipient is not a usable "
+                       "peer name"
                        + (f"; live {kind} peers: {names}" if names else "")),
                 "refusal")
         # Exact, or not at all. A near miss is a different peer.
