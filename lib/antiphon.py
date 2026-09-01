@@ -16,6 +16,7 @@ Usage:
   antiphon mcp                 # MCP stdio server for Codex (fallback path)
   antiphon catch-up [side]     # skip undelivered history: page cursors jump to the live edge
   antiphon sources scan        # finish or refresh the durable source catalog
+  antiphon sources compact     # retire aged gone sources proved safe by every reader
   antiphon --version           # the installed version (also -V, version)
 
 Design: NO SHARED MESSAGE LOG IS KEPT. Both CLIs already write transcripts;
@@ -5786,7 +5787,15 @@ AGENTS_RULE = ("\n## The Antiphon bridge\n\n"
                "automatic prompt hook delivers it whole. That injected context is "
                "project-wide awareness rather than mail addressed to you: it may merge "
                "activity from several project transcripts under one Claude label, so read "
-               "it as what is happening nearby.\n\n"
+               "it as what is happening nearby. Paging writes `<side>_pages_v4` beside "
+               "the preserved v3 sibling. During adoption, at most the v3 frontier's last "
+               "record repeats while a content anchor is established. Live and unknown "
+               "sources stay in the active lane; only a current process fingerprint can "
+               "prove a source dead, and mixed backlog alternates whole pages between "
+               "active and dead after successful delivery. Candidate retirement is never "
+               "a hook side effect: `antiphon sources compact` explicitly retires only "
+               "aged, gone sources every relevant v4 reader proves consumed. Hooks never "
+               "retire candidates.\n\n"
                "When Claude wants to tell you something directly, you'll see it as a user "
                "message starting with `[Antiphon bridge] Claude:` (pushed from Claude's Stop "
                "hook) or `[Antiphon channel] Claude:` (a direct reply through the channel) — "
@@ -5849,7 +5858,15 @@ CLAUDE_RULE = ("\n## The Antiphon bridge\n\n"
                "incomplete. That "
                "injected context is project-wide awareness rather than mail addressed to you: "
                "it may merge activity from several project transcripts under one Codex label, "
-               "so read it as what is happening nearby.\n\n"
+               "so read it as what is happening nearby. Paging writes `<side>_pages_v4` "
+               "beside the preserved v3 sibling. During adoption, at most the v3 frontier's "
+               "last record repeats while a content anchor is established. Live and unknown "
+               "sources stay in the active lane; only a current process fingerprint can "
+               "prove a source dead, and mixed backlog alternates whole pages between active "
+               "and dead after successful delivery. Candidate retirement is never a hook "
+               "side effect: `antiphon sources compact` explicitly retires only aged, gone "
+               "sources every relevant v4 reader proves consumed. Hooks never retire "
+               "candidates.\n\n"
                "Events that come directly from that agent are marked "
                "`<channel source=\"antiphon\" sender=\"codex\" sender_kind=\"agent\" "
                "sender_alias=\"...\">`; ordinary events "
@@ -6461,7 +6478,9 @@ def _peer_report(live):
 
 _STATUS_SEEN_KEYS = frozenset(("claude_seen", "codex_seen"))
 _STATUS_PAGE_KEYS = frozenset(("claude_pages", "codex_pages"))
+_STATUS_V4_PAGE_KEYS = frozenset(("claude_pages_v4", "codex_pages_v4"))
 _STATUS_CURSOR_KEYS = (_STATUS_SEEN_KEYS | _STATUS_PAGE_KEYS
+                       | _STATUS_V4_PAGE_KEYS
                        | {"last_pushed_claude", "last_pushed_codex"})
 
 
@@ -6481,6 +6500,14 @@ def _cursor_entry(key, value):
             return datetime.fromtimestamp(value).strftime("%H:%M:%S")
         except (ValueError, OverflowError, OSError):
             pass
+    if key in _STATUS_V4_PAGE_KEYS:
+        if _valid_v4_page_cursor(value):
+            anchored = len(value["sources"])
+            adopting = len(value["adopting_v3"])
+            return (f"{anchored} anchored "
+                    f"source{'' if anchored == 1 else 's'}; "
+                    f"{adopting} adopting v3; next lane {value['next_lane']}")
+        return "invalid cursor state"
     if key in _STATUS_SEEN_KEYS or key in _STATUS_PAGE_KEYS:
         expected = (PAGE_CURSOR_VERSION if key in _STATUS_PAGE_KEYS
                     else CURSOR_VERSION)
@@ -6528,6 +6555,23 @@ def _catalog_status_line(side, discovery):
     return (f"source catalog {page_cursor_key(side)}: {discovery.state}; "
             f"{len(discovery.sources)} readable; {discovery.pending} pending; "
             f"{discovery.refusals} refused; {discovery.gone} gone")
+
+
+def _source_activity_line(cwd, side, discovery, positions=None):
+    """Aggregate scheduler evidence for readable sources, never identities."""
+    kind = "codex" if side == "claude" else "claude"
+    join = _source_activity(cwd, kind)
+    counts = {"live": 0, "unknown": 0, "dead": 0}
+    for path in discovery.sources:
+        source = (path.candidate.expected_source
+                  if isinstance(path, DiscoveredSourcePath)
+                  else source_id(path))
+        state = join.states.get(source, "unknown")
+        counts[state if state in counts else "unknown"] += 1
+    lane = getattr(positions, "next_lane", "active")
+    return (f"source activity {anchored_page_cursor_key(side)}: "
+            f"{counts['live']} live; {counts['unknown']} unknown; "
+            f"{counts['dead']} dead readable; next lane {lane}")
 
 
 def _status_preview(text):
@@ -6580,10 +6624,19 @@ def status():
             shown_key = (key if key in _STATUS_CURSOR_KEYS
                          else "unknown cursor entry")
             print(f"cursor {label}{shown_key}: {_cursor_entry(key, value)}")
+    discoveries = {}
+    runtime_positions = {}
     for side in ("claude", "codex"):
         cursor, cursor_state = snapshots[side]
-        print(_catalog_status_line(
-            side, _reader_discovery(cwd, side, cursor, cursor_state)))
+        positions, _since, _replay = positions_for(
+            cursor, side, cursor_state)
+        discovery = _reader_discovery(cwd, side, cursor, cursor_state)
+        discoveries[side] = discovery
+        runtime_positions[side] = positions
+        print(_catalog_status_line(side, discovery))
+    for side in ("claude", "codex"):
+        print(_source_activity_line(
+            cwd, side, discoveries[side], runtime_positions[side]))
     cleanup_pending = _catalog_cleanup_pending(cwd)
     if cleanup_pending is None:
         print("source manifests: cleanup pending unknown")
@@ -7479,6 +7532,22 @@ def _doctor_sources(report, cwd):
         else:
             report.bad(f"{line} — run `antiphon sources scan` and inspect "
                        "its stderr; delivery remains explicitly incomplete")
+        v4_key = anchored_page_cursor_key(side)
+        if isinstance(cursor, dict) and v4_key in cursor:
+            value = cursor.get(v4_key)
+            if not _valid_v4_page_cursor(value):
+                report.bad(f"{v4_key}: invalid anchored cursor; the next "
+                           "reader turn recovers conservatively")
+            elif value["adopting_v3"]:
+                count = len(value["adopting_v3"])
+                report.note(f"{v4_key}: {count} v3 source "
+                            f"boundar{'y' if count == 1 else 'ies'} still "
+                            "adopting; at most each last record repeats")
+        positions, _since, _replay = positions_for(
+            cursor, side, cursor_state)
+        if discovery.sources:
+            report.note(_source_activity_line(
+                cwd, side, discovery, positions))
     cleanup_pending = _catalog_cleanup_pending(cwd)
     if cleanup_pending is None:
         report.bad("source manifests: cleanup pending amount unknown because "

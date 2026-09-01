@@ -429,6 +429,111 @@ contains "catch-up says what it abandons" "$CATCHUP" "will not be delivered"
 AFTER_PAGE="$(page_now)" && pass "the post-catch-up page was produced" || fail "the post-catch-up page was produced — hook failed"
 check "nothing is left to deliver after catch-up" "$(printf '%s' "$AFTER_PAGE" | tr -d '[:space:]')" ""
 
+step "T6 — v3 adoption anchors the boundary and catches an in-place rewrite"
+ANCHOR_HOME="$TMP/anchor-home"; ANCHOR_PROJECT="$TMP/anchor-project"
+mkdir -p "$ANCHOR_HOME" "$ANCHOR_PROJECT"
+(cd "$ANCHOR_PROJECT" && git init -q)
+ANCHOR_SLUG="$(printf '%s' "$ANCHOR_PROJECT" | sed 's|[^A-Za-z0-9]|-|g')"
+ANCHOR_CLAUDE="$ANCHOR_HOME/.claude/projects/$ANCHOR_SLUG"
+mkdir -p "$ANCHOR_CLAUDE"
+ANCHOR_SID="aaaaaaaa-5555-4555-8555-aaaaaaaaaaaa"
+ANCHOR_SOURCE="$ANCHOR_CLAUDE/$ANCHOR_SID.jsonl"
+python3 - "$ANCHOR_SOURCE" "$NONCE" <<'PY'
+import datetime, json, sys
+path, nonce = sys.argv[1:]
+now = datetime.datetime.now(datetime.timezone.utc)
+records = []
+for offset, text in enumerate((f"{nonce}-anchor-first", f"{nonce}-anchor-old")):
+    records.append({
+        "type": "assistant",
+        "timestamp": (now + datetime.timedelta(seconds=offset)).isoformat(),
+        "message": {"content": [{"type": "text", "text": text}]},
+    })
+with open(path, "w", encoding="utf-8") as stream:
+    for record in records:
+        stream.write(json.dumps(record, separators=(",", ":")) + "\n")
+PY
+HOME="$ANCHOR_HOME" ANTIPHON_CWD="$ANCHOR_PROJECT" ANTIPHON_NAME= \
+  antiphon sources scan >/dev/null 2>&1 \
+  && pass "the anchor fixture catalog completes" || fail "the anchor fixture catalog failed"
+PYTHONPATH="$PREFIX/lib/node_modules/antiphon/lib" python3 - \
+  "$ANCHOR_PROJECT" "$ANCHOR_SOURCE" "$ANCHOR_SID" <<'PY'
+import json, os, sys
+import antiphon
+project, source, sid = sys.argv[1:]
+cursor = {"codex_pages": {"v": 3, "sources": {sid: {
+    "gen": antiphon.source_generation(source),
+    "offset": os.path.getsize(source),
+}}}}
+path = os.path.join(project, ".antiphon", "cursor.json")
+os.makedirs(os.path.dirname(path), exist_ok=True)
+with open(path, "w", encoding="utf-8") as stream:
+    json.dump(cursor, stream, sort_keys=True)
+PY
+ANCHOR_CURSOR="$ANCHOR_PROJECT/.antiphon/cursor.json"
+V3_BEFORE="$(python3 - "$ANCHOR_CURSOR" <<'PY'
+import hashlib, json, sys
+value = json.load(open(sys.argv[1], encoding="utf-8"))["codex_pages"]
+print(hashlib.sha256(json.dumps(value, sort_keys=True).encode()).hexdigest())
+PY
+)"
+anchor_page() {
+  local raw decoded
+  raw="$(printf '{"cwd":"%s","hook_event_name":"UserPromptSubmit"}' "$ANCHOR_PROJECT" \
+    | HOME="$ANCHOR_HOME" ANTIPHON_CWD="$ANCHOR_PROJECT" ANTIPHON_NAME= \
+      antiphon hook codex 2>/dev/null)" || { echo "HOOK-FAILED"; return 1; }
+  [ -z "$raw" ] && return 0
+  decoded="$(printf '%s' "$raw" | python3 -c "
+import sys, json
+try: print(json.loads(sys.stdin.read())['hookSpecificOutput']['additionalContext'])
+except Exception as error:
+    print('HOOK-UNDECODABLE: %s' % error); raise SystemExit(1)")" \
+    || { echo "$decoded"; return 1; }
+  printf '%s' "$decoded"
+}
+ADOPTION_PAGE="$(anchor_page)" && pass "the v3 adoption page was produced" \
+  || fail "the v3 adoption page failed"
+contains "v3 adoption repeats its last record" "$ADOPTION_PAGE" "$NONCE-anchor-old"
+lacks "v3 adoption does not replay the earlier record" "$ADOPTION_PAGE" "$NONCE-anchor-first"
+contains "v3 adoption names the bounded repeat" "$ADOPTION_PAGE" "adopting a delivered frontier"
+V3_AFTER="$(python3 - "$ANCHOR_CURSOR" <<'PY'
+import hashlib, json, sys
+value = json.load(open(sys.argv[1], encoding="utf-8"))["codex_pages"]
+print(hashlib.sha256(json.dumps(value, sort_keys=True).encode()).hexdigest())
+PY
+)"
+check "the preserved v3 sibling is byte-equivalent" "$V3_AFTER" "$V3_BEFORE"
+V4_STATE="$(python3 - "$ANCHOR_CURSOR" "$ANCHOR_SID" <<'PY'
+import json, sys
+cursor = json.load(open(sys.argv[1], encoding="utf-8"))
+value = cursor.get("codex_pages_v4") or {}
+position = (value.get("sources") or {}).get(sys.argv[2]) or {}
+print("%s|%s|%s" % (value.get("v"), bool(position.get("anchor")),
+                     len(value.get("adopting_v3") or {})))
+PY
+)"
+check "the adopted cursor is anchored v4 with no pending v3 source" "$V4_STATE" "4|True|0"
+ANCHOR_STAT_BEFORE="$(stat -f '%i:%z' "$ANCHOR_SOURCE")"
+python3 - "$ANCHOR_SOURCE" "$NONCE" <<'PY'
+import sys
+path, nonce = sys.argv[1:]
+old = (nonce + "-anchor-old").encode()
+new = (nonce + "-anchor-new").encode()
+assert len(old) == len(new)
+with open(path, "r+b") as stream:
+    raw = stream.read()
+    assert raw.count(old) == 1
+    stream.seek(0)
+    stream.write(raw.replace(old, new))
+    stream.truncate()
+PY
+check "the rewrite preserves inode and length" "$(stat -f '%i:%z' "$ANCHOR_SOURCE")" "$ANCHOR_STAT_BEFORE"
+REWRITE_PAGE="$(anchor_page)" && pass "the rewritten-anchor page was produced" \
+  || fail "the rewritten-anchor page failed"
+contains "an in-place rewrite repeats the changed anchored record" "$REWRITE_PAGE" "$NONCE-anchor-new"
+lacks "the rewrite does not replay the earlier record" "$REWRITE_PAGE" "$NONCE-anchor-first"
+lacks "the superseded anchored bytes are not delivered" "$REWRITE_PAGE" "$NONCE-anchor-old"
+
 step "what the run changed outside its own temp tree"
 # Not "the machine is as it was": this run leaves a Codex rollout behind on
 # purpose — deleting from that store on a discovery result is a risk no test

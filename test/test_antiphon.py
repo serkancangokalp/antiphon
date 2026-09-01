@@ -6063,6 +6063,88 @@ class CatalogDiscoveryTest(unittest.TestCase):
         self.assertFalse(report.broken)
         self.assertEqual(DoctorTest.snapshot(self.project), before)
 
+    def test_status_reports_v4_adoption_lane_and_aggregate_activity(self):
+        sources = [self._claude(number, f"secret-{number}")
+                   for number in range(30, 33)]
+        self._scan()
+        anchored_sid, anchored_path = sources[0]
+        adopting_sid, adopting_path = sources[1]
+        anchored_size = os.path.getsize(anchored_path)
+        cursor = {antiphon.anchored_page_cursor_key("codex"): {
+            "v": antiphon.ANCHORED_PAGE_CURSOR_VERSION,
+            "sources": {anchored_sid: {
+                "gen": antiphon.source_generation(anchored_path),
+                "offset": anchored_size,
+                "anchor": antiphon._path_anchor_at(
+                    anchored_path, anchored_size),
+            }},
+            "adopting_v3": {adopting_sid: {
+                "gen": antiphon.source_generation(adopting_path),
+                "offset": os.path.getsize(adopting_path),
+            }},
+            "next_lane": "dead",
+        }}
+        path = os.path.join(self.project, ".antiphon", "cursor.json")
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w", encoding="utf-8") as stream:
+            json.dump(cursor, stream)
+        states = {sources[0][0]: "live", sources[1][0]: "unknown",
+                  sources[2][0]: "dead"}
+        out = io.StringIO()
+
+        def activity(_cwd, kind):
+            return (antiphon.SessionJoin({}, False, states)
+                    if kind == "claude" else antiphon.NO_SESSION_JOIN)
+
+        with patch.object(antiphon, "project_dir", return_value=self.project), \
+             patch.object(antiphon, "_live_by_kind",
+                          return_value={"claude": [], "codex": []}), \
+             patch.object(antiphon, "_channel_answering", return_value=False), \
+             patch.object(antiphon, "_source_activity", side_effect=activity), \
+             patch.object(antiphon, "build_summary",
+                          return_value=("", None, 0)), \
+             contextlib.redirect_stdout(out):
+            self.assertEqual(antiphon.status(), 0)
+        printed = out.getvalue()
+        self.assertIn("cursor codex_pages_v4: 1 anchored source; "
+                      "1 adopting v3; next lane dead", printed)
+        self.assertIn("source activity codex_pages_v4: 1 live; 1 unknown; "
+                      "1 dead readable; next lane dead", printed)
+        self.assertNotIn("a" * 64, printed)
+        for sid, source_path in sources:
+            self.assertNotIn(sid, printed)
+            self.assertNotIn(source_path, printed)
+
+    def test_doctor_rejects_invalid_v4_and_notes_bounded_adoption(self):
+        sid, path = self._claude(40, "doctor-private")
+        self._scan()
+        cursor_path = os.path.join(self.project, ".antiphon", "cursor.json")
+        os.makedirs(os.path.dirname(cursor_path), exist_ok=True)
+        valid = {antiphon.anchored_page_cursor_key("codex"): {
+            "v": antiphon.ANCHORED_PAGE_CURSOR_VERSION,
+            "sources": {}, "adopting_v3": {sid: {
+                "gen": antiphon.source_generation(path),
+                "offset": os.path.getsize(path),
+            }}, "next_lane": "active",
+        }}
+        with open(cursor_path, "w", encoding="utf-8") as stream:
+            json.dump(valid, stream)
+        report, out = antiphon._Report(), io.StringIO()
+        with contextlib.redirect_stdout(out):
+            antiphon._doctor_sources(report, self.project)
+        self.assertFalse(report.broken)
+        self.assertIn("1 v3 source boundary still adopting", out.getvalue())
+
+        valid[antiphon.anchored_page_cursor_key("codex")]["v"] = 99
+        with open(cursor_path, "w", encoding="utf-8") as stream:
+            json.dump(valid, stream)
+        report, out = antiphon._Report(), io.StringIO()
+        with contextlib.redirect_stdout(out), \
+             contextlib.redirect_stderr(io.StringIO()):
+            antiphon._doctor_sources(report, self.project)
+        self.assertTrue(report.broken)
+        self.assertIn("invalid anchored cursor", out.getvalue())
+
     def test_doctor_reports_catalog_advice_read_only(self):
         before = DoctorTest.snapshot(self.project)
         out = io.StringIO()
@@ -11399,6 +11481,29 @@ class SenderIdentityTest(unittest.TestCase):
 
     UUID = "1d5a03e0-0548-4339-87c3-45c5dbf7e9d7"
     OWNER = "300:mine"
+
+    def test_every_agent_facing_surface_states_the_v4_retention_contract(self):
+        node = read_source("lib", "channel.mjs")
+        start = node.index("    instructions:")
+        end = node.index("\n  },\n);", start)
+        channel = re.sub(r'"\s*\+\s*\n\s*"', "", node[start:end])
+        surfaces = {
+            "AGENTS.md rule": antiphon.AGENTS_RULE,
+            "CLAUDE.md rule": antiphon.CLAUDE_RULE,
+            "channel instructions": channel,
+            "README": read_source("README.md"),
+            "BACKLOG": read_source("BACKLOG.md"),
+        }
+        required = (
+            "<side>_pages_v4", "v3 sibling", "last record repeats",
+            "current process fingerprint", "alternates whole pages",
+            "antiphon sources compact", "hooks never retire",
+        )
+        for name, surface in surfaces.items():
+            with self.subTest(surface=name):
+                words = surface.lower()
+                for phrase in required:
+                    self.assertIn(phrase, words)
 
     def test_every_agent_facing_surface_separates_claude_identity_from_reachability(self):
         """A labelled message must not make either agent infer that its reply

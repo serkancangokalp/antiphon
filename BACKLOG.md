@@ -102,6 +102,33 @@ the write-and-flush-before-advance transaction.
   plus boolean/non-finite observation times before either can manufacture a
   false `complete` result.
 
+### Completed by Wave 1B anchored paging and bounded retention
+
+- Paging writes `<side>_pages_v4` beside the preserved v3 sibling and legacy
+  key. A v4 frontier includes a content anchor for the last complete record;
+  during v3 adoption that last record repeats at most once while its anchor is
+  established. In-place rewrites that preserve inode, length and the first
+  line therefore repeat rather than skip. Later v3 writes cannot move the
+  frozen v4 adoption frontier, and failed delivery changes no anchor or lane.
+- Live and unknown sources share the active lane. Only a current process
+  fingerprint can prove a source dead; missing, legacy or unreadable evidence
+  remains unknown. A mixed backlog alternates whole pages between active and
+  dead after successful delivery, so live replies are bounded without starving
+  history. The owed lane is persisted atomically with the page frontier.
+- Catalog readers copy state plus immutable manifests under a short shared
+  lock. After a state switch, mutation holders remove only grammar-valid,
+  unreferenced regular manifests inside the owned directory; crash leftovers
+  retry on later catalog mutations. Cleanup failure never suppresses a page and
+  is reported only as an aggregate pending count.
+- `antiphon sources compact` is the explicit candidate-retirement boundary.
+  It retires only whole aged, gone source groups every relevant v4 reader
+  proves consumed or has no entry for after lookback. The shared cursor is
+  always relevant; a named cursor is dormant only when the recorded owner is
+  proved dead by a current process fingerprint. Cursor, owner, source and
+  catalog inputs are revalidated around the atomic state switch; output exposes
+  only aggregate blocker classes and reclaimed files/bytes. Hooks never retire
+  candidates.
+
 ### Still open, by name
 
 - Stable event ids and full tool-call retrieval: tool calls remain compressed
@@ -133,8 +160,6 @@ the write-and-flush-before-advance transaction.
   only an unreadable cursor file is `unknown`. Malformed v3 keeps `cursor_recovery` from byte zero and
   never falls to the v2 sibling; generation mismatch and offset-past-EOF keep
   byte zero.
-- The last-record content anchor (an in-place rewrite that keeps inode,
-  length and first line still resumes silently).
 - Retirement of the preserved v2 sibling key once pre-v3 processes and
   rollback support are no longer needed.
 
@@ -1255,12 +1280,11 @@ socket. Abrupt host death or SIGKILL can still leave a stale record or socket
 and remain a doctor-guided recovery case; Antiphon does not broadly reap paths
 it cannot prove it owns.
 
-The passive fallback's own arithmetic remains open: with a real backlog the
-reader advances roughly one page per turn and iterates dead sources ahead of
-live ones — measured by the reporter at ~940 KB across four sources, two of
-them sessions that had already exited, putting a reply 15-20 turns away.
-`antiphon catch-up` is the blunt escape; deprioritising sources whose session
-is gone is the real answer, and belongs with the source-catalog entry.
+The passive fallback arithmetic is now closed by the Wave 1B scheduler above.
+The triggering report measured ~940 KB across four sources, two already exited,
+with a reply 15-20 turns away. Live and unknown work now takes the active lane;
+only current-generation owner proof demotes a source to dead, and mixed backlog
+alternates whole pages so neither lane starves.
 
 ## P1 — Same-vendor bridging: Codex ↔ Codex and Claude ↔ Claude
 

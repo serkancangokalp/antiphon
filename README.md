@@ -21,11 +21,10 @@ The other side's recent messages enter your turn's context when you type
 something. Nobody is woken up.
 
 This path is project-wide awareness, not delivery. It is not addressed to
-anyone, and today it can merge activity from several project transcripts under
-one generic `Claude` or `Codex` label — so with several terminals open, one
-agent's words can arrive looking like another's. Source-aware labelling is a
-tracked P1 item in [BACKLOG.md](BACKLOG.md). Until it lands, do not read pull
-context as a private line between two particular peers.
+anyone. When a page interleaves multiple sessions, blocks that can be joined to
+a current named peer carry that peer's label; older, unnamed or unjoinable
+blocks remain honestly unlabelled. Do not read pull context as a private line
+between two particular peers.
 
 ### Push — addressed, live wake
 
@@ -187,6 +186,7 @@ antiphon summary [side]    # show the context that would be injected
 antiphon setup             # (re)install the project setup
 antiphon catch-up [side]   # skip undelivered history: page cursors jump to the live edge
 antiphon sources scan      # finish or refresh the durable source catalog
+antiphon sources compact   # retire aged gone sources proved consumed by every relevant reader
 antiphon --version         # the installed version
 npm test                   # Python unit tests + real MCP protocol test
 test/e2e/fresh-user.sh     # what a new user gets, with the real CLIs (not in npm test)
@@ -268,7 +268,11 @@ source first and inspects at most 8 candidate records per hook. A generation is
 finite (`base`, one reconciliation pass, one delta, then `complete`); later
 changes start a new refresh. `antiphon sources scan` runs the same bounded
 steps explicitly until the catalog is complete, returns nonzero for pending or
-refused work, and never moves a page cursor.
+refused work, and never moves a page cursor. State and immutable manifests are
+loaded under a short shared lock; successful state switches reclaim only
+grammar-valid, unreferenced regular manifests. Failed cleanup is retried by the
+next catalog mutation and appears as an aggregate count in `status`, `doctor`
+and the scanner, never as paths or source ids.
 
 Every admitted transcript is opened beneath its host root without following
 symlinks, checked as a regular file, and read for identity, metadata, generation
@@ -290,30 +294,42 @@ lifecycle. Codex's MCP tool-result surface showed no such verified path, so
 `antiphon_read` refuses that one record instead: nothing is read or marked
 seen, and the next automatic prompt hook delivers it.
 
-Page positions live under an isolated v3 cursor key, `<side>_pages`
-(`claude_pages`, `codex_pages`). The old `<side>_seen` value is
-preserved untouched beside it for still-running pre-upgrade processes and
-rollback — it is never trusted or overwritten by paging code, and it is
-scheduled for
-retirement once pre-v3 processes no longer need it, not a template for
-accumulating keys. Any present legacy value, and equally a malformed or
-unreadable existing cursor file, starts a conservative replay of the currently
-discovered sources from byte zero; only a genuinely missing cursor means a new
-side and keeps the normal six-hour lookback. The old promise that a timestamp
-cursor migrates at its exact boundary is gone: that boundary cannot be trusted
-while an old process may still move it. The replay is bounded but it is not
-small — on the reviewed snapshots it took 69 Claude-source pages and 53
-Codex-source pages, up to that many automatic prompt turns — and every replay
-page carries one of exactly two fixed explanation lines, one for the legacy
-upgrade and one for cursor recovery, until the final successfully persisted
-page clears it, so duplicated history is visible as recovery rather than
-mistaken for a malfunction. A failed delivery leaves the cursor bytes exactly
-as they were.
+Page positions now live under `<side>_pages_v4`, beside the preserved v3 sibling
+`<side>_pages` and legacy `<side>_seen` key. The siblings remain
+byte-for-byte available to rolling old processes and rollback; v4 never lets a
+later sibling write move its frozen adoption frontier. Each v4 position anchors
+the last complete source record by content. During adoption from a valid v3
+frontier, that last record repeats at most once while the anchor is established;
+an in-place rewrite that keeps inode, length and the first line no longer skips
+silently. A malformed or unreadable existing cursor restarts every discovered
+source from byte zero; only a genuinely missing cursor means a new side and
+keeps the normal six-hour lookback. The measured full recovery was 69
+Claude-source pages and 53 Codex-source pages on the reviewed snapshots. Every
+replay page carries one of exactly three fixed explanation lines — legacy
+upgrade, cursor recovery or anchor adoption — until its corresponding recovery
+finishes. A failed delivery changes neither frontier nor scheduler lane.
+
+Live and unknown sources share the active lane. Only a current process
+fingerprint can prove a source dead; missing, legacy or unreadable identity
+evidence stays unknown. When both active and dead backlog exist, delivery
+alternates whole pages after each successful delivery, so live replies are not
+stranded behind dead history and dead history still drains. `status` and
+`doctor` report aggregate live/unknown/dead counts, adoption and the next lane,
+without identities or anchors.
+
+Candidate retirement is separate and explicit. `antiphon sources compact`
+first completes discovery, then retires only a whole aged, gone source that
+every relevant v4 reader proves consumed (or has no entry for after lookback).
+The shared cursor is always relevant; a named cursor is dormant only when its
+current process fingerprint proves its recorded owner dead. Unknown ownership
+stays relevant. The command revalidates catalog generation, source absence,
+cursor bytes and owner evidence around its atomic state switch, reports only
+aggregate blocker classes and reclaimed files/bytes, and preserves all cursor
+files. Hooks never retire candidates.
 
 What still loses, by name: tool calls remain compressed one-line summaries
-with no stable-id retrieval yet, there is no last-record anchor against an
-in-place rewrite that preserves the first record, and there is no backward
-paging into history an older version already marked seen. Those are tracked in
+with no stable-id retrieval yet, and there is no backward paging into history
+an older version already marked seen. Those are tracked in
 [BACKLOG.md](BACKLOG.md).
 
 ### An oversized direct message is parked, never truncated

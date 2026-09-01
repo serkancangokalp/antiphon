@@ -386,7 +386,8 @@ class ShippedContractTest(unittest.TestCase):
         for side in ("claude", "codex"):
             self.assertEqual(antiphon.page_cursor_key(side), side + "_pages")
         self.assertEqual(set(antiphon.REPLAY_NOTICES), {"legacy_upgrade",
-                                                        "cursor_recovery"})
+                                                        "cursor_recovery",
+                                                        "anchor_upgrade"})
         self.assertFalse(hasattr(antiphon, "SUMMARY_BUDGET"),
                          "the summary budget must not survive as an unused "
                          "constant a later reader mistakes for a live setting")
@@ -575,19 +576,21 @@ class ShippedContractTest(unittest.TestCase):
                          "record atomicity is stated")
         self.assertIn("_pages", limits, "the semantic key is named")
         self.assertIn("_seen", limits, "the preserved legacy key is named")
-        self.assertRegex(limits, r"(?i)exactly\s+two\s+fixed\s+explanation",
+        self.assertRegex(limits, r"(?i)exactly\s+three\s+fixed\s+explanation",
                          "the replay reasons are a closed set, and the README "
                          "says so rather than leaving the set open")
         self.assertRegex(limits, r"(?i)legacy\s+upgrade", "reason one, named")
         self.assertRegex(limits, r"(?i)cursor\s+recovery", "reason two, named")
+        self.assertRegex(limits, r"(?i)anchor\s+(upgrade|adoption)",
+                         "reason three, named")
         self.assertRegex(limits, r"(?i)(malformed|unreadable)[^.]*byte\s+zero",
                          "a malformed existing cursor replays; it is not a "
                          "fresh install")
         self.assertRegex(limits, r"(?i)missing\s+cursor[^.]*new\s+side",
                          "only a genuinely missing cursor means a new side")
-        self.assertRegex(limits, r"(?i)timestamp\s+cursor[^.]*boundary[^.]*gone",
-                         "the retired boundary-migration promise is named as "
-                         "retired")
+        self.assertRegex(limits, r"(?i)(adopt[^.]*valid\s+v3\s+frontier|"
+                                 r"valid\s+v3\s+frontier[^.]*adopt)",
+                         "the v4 migration contract names bounded adoption")
         self.assertNotRegex(antiphon.offset_at_or_after.__doc__,
                             r"(?i)migrat",
                             "the helper's docstring described the rejected "
