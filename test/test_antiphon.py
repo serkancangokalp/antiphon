@@ -1151,12 +1151,9 @@ class AntiphonTest(unittest.TestCase):
         self.assertIs(responses[0]["result"].get("isError"), True)
         self.assertEqual(record, [], "and nothing was marked seen")
 
-    def test_mcp_offers_codex_both_a_read_and_a_send_tool(self):
-        """Reading was live from the start; sending was not. Codex could only reach
-        Claude by ending its turn with `@claude`, so it could never hand over work
-        and keep going."""
+    def test_mcp_offers_codex_read_send_and_retrieve_tools(self):
         self.assertEqual(sorted(t["name"] for t in antiphon.TOOLS),
-                         ["antiphon_read", "antiphon_send"])
+                         ["antiphon_read", "antiphon_retrieve", "antiphon_send"])
 
     def test_antiphon_send_delivers_the_text_to_the_claude_channel(self):
         sent = []
@@ -2432,6 +2429,7 @@ class AntiphonTest(unittest.TestCase):
                 self.assertEqual(self._events_from_real_jsonl(side, record),
                                  ["   "])
 
+
     def test_leading_whitespace_before_a_measured_host_wrapper_is_filtered(self):
         records = {
             "claude": {
@@ -2797,6 +2795,661 @@ class AntiphonTest(unittest.TestCase):
                     "codex_seen": 12.0,
                     "last_pushed_claude": {"": "fingerprint"},
                 }, "the next write persists the translation")
+
+
+class ToolInvocationIdentityTest(unittest.TestCase):
+    SOURCE = "4eecac24-1c21-47ad-ab11-a650708f3098"
+
+    @staticmethod
+    def _claude(arguments=None, native_id="toolu_native", **extra):
+        block = {"type": "tool_use", "id": native_id, "name": "Read",
+                 "input": ({"path": "x", "nested": [1, True, None]}
+                           if arguments is None else arguments),
+                 "caller": {"type": "direct"}}
+        block.update(extra)
+        return block
+
+    @staticmethod
+    def _custom(argument="printf 'free form'", native_id="call_native", **extra):
+        payload = {"type": "custom_tool_call", "name": "exec",
+                   "call_id": native_id, "input": argument}
+        payload.update(extra)
+        return payload
+
+    @staticmethod
+    def _function(arguments='{"exact":true}', native_id="call_native", **extra):
+        payload = {"type": "function_call", "namespace": "collaboration",
+                   "name": "send_message", "call_id": native_id,
+                   "arguments": arguments}
+        payload.update(extra)
+        return payload
+
+    def test_public_id_is_exactly_the_22_character_versioned_grammar(self):
+        invocation = antiphon._claude_invocation(
+            self._claude(), self.SOURCE, 100, 0)
+        self.assertRegex(invocation.public_id,
+                         r"^tc1\.c\.[A-Za-z0-9_-]{16}$")
+        self.assertEqual(len(invocation.public_id), 22)
+
+    def test_claude_invocation_keeps_nested_json_types_and_caller(self):
+        invocation = antiphon._claude_invocation(
+            self._claude(), self.SOURCE, 100, 0)
+        self.assertEqual(antiphon._public_invocation(invocation), {
+            "id": invocation.public_id, "side": "claude",
+            "call_type": "tool_use", "name": "Read", "caller": "direct",
+            "arguments": {"path": "x", "nested": [1, True, None]},
+        })
+
+    def test_codex_custom_input_remains_free_form_text(self):
+        invocation = antiphon._codex_invocation(
+            self._custom("not json { still text"), self.SOURCE, 100)
+        self.assertEqual(invocation.arguments, "not json { still text")
+        self.assertEqual(invocation.side, "codex")
+        self.assertEqual(invocation.call_type, "custom_tool_call")
+        self.assertRegex(invocation.public_id,
+                         r"^tc1\.x\.[A-Za-z0-9_-]{16}$")
+
+    def test_codex_function_arguments_remain_the_exact_host_string(self):
+        raw = '{ "b": 2, "a": 1 }'
+        invocation = antiphon._codex_invocation(
+            self._function(raw), self.SOURCE, 100)
+        self.assertEqual(invocation.arguments, raw)
+        self.assertEqual(invocation.namespace, "collaboration")
+
+    def test_token_uses_source_identity_not_path_or_generation(self):
+        first = antiphon._codex_invocation(
+            self._custom(), self.SOURCE, 100)
+        copied = antiphon._codex_invocation(
+            self._custom(), self.SOURCE, 100)
+        self.assertEqual(first.public_id, copied.public_id)
+
+    def test_path_rename_or_copy_keeps_the_id_for_the_same_source_identity(self):
+        record = {
+            "type": "assistant", "timestamp": "2026-09-01T00:00:00Z",
+            "message": {"content": [self._claude()]},
+        }
+        ids = []
+        with tempfile.TemporaryDirectory() as directory:
+            for parent in ("before", "after-renamed"):
+                path = os.path.join(directory, parent, self.SOURCE + ".jsonl")
+                os.makedirs(os.path.dirname(path))
+                with open(path, "w", encoding="utf-8") as stream:
+                    stream.write(json.dumps(record) + "\n")
+                events, _ = antiphon.claude_events(
+                    directory, source_paths=[path])
+                ids.append(next(event.public_id for event in events
+                                if event.kind == "tool"))
+        self.assertEqual(ids[0], ids[1])
+
+    def test_same_native_id_and_source_cannot_hide_changed_arguments(self):
+        before = antiphon._codex_invocation(
+            self._custom("A" * 20), self.SOURCE, 100)
+        after = antiphon._codex_invocation(
+            self._custom("B" * 20), self.SOURCE, 100)
+        self.assertNotEqual(before.public_id, after.public_id)
+
+    def test_source_and_native_id_each_participate_in_the_token(self):
+        base = antiphon._codex_invocation(
+            self._custom(), self.SOURCE, 100)
+        other_source = antiphon._codex_invocation(
+            self._custom(), "01a04f6b-4485-7290-afbd-9eae74405ec8", 100)
+        other_native = antiphon._codex_invocation(
+            self._custom(native_id="call_other"), self.SOURCE, 100)
+        self.assertNotEqual(base.public_id, other_source.public_id)
+        self.assertNotEqual(base.public_id, other_native.public_id)
+
+    def test_idless_calls_use_complete_record_start_and_block_ordinal(self):
+        block = self._claude(native_id=None)
+        stable = antiphon._claude_invocation(block, self.SOURCE, 100, 2)
+        self.assertEqual(
+            stable.public_id,
+            antiphon._claude_invocation(block, self.SOURCE, 100, 2).public_id)
+        self.assertNotEqual(
+            stable.public_id,
+            antiphon._claude_invocation(block, self.SOURCE, 101, 2).public_id)
+        self.assertNotEqual(
+            stable.public_id,
+            antiphon._claude_invocation(block, self.SOURCE, 100, 3).public_id)
+
+    def test_malformed_and_non_finite_invocations_fail_closed(self):
+        malformed = [
+            self._claude(arguments=[]),
+            self._claude(arguments={"bad": float("nan")}),
+            self._claude(name="line\nbreak"),
+        ]
+        for block in malformed:
+            with self.subTest(block=block):
+                self.assertIsNone(antiphon._claude_invocation(
+                    block, self.SOURCE, 100, 0))
+
+    def _parsed(self, side, records):
+        with tempfile.TemporaryDirectory() as directory:
+            name = (self.SOURCE + ".jsonl" if side == "claude" else
+                    "rollout-2026-08-30T00-00-00-%s.jsonl" % self.SOURCE)
+            path = os.path.join(directory, name)
+            with open(path, "w", encoding="utf-8") as stream:
+                for record in records:
+                    stream.write(json.dumps(record) + "\n")
+            discover = "claude_transcripts" if side == "claude" else "codex_rollout_files"
+            parser = antiphon.claude_events if side == "claude" else antiphon.codex_events
+            with patch.object(antiphon, discover, return_value=[path]):
+                events, scanned = parser(directory)
+        return events, scanned
+
+    def test_both_parsers_attach_ids_to_real_calls_and_not_messages(self):
+        records = {
+            "claude": [{
+                "type": "assistant", "timestamp": "2026-09-01T00:00:00Z",
+                "message": {"content": [
+                    {"type": "text", "text": "plain"}, self._claude(),
+                ]},
+            }],
+            "codex": [{
+                "type": "response_item", "timestamp": "2026-09-01T00:00:00Z",
+                "payload": self._function(),
+            }],
+        }
+        for side, source_records in records.items():
+            with self.subTest(side=side):
+                events, _scanned = self._parsed(side, source_records)
+                tools = [event for event in events if event.kind == "tool"]
+                self.assertEqual(len(tools), 1)
+                self.assertRegex(tools[0].public_id,
+                                 r"^tc1\.[cx]\.[A-Za-z0-9_-]{16}$")
+                for event in events:
+                    if event.kind != "tool":
+                        self.assertIsNone(event.public_id)
+
+    def test_a_multi_call_record_renders_every_public_id_without_payloads(self):
+        records = [{
+            "type": "assistant", "timestamp": "2026-09-01T00:00:00Z",
+            "message": {"content": [
+                self._claude({"path": "secret-one"}, native_id=None,
+                             name="Read"),
+                self._claude({"path": "secret-two"}, native_id=None,
+                             name="Write"),
+            ]},
+        }]
+        events, scanned = self._parsed("claude", records)
+        page, _advance, count = antiphon._build_page(events, scanned, "codex")
+        public_ids = [event.public_id for event in events]
+        self.assertEqual(len(set(public_ids)), 2)
+        for public_id in public_ids:
+            self.assertIn("[%s]" % public_id, page)
+        self.assertNotIn("secret-one", " ".join(public_ids))
+        self.assertNotIn("secret-two", " ".join(public_ids))
+        self.assertEqual(count, 0)
+
+    def test_forty_record_limit_keeps_every_selected_tool_id(self):
+        events = []
+        scanned = {self.SOURCE: {"gen": "g", "offset": 410}}
+        for index in range(41):
+            invocation = antiphon._make_invocation(
+                "claude", "tool_use", "Read", {"i": index}, self.SOURCE,
+                "toolu_%d" % index, index * 10, 0)
+            events.append(antiphon.Event(
+                index, "tool", "Read", self.SOURCE, "g", index * 10,
+                index * 10 + 10, None, None, invocation.public_id))
+        page, advance, count = antiphon._build_page(events, scanned, "codex")
+        shown = re.findall(r"\[(tc1\.c\.[A-Za-z0-9_-]{16})\]", page)
+        self.assertEqual(shown, [event.public_id for event in events[:40]])
+        self.assertTrue(advance.has_more)
+        self.assertEqual(count, 0)
+
+    def test_tool_page_stays_byte_bounded_without_dropping_selected_ids(self):
+        events = []
+        scanned = {self.SOURCE: {"gen": "g", "offset": 400}}
+        for index in range(40):
+            for ordinal in range(2):
+                invocation = antiphon._make_invocation(
+                    "claude", "tool_use", "Read", {"i": index}, self.SOURCE,
+                    "toolu_%d_%d" % (index, ordinal), index * 10, ordinal)
+                events.append(antiphon.Event(
+                    index, "tool", "R" * 100, self.SOURCE, "g", index * 10,
+                    index * 10 + 10, None, None, invocation.public_id))
+        page, advance, _ = antiphon._build_page(events, scanned, "codex")
+        self.assertLessEqual(len(page.encode("utf-8")), antiphon.PAGE_BUDGET)
+        shown = re.findall(r"\[(tc1\.c\.[A-Za-z0-9_-]{16})\]", page)
+        self.assertGreater(len(shown), 0)
+        self.assertLess(len(shown), len(events))
+        self.assertEqual(shown, [event.public_id for event in events[:len(shown)]])
+        self.assertTrue(advance.has_more)
+
+    def test_one_oversized_multi_call_record_is_atomic_and_keeps_every_id(self):
+        events = []
+        for ordinal in range(100):
+            invocation = antiphon._make_invocation(
+                "claude", "tool_use", "Read", {"i": ordinal}, self.SOURCE,
+                "toolu_%d" % ordinal, 0, ordinal)
+            events.append(antiphon.Event(
+                0, "tool", "R" * 100, self.SOURCE, "g", 0, 10,
+                None, None, invocation.public_id))
+        page, advance, _ = antiphon._build_page(
+            events, {self.SOURCE: {"gen": "g", "offset": 10}}, "codex")
+        self.assertGreater(len(page.encode("utf-8")), antiphon.PAGE_BUDGET)
+        for event in events:
+            self.assertIn("[%s]" % event.public_id, page)
+        self.assertFalse(advance.has_more)
+
+    def test_non_tool_rendering_is_unchanged_by_the_optional_event_field(self):
+        event = antiphon.Event(0, "claude", "plain", self.SOURCE, "g", 0, 10)
+        record = antiphon.Record(0, self.SOURCE, "g", 0, 10, (event,))
+        self.assertEqual(antiphon._render_record(record, "codex"),
+                         "[%s] Claude:\nplain" %
+                         antiphon.datetime.fromtimestamp(0).strftime("%H:%M"))
+
+
+class ToolInvocationRetrievalTest(unittest.TestCase):
+    SOURCE = "4eecac24-1c21-47ad-ab11-a650708f3098"
+
+    @staticmethod
+    def _block(argument="value", native_id="toolu_native"):
+        return {"type": "tool_use", "id": native_id, "name": "Read",
+                "input": {"argument": argument},
+                "caller": {"type": "direct"}}
+
+    @classmethod
+    def _record(cls, block):
+        return {"type": "assistant", "timestamp": "2026-09-01T00:00:00Z",
+                "message": {"content": [block]}}
+
+    @staticmethod
+    def _write(path, records):
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w", encoding="utf-8") as stream:
+            for record in records:
+                stream.write(json.dumps(record) + "\n")
+
+    @staticmethod
+    def _metadata(project):
+        root = os.path.join(project, ".antiphon")
+        snapshot = {}
+        for base, directories, files in os.walk(root):
+            directories.sort()
+            for name in sorted(files):
+                path = os.path.join(base, name)
+                with open(path, "rb") as stream:
+                    snapshot[os.path.relpath(path, root)] = stream.read()
+        return snapshot
+
+    @contextlib.contextmanager
+    def _forbid_writes(self):
+        forbidden = AssertionError("retrieval attempted project mutation")
+        with patch.object(antiphon, "write_cursor", side_effect=forbidden), \
+             patch.object(antiphon, "_write_catalog_state", side_effect=forbidden), \
+             patch.object(antiphon, "_write_catalog_record", side_effect=forbidden), \
+             patch.object(antiphon, "_record_current_source", side_effect=forbidden), \
+             patch.object(antiphon, "_cleanup_catalog_manifests",
+                          side_effect=forbidden), \
+             patch.object(antiphon, "_spill", side_effect=forbidden), \
+             patch.object(antiphon, "drop_attachment", side_effect=forbidden), \
+             patch.object(antiphon.peers, "register", side_effect=forbidden):
+            yield
+
+    def _fixture(self, project, records):
+        path = os.path.join(project, "sources", self.SOURCE + ".jsonl")
+        self._write(path, records)
+        return path
+
+    def test_invalid_id_is_rejected_before_discovery_and_writes_nothing(self):
+        with tempfile.TemporaryDirectory() as project:
+            sentinel = os.path.join(project, ".antiphon", "sentinel.bin")
+            self._write(sentinel, [{"sentinel": True}])
+            before = self._metadata(project)
+            for public_id in (
+                    None, "not-an-id", "../../cursor.json", "tc1.c.line\nbreak",
+                    "tc1.z.AAAAAAAAAAAAAAAA", "tc1.c.çççççççççççççççç",
+                    "tc1.c." + "A" * 17):
+                with self.subTest(public_id=public_id), self._forbid_writes(), \
+                     patch.object(antiphon, "_discover_sources",
+                                  side_effect=AssertionError("invalid id discovered")):
+                    result = antiphon._retrieve_invocation(project, public_id)
+                self.assertEqual(result.status, "invalid-id")
+                self.assertIsNone(result.invocation)
+            after = self._metadata(project)
+        self.assertEqual(after, before)
+
+    def test_exact_match_returns_only_the_public_invocation_write_free(self):
+        block = self._block("secret\ncontrol")
+        public_id = antiphon._claude_invocation(
+            block, self.SOURCE, 0, 0).public_id
+        with tempfile.TemporaryDirectory() as project:
+            path = self._fixture(project, [self._record(block)])
+            sentinel = os.path.join(project, ".antiphon", "sentinel.bin")
+            self._write(sentinel, [{"sentinel": True}])
+            before = self._metadata(project)
+            with self._forbid_writes():
+                result = antiphon._retrieve_invocation(
+                    project, public_id, source_paths=[path])
+            after = self._metadata(project)
+        self.assertEqual(result.status, "found")
+        public = antiphon._public_invocation(result.invocation)
+        self.assertEqual(public["arguments"], {"argument": "secret\ncontrol"})
+        self.assertEqual(set(public), {
+            "id", "side", "call_type", "name", "caller", "arguments"})
+        self.assertEqual(after, before)
+
+    def test_changed_content_under_the_old_id_is_only_unavailable(self):
+        before_block = self._block("AAAA")
+        after_block = self._block("BBBB")
+        old_id = antiphon._claude_invocation(
+            before_block, self.SOURCE, 0, 0).public_id
+        with tempfile.TemporaryDirectory() as project:
+            path = self._fixture(project, [self._record(after_block)])
+            result = antiphon._retrieve_invocation(
+                project, old_id, source_paths=[path])
+        self.assertEqual(result.status, "unavailable")
+        self.assertIsNone(result.invocation)
+
+    def test_two_exact_matches_are_ambiguous_and_return_no_content(self):
+        block = self._block()
+        public_id = antiphon._claude_invocation(
+            block, self.SOURCE, 0, 0).public_id
+        with tempfile.TemporaryDirectory() as project:
+            path = self._fixture(
+                project, [self._record(block), self._record(block)])
+            result = antiphon._retrieve_invocation(
+                project, public_id, source_paths=[path])
+        self.assertEqual(result.status, "ambiguous")
+        self.assertIsNone(result.invocation)
+
+    def test_two_idless_copies_with_the_same_source_identity_are_ambiguous(self):
+        block = self._block(native_id=None)
+        public_id = antiphon._claude_invocation(
+            block, self.SOURCE, 0, 0).public_id
+        with tempfile.TemporaryDirectory() as project:
+            paths = []
+            for parent in ("copy-one", "copy-two"):
+                path = os.path.join(project, parent, self.SOURCE + ".jsonl")
+                self._write(path, [self._record(block)])
+                paths.append(path)
+            result = antiphon._retrieve_invocation(
+                project, public_id, source_paths=paths)
+        self.assertEqual(result.status, "ambiguous")
+        self.assertIsNone(result.invocation)
+
+    def test_digest_collision_is_ambiguous_because_scan_does_not_return_early(self):
+        first, second = self._block("one", "a"), self._block("two", "b")
+        fixed = b"x" * 12
+        with patch.object(antiphon, "_tool_digest", return_value=fixed):
+            public_id = antiphon._claude_invocation(
+                first, self.SOURCE, 0, 0).public_id
+            with tempfile.TemporaryDirectory() as project:
+                path = self._fixture(
+                    project, [self._record(first), self._record(second)])
+                result = antiphon._retrieve_invocation(
+                    project, public_id, source_paths=[path])
+        self.assertEqual(result.status, "ambiguous")
+        self.assertIsNone(result.invocation)
+
+    def test_scan_retains_only_matches_and_still_visits_later_records(self):
+        first = self._block("not the target", "first")
+        target = self._block("target", "second")
+        public_id = antiphon._claude_invocation(
+            target, self.SOURCE, 0, 0).public_id
+        with tempfile.TemporaryDirectory() as project:
+            path = self._fixture(
+                project, [self._record(first), self._record(target)])
+            matches, unsafe = antiphon._scan_invocations(
+                project, "claude", [path], public_id)
+        self.assertFalse(unsafe)
+        self.assertEqual([match.public_id for match in matches], [public_id])
+        self.assertEqual(matches[0].arguments, {"argument": "target"})
+
+    def test_degraded_or_unsafe_discovery_is_untrusted(self):
+        public_id = antiphon._claude_invocation(
+            self._block(), self.SOURCE, 0, 0).public_id
+        degraded = antiphon.Discovery((), "degraded", 0, 1, 0,
+                                      "catalog could not be trusted")
+        with tempfile.TemporaryDirectory() as project:
+            degraded_result = antiphon._retrieve_invocation(
+                project, public_id, discovery=degraded)
+            path = self._fixture(project, [self._record(self._block())])
+            with patch.object(antiphon, "_open_discovered_source",
+                              return_value=antiphon.SourceRefusal("unsafe-path")):
+                unsafe_result = antiphon._retrieve_invocation(
+                    project, public_id, source_paths=[path])
+        self.assertEqual(degraded_result.status, "untrusted")
+        self.assertEqual(unsafe_result.status, "untrusted")
+
+    def test_building_discovery_can_find_current_but_names_an_incomplete_miss(self):
+        block = self._block()
+        public_id = antiphon._claude_invocation(
+            block, self.SOURCE, 0, 0).public_id
+        missing_id = antiphon._claude_invocation(
+            self._block("missing", "other"), self.SOURCE, 0, 0).public_id
+        with tempfile.TemporaryDirectory() as project:
+            path = self._fixture(project, [self._record(block)])
+            building = antiphon.Discovery((path,), "building", 2, 0, 0,
+                                          "bootstrap incomplete")
+            found = antiphon._retrieve_invocation(
+                project, public_id, discovery=building)
+            missing = antiphon._retrieve_invocation(
+                project, missing_id, discovery=building)
+        self.assertEqual(found.status, "found")
+        self.assertEqual(missing.status, "unavailable")
+        self.assertIn("incomplete", missing.reason)
+
+    def test_malformed_and_partial_records_are_not_invented_as_invocations(self):
+        block = self._block("partial", "toolu_partial")
+        public_id = antiphon._claude_invocation(
+            block, self.SOURCE, 0, 0).public_id
+        with tempfile.TemporaryDirectory() as project:
+            path = os.path.join(project, self.SOURCE + ".jsonl")
+            with open(path, "wb") as stream:
+                stream.write(b"{malformed}\n")
+                stream.write(json.dumps(self._record(block)).encode("utf-8"))
+            result = antiphon._retrieve_invocation(
+                project, public_id, source_paths=[path])
+        self.assertEqual(result.status, "unavailable")
+        self.assertIsNone(result.invocation)
+
+    def test_symlink_and_changed_after_discovery_sources_are_untrusted(self):
+        block = self._block()
+        public_id = antiphon._claude_invocation(
+            block, self.SOURCE, 0, 0).public_id
+        with tempfile.TemporaryDirectory() as project:
+            root = os.path.join(project, "host")
+            prefix = "project"
+            target = os.path.join(project, "outside.jsonl")
+            self._write(target, [self._record(block)])
+            link = os.path.join(root, prefix, self.SOURCE + ".jsonl")
+            os.makedirs(os.path.dirname(link))
+            os.symlink(target, link)
+            unsafe = antiphon._discovered_source_path(
+                link, root, "claude", prefix)
+            symlink_result = antiphon._retrieve_invocation(
+                project, public_id, source_paths=[unsafe])
+
+            os.unlink(link)
+            self._write(link, [self._record(block)])
+            replaced = antiphon._discovered_source_path(
+                link, root, "claude", prefix)
+            replaced.expected_generation = "a different generation"
+            replaced_result = antiphon._retrieve_invocation(
+                project, public_id, source_paths=[replaced])
+        self.assertEqual(symlink_result.status, "untrusted")
+        self.assertEqual(replaced_result.status, "untrusted")
+
+    def test_absence_after_retention_or_compaction_is_unavailable(self):
+        public_id = antiphon._claude_invocation(
+            self._block(), self.SOURCE, 0, 0).public_id
+        with tempfile.TemporaryDirectory() as project:
+            result = antiphon._retrieve_invocation(
+                project, public_id, source_paths=[])
+        self.assertEqual(result.status, "unavailable")
+        self.assertIn("no matching invocation", result.reason)
+
+    def test_every_outcome_leaves_the_project_metadata_tree_byte_identical(self):
+        block = self._block()
+        public_id = antiphon._claude_invocation(
+            block, self.SOURCE, 0, 0).public_id
+        with tempfile.TemporaryDirectory() as project:
+            path = self._fixture(project, [self._record(block)])
+            sentinel = os.path.join(project, ".antiphon", "sentinel.bin")
+            self._write(sentinel, [{"sentinel": True}])
+            cases = (
+                ("invalid-id", lambda: antiphon._retrieve_invocation(
+                    project, "bad")),
+                ("unavailable", lambda: antiphon._retrieve_invocation(
+                    project, public_id, source_paths=[])),
+                ("ambiguous", lambda: antiphon._retrieve_invocation(
+                    project, public_id, source_paths=[path, path])),
+                ("untrusted", lambda: antiphon._retrieve_invocation(
+                    project, public_id,
+                    discovery=antiphon.Discovery(
+                        (), "degraded", 0, 1, 0, "untrusted"))),
+                ("found", lambda: antiphon._retrieve_invocation(
+                    project, public_id, source_paths=[path])),
+            )
+            for expected, operation in cases:
+                with self.subTest(status=expected):
+                    before = self._metadata(project)
+                    with self._forbid_writes():
+                        result = operation()
+                    self.assertEqual(result.status, expected)
+                    self.assertEqual(self._metadata(project), before)
+
+    def test_duplicate_inside_host_root_is_untrusted_but_outside_copy_is_irrelevant(self):
+        payload = {"type": "custom_tool_call", "name": "exec",
+                   "call_id": "call_duplicate", "input": "opaque"}
+        public_id = antiphon._codex_invocation(
+            payload, self.SOURCE, 0).public_id
+        with tempfile.TemporaryDirectory() as project:
+            host_root = os.path.join(project, "host-codex-sessions")
+            transcript_dir = os.path.join(host_root, "2026", "09", "01")
+            primary = os.path.join(
+                transcript_dir, "rollout-a-" + self.SOURCE + ".jsonl")
+            duplicate = os.path.join(
+                transcript_dir, "rollout-b-" + self.SOURCE + ".jsonl")
+            records = [
+                {"type": "session_meta", "payload": {"cwd": project}},
+                {"type": "response_item",
+                 "timestamp": "2026-09-01T00:00:00Z", "payload": payload},
+            ]
+            self._write(primary, records)
+            shutil.copyfile(primary, duplicate)
+            with patch.object(antiphon, "CODEX_SESSIONS", host_root), \
+                 self._forbid_writes():
+                inside = antiphon._retrieve_invocation(project, public_id)
+                outside = os.path.join(project, "backup", os.path.basename(duplicate))
+                os.makedirs(os.path.dirname(outside))
+                shutil.move(duplicate, outside)
+                after_move = antiphon._retrieve_invocation(project, public_id)
+        self.assertEqual(inside.status, "untrusted")
+        self.assertEqual(after_move.status, "found")
+
+    @staticmethod
+    def _result_with_argument(argument):
+        invocation = antiphon._make_invocation(
+            "codex", "custom_tool_call", "exec", argument,
+            ToolInvocationRetrievalTest.SOURCE, "call_native", 0)
+        return antiphon.RetrievalResult("found", invocation, None)
+
+    def _argument_for_json_size(self, target):
+        empty = self._result_with_argument("")
+        overhead = len(antiphon._invocation_json(empty.invocation).encode())
+        argument = "x" * (target - overhead)
+        self.assertEqual(
+            len(antiphon._invocation_json(
+                self._result_with_argument(argument).invocation).encode()), target)
+        return argument
+
+    def test_invocation_json_escapes_controls_and_contains_no_internal_identity(self):
+        invocation = self._result_with_argument("line\n\u0000end").invocation
+        rendered = antiphon._invocation_json(invocation)
+        self.assertNotIn("\n", rendered)
+        self.assertNotIn("\x00", rendered)
+        decoded = json.loads(rendered)
+        self.assertEqual(decoded["arguments"], "line\n\u0000end")
+        for secret in (self.SOURCE, "call_native", "source", "offset",
+                       "generation", "path"):
+            self.assertNotIn(secret, rendered)
+
+    def test_python_mcp_accepts_8000_bytes_and_refuses_8001_without_truncation(self):
+        public_id = self._result_with_argument("").invocation.public_id
+        exact = self._result_with_argument(
+            self._argument_for_json_size(antiphon.PAGE_BUDGET))
+        over = self._result_with_argument(
+            self._argument_for_json_size(antiphon.PAGE_BUDGET + 1))
+        with patch.object(antiphon, "_retrieve_invocation",
+                          side_effect=[exact, over]):
+            accepted = antiphon._retrieve_tool("/tmp/project", public_id)
+            refused = antiphon._retrieve_tool("/tmp/project", public_id)
+        self.assertIsNot(accepted.get("isError"), True)
+        self.assertEqual(len(accepted["content"][0]["text"].encode()),
+                         antiphon.PAGE_BUDGET)
+        self.assertIs(refused.get("isError"), True)
+        self.assertIn("antiphon retrieve %s" % public_id,
+                      refused["content"][0]["text"])
+        self.assertNotIn("xxxxxxxxxx", refused["content"][0]["text"])
+
+    def test_oversized_mcp_refusal_is_write_free(self):
+        result = self._result_with_argument("z" * (antiphon.PAGE_BUDGET + 1))
+        with tempfile.TemporaryDirectory() as project:
+            sentinel = os.path.join(project, ".antiphon", "sentinel.bin")
+            self._write(sentinel, [{"sentinel": True}])
+            before = self._metadata(project)
+            with self._forbid_writes(), \
+                 patch.object(antiphon, "_retrieve_invocation",
+                              return_value=result):
+                refused = antiphon._retrieve_tool(
+                    project, result.invocation.public_id)
+            after = self._metadata(project)
+        self.assertIs(refused.get("isError"), True)
+        self.assertEqual(after, before)
+
+    def test_cli_returns_the_full_large_invocation(self):
+        result = self._result_with_argument("z" * 36_963)
+        out, err = io.StringIO(), io.StringIO()
+        with patch.object(antiphon, "_retrieve_invocation", return_value=result), \
+             contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            code = antiphon.retrieve(result.invocation.public_id)
+        self.assertEqual(code, 0)
+        self.assertEqual(err.getvalue(), "")
+        decoded = json.loads(out.getvalue())
+        self.assertEqual(decoded["arguments"], "z" * 36_963)
+        self.assertGreater(len(out.getvalue().encode()), antiphon.PAGE_BUDGET)
+
+    def test_cli_failure_classes_are_fixed_and_return_no_content(self):
+        public_id = self._result_with_argument("").invocation.public_id
+        for status, expected_code in (
+                ("invalid-id", 2), ("unavailable", 3),
+                ("ambiguous", 4), ("untrusted", 5)):
+            with self.subTest(status=status), \
+                 patch.object(antiphon, "_retrieve_invocation",
+                              return_value=antiphon.RetrievalResult(
+                                  status, None, "fixed reason")), \
+                 contextlib.redirect_stdout(io.StringIO()) as out, \
+                 contextlib.redirect_stderr(io.StringIO()) as err:
+                code = antiphon.retrieve(public_id)
+            self.assertEqual(code, expected_code)
+            self.assertEqual(out.getvalue(), "")
+            self.assertEqual(err.getvalue(),
+                             "antiphon retrieve: %s — fixed reason\n" % status)
+
+    def test_codex_mcp_lists_and_dispatches_the_read_only_retrieval_tool(self):
+        listed = {tool["name"]: tool for tool in antiphon.TOOLS}
+        self.assertIn("antiphon_retrieve", listed)
+        retrieval = listed["antiphon_retrieve"]
+        self.assertEqual(retrieval["inputSchema"]["required"], ["id"])
+        description = retrieval["description"].lower()
+        self.assertIn("invocation only", description)
+        self.assertIn("read-only", description)
+        self.assertIn("antiphon retrieve", description)
+
+        request = {"jsonrpc": "2.0", "id": 9, "method": "tools/call",
+                   "params": {"name": "antiphon_retrieve",
+                              "arguments": {"id": "tc1.c.AAAAAAAAAAAAAAAA"}}}
+        answer = {"content": [{"type": "text", "text": "retrieved"}]}
+        out = io.StringIO()
+        with patch.object(antiphon.sys, "stdin",
+                          io.StringIO(json.dumps(request) + "\n")), \
+             patch.object(antiphon, "_retrieve_tool", return_value=answer) as called, \
+             contextlib.redirect_stdout(out):
+            antiphon._mcp_serve("/tmp/project")
+        called.assert_called_once_with("/tmp/project", "tc1.c.AAAAAAAAAAAAAAAA")
+        self.assertEqual(json.loads(out.getvalue())["result"], answer)
 
 
 class LiveCodexTargetTest(unittest.TestCase):
@@ -4228,8 +4881,47 @@ class SetupShapeCharacterizationTest(unittest.TestCase):
                     {"hooks": [{"type": "command",
                                 "command": "antiphon push codex"}]}],
             },
-            "permissions": {"allow": ["mcp__antiphon__reply_to_codex"]},
+            "permissions": {"allow": [
+                "mcp__antiphon__reply_to_codex",
+                "mcp__antiphon__antiphon_retrieve",
+            ]},
         })
+
+    def test_doctor_requires_both_claude_channel_tool_permissions(self):
+        project, _ = self.install()
+        target = os.path.join(project, antiphon.CLAUDE_SETTINGS_FILE)
+        data = json.loads(self.written(project, antiphon.CLAUDE_SETTINGS_FILE))
+        data["permissions"]["allow"].remove(
+            "mcp__antiphon__antiphon_retrieve")
+        with open(target, "w", encoding="utf-8") as stream:
+            json.dump(data, stream)
+        states = antiphon._config_state(project)
+        report = antiphon._Report()
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            antiphon._doctor_config(report, project, states)
+        self.assertTrue(report.broken)
+        self.assertIn("mcp__antiphon__antiphon_retrieve", out.getvalue())
+
+    def test_setup_upgrade_adds_retrieval_permission_once_and_preserves_others(self):
+        project, _ = self.install()
+        target = os.path.join(project, antiphon.CLAUDE_SETTINGS_FILE)
+        data = json.loads(self.written(project, antiphon.CLAUDE_SETTINGS_FILE))
+        data["permissions"]["allow"] = [
+            "Bash(ls:*)", antiphon.REPLY_TOOL_PERMISSION,
+        ]
+        with open(target, "w", encoding="utf-8") as stream:
+            json.dump(data, stream)
+        with patch.object(antiphon, "project_dir", return_value=project), \
+             contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(antiphon.setup(), 0)
+            self.assertEqual(antiphon.setup(), 0)
+        upgraded = json.loads(self.written(project, antiphon.CLAUDE_SETTINGS_FILE))
+        allowed = upgraded["permissions"]["allow"]
+        self.assertEqual(allowed, [
+            "Bash(ls:*)", antiphon.REPLY_TOOL_PERMISSION,
+            antiphon.RETRIEVE_TOOL_PERMISSION,
+        ])
 
     def test_setup_writes_the_whole_local_allowlist_shape(self):
         """Claude Code gates `.mcp.json` servers behind this list. Without the
@@ -12438,8 +13130,8 @@ class SenderIdentityTest(unittest.TestCase):
     UUID = "1d5a03e0-0548-4339-87c3-45c5dbf7e9d7"
     OWNER = "300:mine"
 
-    def test_every_agent_facing_surface_bounds_codex_tool_visibility(self):
-        """A tool-name line is awareness, never disclosure of its invocation."""
+    def test_every_agent_facing_surface_bounds_tool_retrieval_to_the_invocation(self):
+        """The page stays compact; explicit lookup reveals no tool result."""
         node = read_source("lib", "channel.mjs")
         start = node.index("    instructions:")
         end = node.index("\n  },\n);", start)
@@ -12453,9 +13145,11 @@ class SenderIdentityTest(unittest.TestCase):
         for name, surface in surfaces.items():
             with self.subTest(surface=name):
                 words = " ".join(surface.lower().split())
-                self.assertIn("codex tool calls", words)
-                self.assertIn("compact name-only events", words)
-                self.assertIn("arguments and results stay unavailable", words)
+                self.assertIn("compact tool-call", words)
+                self.assertIn("content-bound", words)
+                self.assertIn("antiphon_retrieve", words)
+                self.assertIn("invocation only", words)
+                self.assertIn("never the tool result", words)
 
     def test_every_agent_facing_surface_states_the_v4_retention_contract(self):
         node = read_source("lib", "channel.mjs")

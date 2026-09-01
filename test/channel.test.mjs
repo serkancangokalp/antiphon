@@ -25,6 +25,10 @@ const socketPath = join(process.env.TMPDIR || "/tmp", `antiphon-channel-${projec
 // `ANTIPHON_NAME=ui npm test` is a perfectly reasonable thing to do now.
 const mainEnv = { ...process.env, ANTIPHON_CWD: projectDir };
 delete mainEnv.ANTIPHON_NAME;
+// Every transcript and catalog this integration run discovers stays inside its
+// throwaway project. The real channel process receives this HOME too, so its
+// Python retrieval child and this test name the same isolated source roots.
+mainEnv.HOME = projectDir;
 
 // A `codex` that records instead of queueing. Without it the reply tool can
 // only ever be tested on its failure paths, and the sentence it hands back on
@@ -1178,14 +1182,70 @@ try {
   };
 
   const tools = await client.listTools();
-  assert.equal(tools.tools[0].name, "reply_to_codex");
-  assert.doesNotMatch(tools.tools[0].description, /you can leave it out/,
+  assert.deepEqual(tools.tools.map((tool) => tool.name),
+    ["reply_to_codex", "antiphon_retrieve"]);
+  const replyTool = tools.tools.find((tool) => tool.name === "reply_to_codex");
+  const retrieveTool = tools.tools.find((tool) => tool.name === "antiphon_retrieve");
+  assert.doesNotMatch(replyTool.description, /you can leave it out/,
     "there is no single-peer shortcut on the Codex side to promise");
-  const schema = tools.tools[0].inputSchema;
+  const schema = replyTool.inputSchema;
   assert.equal(schema.properties.to.type, "string");
   assert.deepEqual(schema.required, ["text"],
     "`to` is optional here only to preserve the project with no registered " +
     "Codex peer at all; requiring it would break every unnamed single pair");
+  assert.deepEqual(retrieveTool.inputSchema.required, ["id"]);
+  assert.match(retrieveTool.description, /invocation only/);
+  assert.match(retrieveTool.description, /read-only/i);
+  assert.match(retrieveTool.description, /antiphon retrieve/);
+
+  // The Claude-facing retrieval tool crosses the real Node -> Python boundary.
+  // Build its source catalog in an isolated HOME, then prove both a small exact
+  // invocation and the bounded refusal for a value that cannot fit in MCP.
+  const retrievalSource = "4eecac24-1c21-47ad-ab11-a650708f3098";
+  const retrievalDir = join(
+    projectDir, ".claude", "projects", projectDir.replace(/[^A-Za-z0-9]/g, "-"));
+  mkdirSync(retrievalDir, { recursive: true });
+  const smallBlock = {
+    type: "tool_use", id: "toolu_node_small", name: "Read",
+    input: { argument: "line\nsmall" }, caller: { type: "direct" },
+  };
+  const largeBlock = {
+    type: "tool_use", id: "toolu_node_large", name: "Read",
+    input: { argument: "z".repeat(9_000) }, caller: { type: "direct" },
+  };
+  writeFileSync(join(retrievalDir, `${retrievalSource}.jsonl`), `${JSON.stringify({
+    type: "assistant", cwd: projectDir, timestamp: "2026-09-01T00:00:00Z",
+    message: { content: [smallBlock, largeBlock] },
+  })}\n`);
+  execFileSync("python3", [join(process.cwd(), "lib", "antiphon.py"),
+                           "sources", "scan"],
+    { cwd: projectDir, env: mainEnv, encoding: "utf8" });
+  const invocationId = (block) => execFileSync("python3", [
+    "-c",
+    "import json, sys\n" +
+    "sys.path.insert(0, sys.argv[1])\n" +
+    "import antiphon\n" +
+    "b = json.load(sys.stdin)\n" +
+    "print(antiphon._claude_invocation(b, sys.argv[2], 0, int(sys.argv[3])).public_id)\n",
+    join(process.cwd(), "lib"), retrievalSource, String(block === largeBlock ? 1 : 0),
+  ], { input: JSON.stringify(block), env: mainEnv, encoding: "utf8" }).trim();
+
+  const smallId = invocationId(smallBlock);
+  const smallRetrieved = await client.callTool({
+    name: "antiphon_retrieve", arguments: { id: smallId },
+  });
+  assert.equal(smallRetrieved.isError, undefined);
+  assert.deepEqual(JSON.parse(smallRetrieved.content[0].text).arguments,
+    { argument: "line\nsmall" });
+  const largeId = invocationId(largeBlock);
+  const largeRetrieved = await client.callTool({
+    name: "antiphon_retrieve", arguments: { id: largeId },
+  });
+  assert.equal(largeRetrieved.isError, true);
+  assert.match(largeRetrieved.content[0].text,
+    new RegExp(`antiphon retrieve ${largeId}`));
+  assert.doesNotMatch(largeRetrieved.content[0].text, /zzzzzzzzzz/,
+    "an oversized refusal carries no invocation content");
 
   // `to` has to survive the hop into the Python process. Only the resolver
   // there can produce this sentence, so seeing the alias in the error proves

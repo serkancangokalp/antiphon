@@ -161,10 +161,44 @@ the write-and-flush-before-advance transaction.
   frontier nor scheduler lane, and no output can move the frontier past a first
   undelivered visible call.
 
+### Completed by Wave 1D stable tool invocation retrieval (candidate, not published)
+
+- Every recognized tool invocation now carries a 22-character opaque,
+  content-bound `tc1.<kind>.<digest>` id on its compact page entry. The digest
+  binds source identity, native call id (or record start plus block ordinal),
+  and exactly the invocation fields retrieval returns. Claude objects preserve
+  nested JSON types; Codex custom and function arguments remain exact strings.
+  Source/native ids, paths, offsets and generations never enter public output.
+- Both MCP servers expose the same read-only, cursor-neutral
+  `antiphon_retrieve(id="<id>")`; `antiphon retrieve <id>` is the lossless CLI
+  escape hatch. Retrieval returns the invocation only, never the tool result.
+  It scans the complete trusted candidate set without an early success return
+  and reports `found`, `invalid-id`, `unavailable`, `ambiguous` or `untrusted`.
+  The MCP road accepts at most 8,000 UTF-8 bytes and refuses 8,001 without
+  truncation; the CLI is pinned with a 36,963-byte-like argument.
+- The id closes the earlier-prefix rewrite hole for invocation content. A
+  same-size mutation with unchanged source generation and native id receives a
+  different id; the old id never returns the new bytes. It returns
+  `unavailable`, because there is no persistent invocation index or tombstone.
+  `changed`, `expired` and `never existed` cannot be distinguished without the
+  rejected delivered-prefix/index state, and doctor does not invent one.
+- Lookup writes no cursor, catalog, peer, cleanup or attachment state. Every
+  result class is tested against a byte-identical project metadata tree and
+  mutation seams that raise if reached. Malformed and partial records are not
+  invented into calls; unsafe, replaced or degraded sources fail untrusted.
+  Host retention and explicit candidate compaction may make an old id
+  unavailable. Duplicate transcript identities inside a host discovery root
+  degrade discovery and make retrieval untrusted; backups outside those roots
+  are irrelevant.
+- The pre-change corpus measured about 8,400 calls. Indexless full-set scans
+  cost about 106 ms over 27.8 MB of Claude transcripts and 579 ms over 243 MB
+  of Codex rollouts. The 22-byte id added 5.2% bytes / 3.6% pages to Claude tool
+  traffic and, after Wave 1C made the real Codex shapes visible, 2.7% bytes /
+  0.4% pages there. That explicit-call latency and page cost are accepted in
+  exchange for no new persistent proof surface.
+
 ### Still open, by name
 
-- Stable event ids and full tool-call retrieval: tool calls remain compressed
-  one-line summaries with no `antiphon_read(id)` route.
 - Backward paging into history an older version already marked seen —
   **settled for the published path, ruled for the rest.** Its cost was
   measured on 2026-08-31: the byte-zero `legacy_upgrade` replay of two days

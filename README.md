@@ -187,6 +187,7 @@ antiphon setup             # (re)install the project setup
 antiphon catch-up [side]   # skip undelivered history: page cursors jump to the live edge
 antiphon sources scan      # finish or refresh the durable source catalog
 antiphon sources compact   # retire aged gone sources proved consumed by every relevant reader
+antiphon retrieve <id>     # print one complete tool invocation (never its result)
 antiphon --version         # the installed version
 npm test                   # Python unit tests + real MCP protocol test
 test/e2e/fresh-user.sh     # what a new user gets, with the real CLIs (not in npm test)
@@ -223,17 +224,22 @@ a `✗` makes it exit non-zero, so a set-up project with no session running
 exits 0. It never takes a lock, never writes, and never removes the stale
 record it is explaining.
 
-`setup` registers Codex's MCP tools — `antiphon_read` and `antiphon_send`
+`setup` registers Codex's MCP tools — `antiphon_read`, `antiphon_send` and
+`antiphon_retrieve`
 — in this project's `.codex/config.toml`, so there is nothing to add by
 hand. Note the entry
 names `args = ["mcp"]`: the `channel` server is Claude's side and hands out
-`reply_to_codex`. Aiming Codex at it would let Codex publish messages
+`reply_to_codex` plus its own `antiphon_retrieve`. Aiming Codex at it would let
+Codex publish messages
 labelled as Claude's — exactly what this bridge exists to prevent — so
 `setup` rewrites that table whenever it is wrong, leaving the rest of the
 file alone. The same table forwards `ANTIPHON_NAME` into the tool process,
 because Codex does not pass the parent environment through on its own.
 
-Without this entry the pull hook still delivers Claude's context at the start of each Codex turn, but Codex loses both tools: it can no longer check the bridge by hand, nor reach Claude before its turn ends.
+Without this entry the pull hook still delivers Claude's context at the start
+of each Codex turn, but Codex loses all three tools: it can no longer check the
+bridge by hand, retrieve a complete invocation, nor reach Claude before its
+turn ends.
 
 ## Limits
 
@@ -252,9 +258,36 @@ most 40 completed source records — the byte number is measured against the
 installed hosts' injection limits, not a permanent host guarantee. Non-tool
 records are no longer cut or flattened: line structure, indentation, code and
 SQL formatting travel intact, and a record is never split across pages.
-Codex tool calls appear as compact name-only events; arguments and results stay
-unavailable. Tool outputs remain filtered while still advancing the safe
-scanned frontier.
+Tool calls appear as compact name-and-id events. Their arguments are absent
+from the page and tool results remain unavailable. Tool outputs remain filtered
+while still advancing the safe scanned frontier.
+
+#### Tool invocation ids and retrieval
+
+Every compact tool-call entry carries a 22-character opaque, content-bound
+`tc1.<kind>.<digest>` id. Both agents can call
+`antiphon_retrieve(id="<id>")`; the CLI equivalent is `antiphon retrieve <id>`.
+Retrieval returns the complete invocation only, never the tool result: side,
+call type, safe tool name, optional namespace/caller and the complete argument
+value. Claude argument objects keep their JSON types; Codex free-form and
+function arguments remain exact strings rather than being guessed into JSON.
+Source ids, native ids, paths, offsets and generations are not returned.
+
+Retrieval is read-only, write-free and cursor-neutral. It scans every safely
+discovered candidate to avoid accepting the first of two matches, and returns
+one of five honest outcomes: `found`, `invalid-id`, `unavailable`, `ambiguous`
+or `untrusted`. A content-bound id protects an earlier-prefix rewrite: changed
+invocation bytes receive a new id, and the old id never returns the new bytes.
+There is no persistent invocation index or tombstone. Consequently changed,
+expired and never-existed ids cannot be distinguished and all honestly collapse
+to `unavailable`; doctor cannot recover that distinction without the rejected
+persistent prefix/index state.
+
+An MCP retrieval above 8,000 UTF-8 bytes is refused without truncation and
+names `antiphon retrieve <id>`, which prints the full invocation. Host retention
+or `antiphon sources compact` can make an old id unavailable. Two copies of one
+transcript identity inside a host discovery root make retrieval `untrusted`;
+a backup outside those roots does not affect discovery.
 
 A page that leaves work behind says so with a visible `has_more: true` line;
 calling `antiphon_read` again (or simply letting later turns run) drains the
@@ -340,9 +373,9 @@ or rolls back instead of turning an unproved detached record into deletion proof
 Hooks never retire candidates; they may only recover a prepared safe view.
 Committed record cleanup remains an explicit `sources compact` operation.
 
-What still loses, by name: tool calls remain compressed one-line summaries
-with no stable-id retrieval yet, and there is no backward paging into history
-an older version already marked seen. Those are tracked in
+What still loses, by name: tool results remain unavailable, and there is no
+backward paging into history an older version already marked seen. Those are
+tracked in
 [BACKLOG.md](BACKLOG.md).
 
 ### An oversized direct message is parked, never truncated

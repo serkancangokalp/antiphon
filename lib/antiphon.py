@@ -17,6 +17,7 @@ Usage:
   antiphon catch-up [side]     # skip undelivered history: page cursors jump to the live edge
   antiphon sources scan        # finish or refresh the durable source catalog
   antiphon sources compact     # retire aged gone sources proved safe by every reader
+  antiphon retrieve <id>       # print one complete tool invocation (never its result)
   antiphon --version           # the installed version (also -V, version)
 
 Design: NO SHARED MESSAGE LOG IS KEPT. Both CLIs already write transcripts;
@@ -34,6 +35,7 @@ The pull and hook layer uses the Python standard library; the Claude Channel
 server runs on Node.js with the official MCP SDK.
 """
 
+import base64
 import glob
 import collections
 import contextlib
@@ -2486,13 +2488,101 @@ def iso_epoch(s):
 
 
 Event = collections.namedtuple(
-    "Event", "time kind text source generation offset end before_anchor anchor",
-    defaults=(None, None))
+    "Event", "time kind text source generation offset end before_anchor anchor public_id",
+    defaults=(None, None, None))
 Record = collections.namedtuple(
     "Record", "time source generation offset end events before_anchor anchor",
     defaults=(None, None))
 PageAdvance = collections.namedtuple(
     "PageAdvance", "sources has_more replay_reason next_lane", defaults=(None,))
+
+TOOL_COMPONENT = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]*")
+TOOL_ID = re.compile(r"tc1\.(?P<kind>[cx])\.(?P<digest>[A-Za-z0-9_-]{16})")
+TOOL_KIND_CODE = {"claude": "c", "codex": "x"}
+TOOL_CODE_KIND = {code: kind for kind, code in TOOL_KIND_CODE.items()}
+ToolInvocation = collections.namedtuple(
+    "ToolInvocation",
+    "public_id side call_type name arguments namespace caller",
+    defaults=(None, None))
+RetrievalResult = collections.namedtuple(
+    "RetrievalResult", "status invocation reason", defaults=(None, None))
+
+
+def _public_invocation(invocation):
+    """The complete invocation a public id names, with no source metadata."""
+    value = {
+        "id": invocation.public_id,
+        "side": invocation.side,
+        "call_type": invocation.call_type,
+        "name": invocation.name,
+    }
+    if invocation.namespace is not None:
+        value["namespace"] = invocation.namespace
+    if invocation.caller is not None:
+        value["caller"] = invocation.caller
+    value["arguments"] = invocation.arguments
+    return value
+
+
+def _tool_digest(value):
+    """The 96 content-bound bits carried in a tc1 public id."""
+    return hashlib.sha256(value).digest()[:12]
+
+
+def _make_invocation(side, call_type, name, arguments, source, native_id,
+                     start, ordinal=0, namespace=None, caller=None):
+    """Build one strict, canonical invocation or fail closed with ``None``."""
+    if (side not in TOOL_KIND_CODE
+            or not isinstance(call_type, str) or not call_type
+            or not isinstance(name, str)
+            or TOOL_COMPONENT.fullmatch(name) is None
+            or not isinstance(source, str) or not source
+            or not isinstance(start, int) or isinstance(start, bool) or start < 0
+            or not isinstance(ordinal, int) or isinstance(ordinal, bool)
+            or ordinal < 0):
+        return None
+    namespace = (namespace if isinstance(namespace, str)
+                 and TOOL_COMPONENT.fullmatch(namespace) is not None else None)
+    caller = caller if isinstance(caller, str) and caller else None
+    fields = {
+        "side": side, "call_type": call_type, "name": name,
+        "arguments": arguments,
+    }
+    if namespace is not None:
+        fields["namespace"] = namespace
+    if caller is not None:
+        fields["caller"] = caller
+    identity = ({"native_id": native_id}
+                if isinstance(native_id, str) and native_id
+                else {"record_start": start, "block_ordinal": ordinal})
+    bound = {
+        "token": "tc1", "source_kind": side, "source_identity": source,
+        "call_identity": identity, "invocation": fields,
+    }
+    try:
+        canonical = json.dumps(
+            bound, ensure_ascii=False, allow_nan=False,
+            sort_keys=True, separators=(",", ":")).encode("utf-8")
+    except (TypeError, ValueError, UnicodeEncodeError):
+        return None
+    digest = base64.urlsafe_b64encode(_tool_digest(canonical)).decode("ascii")
+    public_id = f"tc1.{TOOL_KIND_CODE[side]}.{digest.rstrip('=')}"
+    return ToolInvocation(
+        public_id, side, call_type, name, arguments, namespace, caller)
+
+
+def _claude_invocation(block, source, start, ordinal):
+    """Extract one real Claude ``tool_use`` invocation without its result."""
+    if not isinstance(block, dict) or block.get("type") != "tool_use":
+        return None
+    arguments = block.get("input")
+    if not isinstance(arguments, dict):
+        return None
+    caller = block.get("caller")
+    caller = caller.get("type") if isinstance(caller, dict) else None
+    return _make_invocation(
+        "claude", "tool_use", block.get("name"), arguments, source,
+        block.get("id"), start, ordinal, caller=caller)
 REPLAY_NOTICES = {
     "legacy_upgrade": (
         "replay: replaying discovered history after an upgrade; duplicates "
@@ -2858,7 +2948,8 @@ def claude_events(cwd, positions=None, since=None, visible_record_limit=None,
                                                 start, end, previous_anchor,
                                                 anchor)))
                     elif kind == "assistant":
-                        for c in content if isinstance(content, list) else []:
+                        for ordinal, c in enumerate(
+                                content if isinstance(content, list) else []):
                             if not isinstance(c, dict):
                                 continue
                             if c.get("type") == "text":
@@ -2869,17 +2960,20 @@ def claude_events(cwd, positions=None, since=None, visible_record_limit=None,
                                                         sid, gen, start, end,
                                                         previous_anchor, anchor)))
                             elif c.get("type") == "tool_use":
-                                arguments = c.get("input") or {}
-                                arguments = (arguments if isinstance(arguments, dict)
-                                             else {})
+                                invocation = _claude_invocation(
+                                    c, sid, start, ordinal)
+                                if invocation is None:
+                                    continue
+                                arguments = invocation.arguments
                                 detail = (arguments.get("file_path")
                                           or arguments.get("command")
                                           or arguments.get("pattern") or "")
                                 events.append((ts, path, next(position),
                                               Event(ts, "tool",
-                                                    f"{c.get('name', '?')} {detail}".strip(),
+                                                    f"{invocation.name} {detail}".strip(),
                                                     sid, gen, start, end,
-                                                    previous_anchor, anchor)))
+                                                    previous_anchor, anchor,
+                                                    invocation.public_id)))
                 previous_anchor = anchor
                 if len(events) > before:
                     visible_records += 1
@@ -2943,11 +3037,24 @@ def codex_rollout_files(cwd, days=3):
     return matched
 
 
-CODEX_TOOL_COMPONENT = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]*")
+def _codex_tool_fields(payload):
+    """Return validated host fields from one measured Codex call shape."""
+    kind = payload.get("type")
+    argument_key = {"custom_tool_call": "input",
+                    "function_call": "arguments"}.get(kind)
+    if argument_key is None or not isinstance(payload.get(argument_key), str):
+        return None
+    name = payload.get("name")
+    if not isinstance(name, str) or TOOL_COMPONENT.fullmatch(name) is None:
+        return None
+    namespace = payload.get("namespace")
+    namespace = (namespace if isinstance(namespace, str)
+                 and TOOL_COMPONENT.fullmatch(namespace) is not None else None)
+    return kind, name, namespace, payload[argument_key]
 
 
 def _codex_tool_name(payload):
-    """Return the only safe public detail from one measured Codex tool call.
+    """Return the only safe page detail from one measured Codex tool call.
 
     Codex writes calls as `response_item` records. `custom_tool_call.input`
     and `function_call.arguments` contain the caller's private payload, while
@@ -2957,19 +3064,26 @@ def _codex_tool_name(payload):
     `event_msg/exec_command_begin` shape is deliberately not accepted: no
     current rollout in the measured corpus writes it, and it exposed commands.
     """
-    kind = payload.get("type")
-    argument_key = {"custom_tool_call": "input",
-                    "function_call": "arguments"}.get(kind)
-    if argument_key is None or not isinstance(payload.get(argument_key), str):
+    fields = _codex_tool_fields(payload)
+    if fields is None:
         return None
-    name = payload.get("name")
-    if not isinstance(name, str) or CODEX_TOOL_COMPONENT.fullmatch(name) is None:
-        return None
-    namespace = payload.get("namespace")
-    if (isinstance(namespace, str)
-            and CODEX_TOOL_COMPONENT.fullmatch(namespace) is not None):
+    _kind, name, namespace, _arguments = fields
+    if namespace is not None:
         return f"{namespace}.{name}"
     return name
+
+
+def _codex_invocation(payload, source, start, ordinal=0):
+    """Extract one real Codex invocation; arguments remain opaque strings."""
+    if not isinstance(payload, dict):
+        return None
+    fields = _codex_tool_fields(payload)
+    if fields is None:
+        return None
+    kind, name, namespace, arguments = fields
+    return _make_invocation(
+        "codex", kind, name, arguments, source, payload.get("call_id"),
+        start, ordinal, namespace=namespace)
 
 
 def codex_events(cwd, positions=None, since=None, visible_record_limit=None,
@@ -3026,12 +3140,16 @@ def codex_events(cwd, positions=None, since=None, visible_record_limit=None,
                                                     start, end, previous_anchor,
                                                     anchor)))
                     elif kind == "response_item":
-                        tool_name = _codex_tool_name(payload)
-                        if tool_name is not None:
+                        invocation = _codex_invocation(payload, sid, start)
+                        if invocation is not None:
+                            tool_name = (f"{invocation.namespace}."
+                                         if invocation.namespace else "")
+                            tool_name += invocation.name
                             events.append((ts, path, next(position),
                                           Event(ts, "tool", tool_name,
                                                 sid, gen, start, end,
-                                                previous_anchor, anchor)))
+                                                previous_anchor, anchor,
+                                                invocation.public_id)))
                 previous_anchor = anchor
                 if len(events) > before:
                     visible_records += 1
@@ -3042,6 +3160,115 @@ def codex_events(cwd, positions=None, since=None, visible_record_limit=None,
         item[0], item[3].source, item[3].generation or "",
         item[3].offset, item[2]))
     return [item[3] for item in events], reached
+
+
+def _record_invocations(kind, record, source, start):
+    """Extract invocations from one complete record through the page rules."""
+    if not isinstance(record, dict):
+        return []
+    if kind == "claude":
+        if record.get("isMeta") or record.get("type") != "assistant":
+            return []
+        message = record.get("message")
+        content = message.get("content") if isinstance(message, dict) else None
+        if not isinstance(content, list):
+            return []
+        return [invocation for ordinal, block in enumerate(content)
+                for invocation in (
+                    _claude_invocation(block, source, start, ordinal),)
+                if invocation is not None]
+    if kind == "codex" and record.get("type") == "response_item":
+        payload = record.get("payload")
+        invocation = _codex_invocation(payload, source, start)
+        return [] if invocation is None else [invocation]
+    return []
+
+
+def _scan_invocations(cwd, kind, paths, public_id):
+    """Scan every trusted record, retaining matches only; unsafe poisons trust."""
+    matches = []
+    for path in paths:
+        opened = _open_discovered_source(path, cwd, kind, report=False)
+        if isinstance(opened, SourceRefusal):
+            return [], True
+        with opened as source:
+            for start, _end, line, _anchor in source.read_anchored_records(0):
+                try:
+                    record = json.loads(line)
+                except (json.JSONDecodeError, ValueError):
+                    continue
+                matches.extend(
+                    invocation for invocation in _record_invocations(
+                        kind, record, source.source, start)
+                    if invocation.public_id == public_id)
+    return matches, False
+
+
+def _retrieve_invocation(cwd, public_id, discovery=None, source_paths=None):
+    """Resolve one content-bound invocation id without writing project state."""
+    match = TOOL_ID.fullmatch(public_id) if isinstance(public_id, str) else None
+    if match is None:
+        return RetrievalResult(
+            "invalid-id", None,
+            "the id must match tc1.<kind>.<16 base64url characters>")
+    kind = TOOL_CODE_KIND[match.group("kind")]
+    if source_paths is not None:
+        paths = tuple(source_paths)
+        state = "complete"
+    else:
+        if discovery is None:
+            reader = "codex" if kind == "claude" else "claude"
+            discovery = _discover_sources(
+                cwd, kind, reader, {}, None,
+                catalog_snapshot=_catalog_snapshot(cwd, kind))
+        if discovery.state == "degraded":
+            return RetrievalResult(
+                "untrusted", None,
+                "project source discovery could not be proved safe")
+        paths = discovery.sources
+        state = discovery.state
+    matches, unsafe = _scan_invocations(cwd, kind, paths, public_id)
+    if unsafe:
+        return RetrievalResult(
+            "untrusted", None,
+            "a project source changed or could not be opened safely")
+    if len(matches) > 1:
+        return RetrievalResult(
+            "ambiguous", None,
+            "more than one complete invocation matches this id")
+    if len(matches) == 1:
+        return RetrievalResult("found", matches[0], None)
+    incomplete = ("; project source discovery is incomplete"
+                  if state == "building" else "")
+    return RetrievalResult(
+        "unavailable", None,
+        "no matching invocation is available" + incomplete)
+
+
+def _invocation_json(invocation):
+    """Render only the public invocation as one deterministic JSON value."""
+    return json.dumps(
+        _public_invocation(invocation), ensure_ascii=False, allow_nan=False,
+        sort_keys=True, separators=(",", ":"))
+
+
+RETRIEVE_EXIT_CODES = {
+    "invalid-id": 2,
+    "unavailable": 3,
+    "ambiguous": 4,
+    "untrusted": 5,
+}
+
+
+def retrieve(public_id=None):
+    """Print a full invocation by public id without moving bridge state."""
+    result = _retrieve_invocation(project_dir(), public_id)
+    if result.status == "found":
+        print(_invocation_json(result.invocation))
+        return 0
+    print(f"antiphon retrieve: {result.status} — {result.reason}",
+          file=sys.stderr)
+    return RETRIEVE_EXIT_CODES.get(result.status, 5)
 
 
 # ---------- summary ----------
@@ -3232,7 +3459,7 @@ def _render_record(record, side, join=None):
     def flush_tools():
         if tools:
             pieces.append("  {} {} tool calls: {}".format(
-                mark, len(tools), truncate(" | ".join(tools[-3:]), 130)))
+                mark, len(tools), " | ".join(tools)))
             del tools[:]
 
     def flush_run():
@@ -3248,7 +3475,8 @@ def _render_record(record, side, join=None):
     for event in record.events:
         if event.kind == "tool":
             flush_run()
-            tools.append(truncate(event.text, 70))
+            public_id = f" [{event.public_id}]" if event.public_id else ""
+            tools.append(truncate(event.text, 70) + public_id)
             continue
         flush_tools()
         if run_kind != event.kind:
@@ -5307,6 +5535,13 @@ TO_DESCRIPTION = ("Alias of the peer to send to. Required whenever the recipient
                   "refused rather than guessed — so pass it whenever you know "
                   "which peer you mean.")
 
+RETRIEVE_DESCRIPTION = (
+    "Read-only, write-free retrieval of the complete tool invocation named by a "
+    "tc1 id from the original project transcript. It returns the invocation only, "
+    "never the tool result, and does not move a cursor or write bridge state. MCP results "
+    "larger than 8000 UTF-8 bytes are refused without truncation; use `antiphon "
+    "retrieve <id>` for the full value.")
+
 TOOLS = [{
     "name": "antiphon_read",
     "description": ("Returns one page of what happened on the Claude Code side since "
@@ -5339,6 +5574,19 @@ TOOLS = [{
             "to": {"type": "string", "description": TO_DESCRIPTION},
         },
         "required": ["text"],
+    },
+}, {
+    "name": "antiphon_retrieve",
+    "description": RETRIEVE_DESCRIPTION,
+    "inputSchema": {
+        "type": "object",
+        "properties": {
+            "id": {
+                "type": "string",
+                "description": "The 22-character tc1 invocation id shown on a tool line.",
+            },
+        },
+        "required": ["id"],
     },
 }]
 
@@ -5426,6 +5674,28 @@ def _send_tool(cwd, text, to=None, sender=None):
             "file went in its place.")}]}
     return {"content": [{"type": "text",
                          "text": f"Delivered to the Claude Code {where}."}]}
+
+
+def _retrieve_tool(cwd, public_id):
+    """Return one bounded MCP result; the CLI is the lossless escape hatch."""
+    result = _retrieve_invocation(cwd, public_id)
+    if result.status != "found":
+        return _tool_error(
+            f"antiphon retrieve: {result.status} — {result.reason}")
+    rendered = _invocation_json(result.invocation)
+    if len(rendered.encode("utf-8")) > PAGE_BUDGET:
+        return _tool_error(
+            "The complete invocation is larger than the 8000-byte MCP limit; "
+            "nothing was returned or truncated. Run `antiphon retrieve "
+            f"{public_id}` for the full value.")
+    return {"content": [{"type": "text", "text": rendered}]}
+
+
+def _retrieve_mcp_bridge(public_id=None):
+    """Private fixed-argv bridge used by the Node Channel MCP server."""
+    print(json.dumps(_retrieve_tool(project_dir(), public_id),
+                     ensure_ascii=False, separators=(",", ":")))
+    return 0
 
 
 def register_codex_peer(cwd):
@@ -5681,6 +5951,10 @@ def _mcp_serve(cwd, alias=None):
                 arguments = arguments if isinstance(arguments, dict) else {}
                 _mcp_result(mid, _send_tool(cwd, arguments.get("text"),
                                             arguments.get("to"), alias))
+            elif name == "antiphon_retrieve":
+                arguments = p.get("arguments")
+                arguments = arguments if isinstance(arguments, dict) else {}
+                _mcp_result(mid, _retrieve_tool(cwd, arguments.get("id")))
             else:
                 _mcp_result(mid, _tool_error(f"unknown tool: {name}"))
         elif mid is not None:
@@ -5712,6 +5986,11 @@ CODEX_HOOK_LABEL = "Antiphon bridge"
 # Without this in `permissions.allow`, Claude is asked to approve the reply tool
 # on every single use, and the Claude → Codex direction goes quiet in practice.
 REPLY_TOOL_PERMISSION = "mcp__antiphon__reply_to_codex"
+RETRIEVE_TOOL_PERMISSION = "mcp__antiphon__antiphon_retrieve"
+CLAUDE_TOOL_PERMISSIONS = (
+    REPLY_TOOL_PERMISSION,
+    RETRIEVE_TOOL_PERMISSION,
+)
 
 # The `.mcp.json` server key. `.claude/settings.local.json` allow-lists the same
 # name — it is one server, so it is one fact and one spelling.
@@ -5831,6 +6110,20 @@ def hook_installed(data, shape):
 
 SECTION_HEADING = "## The Antiphon bridge"
 
+TOOL_RETRIEVAL_RULE = (
+    "Every compact tool-call entry carries a 22-character opaque, content-bound "
+    "`tc1` id. Call the `antiphon_retrieve` tool with `id=\"<id>\"` for the complete invocation "
+    "only, never the tool result. Retrieval is read-only and cursor-neutral; it "
+    "reports `invalid-id`, `unavailable`, `ambiguous` or `untrusted` without "
+    "inventing content. An MCP value above 8,000 UTF-8 bytes is refused without "
+    "truncation; run `antiphon retrieve <id>` for the full invocation. Host "
+    "retention or `antiphon sources compact` can make an old id unavailable. Two "
+    "copies of one transcript identity inside a host discovery root make retrieval "
+    "untrusted; backups outside those roots do not affect it. There is no persistent "
+    "invocation index or tombstone, so changed, expired and never-existed ids all "
+    "honestly collapse to `unavailable`; binding invocation content into the id "
+    "prevents changed bytes from being returned under the old id.")
+
 AGENTS_RULE = ("\n## The Antiphon bridge\n\n"
                "You are working alongside Claude Code on this project. What happens on the "
                "other side is injected into your context automatically at the start of each "
@@ -5857,8 +6150,7 @@ AGENTS_RULE = ("\n## The Antiphon bridge\n\n"
                "active and dead after successful delivery. Candidate retirement is never "
                "a hook side effect: `antiphon sources compact` explicitly retires only "
                "aged, gone sources every relevant v4 reader proves consumed. Hooks never "
-               "retire candidates. Codex tool calls appear on Claude's passive page as "
-               "compact name-only events; arguments and results stay unavailable.\n\n"
+               "retire candidates. " + TOOL_RETRIEVAL_RULE + "\n\n"
                "When Claude wants to tell you something directly, you'll see it as a user "
                "message starting with `[Antiphon bridge] Claude:` (pushed from Claude's Stop "
                "hook) or `[Antiphon channel] Claude:` (a direct reply through the channel) — "
@@ -5929,8 +6221,7 @@ CLAUDE_RULE = ("\n## The Antiphon bridge\n\n"
                "and dead after successful delivery. Candidate retirement is never a hook "
                "side effect: `antiphon sources compact` explicitly retires only aged, gone "
                "sources every relevant v4 reader proves consumed. Hooks never retire "
-               "candidates. Codex tool calls appear on this passive page as compact "
-               "name-only events; arguments and results stay unavailable.\n\n"
+               "candidates. " + TOOL_RETRIEVAL_RULE + "\n\n"
                "Events that come directly from that agent are marked "
                "`<channel source=\"antiphon\" sender=\"codex\" sender_kind=\"agent\" "
                "sender_alias=\"...\">`; ordinary events "
@@ -6320,9 +6611,10 @@ def setup():
             data, CONFIG_KEYS.permissions, claude_target)
         allowed = _config_list(
             permissions, CONFIG_KEYS.allow, claude_target)
-        if REPLY_TOOL_PERMISSION not in allowed:
-            allowed.append(REPLY_TOOL_PERMISSION)
-            changed = True
+        for permission in CLAUDE_TOOL_PERMISSIONS:
+            if permission not in allowed:
+                allowed.append(permission)
+                changed = True
         return changed
 
     install(claude_target, claude_mutate,
@@ -7325,9 +7617,9 @@ def _doctor_config(report, cwd, states):
             allowed = (data or {}).get(CONFIG_KEYS.permissions) or {}
             allowed = (allowed.get(CONFIG_KEYS.allow)
                        if isinstance(allowed, dict) else None)
-            if not (isinstance(allowed, list)
-                    and REPLY_TOOL_PERMISSION in allowed):
-                missing.append(f"the `{REPLY_TOOL_PERMISSION}` permission")
+            for permission in CLAUDE_TOOL_PERMISSIONS:
+                if not (isinstance(allowed, list) and permission in allowed):
+                    missing.append(f"the `{permission}` permission")
         verdict(name, missing)
 
     # Claude Code gates every `.mcp.json` server behind this allowlist. Without
@@ -8652,10 +8944,10 @@ def print_summary(side="claude"):
 
 COMMANDS = {
     "setup": setup, "status": status, "doctor": doctor, "catch-up": catch_up,
-    "sources": sources,
+    "sources": sources, "retrieve": retrieve,
     "hook": hook, "summary": print_summary,
     "push": push, "reply": reply, "mcp": mcp, "register_peer": register_peer,
-    "unregister_peer": unregister_peer,
+    "unregister_peer": unregister_peer, "retrieve_mcp": _retrieve_mcp_bridge,
     # Legacy aliases for old local installs, kept during the transition period.
     "kur": setup, "durum": status, "kanca": hook, "ozet": print_summary,
     "it": push, "yanit": reply,

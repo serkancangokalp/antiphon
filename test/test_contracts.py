@@ -238,6 +238,52 @@ class CrossBoundaryContractTest(unittest.TestCase):
         self.assertIn('required: ["text"]', node,
                       "and must not make it required on its side alone")
 
+    def test_both_mcp_servers_publish_one_retrieval_contract(self):
+        node = re.sub(r'"\s*\+\s*\n\s*"', "", read("lib", "channel.mjs"))
+        self.assertIn(antiphon.RETRIEVE_DESCRIPTION, node)
+        description = antiphon.RETRIEVE_DESCRIPTION.lower()
+        for phrase in ("invocation only", "never the tool result", "read-only",
+                       "write-free", "8000", "antiphon retrieve"):
+            self.assertIn(phrase, description, phrase)
+
+    def test_every_agent_surface_teaches_the_retrieval_limits(self):
+        channel = re.sub(r'"\s*\+\s*\n\s*"', "", read("lib", "channel.mjs"))
+        surfaces = {
+            "AGENTS rule": antiphon.AGENTS_RULE,
+            "CLAUDE rule": antiphon.CLAUDE_RULE,
+            "channel instructions": channel,
+            "README": read("README.md"),
+        }
+        for where, text in surfaces.items():
+            self.assertIn("antiphon_retrieve", text, where)
+            self.assertRegex(text, r"(?i)content-bound", where)
+            self.assertRegex(text, r"(?i)invocation only", where)
+            self.assertRegex(text, r"(?i)never (the |a )?(tool )?result", where)
+            self.assertRegex(text, r"(?i)read-only|cursor-neutral", where)
+            self.assertRegex(text, r"8,?000", where)
+            self.assertIn("antiphon retrieve", text, where)
+            self.assertRegex(text, r"(?i)retention|compact", where)
+            self.assertRegex(text, r"(?i)unavailable", where)
+            self.assertRegex(text, r"(?i)duplicate|two copies", where)
+            self.assertRegex(text, r"(?i)untrusted", where)
+
+    def test_docs_name_the_indexless_diagnostic_trade_and_closed_p0(self):
+        readme = read("README.md")
+        backlog = read("BACKLOG.md")
+        for where, text in (("README", readme), ("BACKLOG", backlog)):
+            self.assertRegex(text, r"(?i)no persistent (invocation )?index", where)
+            self.assertRegex(text, r"(?i)tombstone", where)
+            self.assertRegex(text, r"(?is)changed.{0,80}expired.{0,80}never[- ]existed|"
+                                   r"never[- ]existed.{0,80}changed", where)
+            self.assertRegex(text, r"(?i)earlier-prefix", where)
+            self.assertRegex(text, r"(?i)old id.{0,100}(not|never).{0,40}new|"
+                                   r"changed.{0,100}old id", where)
+        p0 = section(backlog, "P0 — Lossless, paged context transfer")
+        open_phase = capture(
+            r"(?ms)^### Still open, by name\s*$(.*?)(?=^### |\Z)", p0)
+        self.assertNotRegex(open_phase, r"(?i)stable event ids|tool-call retrieval")
+        self.assertRegex(p0, r"(?i)Completed by Wave 1D")
+
     def test_both_sides_agree_on_the_channel_message_limit(self):
         """The sender refuses before transport and the server refuses on arrival.
         If the two numbers drift the sender lets through what the server then
@@ -559,7 +605,7 @@ class ShippedContractTest(unittest.TestCase):
         limits = section(read("README.md"), "Limits")
         self.assertIsNotNone(limits, "the README has no Limits section")
         for gap, pattern in (
-                ("compressed tool detail", r"(?i)tool (call|detail)s? (are|remain|stay)[a-z ]*compressed"),
+                ("unavailable tool results", r"(?i)tool results? remain unavailable"),
                 ("backward paging", r"(?i)backward"),
                 ("catalog failure visibility", r"(?i)building|degraded"),
                 ("host spill contents", r"(?i)verbatim"),
@@ -600,7 +646,7 @@ class ShippedContractTest(unittest.TestCase):
                          "README says whose files they are")
         backlog = read("BACKLOG.md")
         for gap, pattern in (
-                ("stable event id", r"(?i)stable\s+event\s+id"),
+                ("stable invocation id", r"(?i)stable\s+(event\s+id|tool\s+invocation)"),
                 ("source catalog", r"(?i)source\s+catalog"),
                 ("degraded-discovery marker", r"(?i)degraded-discovery"),
                 ("backward paging", r"(?i)backward\s+paging"),
