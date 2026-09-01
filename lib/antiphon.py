@@ -45,6 +45,7 @@ import os
 import re
 import shutil
 import socket
+import stat
 import subprocess
 import sys
 import tempfile
@@ -1050,6 +1051,245 @@ def head_lines(path, limit=12, num_bytes=64 * 1024):
         return []
 
 
+SourceCandidate = collections.namedtuple(
+    "SourceCandidate", "kind relative_path expected_source project_prefix",
+    defaults=(None,))
+SourceRefusal = collections.namedtuple("SourceRefusal", "reason")
+
+
+class DiscoveredSourcePath(str):
+    """A path whose host root and relative candidate came from discovery."""
+
+    def __new__(cls, path, root, candidate):
+        value = str.__new__(cls, path)
+        value.root = root
+        value.candidate = candidate
+        return value
+
+
+class SafeSource:
+    """One validated transcript object, read only through its open descriptor."""
+
+    def __init__(self, fd, kind, relative_path, source, stat_result):
+        self.fd = fd
+        self.kind = kind
+        self.relative_path = relative_path
+        self.source = source
+        self.stat = stat_result
+        self.generation = self._generation()
+        self._closed = False
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, _type, _value, _traceback):
+        self.close()
+
+    def close(self):
+        if not self._closed:
+            os.close(self.fd)
+            self._closed = True
+
+    @contextlib.contextmanager
+    def _reader(self, offset=0):
+        duplicate = os.dup(self.fd)
+        try:
+            with os.fdopen(duplicate, "rb") as stream:
+                duplicate = None
+                stream.seek(offset)
+                yield stream
+        finally:
+            if duplicate is not None:
+                os.close(duplicate)
+
+    def _generation(self):
+        try:
+            with self._reader() as stream:
+                first = stream.readline()
+        except OSError:
+            return None
+        if not first.endswith(b"\n"):
+            return None
+        digest = hashlib.sha256(first).hexdigest()[:16]
+        return "%d:%d:%s" % (self.stat.st_dev, self.stat.st_ino, digest)
+
+    def head_lines(self, limit=12, num_bytes=64 * 1024):
+        try:
+            with self._reader() as stream:
+                return stream.read(num_bytes).decode(
+                    "utf-8", "replace").splitlines()[:limit]
+        except OSError:
+            return []
+
+    def read_records(self, offset=0):
+        try:
+            with self._reader(offset) as stream:
+                position = offset
+                for raw in stream:
+                    if not raw.endswith(b"\n"):
+                        return
+                    start, position = position, position + len(raw)
+                    yield start, position, raw[:-1].decode("utf-8", "replace")
+        except OSError:
+            return
+
+    def size(self):
+        try:
+            return os.fstat(self.fd).st_size
+        except OSError:
+            return None
+
+    def complete_prefix_end(self):
+        try:
+            size = os.fstat(self.fd).st_size
+            if size == 0:
+                return 0
+            with self._reader() as stream:
+                stream.seek(size - 1)
+                if stream.read(1) == b"\n":
+                    return size
+                pos = size - 1
+                while pos > 0:
+                    start = max(0, pos - 65536)
+                    stream.seek(start)
+                    newline = stream.read(pos - start).rfind(b"\n")
+                    if newline >= 0:
+                        return start + newline + 1
+                    pos = start
+        except OSError:
+            return 0
+        return 0
+
+
+def _source_open_refusal(error):
+    if error.errno == errno.ENOENT:
+        return SourceRefusal("missing")
+    if error.errno in (errno.ELOOP, errno.ENOTDIR):
+        return SourceRefusal("unsafe-path")
+    if error.errno in (errno.EACCES, errno.EPERM):
+        return SourceRefusal("unreadable")
+    return SourceRefusal("io-error")
+
+
+def _open_safe_source(root, candidate, cwd):
+    """Open and validate one transcript without trusting or reopening a path."""
+    if not isinstance(candidate, SourceCandidate):
+        return SourceRefusal("invalid-candidate")
+    if candidate.kind not in ("claude", "codex"):
+        return SourceRefusal("invalid-kind")
+    relative = candidate.relative_path
+    if not isinstance(relative, str) or not relative or os.path.isabs(relative):
+        return SourceRefusal("outside-root")
+    parts = relative.split(os.sep)
+    if any(part in ("", ".", "..") for part in parts):
+        return SourceRefusal("outside-root")
+    if candidate.kind == "claude" and candidate.project_prefix is not None:
+        prefix = candidate.project_prefix.split(os.sep)
+        if (any(part in ("", ".", "..") for part in prefix)
+                or parts[:len(prefix)] != prefix
+                or len(parts) != len(prefix) + 1):
+            return SourceRefusal("project-mismatch")
+    required_flags = all(hasattr(os, name) for name in
+                         ("O_DIRECTORY", "O_NOFOLLOW", "O_NONBLOCK"))
+    if os.open not in getattr(os, "supports_dir_fd", set()) or not required_flags:
+        return SourceRefusal("unsupported-platform")
+
+    directories = []
+    leaf = None
+    try:
+        resolved_root = os.path.realpath(root)
+        current = os.open(resolved_root, os.O_RDONLY | os.O_DIRECTORY)
+        directories.append(current)
+        for component in parts[:-1]:
+            current = os.open(
+                component, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+                dir_fd=current)
+            directories.append(current)
+        leaf = os.open(
+            parts[-1], os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK,
+            dir_fd=current)
+        stat_result = os.fstat(leaf)
+        if not stat.S_ISREG(stat_result.st_mode):
+            os.close(leaf)
+            leaf = None
+            return SourceRefusal("non-regular")
+        actual_source = source_id(relative)
+        if actual_source != candidate.expected_source:
+            os.close(leaf)
+            leaf = None
+            return SourceRefusal("identity-mismatch")
+        source = SafeSource(
+            leaf, candidate.kind, relative, actual_source, stat_result)
+        leaf = None
+        if candidate.kind == "codex":
+            recorded = _rollout_cwd(source.head_lines())
+            if recorded is None:
+                source.close()
+                return SourceRefusal("metadata-missing")
+            if recorded != cwd:
+                source.close()
+                return SourceRefusal("project-mismatch")
+        return source
+    except OSError as error:
+        return _source_open_refusal(error)
+    finally:
+        if leaf is not None:
+            os.close(leaf)
+        for directory in reversed(directories):
+            os.close(directory)
+
+
+class _PathSource:
+    """Compatibility view for isolated tests that inject bare path strings."""
+
+    def __init__(self, path, kind):
+        self.path = path
+        self.kind = kind
+        self.source = source_id(path)
+        self.generation = source_generation(path)
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, _type, _value, _traceback):
+        return None
+
+    def head_lines(self, limit=12, num_bytes=64 * 1024):
+        return head_lines(self.path, limit, num_bytes)
+
+    def read_records(self, offset=0):
+        return read_records(self.path, offset)
+
+    def size(self):
+        return _source_size(self.path)
+
+    def complete_prefix_end(self):
+        return _complete_prefix_end(self.path)
+
+
+def _discovered_source_path(path, root, kind, project_prefix=None):
+    relative = os.path.relpath(path, root)
+    return DiscoveredSourcePath(
+        path, root, SourceCandidate(
+            kind, relative, source_id(relative), project_prefix))
+
+
+def _report_source_refusal(kind, refusal):
+    print(f"antiphon: {kind} transcript refused ({refusal.reason}); "
+          "discovery is incomplete", file=sys.stderr)
+
+
+def _open_discovered_source(path, cwd, kind, report=True):
+    if not isinstance(path, DiscoveredSourcePath):
+        return _PathSource(path, kind)
+    opened = _open_safe_source(path.root, path.candidate, cwd)
+    if isinstance(opened, SourceRefusal):
+        if report:
+            _report_source_refusal(kind, opened)
+        return opened
+    return opened
+
+
 def iso_epoch(s):
     if not s:
         return 0.0
@@ -1100,6 +1340,19 @@ def offset_at_or_after(path, timestamp):
     return end
 
 
+def _source_offset_at_or_after(source, timestamp):
+    """Descriptor/path-view equivalent of `offset_at_or_after`."""
+    end = 0
+    for start, end, line in source.read_records():
+        try:
+            when = iso_epoch(json.loads(line).get("timestamp"))
+        except (json.JSONDecodeError, AttributeError):
+            continue
+        if when >= timestamp:
+            return start
+    return end
+
+
 def _source_size(path):
     """The file's size, or None when it could not be measured at all.
 
@@ -1138,6 +1391,38 @@ def _start_offset(path, sid, generation, positions, since):
               "read from it; reading it again" % positions[sid]["offset"],
               file=sys.stderr)
     return start
+
+
+def _start_source_offset(source, positions, since):
+    """The existing start rule applied to one already-open source object."""
+    start, reason = _resolve_source_start(source, positions, since)
+    if reason == "replaced":
+        print("antiphon: a transcript was replaced since it was last read; "
+              "reading it again", file=sys.stderr)
+    elif reason == "unmeasurable":
+        print("antiphon: a transcript could not be measured; reading it again",
+              file=sys.stderr)
+    elif reason == "shrunk":
+        print("antiphon: a transcript is shorter than the %d bytes already "
+              "read from it; reading it again" %
+              positions[source.source]["offset"], file=sys.stderr)
+    return start
+
+
+def _resolve_source_start(source, positions, since):
+    recorded = (positions or {}).get(source.source)
+    if recorded:
+        if recorded.get("gen") != source.generation:
+            return 0, "replaced"
+        size = source.size()
+        if size is None:
+            return 0, "unmeasurable"
+        if recorded["offset"] > size:
+            return 0, "shrunk"
+        return recorded["offset"], "positioned"
+    if since is not None:
+        return _source_offset_at_or_after(source, since), "since"
+    return 0, "start"
 
 
 def _resolve_start(path, sid, generation, positions, since):
@@ -1183,9 +1468,9 @@ def _claude_slug(cwd):
     return re.sub(r"[^A-Za-z0-9]", "-", cwd)
 
 
-def _transcript_cwd(path):
-    """The project directory a Claude transcript records, or None."""
-    for line in head_lines(path, limit=40):
+def _transcript_cwd_lines(lines):
+    """The first project directory recorded in Claude transcript head lines."""
+    for line in lines:
         if '"cwd"' not in line:       # cheap pre-filter, skips parsing big lines
             continue
         try:
@@ -1195,6 +1480,11 @@ def _transcript_cwd(path):
         if isinstance(d, dict) and isinstance(d.get("cwd"), str):
             return d["cwd"]
     return None
+
+
+def _transcript_cwd(path):
+    """Compatibility path helper for isolated discovery tests."""
+    return _transcript_cwd_lines(head_lines(path, limit=40))
 
 
 def _find_claude_project_dir(cwd):
@@ -1217,10 +1507,17 @@ def _find_claude_project_dir(cwd):
     candidates = [p for p in entries if os.path.isdir(p)]
     candidates.sort(key=mtime, reverse=True)               # most recently used first
     for directory in candidates:
+        prefix = os.path.relpath(directory, CLAUDE_PROJECTS)
         transcripts = sorted(glob.glob(os.path.join(directory, "*.jsonl")),
                              key=mtime, reverse=True)
         for path in transcripts[:3]:
-            recorded = _transcript_cwd(path)
+            discovered = _discovered_source_path(
+                path, CLAUDE_PROJECTS, "claude", prefix)
+            opened = _open_discovered_source(discovered, cwd, "claude")
+            if isinstance(opened, SourceRefusal):
+                continue
+            with opened as source:
+                recorded = _transcript_cwd_lines(source.head_lines(limit=40))
             if recorded is not None:
                 if recorded == cwd:
                     return directory
@@ -1241,10 +1538,18 @@ def claude_transcripts(cwd):
     directory = claude_project_dir(cwd)
     if not directory:
         return []
-    files = [p for p in glob.glob(os.path.join(directory, "*.jsonl"))
-             if os.path.getsize(p) > 0]
-    files.sort(key=os.path.getmtime, reverse=True)
-    return files
+    files = []
+    for path in glob.glob(os.path.join(directory, "*.jsonl")):
+        try:
+            info = os.lstat(path)
+        except OSError:
+            continue
+        if info.st_size > 0 or stat.S_ISLNK(info.st_mode):
+            files.append((info.st_mtime, path))
+    files.sort(key=lambda item: item[0], reverse=True)
+    prefix = os.path.relpath(directory, CLAUDE_PROJECTS)
+    return [_discovered_source_path(path, CLAUDE_PROJECTS, "claude", prefix)
+            for _mtime, path in files]
 
 
 def claude_events(cwd, positions=None, since=None, visible_record_limit=None):
@@ -1258,64 +1563,68 @@ def claude_events(cwd, positions=None, since=None, visible_record_limit=None):
     reached = {}
     position = itertools.count()
     for path in claude_transcripts(cwd)[:RECENT_FILES]:
-        visible_records = 0
-        sid = source_id(path)
-        gen = source_generation(path)
-        offset = _start_offset(path, sid, gen, positions, since)
-        if gen is not None:
-            reached[sid] = {"gen": gen, "offset": offset}
-        for start, end, line in read_records(path, offset):
+        opened = _open_discovered_source(path, cwd, "claude")
+        if isinstance(opened, SourceRefusal):
+            continue
+        with opened as source:
+            visible_records = 0
+            sid, gen = source.source, source.generation
+            offset = _start_source_offset(source, positions, since)
             if gen is not None:
-                reached[sid] = {"gen": gen, "offset": end}
-            before = len(events)
-            try:
-                d = json.loads(line)
-            except json.JSONDecodeError:
-                d = None
-            if isinstance(d, dict) and not d.get("isMeta"):
-                ts = iso_epoch(d.get("timestamp"))
-                kind = d.get("type")
-                msg = d.get("message") or {}
-                content = msg.get("content") if isinstance(msg, dict) else None
-                if kind == "user":
-                    text = ""
-                    if isinstance(content, str):
-                        text = content
-                    elif isinstance(content, list):
-                        text = _join_text_blocks(
-                            c.get("text", "") for c in content
-                            if isinstance(c, dict) and c.get("type") == "text")
-                    if (text != ""
-                            and not _is_host_record(text, CLAUDE_WRAPPER_OPENING,
-                                                    d.get("promptSource"))
-                            and not _is_self_injected(text)):
-                        events.append((ts, path, next(position),
-                                      Event(ts, "you", text, sid, gen, start, end)))
-                elif kind == "assistant":
-                    for c in content if isinstance(content, list) else []:
-                        if not isinstance(c, dict):
-                            continue
-                        if c.get("type") == "text":
-                            text = c.get("text")
-                            if isinstance(text, str) and text != "":
-                                events.append((ts, path, next(position),
-                                              Event(ts, "claude", text,
-                                                    sid, gen, start, end)))
-                        elif c.get("type") == "tool_use":
-                            arguments = c.get("input") or {}
-                            arguments = arguments if isinstance(arguments, dict) else {}
-                            detail = (arguments.get("file_path")
-                                      or arguments.get("command")
-                                      or arguments.get("pattern") or "")
+                reached[sid] = {"gen": gen, "offset": offset}
+            for start, end, line in source.read_records(offset):
+                if gen is not None:
+                    reached[sid] = {"gen": gen, "offset": end}
+                before = len(events)
+                try:
+                    d = json.loads(line)
+                except json.JSONDecodeError:
+                    d = None
+                if isinstance(d, dict) and not d.get("isMeta"):
+                    ts = iso_epoch(d.get("timestamp"))
+                    kind = d.get("type")
+                    msg = d.get("message") or {}
+                    content = msg.get("content") if isinstance(msg, dict) else None
+                    if kind == "user":
+                        text = ""
+                        if isinstance(content, str):
+                            text = content
+                        elif isinstance(content, list):
+                            text = _join_text_blocks(
+                                c.get("text", "") for c in content
+                                if isinstance(c, dict) and c.get("type") == "text")
+                        if (text != ""
+                                and not _is_host_record(text, CLAUDE_WRAPPER_OPENING,
+                                                        d.get("promptSource"))
+                                and not _is_self_injected(text)):
                             events.append((ts, path, next(position),
-                                          Event(ts, "tool",
-                                                f"{c.get('name', '?')} {detail}".strip(),
-                                                sid, gen, start, end)))
-            if len(events) > before:
-                visible_records += 1
-                if (visible_record_limit is not None
-                        and visible_records >= visible_record_limit):
-                    break
+                                          Event(ts, "you", text, sid, gen, start, end)))
+                    elif kind == "assistant":
+                        for c in content if isinstance(content, list) else []:
+                            if not isinstance(c, dict):
+                                continue
+                            if c.get("type") == "text":
+                                text = c.get("text")
+                                if isinstance(text, str) and text != "":
+                                    events.append((ts, path, next(position),
+                                                  Event(ts, "claude", text,
+                                                        sid, gen, start, end)))
+                            elif c.get("type") == "tool_use":
+                                arguments = c.get("input") or {}
+                                arguments = (arguments if isinstance(arguments, dict)
+                                             else {})
+                                detail = (arguments.get("file_path")
+                                          or arguments.get("command")
+                                          or arguments.get("pattern") or "")
+                                events.append((ts, path, next(position),
+                                              Event(ts, "tool",
+                                                    f"{c.get('name', '?')} {detail}".strip(),
+                                                    sid, gen, start, end)))
+                if len(events) > before:
+                    visible_records += 1
+                    if (visible_record_limit is not None
+                            and visible_records >= visible_record_limit):
+                        break
     events.sort(key=lambda item: (
         item[0], item[3].source, item[3].generation or "",
         item[3].offset, item[2]))
@@ -1333,7 +1642,7 @@ def _rollout_cwd(lines):
             d = json.loads(line)
         except (json.JSONDecodeError, ValueError):
             continue
-        if not isinstance(d, dict):
+        if not isinstance(d, dict) or d.get("type") != "session_meta":
             continue
         for holder in (d, d.get("payload")):
             if isinstance(holder, dict) and isinstance(holder.get("cwd"), str):
@@ -1359,19 +1668,17 @@ def codex_rollout_files(cwd, days=3):
         # cwd lives in the session metadata. Reading the tail of a growing,
         # active rollout could miss it and match the wrong, already-closed
         # subsession instead.
-        lines = head_lines(path)
-        recorded = _rollout_cwd(lines)
-        if recorded is not None:
-            # An equality test, never a substring one: `/x/api` used to match
-            # a rollout recorded for `/x/api-v2`, and a push then landed in
-            # the sibling project's Codex.
-            if recorded == cwd:
-                matched.append(path)
+        discovered = _discovered_source_path(path, CODEX_SESSIONS, "codex")
+        opened = _open_discovered_source(discovered, cwd, "codex", report=False)
+        if isinstance(opened, SourceRefusal):
+            # A different exact project is an ordinary exclusion. Every other
+            # refusal narrows what the old scanner might have found and stays
+            # visible until the page-level degraded marker lands in Task 4.
+            if opened.reason != "project-mismatch":
+                _report_source_refusal("codex", opened)
             continue
-        # No head line carries a cwd field: fall back to the old substring
-        # test rather than dropping a file we can't read properly.
-        if any(cwd in line for line in lines):
-            matched.append(path)
+        opened.close()
+        matched.append(discovered)
     return matched
 
 
@@ -1381,55 +1688,58 @@ def codex_events(cwd, positions=None, since=None, visible_record_limit=None):
     reached = {}
     position = itertools.count()
     for path in codex_rollout_files(cwd)[:RECENT_FILES]:
-        visible_records = 0
-        sid = source_id(path)
-        gen = source_generation(path)
-        offset = _start_offset(path, sid, gen, positions, since)
-        if gen is not None:
-            reached[sid] = {"gen": gen, "offset": offset}
-        for start, end, line in read_records(path, offset):
+        opened = _open_discovered_source(path, cwd, "codex")
+        if isinstance(opened, SourceRefusal):
+            continue
+        with opened as source:
+            visible_records = 0
+            sid, gen = source.source, source.generation
+            offset = _start_source_offset(source, positions, since)
             if gen is not None:
-                reached[sid] = {"gen": gen, "offset": end}
-            before = len(events)
-            try:
-                d = json.loads(line)
-            except json.JSONDecodeError:
-                d = None
-            if isinstance(d, dict):
-                ts = iso_epoch(d.get("timestamp"))
-                kind, payload = d.get("type"), d.get("payload") or {}
-                payload = payload if isinstance(payload, dict) else {}
-                if kind == "response_item" and payload.get("type") == "message":
-                    role = payload.get("role")
-                    text = _join_text_blocks(
-                        (c.get("text") or c.get("input_text") or "")
-                        for c in payload.get("content") or []
-                        if isinstance(c, dict))
-                    if text != "" and role != "developer":
-                        if role == "user":
-                            if (not _is_host_record(text, CODEX_WRAPPER_OPENING)
-                                    and not _is_self_injected(text)):
+                reached[sid] = {"gen": gen, "offset": offset}
+            for start, end, line in source.read_records(offset):
+                if gen is not None:
+                    reached[sid] = {"gen": gen, "offset": end}
+                before = len(events)
+                try:
+                    d = json.loads(line)
+                except json.JSONDecodeError:
+                    d = None
+                if isinstance(d, dict):
+                    ts = iso_epoch(d.get("timestamp"))
+                    kind, payload = d.get("type"), d.get("payload") or {}
+                    payload = payload if isinstance(payload, dict) else {}
+                    if kind == "response_item" and payload.get("type") == "message":
+                        role = payload.get("role")
+                        text = _join_text_blocks(
+                            (c.get("text") or c.get("input_text") or "")
+                            for c in payload.get("content") or []
+                            if isinstance(c, dict))
+                        if text != "" and role != "developer":
+                            if role == "user":
+                                if (not _is_host_record(text, CODEX_WRAPPER_OPENING)
+                                        and not _is_self_injected(text)):
+                                    events.append((ts, path, next(position),
+                                                  Event(ts, "you", text, sid, gen,
+                                                        start, end)))
+                            elif role == "assistant":
                                 events.append((ts, path, next(position),
-                                              Event(ts, "you", text, sid, gen,
+                                              Event(ts, "codex", text, sid, gen,
                                                     start, end)))
-                        elif role == "assistant":
+                    elif (kind == "event_msg"
+                          and payload.get("type") == "exec_command_begin"):
+                        command = payload.get("command")
+                        if isinstance(command, list):
+                            command = " ".join(command)
+                        if command:
                             events.append((ts, path, next(position),
-                                          Event(ts, "codex", text, sid, gen,
-                                                start, end)))
-                elif (kind == "event_msg"
-                      and payload.get("type") == "exec_command_begin"):
-                    command = payload.get("command")
-                    if isinstance(command, list):
-                        command = " ".join(command)
-                    if command:
-                        events.append((ts, path, next(position),
-                                      Event(ts, "tool", f"shell {command}",
-                                            sid, gen, start, end)))
-            if len(events) > before:
-                visible_records += 1
-                if (visible_record_limit is not None
-                        and visible_records >= visible_record_limit):
-                    break
+                                          Event(ts, "tool", f"shell {command}",
+                                                sid, gen, start, end)))
+                if len(events) > before:
+                    visible_records += 1
+                    if (visible_record_limit is not None
+                            and visible_records >= visible_record_limit):
+                        break
     events.sort(key=lambda item: (
         item[0], item[3].source, item[3].generation or "",
         item[3].offset, item[2]))
@@ -5808,18 +6118,20 @@ def reader_backlog(cwd, side, cursor, cursor_state="valid"):
     positions, since, replay = positions_for(cursor, side, cursor_state)
     unread, positioned, unpositioned = 0, 0, 0
     for path in CATCH_UP_SOURCES[side](cwd):
-        try:
-            size = os.path.getsize(path)
-        except OSError:
+        kind = "codex" if side == "claude" else "claude"
+        opened = _open_discovered_source(path, cwd, kind)
+        if isinstance(opened, SourceRefusal):
             continue
-        sid = source_id(path)
-        start, reason = _resolve_start(path, sid, source_generation(path),
-                                       positions, since)
-        unread += max(0, size - start)
-        if reason == "positioned":
-            positioned += 1
-        else:
-            unpositioned += 1
+        with opened as source:
+            size = source.size()
+            if size is None:
+                continue
+            start, reason = _resolve_source_start(source, positions, since)
+            unread += max(0, size - start)
+            if reason == "positioned":
+                positioned += 1
+            else:
+                unpositioned += 1
     return unread, positioned, unpositioned, replay
 
 
@@ -5857,12 +6169,18 @@ def catch_up(side=None):
         key = page_cursor_key(one)
         frontier, unpinned = {}, []
         for path in CATCH_UP_SOURCES[one](cwd):
-            gen = source_generation(path)
-            if gen is None:
-                unpinned.append(path)
+            kind = "codex" if one == "claude" else "claude"
+            opened = _open_discovered_source(path, cwd, kind)
+            if isinstance(opened, SourceRefusal):
+                unpinned.append(opened.reason)
                 continue
-            frontier[source_id(path)] = {"gen": gen,
-                                         "offset": _complete_prefix_end(path)}
+            with opened as source:
+                if source.generation is None:
+                    unpinned.append("incomplete-first-record")
+                    continue
+                frontier[source.source] = {
+                    "gen": source.generation,
+                    "offset": source.complete_prefix_end()}
         skipped = {"bytes": 0}
 
         def mutate(cursor, key=key, frontier=frontier, skipped=skipped):
@@ -5874,7 +6192,9 @@ def catch_up(side=None):
                 was = (was.get("offset") if isinstance(was, dict)
                        and isinstance(was.get("offset"), int) else 0)
                 skipped["bytes"] += max(0, entry["offset"] - was)
-            cursor[key] = {"v": PAGE_CURSOR_VERSION, "sources": frontier}
+            merged = json.loads(json.dumps(old))
+            merged.update(frontier)
+            cursor[key] = {"v": PAGE_CURSOR_VERSION, "sources": merged}
             return cursor
 
         if not update_cursor(cwd, one, mutate):
@@ -5885,9 +6205,9 @@ def catch_up(side=None):
         print(f"{key}: {len(frontier)} source(s) moved to the live edge; "
               f"{skipped['bytes']:,} bytes of undelivered history will not be "
               "delivered")
-        for path in unpinned:
-            print(f"{key}: {os.path.basename(path)} has no complete first "
-                  "record yet and was left alone")
+        if unpinned:
+            print(f"{key}: {len(unpinned)} source(s) could not be measured "
+                  "safely and were left alone")
     return status
 
 

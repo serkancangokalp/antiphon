@@ -81,7 +81,17 @@ the write-and-flush-before-advance transaction.
   byte zero.
 - The last-record content anchor (an in-place rewrite that keeps inode,
   length and first line still resumes silently).
-- Descriptor-safe reading of registry-supplied transcript paths.
+- Descriptor-safe reading of registry-supplied transcript paths. Wave 1A's
+  Task 2 pre-commit narrowing gate ran read-only on 2026-09-01 against both
+  real host roots for the main project and its implementation worktree. On the
+  main project, old/new admitted identity counts were Claude 3/3 and Codex 3/3,
+  with zero missing, zero extra and no refusal class; the worktree had 0/0 on
+  both hosts, also with no refusal. The comparison used the old newest-three
+  admission rules versus the descriptor primitive's exact source-id sets; it
+  printed aggregate counts only and touched no cursor or registry. Thus the
+  safe-reader commit is blocked by any unexplained missing identity, and this
+  measured corpus had none. The durable catalog and degraded page marker remain
+  open in the separate item above.
 - Retirement of the preserved v2 sibling key once pre-v3 processes and
   rollback support are no longer needed.
 

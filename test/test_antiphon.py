@@ -563,14 +563,18 @@ class AntiphonTest(unittest.TestCase):
                              "reply to peer")
 
     def test_large_codex_rollout_reads_cwd_from_head(self):
-        with tempfile.NamedTemporaryFile(prefix="rollout-", suffix=".jsonl") as f:
-            f.write(b'{"cwd":"/tmp/project"}\n')
-            f.write(b'x' * (antiphon.TAIL_BYTES + 1))
-            f.flush()
-            os.utime(f.name, None)
-            with patch.object(antiphon.glob, "glob", return_value=[f.name]):
+        uuid = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
+        with tempfile.TemporaryDirectory() as sessions:
+            day = os.path.join(sessions, "2026", "09", "01")
+            os.makedirs(day)
+            path = os.path.join(
+                day, f"rollout-2026-09-01T00-00-00-{uuid}.jsonl")
+            with open(path, "wb") as f:
+                f.write(b'{"type":"session_meta","payload":{"cwd":"/tmp/project"}}\n')
+                f.write(b'x' * (antiphon.TAIL_BYTES + 1))
+            with patch.object(antiphon, "CODEX_SESSIONS", sessions):
                 self.assertEqual(antiphon.codex_rollout_files("/tmp/project"),
-                                 [f.name])
+                                 [path])
 
     def test_push_claude_target(self):
         sent = []
@@ -2507,16 +2511,19 @@ class AntiphonTest(unittest.TestCase):
             with patch.object(antiphon, "CODEX_SESSIONS", sessions):
                 self.assertIsNone(antiphon.codex_session_id("/Users/x/api"))
 
-    def test_codex_rollout_files_keep_the_substring_test_without_a_cwd_field(self):
-        """Behaviour is preserved for heads that carry no cwd field at all."""
+    def test_codex_rollout_files_refuse_a_head_without_session_metadata(self):
+        """Free text containing a cwd is not project authority."""
         with tempfile.TemporaryDirectory() as sessions:
             day = os.path.join(sessions, "2026", "08", "30")
             os.makedirs(day)
             path = os.path.join(day, f"rollout-2026-08-30T10-00-00-{self.MINE_UUID}.jsonl")
             with open(path, "w", encoding="utf-8") as f:
                 f.write("not json at all /Users/x/api\n")
-            with patch.object(antiphon, "CODEX_SESSIONS", sessions):
-                self.assertEqual(antiphon.codex_rollout_files("/Users/x/api"), [path])
+            with patch.object(antiphon, "CODEX_SESSIONS", sessions), \
+                 contextlib.redirect_stderr(io.StringIO()) as err:
+                self.assertEqual(antiphon.codex_rollout_files("/Users/x/api"), [])
+        self.assertIn("metadata-missing", err.getvalue())
+        self.assertNotIn(self.MINE_UUID, err.getvalue())
 
     # ---- Critical 2: finding this project's Claude transcript directory ----
 
@@ -4664,6 +4671,222 @@ class OffsetReadingTest(unittest.TestCase):
                  contextlib.redirect_stderr(err):
                 antiphon.claude_events("/tmp/project", {})
         self.assertEqual(err.getvalue(), "")
+
+
+class SafeSourceTest(unittest.TestCase):
+    UUID = "4eecac24-1c21-47ad-ab11-a650708f3098"
+    OTHER_UUID = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
+
+    def _candidate(self, kind="claude", relative=None, expected=None):
+        relative = relative or (self.UUID + ".jsonl")
+        return antiphon.SourceCandidate(kind, relative, expected or self.UUID)
+
+    @staticmethod
+    def _write(path, records):
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w", encoding="utf-8") as f:
+            for record in records:
+                f.write(json.dumps(record) + "\n")
+
+    def test_one_descriptor_supplies_generation_head_records_and_prefix(self):
+        with tempfile.TemporaryDirectory() as root:
+            path = os.path.join(root, self.UUID + ".jsonl")
+            records = [
+                {"type": "user", "cwd": "/repo",
+                 "message": {"content": "first"}},
+                {"type": "assistant", "cwd": "/repo/.worktrees/one",
+                 "message": {"content": [{"type": "text", "text": "second"}]}},
+                {"type": "user", "cwd": "/repo/.worktrees/two",
+                 "message": {"content": "third"}},
+            ]
+            self._write(path, records)
+            opened = antiphon._open_safe_source(
+                root, self._candidate(), "/repo")
+            self.assertIsInstance(opened, antiphon.SafeSource)
+            fd = opened.fd
+            with opened as source:
+                self.assertEqual(source.source, self.UUID)
+                self.assertTrue(source.generation)
+                self.assertIn('"cwd": "/repo"', source.head_lines()[0])
+                self.assertEqual(len(list(source.read_records())), 3)
+                self.assertEqual(source.complete_prefix_end(), os.path.getsize(path))
+            with self.assertRaises(OSError):
+                os.fstat(fd)
+
+    def test_path_replacement_after_open_cannot_redirect_the_reader(self):
+        with tempfile.TemporaryDirectory() as root:
+            path = os.path.join(root, self.UUID + ".jsonl")
+            self._write(path, [{"type": "user", "message": {"content": "old"}}])
+            source = antiphon._open_safe_source(root, self._candidate(), "/repo")
+            old_generation = source.generation
+            os.rename(path, path + ".old")
+            self._write(path, [{"type": "user", "message": {"content": "new"}}])
+            with source:
+                lines = [line for _start, _end, line in source.read_records()]
+                self.assertEqual(source.generation, old_generation)
+            self.assertIn('"old"', lines[0])
+            self.assertNotIn('"new"', lines[0])
+
+    def test_leaf_and_parent_symlinks_are_refused(self):
+        with tempfile.TemporaryDirectory() as root, \
+             tempfile.TemporaryDirectory() as outside:
+            target = os.path.join(outside, self.UUID + ".jsonl")
+            self._write(target, [{"type": "user"}])
+            os.symlink(target, os.path.join(root, self.UUID + ".jsonl"))
+            leaf = antiphon._open_safe_source(root, self._candidate(), "/repo")
+            self.assertIsInstance(leaf, antiphon.SourceRefusal)
+
+            os.mkdir(os.path.join(outside, "nested"))
+            nested = os.path.join(outside, "nested", self.UUID + ".jsonl")
+            self._write(nested, [{"type": "user"}])
+            os.symlink(os.path.join(outside, "nested"), os.path.join(root, "escape"))
+            parent = antiphon._open_safe_source(
+                root, self._candidate(relative="escape/" + self.UUID + ".jsonl"),
+                "/repo")
+            self.assertIsInstance(parent, antiphon.SourceRefusal)
+            self.assertEqual({leaf.reason, parent.reason}, {"unsafe-path"})
+
+    def test_absolute_parent_escape_and_nonregular_leaves_are_refused(self):
+        with tempfile.TemporaryDirectory() as root:
+            for relative in ("../" + self.UUID + ".jsonl", "/tmp/out.jsonl"):
+                refusal = antiphon._open_safe_source(
+                    root, self._candidate(relative=relative), "/repo")
+                self.assertEqual(refusal.reason, "outside-root")
+
+            directory = os.path.join(root, self.UUID + ".jsonl")
+            os.mkdir(directory)
+            refusal = antiphon._open_safe_source(root, self._candidate(), "/repo")
+            self.assertEqual(refusal.reason, "non-regular")
+            os.rmdir(directory)
+            os.mkfifo(directory)
+            started = time.monotonic()
+            refusal = antiphon._open_safe_source(root, self._candidate(), "/repo")
+            self.assertLess(time.monotonic() - started, 0.5,
+                            "opening a FIFO must not wait for a writer")
+            self.assertEqual(refusal.reason, "non-regular")
+
+    def test_source_identity_and_codex_metadata_cwd_are_authority(self):
+        with tempfile.TemporaryDirectory() as root:
+            path = os.path.join(root, self.UUID + ".jsonl")
+            self._write(path, [{"type": "user"}])
+            mismatch = antiphon._open_safe_source(
+                root, self._candidate(expected="aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"),
+                "/repo")
+            self.assertEqual(mismatch.reason, "identity-mismatch")
+
+        with tempfile.TemporaryDirectory() as root:
+            relative = "2026/09/01/rollout-2026-09-01T00-00-00-%s.jsonl" % self.UUID
+            path = os.path.join(root, relative)
+            self._write(path, [{"type": "session_meta",
+                                "payload": {"cwd": "/another"}}])
+            refusal = antiphon._open_safe_source(
+                root, self._candidate("codex", relative), "/repo")
+            self.assertEqual(refusal.reason, "project-mismatch")
+
+    def test_only_session_metadata_can_authorize_a_codex_project(self):
+        with tempfile.TemporaryDirectory() as root:
+            relative = "2026/09/01/rollout-2026-09-01T00-00-00-%s.jsonl" % self.UUID
+            path = os.path.join(root, relative)
+            self._write(path, [{"type": "event_msg",
+                                "payload": {"cwd": "/repo"}}])
+            refusal = antiphon._open_safe_source(
+                root, self._candidate("codex", relative), "/repo")
+        self.assertIsInstance(refusal, antiphon.SourceRefusal)
+        self.assertEqual(refusal.reason, "metadata-missing")
+
+    def test_source_identity_comes_from_the_filename_not_a_uuid_parent(self):
+        path = os.path.join("worktrees", self.OTHER_UUID, self.UUID + ".jsonl")
+        self.assertEqual(antiphon.source_id(path), self.UUID)
+
+    def test_missing_dir_fd_support_is_a_classified_refusal(self):
+        with tempfile.TemporaryDirectory() as root, \
+             patch.object(antiphon.os, "supports_dir_fd", set()):
+            refusal = antiphon._open_safe_source(root, self._candidate(), "/repo")
+        self.assertIsInstance(refusal, antiphon.SourceRefusal)
+        self.assertEqual(refusal.reason, "unsupported-platform")
+
+    def test_production_claude_discovery_reads_without_path_helpers(self):
+        project = "/repo"
+        record = {"type": "assistant", "timestamp": "2026-09-01T00:00:00Z",
+                  "message": {"content": [{"type": "text", "text": "safe"}]}}
+        with tempfile.TemporaryDirectory() as roots, \
+             patch.object(antiphon, "CLAUDE_PROJECTS", roots):
+            directory = os.path.join(roots, antiphon._claude_slug(project))
+            path = os.path.join(directory, self.UUID + ".jsonl")
+            self._write(path, [record])
+            discovered = antiphon.claude_transcripts(project)
+            self.assertEqual(len(discovered), 1)
+            self.assertIsInstance(discovered[0], antiphon.DiscoveredSourcePath)
+            with patch.object(antiphon, "source_generation",
+                              side_effect=AssertionError("path generation")), \
+                 patch.object(antiphon, "read_records",
+                              side_effect=AssertionError("path read")):
+                events, reached = antiphon.claude_events(project, {}, since=0)
+        self.assertEqual([event.text for event in events], ["safe"])
+        self.assertIn(self.UUID, reached)
+
+    def test_production_codex_discovery_uses_exact_metadata_and_safe_reads(self):
+        project = "/repo"
+        relative = "2026/09/01/rollout-2026-09-01T00-00-00-%s.jsonl" % self.UUID
+        records = [
+            {"type": "session_meta", "payload": {"cwd": project}},
+            {"type": "response_item", "timestamp": "2026-09-01T00:00:00Z",
+             "payload": {"type": "message", "role": "assistant",
+                         "content": [{"type": "output_text", "text": "safe"}]}},
+        ]
+        with tempfile.TemporaryDirectory() as roots, \
+             patch.object(antiphon, "CODEX_SESSIONS", roots):
+            self._write(os.path.join(roots, relative), records)
+            discovered = antiphon.codex_rollout_files(project)
+            self.assertEqual(len(discovered), 1)
+            self.assertIsInstance(discovered[0], antiphon.DiscoveredSourcePath)
+            with patch.object(antiphon, "source_generation",
+                              side_effect=AssertionError("path generation")), \
+                 patch.object(antiphon, "read_records",
+                              side_effect=AssertionError("path read")):
+                events, reached = antiphon.codex_events(project, {}, since=0)
+        self.assertEqual([event.text for event in events], ["safe"])
+        self.assertIn(self.UUID, reached)
+
+    def test_a_production_refusal_is_visible_without_revealing_the_path(self):
+        project = "/repo"
+        with tempfile.TemporaryDirectory() as roots, \
+             tempfile.TemporaryDirectory() as outside, \
+             patch.object(antiphon, "CLAUDE_PROJECTS", roots), \
+             contextlib.redirect_stderr(io.StringIO()) as err:
+            directory = os.path.join(roots, antiphon._claude_slug(project))
+            os.makedirs(directory)
+            target = os.path.join(outside, self.UUID + ".jsonl")
+            self._write(target, [{"type": "assistant"}])
+            os.symlink(target, os.path.join(directory, self.UUID + ".jsonl"))
+            events, reached = antiphon.claude_events(project, {}, since=0)
+        self.assertEqual((events, reached), ([], {}))
+        self.assertIn("unsafe-path", err.getvalue())
+        self.assertNotIn(self.UUID, err.getvalue())
+        self.assertNotIn(outside, err.getvalue())
+
+    def test_catch_up_preserves_a_position_for_a_refused_safe_source(self):
+        held = {"gen": "old-generation", "offset": 123}
+        with tempfile.TemporaryDirectory() as project, \
+             tempfile.TemporaryDirectory() as root, \
+             tempfile.TemporaryDirectory() as outside:
+            target = os.path.join(outside, self.UUID + ".jsonl")
+            self._write(target, [{"type": "assistant"}])
+            path = os.path.join(root, self.UUID + ".jsonl")
+            os.symlink(target, path)
+            discovered = antiphon._discovered_source_path(path, root, "claude")
+            antiphon.write_cursor(project, {"codex_pages": {
+                "v": antiphon.PAGE_CURSOR_VERSION,
+                "sources": {self.UUID: held}}}, "codex")
+            with patch.object(antiphon, "project_dir", return_value=project), \
+                 patch.dict(antiphon.CATCH_UP_SOURCES,
+                            {"codex": lambda _cwd: [discovered]}), \
+                 contextlib.redirect_stdout(io.StringIO()) as out, \
+                 contextlib.redirect_stderr(io.StringIO()):
+                self.assertEqual(antiphon.catch_up("codex"), 0)
+            after = antiphon.read_cursor(project, "codex")
+        self.assertEqual(after["codex_pages"]["sources"][self.UUID], held)
+        self.assertIn("1 source(s) could not be measured safely", out.getvalue())
 
 
 class SourceCatalogLockTest(unittest.TestCase):
