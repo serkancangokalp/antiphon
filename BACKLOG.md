@@ -372,6 +372,18 @@ readiness, never an address, never a session id.
   extra `HookShape` row is declined as out of scope here — both `setup` and
   `doctor` read that table — and nothing false ships: the label is absent, not
   wrong.
+- **Redaction is scoped, and its two exceptions are deliberate.** One central
+  redactor per language removes unanchored UUIDs, full identity digests, raw
+  owner keys and automatic socket routes from every status, doctor, label,
+  refusal and error, before any truncation. Two shapes stay visible on purpose.
+  An explicitly named peer keeps its socket path, because the operator chose
+  that name and `remove it` needs to say what to remove; only an automatic
+  peer's route — derived from a host session id nobody typed, and whose remedy
+  was always a restart — is withheld. And the channel's own `antiphon channel
+  ready:` line keeps its path: it is a readiness line in the session's own
+  terminal, neither a refusal nor an error, and the tests that find a bound
+  socket read it. Neither exception is a gap to close later; widening the
+  promise would cost an operator the one path they can act on.
 - **An endpoint that records no owner key can never be joined.** Two causes and
   no way to tell them apart from a record: one written before the field existed
   (which is what this machine's one live record is), or an `owner_key()` that

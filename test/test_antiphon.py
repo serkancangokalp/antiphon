@@ -5033,8 +5033,12 @@ class DoctorTest(unittest.TestCase):
         line = self.line_for(printed, "codex queue:")
         self.assertTrue(line.startswith("·"), line)
         self.assertIn("2 message(s)", line)
-        self.assertIn(dead[:8], line)
+        # The prefix is gone on purpose: a truncated session id is still
+        # session identity, and it was never actionable — nobody can address a
+        # thread that is not running. The counts are what a person acts on.
+        self.assertNotIn(dead[:8], line, "no thread-id prefix survives")
         self.assertNotIn(live[:8], line, "the running thread's queue is normal")
+        self.assertIn("1 non-running project thread", line)
         self.assertNotIn(project, line)
         with patch.object(antiphon, "CODEX_THREAD_LOCKS", locks), \
              patch.object(antiphon, "CODEX_QUEUE_DBS", os.path.join(home, "nothing_*.sqlite")), \
@@ -5288,7 +5292,11 @@ class DoctorTest(unittest.TestCase):
             _, printed = self.run_doctor(project)
         queue_lines = [l for l in printed.splitlines() if "codex queue:" in l]
         self.assertEqual(len(queue_lines), 1, queue_lines)
-        self.assertIn(ours[:8], queue_lines[0])
+        self.assertIn("1 message(s)", queue_lines[0],
+                      "this project's own stranded message is counted")
+        self.assertIn("1 non-running project thread", queue_lines[0],
+                      "and exactly one thread, so the scoping still holds")
+        self.assertNotIn(ours[:8], queue_lines[0], "no id prefix, even ours")
         self.assertNotIn(theirs[:8], printed,
                          "a thread this project never queued to is not its business")
 
@@ -14360,7 +14368,14 @@ class SenderIdentityTest(unittest.TestCase):
             "one positively live automatic peer",
             "two or more",
             "never guessed",
-            "identity digest stay private",
+            # The privacy sentence gained the two shapes a refusal or an error
+            # is most likely to leak — the owner key and the socket route — and
+            # a second half naming which surfaces are bound by it. Asserting
+            # only "identity digest stay private" would have passed while a
+            # surface still promised nothing about either new shape, so both
+            # halves are pinned here.
+            "identity digest, owner key and socket route stay private",
+            "expose only the public alias",
         )
         for name, surface in surfaces.items():
             with self.subTest(surface=name):
@@ -17243,3 +17258,250 @@ class IdentityProbeBoundsTest(unittest.TestCase):
                          "never widen a signal past a boundary you failed to "
                          "create")
         self.assertIsNotNone(result.returncode, "the child itself was reaped")
+
+
+class IdentityPrivacyTest(unittest.TestCase):
+    """Private shapes never reach a surface a person or an agent reads.
+
+    Redaction runs before truncation, or a cut could leave half a UUID and the
+    check that looked for a whole one would pass.
+    """
+
+    UUID = "8261c119-2c20-4bf4-87ab-f152ac87dbda"
+    DIGEST = "9aa9141f2a5c704b91ef1d2122ad75e67a1ca8be84b7fe119a6edeca9f0b6937"
+    OWNER = "4242:v1:Mon Sep  1 00:00:00 2026"
+    ALIAS = "auto-tkurihzklryexeppduqsfllv4y"
+
+    def test_identity_privacy_redacts_every_private_shape(self):
+        route = "/tmp/antiphon-channel-abc123.sock"
+        cases = {
+            "canonical uuid": self.UUID,
+            "uppercase uuid": self.UUID.upper(),
+            "uuid inside a sentence": f"session {self.UUID} moved",
+            "uuid in a path": f"/x/{self.UUID}.jsonl",
+            "identity digest": self.DIGEST,
+            "owner key": self.OWNER,
+            "automatic socket route": route,
+        }
+        for name, secret in cases.items():
+            with self.subTest(shape=name):
+                cleaned = antiphon.redact_private(f"before {secret} after")
+                self.assertNotIn(secret, cleaned, name)
+                self.assertNotIn(secret.lower(), cleaned.lower(), name)
+
+    def test_identity_privacy_preserves_alias_and_remedy(self):
+        text = (f"{self.ALIAS} is no longer this session; reconnect to be "
+                f"reachable (session {self.UUID})")
+        cleaned = antiphon.redact_private(text)
+        self.assertIn(self.ALIAS, cleaned, "the public alias is the useful half")
+        self.assertIn("reconnect", cleaned, "the remedy survives")
+        self.assertNotIn(self.UUID, cleaned)
+
+    def test_identity_privacy_runs_before_truncation(self):
+        """A cut first would leave a fragment the whole-shape check misses."""
+        tail = f"trailing {self.UUID}"
+        text = "x" * 190 + tail
+        cleaned = antiphon.redact_private(text, limit=200)
+        self.assertLessEqual(len(cleaned), 200)
+        self.assertNotIn(self.UUID[:20], cleaned,
+                         "no fragment of a session id survives the cut")
+
+    def test_identity_privacy_preserves_the_refusal_class(self):
+        refusal = antiphon._ClassifiedRefusal(
+            f"not delivered: {self.UUID} moved", "no-peer")
+        cleaned = antiphon.redact_refusal(refusal)
+        self.assertEqual(cleaned.refusal_class, "no-peer",
+                         "redaction must not cost the class a caller acts on")
+        self.assertNotIn(self.UUID, str(cleaned))
+
+    # ---- the six surfaces a route-bearing failure actually reaches ----
+
+    @contextlib.contextmanager
+    def project(self):
+        with tempfile.TemporaryDirectory() as project:
+            with patch.object(antiphon, "project_dir", return_value=project):
+                yield project
+
+    def test_identity_privacy_a_queue_refusal_is_redacted_before_it_is_cut(self):
+        """`codex queue` writes its own stderr, and this bridge prints it. The
+        cut is 200 characters, so a truncation taken first leaves the head of a
+        session id behind — a fragment no whole-shape check would catch."""
+        noise = "x" * 180
+        stderr = f"{noise} thread {self.UUID} is not running"
+        with patch.object(antiphon.subprocess, "run", return_value=SimpleNamespace(
+                returncode=1, stdout="", stderr=stderr)):
+            ok, detail = antiphon._queue_codex(self.UUID, "hello")
+        self.assertFalse(ok)
+        self.assertLessEqual(len(str(detail)), 200)
+        self.assertNotIn(self.UUID[:8], str(detail),
+                         "not even the head of a session id survives the cut")
+        self.assertEqual(detail.refusal_class, "transport",
+                         "redaction must not cost the class")
+
+    def test_identity_privacy_the_stop_hook_never_prints_a_private_shape(self):
+        """The Stop hook prints the refusal verbatim on stderr, where the
+        person sitting at the terminal reads it."""
+        refusal = antiphon._ClassifiedRefusal(
+            f"not delivered: {self.DIGEST} moved to {self.UUID}", "no-peer")
+        with tempfile.TemporaryDirectory() as project:
+            transcript = os.path.join(project, "transcript.jsonl")
+            with open(transcript, "w", encoding="utf-8") as f:
+                f.write("\n".join([
+                    claude_prompt("ask", uuid="U1"),
+                    claude_assistant("@codex hello"),
+                ]) + "\n")
+            printed = io.StringIO()
+            with patch.object(antiphon, "send_to_codex",
+                              return_value=(False, refusal)), \
+                 patch.object(antiphon.sys, "stdin", io.StringIO(json.dumps(
+                     {"cwd": project, "transcript_path": transcript}))), \
+                 contextlib.redirect_stderr(printed):
+                antiphon.push("codex")
+        words = printed.getvalue()
+        self.assertIn("delivery failed", words, words)
+        self.assertNotIn(self.UUID, words)
+        self.assertNotIn(self.DIGEST, words)
+
+    def test_identity_privacy_a_startup_refusal_never_echoes_the_owner_key(self):
+        """The session-recording refusal is printed once per turn at startup.
+        `write_session` names the key it rejected, and that key is a pid and a
+        process start time — this session's own, not a peer's to publish."""
+        with self.project() as project:
+            antiphon.peers.register(project, "claude", "ui", "/tmp/ui.sock",
+                                    owner_key=antiphon.peers.owner_key())
+            printed = io.StringIO()
+            with patch.dict(os.environ, {"ANTIPHON_NAME": "ui"}), \
+                 patch.object(antiphon.peers, "owner_key",
+                              return_value=self.OWNER.replace("4242", "0")), \
+                 contextlib.redirect_stderr(printed):
+                antiphon.record_claude_session(project, self.UUID, "/tmp/t.jsonl")
+        words = printed.getvalue()
+        self.assertIn("invalid owner key", words, words)
+        self.assertNotIn("00:00:00 2026", words,
+                         "the process start time is half the owner key")
+
+    def test_identity_privacy_status_never_prints_a_private_shape(self):
+        """Status is the surface people paste into an issue."""
+        with self.project() as project:
+            alias, digest = antiphon.peers.auto_identity(self.UUID)
+            antiphon.peers.register(
+                project, "claude", alias,
+                antiphon.claude_socket_path(project, alias),
+                identity_digest=digest, mode="initial")
+            printed = io.StringIO()
+            with contextlib.redirect_stdout(printed):
+                antiphon.status()
+        words = printed.getvalue()
+        self.assertNotIn(self.UUID, words)
+        self.assertNotIn(digest, words)
+        self.assertNotIn("antiphon-channel-", words)
+
+    def test_identity_privacy_doctor_hides_an_automatic_route(self):
+        """An automatic peer's socket is derived from its alias, so printing it
+        publishes a route nobody can act on: the remedy is a restart, never a
+        path. An explicitly named peer keeps its path, which is the one thing
+        that makes `remove it` actionable."""
+        with self.project() as project:
+            auto, digest = antiphon.peers.auto_identity(self.UUID)
+            live = [
+                {"kind": "claude", "name": auto, "identity_digest": digest,
+                 "address": antiphon.claude_socket_path(project, auto)},
+                {"kind": "claude", "name": "ui",
+                 "address": antiphon.claude_socket_path(project, "ui")},
+            ]
+            printed = io.StringIO()
+            report = antiphon._Report()
+            with patch.object(antiphon, "_probe_channel",
+                              return_value=antiphon.Probe(errno.ECONNREFUSED,
+                                                          False)), \
+                 contextlib.redirect_stdout(printed):
+                antiphon._doctor_channel(report, project, live)
+        lines = printed.getvalue().splitlines()
+        automatic = [line for line in lines if auto in line]
+        explicit = [line for line in lines if '"ui"' in line]
+        self.assertTrue(automatic, printed.getvalue())
+        self.assertTrue(explicit, printed.getvalue())
+        for line in automatic:
+            self.assertNotIn("antiphon-channel-", line,
+                             "an automatic route is not a remedy")
+            self.assertIn("restart", line, line)
+        for line in explicit:
+            self.assertIn("antiphon-channel-", line,
+                          "an explicit peer's path is actionable for it")
+
+    def test_identity_privacy_a_resolver_refusal_keeps_its_class(self):
+        """`send_to_claude` hands the resolver's refusal straight back to the
+        MCP tool and to the Stop hook. Redacting it there rather than trusting
+        every future resolver branch to stay clean is the point of a central
+        redactor — and the class is what a caller acts on, so it must survive."""
+        refusal = antiphon._ClassifiedRefusal(
+            f"not delivered: nothing holds {self.UUID}", "no-peer")
+        with tempfile.TemporaryDirectory() as project:
+            with patch.object(antiphon, "_resolve_target",
+                              return_value=antiphon.ResolvedTarget(
+                                  None, refusal, "refusal")):
+                ok, detail = antiphon.send_to_claude(project, "hi")
+        self.assertFalse(ok)
+        self.assertNotIn(self.UUID, str(detail))
+        self.assertEqual(detail.refusal_class, "no-peer")
+
+    def test_identity_privacy_redaction_parity_holds_across_both_languages(self):
+        """Two redactors, one contract. The Node channel prints its own
+        refusals and never crosses back into Python to do it, so a shape only
+        one side removes is a shape that reaches a surface on the other."""
+        route = "/tmp/antiphon-channel-a561aecdef4cc7b9f794.sock"
+        cases = {
+            "canonical uuid": f"session {self.UUID} moved",
+            "uppercase uuid": f"session {self.UUID.upper()} moved",
+            "identity digest": f"digest {self.DIGEST} refused",
+            "owner key": f"invalid owner key '{self.OWNER}': expected a pid",
+            "automatic route": f"could not clear {route}",
+            "the alias survives": f"{self.ALIAS} is not this session",
+            "the remedy survives": "restart that Claude session",
+        }
+        script = (
+            'import { redactPrivate } from "./lib/identity.mjs";'
+            'process.stdout.write(JSON.stringify('
+            'JSON.parse(process.argv[process.argv.length - 1])'
+            '.map((t) => redactPrivate(t))));'
+        )
+        done = subprocess.run(
+            ["node", "--input-type=module", "-e", script, "--",
+             json.dumps(list(cases.values()))],
+            capture_output=True, text=True,
+            cwd=os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+        if done.returncode != 0:
+            self.fail("node redaction failed: " + done.stderr.strip()[:400])
+        node = json.loads(done.stdout)
+        for (name, text), got in zip(cases.items(), node):
+            with self.subTest(shape=name):
+                self.assertEqual(antiphon.redact_private(text), got,
+                                 f"{name}: the two redactors disagree")
+
+    def test_identity_privacy_doctor_queue_reports_an_aggregate(self):
+        """A truncated session id is still session identity. The queue note
+        counts the threads instead of naming any of them."""
+        import sqlite3
+        second = "7f3a91c2-1111-4222-8333-444455556666"
+        with tempfile.TemporaryDirectory() as project:
+            db = os.path.join(project, "queue_0.sqlite")
+            con = sqlite3.connect(db)
+            con.execute("CREATE TABLE queued_items (thread_id TEXT)")
+            con.executemany("INSERT INTO queued_items VALUES (?)",
+                            [(self.UUID,), (self.UUID,), (second,)])
+            con.commit()
+            con.close()
+            rollouts = [os.path.join(project, f"rollout-{self.UUID}.jsonl"),
+                        os.path.join(project, f"rollout-{second}.jsonl")]
+            printed = io.StringIO()
+            report = antiphon._Report()
+            with patch.object(antiphon, "CODEX_QUEUE_DBS", db), \
+                 patch.object(antiphon, "codex_rollout_files",
+                              return_value=rollouts), \
+                 patch.object(antiphon, "codex_thread_alive", return_value=False), \
+                 contextlib.redirect_stdout(printed):
+                antiphon._doctor_codex_queue(report, project)
+        words = printed.getvalue()
+        self.assertNotIn(self.UUID[:8], words, words)
+        self.assertNotIn(second[:8], words, words)
+        self.assertRegex(words, r"3 message\(s\).*2 non-running")

@@ -1937,3 +1937,58 @@ function sendToSocketAt(path, payload) {
 
 await aStaleInboundIsRefusedAsNoPeerAndEmitsNothing();
 await anUnreadyInboundRefusesWithoutRetiringAnything();
+
+// --- Task 9: an automatic route is private on this side too ----------------
+// The channel prints its own refusals. Nothing here crosses back into Python to
+// have them cleaned, so a shape only the Python redactor removes still reaches
+// the terminal from here.
+async function anAutomaticSessionNeverPrintsItsOwnRoute() {
+  const dir = await mkdtemp(join(tmpdir(), "antiphon-private-"));
+  const stub = await makeAutomaticIdentityPython({
+    alias: STALE_A_ALIAS, identity_digest: STALE_A_DIGEST,
+    session_id: STALE_A,
+  });
+  // A directory on the socket path: `unlink` fails with EPERM and the refusal
+  // that follows is the one that used to name the route.
+  const blocked = socketFor(dir, STALE_A_ALIAS);
+  mkdirSync(blocked, { recursive: true });
+  const session = spawnChannel(dir, undefined, stub.env);
+  try {
+    assert.ok(await waitFor(() => /could not clear|could not serve/.test(session.stderr())),
+      `expected a refusal, got: ${session.stderr()}`);
+    const words = session.stderr();
+    assert.doesNotMatch(words, /antiphon-channel-[0-9a-f]+\.sock/,
+      `an automatic peer's route is not a remedy: ${words}`);
+    assert.match(words, /can still reply to Codex/,
+      "the remedy beside it survives the redaction");
+  } finally {
+    session.child.kill("SIGKILL");
+    await waitForExit(session.child, 2_000);
+    await rm(blocked, { recursive: true, force: true }).catch(() => {});
+    await rm(dir, { recursive: true, force: true }).catch(() => {});
+    await rm(stub.dir, { recursive: true, force: true }).catch(() => {});
+  }
+}
+
+async function anExplicitSessionKeepsTheRouteItCanActOn() {
+  // The mirror case, and the reason redaction is not blanket: an operator who
+  // typed the name can act on the path, and `remove it` needs to name what.
+  const dir = await mkdtemp(join(tmpdir(), "antiphon-explicit-private-"));
+  const blocked = socketFor(dir, "ui");
+  mkdirSync(blocked, { recursive: true });
+  const session = spawnChannel(dir, "ui");
+  try {
+    assert.ok(await waitFor(() => /could not clear|could not serve/.test(session.stderr())),
+      `expected a refusal, got: ${session.stderr()}`);
+    assert.match(session.stderr(), /antiphon-channel-[0-9a-f]+\.sock/,
+      "an explicit peer's path is actionable for it");
+  } finally {
+    session.child.kill("SIGKILL");
+    await waitForExit(session.child, 2_000);
+    await rm(blocked, { recursive: true, force: true }).catch(() => {});
+    await rm(dir, { recursive: true, force: true }).catch(() => {});
+  }
+}
+
+await anAutomaticSessionNeverPrintsItsOwnRoute();
+await anExplicitSessionKeepsTheRouteItCanActOn();

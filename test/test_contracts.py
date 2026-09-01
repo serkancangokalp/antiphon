@@ -868,7 +868,14 @@ class ShippedContractTest(unittest.TestCase):
             self.assertRegex(text, r"(?i)at least[^.]*first hook", where)
             self.assertRegex(text, r"(?i)fixed Claude probe", where)
             self.assertRegex(text, r"(?i)host display name is ignored", where)
-            self.assertRegex(text, r"(?i)identity digest stay private", where)
+            # Widened with the privacy sentence: the owner key and socket
+            # route are now named private too, and the surfaces bound by that
+            # promise are named beside it.
+            self.assertRegex(
+                text,
+                r"(?i)identity digest, owner key and socket route stay private",
+                where)
+            self.assertRegex(text, r"(?i)expose only the public alias", where)
             self.assertIn("ANTIPHON_NAME", text, where)
             self.assertRegex(text, r"(?i)(two or more|multiple)[^.]*refus", where)
 
@@ -897,3 +904,43 @@ class ShippedContractTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class IdentityPrivacyContractTest(unittest.TestCase):
+    """Every surface that teaches the automatic identity says what stays
+    private, in the same words, so a reader cannot learn a weaker rule from
+    whichever one they happen to open."""
+
+    def test_identity_privacy_every_written_surface_agrees(self):
+        node = read("lib", "channel.mjs")
+        start = node.index("    instructions:")
+        end = node.index("\n  },\n);", start)
+        channel = re.sub(r'"\s*\+\s*\n\s*"', "", node[start:end])
+        surfaces = {
+            "README": read("README.md"),
+            "AGENTS rule": antiphon.AGENTS_RULE,
+            "CLAUDE rule": antiphon.CLAUDE_RULE,
+            "channel instructions": channel,
+        }
+        for where, text in surfaces.items():
+            with self.subTest(surface=where):
+                words = " ".join(text.split())
+                for required in ("identity digest", "owner key",
+                                 "socket route", "public alias"):
+                    self.assertIn(required, words, f"{where}: {required}")
+                self.assertRegex(
+                    words, r"(?i)refusals[^.]*errors|errors[^.]*refusals",
+                    f"{where}: error paths are covered, not only refusals")
+
+    def test_identity_privacy_backlog_names_what_is_deliberately_not_redacted(self):
+        """A blanket promise would be the wrong one, and an unwritten exception
+        reads as an oversight later. Two shapes stay visible on purpose: an
+        explicitly named peer's socket path, which is what makes `remove it`
+        actionable for the operator who chose that name, and the channel's own
+        readiness line, which is neither a refusal nor an error."""
+        words = " ".join(read("BACKLOG.md").split())
+        self.assertIn("Redaction is scoped, and its two exceptions are "
+                      "deliberate", words)
+        self.assertRegex(words, r"(?i)explicitly named peer keeps its socket "
+                                r"path")
+        self.assertRegex(words, r"(?i)`antiphon channel ready:` line")

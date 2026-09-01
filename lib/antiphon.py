@@ -4628,7 +4628,12 @@ def push(target="codex"):
             # Returning False leaves this recipient's fingerprint where it was,
             # so the line is offered again next turn instead of being recorded
             # as delivered and lost.
-            print(f"antiphon: delivery failed — {detail}", file=sys.stderr)
+            # Redacted at the surface as well as at each birth site: this
+            # line prints whatever a send hands back, including a refusal
+            # written by the peer's own listener, which is not this side's to
+            # keep clean by construction.
+            print(f"antiphon: delivery failed — {redact_private(str(detail))}",
+                  file=sys.stderr)
         return ok
 
     # The send happens here, outside any lock — reversing an earlier ruling
@@ -4731,6 +4736,40 @@ def push(target="codex"):
     return 0
 
 
+# Private shapes, and the one place that removes them.
+#
+# Applied *before* truncation, always: a cut taken first can leave half a
+# session id behind, and a check that looks for a whole one would then pass
+# over the fragment. The public `auto-` alias is deliberately not a private
+# shape — it is the useful half of every message here, and the remedy beside it
+# is what a person acts on.
+_PRIVATE_UUID = re.compile(
+    r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-"
+    r"[0-9a-fA-F]{4}-[0-9a-fA-F]{12}")
+_PRIVATE_DIGEST = re.compile(r"\b[0-9a-fA-F]{64}\b")
+_PRIVATE_OWNER = re.compile(r"\b\d+:(?:v\d+:)?[A-Z][a-z]{2} [A-Z][a-z]{2} "
+                            r"[ \d]?\d \d{2}:\d{2}:\d{2} \d{4}")
+_PRIVATE_ROUTE = re.compile(r"\S*antiphon-channel-[0-9a-f]+\.sock")
+
+
+def redact_private(text, limit=None):
+    """Remove every private shape, then cut. Never the other way round."""
+    if not isinstance(text, str):
+        return text
+    cleaned = _PRIVATE_ROUTE.sub("<route>", text)
+    cleaned = _PRIVATE_OWNER.sub("<owner>", cleaned)
+    cleaned = _PRIVATE_DIGEST.sub("<digest>", cleaned)
+    cleaned = _PRIVATE_UUID.sub("<session>", cleaned)
+    return cleaned if limit is None else cleaned[:limit]
+
+
+def redact_refusal(refusal, limit=None):
+    """Redact a refusal without costing it the class a caller acts on."""
+    cleaned = redact_private(str(refusal), limit)
+    given = getattr(refusal, "refusal_class", None)
+    return _ClassifiedRefusal(cleaned, given) if given else cleaned
+
+
 class _ClassifiedRefusal(str):
     """A refusal detail that also says which kind of refusal it is.
 
@@ -4814,10 +4853,15 @@ def _queue_codex(session, message):
     except subprocess.SubprocessError as e:
         return False, _ClassifiedRefusal(f"{type(e).__name__}", "transport")
     if result.returncode != 0:
-        # The wrap is outermost: `.strip()[:200]` would hand back a plain `str`
-        # and the class with it.
+        # Codex's own words, and it names the thread it refused. Redacted
+        # before the cut and not after: `[:200]` taken first leaves the head of
+        # a session id on the end of the line, and a whole-shape check reading
+        # that fragment finds nothing to remove. The wrap stays outermost —
+        # any string operation returns a plain `str` and drops the class.
         return False, _ClassifiedRefusal(
-            (result.stderr or result.stdout or "unknown error").strip()[:200],
+            redact_private(
+                (result.stderr or result.stdout or "unknown error").strip(),
+                200),
             "transport")
     return True, ""
 
@@ -5193,7 +5237,11 @@ def send_to_claude(cwd, text, alias=None, sender_alias=None, message_id=None):
             if valid_alias:
                 _notify_unregistered_claude(
                     cwd, alias, sender_alias, request["message_id"])
-            return False, detail
+            # The resolver's words go straight to the MCP tool and to the Stop
+            # hook. Cleaned here rather than left to each branch to stay clean
+            # on its own — and the class rides through, because "no peer" and
+            # "transport" ask a sender for different things.
+            return False, redact_refusal(detail)
         sock = None
         try:
             sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
@@ -5249,8 +5297,11 @@ def send_to_claude(cwd, text, alias=None, sender_alias=None, message_id=None):
         # only the second tells a sender to reconnect; recasting everything as
         # transport threw that away.
         supplied = result.get("refusal_class")
+        # Redact before the cut: a truncation taken first can leave half a
+        # session id behind and a whole-shape check would pass over it.
         return False, _ClassifiedRefusal(
-            str(result.get("error") or "channel delivery failed")[:200],
+            redact_private(str(result.get("error")
+                               or "channel delivery failed"), 200),
             supplied if supplied in LISTENER_REFUSAL_CLASSES else "transport")
     return True, ""
 
@@ -6560,7 +6611,11 @@ def record_claude_session(cwd, session_id, transcript):
                   "on the other side's pages this turn.", file=sys.stderr)
         return False
     if not ok and _endpoint_owner(cwd, "claude", alias) is not None:
-        print(f"antiphon: {detail}", file=sys.stderr)
+        # The refusal quotes the owner key it would not accept — a pid and this
+        # session's own start time, which is diagnostic identity rather than
+        # anything the person reading the line can act on. The remedy in the
+        # sentence survives the redaction; the key does not.
+        print(f"antiphon: {redact_private(str(detail))}", file=sys.stderr)
     return ok
 
 
@@ -6888,8 +6943,9 @@ AUTOMATIC_PEER_IDENTITY_RULE = (
     "peer can be addressed by alias and is the only automatic case a bare send may "
     "choose; two or more positively live candidates make a bare send refused. "
     "Older or mixed-version peers are never guessed into automatic identity. The "
-    "full host session id and identity digest stay private; status, doctor, labels "
-    "and refusals expose only the public alias.")
+    "full host session id, identity digest, owner key and socket route stay "
+    "private; status, doctor, labels, refusals and errors expose only the "
+    "public alias and the remedy beside it.")
 
 AGENTS_RULE = ("\n## The Antiphon bridge\n\n"
                "You are working alongside Claude Code on this project. What happens on the "
@@ -8545,6 +8601,13 @@ def _doctor_channel(report, cwd, live):
         name, path, state = target.name, target.path, target.state
         registered = state == "registered"
         who = f'channel: peer "{name}"' if name else "channel:"
+        # An explicit or legacy peer's path is actionable: its operator chose
+        # the name, and `remove it` is a thing they can do. An automatic peer's
+        # path is derived from a host session id nobody typed, so printing it
+        # publishes a private route in exchange for a remedy that was always
+        # "restart that session" anyway.
+        automatic = bool(name) and name.startswith(peers.AUTO_NAME_PREFIX)
+        route = "its address" if automatic else path
         probe = _probe_channel(path, patient=target.patient)
         if probe.answered and state == "unregistered":
             report.bad(f'{who} answers, but no live endpoint record holds '
@@ -8559,18 +8622,24 @@ def _doctor_channel(report, cwd, live):
                         "Claude session")
         elif probe.error == errno.ECONNREFUSED:
             report.bad(f"{who} socket file present but nothing listening — "
-                       f"restart the Claude session or remove {path}")
+                       + ("restart that Claude session" if automatic else
+                          f"restart the Claude session or remove {path}"))
         elif probe.error == errno.ENOTSOCK:
-            report.bad(f"{who} {path} is not a socket — remove it")
+            report.bad(f"{who} {route} is not a socket — "
+                       + ("restart that Claude session" if automatic
+                          else "remove it"))
         elif probe.error == errno.EACCES:
             report.bad(f"{who} the socket exists but this user cannot "
-                       f"connect to it: {path}")
+                       "connect to it"
+                       + ("; restart that Claude session" if automatic
+                          else f": {path}"))
         elif probe.error is not None:
-            report.bad(f"{who} {os.strerror(probe.error)} at {path}")
+            report.bad(f"{who} {os.strerror(probe.error)} at {route}")
         else:
-            report.bad(f"{who} something is listening at {path}, but it does "
-                       "not answer as an Antiphon channel — remove it or stop "
-                       "whatever holds it")
+            report.bad(f"{who} something is listening at {route}, but it does "
+                       "not answer as an Antiphon channel — "
+                       + ("restart that Claude session" if automatic else
+                          "remove it or stop whatever holds it"))
 
 
 def _doctor_codex(report, cwd):
@@ -8610,8 +8679,9 @@ def _doctor_codex_queue(report, cwd):
     read-only (`mode=ro`), schema feature-detected, and silent on any failure:
     this is Codex's own database and its shape is not this project's to
     promise. A note, never ✗: only Codex can drain its queue, and a permanent
-    ✗ over it is one people learn to ignore. Thread ids are printed as their
-    first eight characters — enough to match `codex resume`, nothing more.
+    ✗ over it is one people learn to ignore. No thread id is printed, not even
+    a prefix: a truncated session id is still session identity, and it was
+    never actionable — nobody can address a thread that is not running.
     """
     import sqlite3
     paths = sorted(glob.glob(CODEX_QUEUE_DBS))
@@ -8642,10 +8712,17 @@ def _doctor_codex_queue(report, cwd):
     stranded = [(tid, n) for tid, n in rows
                 if isinstance(tid, str) and tid in ours
                 and codex_thread_alive(tid) is False]
-    for tid, n in stranded:
-        report.note(f"codex queue: {n} message(s) wait in Codex thread "
-                    f"{tid[:8]}…, which is not running — they are read only if "
-                    "that thread is resumed")
+    if stranded:
+        # Aggregate, never a thread-id prefix. A truncated prefix is still
+        # session identity, and it was never actionable anyway: nobody can
+        # address a thread that is not running. The counts are what a person
+        # can act on.
+        waiting = sum(count for _tid, count in stranded)
+        threads = len(stranded)
+        noun = "thread" if threads == 1 else "threads"
+        report.note(f"codex queue: {waiting} message(s) wait across {threads} "
+                    f"non-running project {noun} — they are read only if those "
+                    "threads are resumed")
 
 
 def _doctor_readonly():
