@@ -1020,6 +1020,28 @@ class IdentityPrivacyContractTest(unittest.TestCase):
                           + antiphon._VERDICT_NOTE["STRUCTURAL_INVALID"],
                           verdict)
 
+    def test_the_shared_verdict_has_exactly_one_consumer(self):
+        """Two consumers of one predicate are two predicates.
+
+        Routing and signing must reach the same answer about the same moment,
+        and they drifted the moment a rule was added to one wrapper and not the
+        other: the fail-closed for a missing fingerprint lived in the inbound
+        gate alone, so a listener refused everything sent to it and went on
+        signing replies with an alias it could no longer prove was its own.
+        Everything goes through `deliveryVerdict`, and the shared function is
+        called in exactly one place.
+        """
+        node = read("lib", "channel.mjs")
+        body = node[node.index("function automaticProofVerdict()"):]
+        after = node[:node.index("function automaticProofVerdict()")] \
+            + body[body.index("}") + 1:]
+        self.assertEqual(after.count("automaticProofVerdict()"), 1,
+                         "one call site, and it is inside `deliveryVerdict`")
+        gate = node[node.index("function deliveryVerdict()"):]
+        self.assertIn("automaticProofVerdict()",
+                      gate[:gate.index("\n}")],
+                      "which is where the one call site is")
+
     def test_the_birth_authority_never_comes_from_the_record_it_judges(self):
         """A listener that learns what it published by re-reading its own
         endpoint has no authority at all: the same bytes anyone could have

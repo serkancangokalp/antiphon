@@ -2705,3 +2705,64 @@ peers.write_identity_proof(${JSON.stringify(dir)}, owner,
 }
 
 await aListenerWithoutItsFingerprintRefuses();
+
+// --- one predicate, both directions ----------------------------------------
+// The fail-closed lived in the inbound gate alone, so a listener whose claim
+// came back without a fingerprint refused everything sent to it and went on
+// signing its replies with the alias it could no longer prove was its own.
+// Driven through the real `reply_to_codex`, which is where signing is visible.
+async function aListenerWithoutItsFingerprintDoesNotSignEither() {
+  const dir = await mkdtemp(join(tmpdir(), "antiphon-no-authority-sign-"));
+  const codex = await makeCodexStub();
+  const harness = await makeBirthlessRegistryHarness({
+    alias: AUTO_ALIAS, identity_digest: AUTO_DIGEST, session_id: CODEX_SESSION,
+  });
+  const env = {
+    ...process.env, ...harness.env, ANTIPHON_CWD: dir, HOME: dir,
+    PATH: `${codex.dir}:${harness.env.PATH}`,
+  };
+  delete env.ANTIPHON_NAME;
+  const transport = new StdioClientTransport({
+    command: "node", args: ["lib/channel.mjs"], env, stderr: "pipe",
+  });
+  const client = new Client({ name: "antiphon-no-authority", version: "1.0.0" });
+  try {
+    liveCodexPeer(dir, "build", "300:build", CODEX_SESSION);
+    await client.connect(transport);
+    assert.ok(await waitFor(() => existsSync(endpointFor(dir, AUTO_ALIAS))),
+      "the claim itself succeeds; only its fingerprint is missing");
+    // Both halves and a current proof, written the way a real hook writes
+    // them: everything a READY verdict needs except the one thing this
+    // listener cannot obtain. Without the proof the raw verdict is UNREADY
+    // anyway, and the test would pass whether or not signing consults the
+    // gate — which is the shape it had first.
+    runPeers(dir, `
+import json, os
+path = os.path.join(${JSON.stringify(dir)}, ".antiphon", "peers",
+                    "claude-${AUTO_ALIAS}", "endpoint.json")
+owner = json.load(open(path))["owner"]
+peers.write_session(${JSON.stringify(dir)}, "claude", "${AUTO_ALIAS}",
+                    ${JSON.stringify(CODEX_SESSION)}, "/t/a.jsonl", owner,
+                    ${JSON.stringify(AUTO_DIGEST)}, True)
+peers.write_identity_proof(${JSON.stringify(dir)}, owner,
+                           ${JSON.stringify(CODEX_SESSION)},
+                           ${JSON.stringify(AUTO_DIGEST)})
+`);
+    await client.callTool({
+      name: "reply_to_codex", arguments: { text: "unsigned", to: "build" },
+    });
+    const queued = readFileSync(codex.log, "utf8");
+    assert.match(queued, /\[from=<unnamed> id=/,
+      `a listener that cannot prove its endpoint is its own signs nothing: ${queued}`);
+    assert.ok(!queued.includes(AUTO_ALIAS),
+      "the alias stays private while the authority is missing");
+  } finally {
+    await client.close().catch(() => {});
+    await rm(socketFor(dir, AUTO_ALIAS), { force: true }).catch(() => {});
+    await rm(dir, { recursive: true, force: true }).catch(() => {});
+    await rm(harness.dir, { recursive: true, force: true }).catch(() => {});
+    await rm(codex.dir, { recursive: true, force: true }).catch(() => {});
+  }
+}
+
+await aListenerWithoutItsFingerprintDoesNotSignEither();
