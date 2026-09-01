@@ -768,8 +768,11 @@ def write_session(cwd, kind, name, session_id, transcript, owner):
     if not (valid_kind(kind) and valid_key(kind, name)):
         return False, f"invalid peer {kind!r}/{name!r}"
     if not valid_session_id(session_id):
-        return False, (f"invalid session id {session_id!r}: expected a canonical "
-                       "UUID")
+        if looks_like_session_id(session_id):
+            return False, ("invalid session id: a UUID-shaped value was not "
+                           "canonical and is not echoed; expected a canonical UUID")
+        return False, (f"invalid session id {session_id!r}: expected a "
+                       "canonical UUID")
     if not valid_owner_key(owner):
         return False, (f"invalid owner key {owner!r}: expected a pid and the "
                        "start time that tells it from a recycled one")

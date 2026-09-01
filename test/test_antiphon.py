@@ -11843,6 +11843,15 @@ class CodexPeerWiringTest(unittest.TestCase):
                        name="build")
             self.assertEqual(antiphon.peers.read_observations(project), [])
 
+    def test_a_named_codex_hook_does_not_echo_a_uuid_shaped_invalid_host_id(self):
+        supplied = self.UUID.upper()
+        with tempfile.TemporaryDirectory() as project:
+            _, _, err, _ = self._hook(
+                project, event="SessionStart", session_id=supplied,
+                name="build")
+        self.assertIn("canonical UUID", err)
+        self.assertNotIn(self.UUID, err.lower())
+
     def test_an_observation_failure_never_costs_context_or_leaks_the_id(self):
         with tempfile.TemporaryDirectory() as project:
             leaked = os.path.join(project, ".antiphon", "observations",
@@ -11999,6 +12008,17 @@ class ClaudeSessionWiringTest(unittest.TestCase):
         self.assertEqual(record["session_id"], self.UUID)
         self.assertEqual(record["transcript"], "/t/c.jsonl")
         self.assertEqual(record["owner"], "300:x")
+
+    def test_a_named_claude_hook_does_not_echo_a_uuid_shaped_invalid_host_id(self):
+        supplied = self.UUID.upper()
+        with tempfile.TemporaryDirectory() as project:
+            ok, detail = antiphon.peers.register(
+                project, "claude", "ui", "/t/ui.sock", pid=os.getpid(),
+                owner_key="300:x")
+            self.assertTrue(ok, detail)
+            _, _, err, _ = self._hook(project, session_id=supplied)
+        self.assertIn("canonical UUID", err)
+        self.assertNotIn(self.UUID, err.lower())
 
     def test_an_unnamed_claude_turn_records_nothing(self):
         """Measured before this change and pinned after it: an unnamed session

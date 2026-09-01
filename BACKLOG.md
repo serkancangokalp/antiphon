@@ -1479,9 +1479,9 @@ proof of death, and `status`/`doctor` show only their count. Positively live
 observations appear only on a labelled local diagnostic row carrying the full
 UUID. Refusals, errors and every other line expose neither that id nor paths.
 The UUID is explicitly not an alias and cannot be addressed. UUID-shaped
-routing or configured-name values are described without being echoed, including
-case and surrounding-whitespace variants; a failed observation write reports
-only its exception class and numeric errno.
+routing, configured-name or malformed hook-session values are described without
+being echoed, including case and surrounding-whitespace variants; a failed
+observation write reports only its exception class and numeric errno.
 
 Observation reads are fail-closed: the schema version is an exact JSON integer,
 the time is finite and representable, and malformed or overflow-sized records
