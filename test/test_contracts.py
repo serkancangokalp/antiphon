@@ -682,11 +682,20 @@ class ShippedContractTest(unittest.TestCase):
         self.assertIsNotNone(source_labels)
         self.assertIn("record_claude_session", source_labels)
         self.assertIn("Labels are per record block", source_labels)
+        self.assertNotIn("there is no Claude-side writer", backlog)
+        self.assertNotIn("read_session` has no production caller", backlog)
+        self.assertNotRegex(
+            backlog,
+            r"(?i)relayed label should carry[^.]*alias[^.]*deferred")
 
         wrapper = section(backlog, "P1 — Re-run the host wrapper census before release")
         self.assertIsNotNone(wrapper)
         self.assertIn("test/host_wrapper_census.py", wrapper)
         self.assertRegex(wrapper, r"(?i)aggregate counts only")
+        self.assertRegex(wrapper, r"Codex user messages")
+        self.assertNotRegex(wrapper, r"Codex user blocks")
+        self.assertRegex(
+            doctor, r"(?is)default read-only command.*configuration repair")
 
     def test_the_readme_shows_how_to_start_each_kind_of_named_peer(self):
         """Naming is not a flag on a command, it is an environment variable read

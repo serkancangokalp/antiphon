@@ -300,13 +300,13 @@ unobservable side parameter can drift back in.
 
 ### The two open questions, settled
 
-**Whether the relayed label should carry the speaking peer's alias — deferred**
-to the source-aware multi-peer P1 above. An alias↔session-UUID join exists
-today **only for named Codex sessions**: `peers.write_session` records that
-UUID under the alias and `Event.source` carries it, but there is no Claude-side
-writer and `read_session` has no production caller at all. A label that named
-aliases now would cover one side of one shape and guess the rest — which is
-misattribution again, wearing a more specific name.
+**Whether the relayed label should carry the speaking peer's alias — resolved
+by the source-aware multi-peer P1 above.** The original work stopped because
+only named Codex sessions wrote the alias↔session-UUID half and no page-building
+path consumed it. The later source-aware work added `record_claude_session`,
+uses `read_session` through the owner-key-checked join, and labels every line of
+an eligible record block together. Its measured limits remain in that entry;
+this older question is historical, not a second open item.
 
 **Whether an agent should act on a relayed instruction — the bridge answers
 provenance and stops.** The shipped sentence says where the words ran and that
@@ -894,7 +894,8 @@ its call succeeded or not.
 
 ## Shipped — `antiphon doctor`
 
-One read-only command that explains the common “bridge is quiet” cases.
+The default read-only command explains the common “bridge is quiet” cases;
+explicit configuration repair is `antiphon doctor --fix`.
 Seven checks, in print order:
 
 1. **Install** — which `antiphon` `PATH` resolves, against the package root of
@@ -1469,9 +1470,15 @@ exactly what a census measured (2026-08-30; re-run 2026-08-31 before 0.3.1,
 which moved `ide_opened_file` into the Codex set on 4 directly inspected
 records; re-run 2026-08-31 before 0.3.2 — 991 Claude text blocks in 86 files,
 1,060 Codex in 134, nothing outside either set, no change; re-run 2026-09-01
-with the checked-in aggregate-only utility — 1,884 Claude user blocks in 508
-files and 1,152 Codex user blocks in 152 files, with both observed tag sets
-matching the constants exactly, no change), and nothing else. They will go
+with the checked-in aggregate-only utility and the production eligibility
+rules — 1,181 Claude user messages in 508 files and 1,156 Codex user messages
+in 154 files. The seven production-eligible Claude tags and all eleven Codex
+tags matched the constants. `<channel>` and `<local-command-caveat>` appeared
+only on Claude records already excluded by `isMeta`, so both were removed:
+keeping them could silently discard a person's pasted text. The accepted cost
+is that a future non-meta host record using either tag would leak one visible
+line; `_is_self_injected` is not a second guard for either tag), and nothing
+else. They will go
 stale as each host adds, renames or drops its own wrapper tags. Re-run before
 every release with:
 
@@ -1484,12 +1491,13 @@ python3 test/host_wrapper_census.py \
 The utility prints aggregate counts only — never transcript text or individual
 paths. Review its tag keys, then:
 
-- count every Claude `type=user` text block and Codex
-  `response_item/message/role=user` message whose text opens with `<`, split by
-  side, each one carrying its `promptSource` value (or its absence);
+- count every production-eligible, non-meta, non-empty Claude `type=user`
+  message and Codex `response_item/message/role=user` message whose joined text
+  opens with `<`, split by side, each one carrying its `promptSource` value (or
+  its absence);
 - for every opening tag that turns up, decide host bookkeeping or a person's
   own words before touching either set — a tag seen on only one side stays out
-  of the other's, the way `local-command-caveat` did until it was measured;
+  of the other's;
 - update the sets, the measurement comment above `CLAUDE_HOST_WRAPPERS`, and
   this entry's date together, so none of the three can drift from the other
   two.

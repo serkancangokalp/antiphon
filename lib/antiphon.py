@@ -343,8 +343,7 @@ def _join_text_blocks(blocks):
 # with `<` too, and used to vanish.
 #
 # The sets are per side because the tags are: `recommended_plugins` and
-# `realtime_delegation` are Codex's, `channel` and `local-command-caveat`
-# were seen only on the Claude side, and `ide_opened_file` — Claude's in the
+# `realtime_delegation` are Codex's, and `ide_opened_file` — Claude's in the
 # first census — was measured on the Codex side too on 2026-08-31 (4 records,
 # the host's own "The user opened the file … in the IDE" bookkeeping).
 # Shared, one side's tag would silence the other side's user for typing that
@@ -354,21 +353,26 @@ def _join_text_blocks(blocks):
 # Strictly what was measured on that side, and nothing else. A tag missing
 # here costs one stray host line in a summary — visible, and fixed by adding
 # it. A tag here that a person could type costs that person's whole message,
-# silently. Adding a plausible sibling by symmetry is how `local-command-caveat`
-# — measured only on the Claude side — first reached the Codex set.
+# silently. Adding a plausible sibling by symmetry is how an unmeasured tag
+# once reached a set.
 # Measured on 2026-08-30 over 1,575 Claude and 445 Codex `role: user`
 # records; re-measured on 2026-08-31 over 4,309 and 872 (one change:
 # `ide_opened_file` joined the Codex set on direct evidence); re-measured
 # again on 2026-08-31 before 0.3.2 over 991 Claude text blocks in 86 files
 # and 1,060 Codex in 134 (no `<` opening outside either set; no change);
-# re-measured on 2026-09-01 with `test/host_wrapper_census.py` over 1,884
-# Claude user blocks in 508 files and 1,152 Codex user blocks in 152 files
-# (the observed tag sets matched these sets exactly; no change). See
-# BACKLOG.md for the repeatable release check.
+# re-measured on 2026-09-01 with the production eligibility rules mirrored by
+# `test/host_wrapper_census.py`: 1,181 Claude user messages in 508 files and
+# 1,156 Codex user messages in 154 files. `channel` and
+# `local-command-caveat` occurred only on Claude records already excluded by
+# `isMeta`, so they were removed: leaving them here could silently discard a
+# person's pasted text. If a future non-meta host record uses either tag, one
+# visible host line may leak; `_is_self_injected` is not a second guard for
+# them. The seven remaining Claude tags and all eleven Codex tags matched.
+# See BACKLOG.md for the repeatable release check.
 CLAUDE_HOST_WRAPPERS = (
-    "channel", "task-notification", "ide_opened_file",
+    "task-notification", "ide_opened_file",
     "command-name", "command-message",
-    "local-command-caveat", "local-command-stdout",
+    "local-command-stdout",
     "bash-input", "bash-stdout",
 )
 
@@ -3978,6 +3982,8 @@ def hook_installed(data, shape):
                 continue
             if entry.get(CONFIG_KEYS.hook_command) != shape.command:
                 continue
+            if entry.get(CONFIG_KEYS.hook_type) != "command":
+                continue
             if (shape.label is not None
                     and entry.get(CONFIG_KEYS.hook_status) != shape.label):
                 continue
@@ -4180,6 +4186,30 @@ def _update_json(path, mutate):
     return True
 
 
+def _config_slot(holder, key, expected, path):
+    """Return/create one mutable config container, or refuse the whole file."""
+    if key not in holder:
+        holder[key] = expected()
+    value = holder[key]
+    if isinstance(value, expected):
+        return value
+    noun = "object" if expected is dict else "array"
+    actual = type(value).__name__
+    raise ConfigFileError(
+        f"{path}: `{key}` holds a JSON {actual}, not an {noun}; refusing to "
+        "overwrite it. Fix the file or move it aside, then run `antiphon "
+        "setup` again.",
+        reason=f"`{key}` holds a JSON {actual}, not an {noun}")
+
+
+def _config_dict(holder, key, path):
+    return _config_slot(holder, key, dict, path)
+
+
+def _config_list(holder, key, path):
+    return _config_slot(holder, key, list, path)
+
+
 def _legacy_commands(script, verb, arg):
     """Values/patterns for finding legacy Python hooks pinned to an absolute path."""
     exact = [f"python3 {script} {verb} {arg}", f"python3 {script} {verb}"]
@@ -4224,6 +4254,39 @@ def _dedupe_hooks(hooks, command):
     return dropped
 
 
+def _validate_hook_groups(groups, event=None):
+    """Refuse a malformed hook array before any setup pass writes its file."""
+    where = f"hook event `{event}`" if event is not None else "hook event"
+    if not isinstance(groups, list):
+        raise ConfigFileError(
+            f"{where} is not an array; refusing to overwrite it. Fix the "
+            "file or move it aside, then run `antiphon setup` again.")
+    for group in groups:
+        if not isinstance(group, dict):
+            raise ConfigFileError(
+                f"{where} contains a non-object group; refusing to overwrite "
+                "it. Fix the file or move it aside, then run `antiphon "
+                "setup` again.")
+        entries = group.get(CONFIG_KEYS.hook_entries)
+        if entries is not None and not isinstance(entries, list):
+            raise ConfigFileError(
+                f"a hook group has non-array `{CONFIG_KEYS.hook_entries}`; "
+                "refusing to overwrite it. Fix the file or move it aside, "
+                "then run `antiphon setup` again.")
+        if isinstance(entries, list) and any(
+                not isinstance(entry, dict) for entry in entries):
+            raise ConfigFileError(
+                f"a `{CONFIG_KEYS.hook_entries}` array contains a non-object "
+                "entry; refusing to overwrite it. Fix the file or move it "
+                "aside, then run `antiphon setup` again.")
+
+
+def _validate_hook_events(events):
+    """Validate every event so two setup passes cannot partly rewrite a file."""
+    for event, groups in events.items():
+        _validate_hook_groups(groups, event)
+
+
 def _add_hook(hooks, command, legacy_commands=None, label=None):
     """Adds the command to one event's list; does nothing if it's already there.
 
@@ -4233,6 +4296,8 @@ def _add_hook(hooks, command, legacy_commands=None, label=None):
     If `legacy_commands` is given, upgrade those first — otherwise, once the
     side argument gets added, the old entry would stick around and the hook
     would fire twice."""
+    _validate_hook_groups(hooks)
+
     changed = False
     if legacy_commands:
         if isinstance(legacy_commands, (str, re.Pattern)):
@@ -4246,6 +4311,7 @@ def _add_hook(hooks, command, legacy_commands=None, label=None):
                     for candidate in legacy_commands
                 )
                 if matched:
+                    entry[CONFIG_KEYS.hook_type] = "command"
                     entry[CONFIG_KEYS.hook_command] = command
                     if label:
                         entry[CONFIG_KEYS.hook_status] = label
@@ -4255,6 +4321,9 @@ def _add_hook(hooks, command, legacy_commands=None, label=None):
     for group in hooks:
         for entry in group.get(CONFIG_KEYS.hook_entries) or []:
             if entry.get(CONFIG_KEYS.hook_command) == command:
+                if entry.get(CONFIG_KEYS.hook_type) != "command":
+                    entry[CONFIG_KEYS.hook_type] = "command"
+                    changed = True
                 if label and entry.get(CONFIG_KEYS.hook_status) != label:
                     entry[CONFIG_KEYS.hook_status] = label
                     changed = True
@@ -4369,11 +4438,14 @@ def setup():
     legacy_commands = _legacy_commands(script, "kanca", "claude")
 
     def claude_mutate(data):
-        hooks = data.setdefault(CONFIG_KEYS.hooks, {}).setdefault(
-            claude_pull.event, [])
+        events = _config_dict(data, CONFIG_KEYS.hooks, claude_target)
+        _validate_hook_events(events)
+        hooks = _config_list(events, claude_pull.event, claude_target)
         changed = _add_hook(hooks, claude_pull.command, legacy_commands)
-        allowed = data.setdefault(CONFIG_KEYS.permissions, {}).setdefault(
-            CONFIG_KEYS.allow, [])
+        permissions = _config_dict(
+            data, CONFIG_KEYS.permissions, claude_target)
+        allowed = _config_list(
+            permissions, CONFIG_KEYS.allow, claude_target)
         if REPLY_TOOL_PERMISSION not in allowed:
             allowed.append(REPLY_TOOL_PERMISSION)
             changed = True
@@ -4386,8 +4458,9 @@ def setup():
     legacy_push_commands = _legacy_commands(script, "it", "codex")
 
     def push_mutate(data):
-        hooks = data.setdefault(CONFIG_KEYS.hooks, {}).setdefault(
-            claude_push.event, [])
+        events = _config_dict(data, CONFIG_KEYS.hooks, claude_target)
+        _validate_hook_events(events)
+        hooks = _config_list(events, claude_push.event, claude_target)
         return _add_hook(hooks, claude_push.command, legacy_push_commands)
 
     install(claude_target, push_mutate,
@@ -4399,8 +4472,9 @@ def setup():
     legacy_codex_commands = _legacy_commands(script, "kanca", "codex")
 
     def codex_mutate(data):
-        hooks = data.setdefault(CONFIG_KEYS.hooks, {}).setdefault(
-            codex_pull.event, [])
+        events = _config_dict(data, CONFIG_KEYS.hooks, codex_target)
+        _validate_hook_events(events)
+        hooks = _config_list(events, codex_pull.event, codex_target)
         return _add_hook(hooks, codex_pull.command, legacy_codex_commands,
                          label=codex_pull.label)
 
@@ -4415,8 +4489,9 @@ def setup():
     # deliberately not installed: it can be delayed or missed, so nothing may
     # depend on it.
     def codex_session_mutate(data):
-        hooks = data.setdefault(CONFIG_KEYS.hooks, {}).setdefault(
-            codex_session.event, [])
+        events = _config_dict(data, CONFIG_KEYS.hooks, codex_target)
+        _validate_hook_events(events)
+        hooks = _config_list(events, codex_session.event, codex_target)
         return _add_hook(hooks, codex_session.command, label=codex_session.label)
 
     install(codex_target, codex_session_mutate,
@@ -4427,8 +4502,9 @@ def setup():
     legacy_reverse_push_commands = _legacy_commands(script, "it", "claude")
 
     def reverse_push_mutate(data):
-        hooks = data.setdefault(CONFIG_KEYS.hooks, {}).setdefault(
-            codex_push.event, [])
+        events = _config_dict(data, CONFIG_KEYS.hooks, codex_target)
+        _validate_hook_events(events)
+        hooks = _config_list(events, codex_push.event, codex_target)
         return _add_hook(hooks, codex_push.command, legacy_reverse_push_commands)
 
     install(codex_target, reverse_push_mutate,
@@ -4446,7 +4522,7 @@ def setup():
     channel_config = channel_server_entry(cwd)
 
     def mcp_mutate(data):
-        servers = data.setdefault(CONFIG_KEYS.mcp_servers, {})
+        servers = _config_dict(data, CONFIG_KEYS.mcp_servers, mcp_target)
         if servers.get(CHANNEL_SERVER_NAME) == channel_config:
             return False
         servers[CHANNEL_SERVER_NAME] = channel_config
@@ -4459,7 +4535,8 @@ def setup():
     local_target = os.path.join(cwd, CLAUDE_LOCAL_SETTINGS_FILE)
 
     def local_mutate(data):
-        enabled = data.setdefault(CONFIG_KEYS.enabled_mcp_servers, [])
+        enabled = _config_list(
+            data, CONFIG_KEYS.enabled_mcp_servers, local_target)
         if CHANNEL_SERVER_NAME in enabled:
             return False
         enabled.append(CHANNEL_SERVER_NAME)

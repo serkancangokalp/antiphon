@@ -62,16 +62,38 @@ class HostWrapperCensusTest(unittest.TestCase):
             result = census.census(claude, codex)
         self.assertEqual(result["claude"]["files"], 1)
         self.assertEqual(result["claude"]["malformed_lines"], 1)
-        self.assertEqual(result["claude"]["user_blocks"], 3)
+        self.assertEqual(result["claude"]["user_messages"], 3)
         self.assertEqual(result["claude"]["tags"]["channel"]["system"], 1)
         self.assertEqual(
             result["claude"]["tags"]["task-notification"]["sdk"], 1)
         self.assertEqual(result["claude"]["tags"]["html"]["typed"], 1)
         self.assertEqual(result["codex"]["files"], 1)
-        self.assertEqual(result["codex"]["user_blocks"], 2)
+        self.assertEqual(result["codex"]["user_messages"], 2)
         self.assertEqual(
             result["codex"]["tags"]["environment_context"]["<absent>"],
             1)
+
+    def test_parsers_match_production_meta_empty_and_join_rules(self):
+        self.assertEqual(census.claude_user_blocks({
+            "type": "user", "isMeta": True, "message": {
+                "content": "<meta-only>\nnot eligible"}}), [])
+        self.assertEqual(census.claude_user_blocks({
+            "type": "user", "message": {"content": ""}}), [])
+        self.assertEqual(census.claude_user_blocks({
+            "type": "user", "promptSource": "sdk", "message": {"content": [
+                {"type": "text", "text": "<channel>\nfirst"},
+                {"type": "text", "text": "second"},
+                {"type": "text", "text": ""},
+            ]}}), [("<channel>\nfirst\n\nsecond", "sdk")])
+        self.assertEqual(census.codex_user_blocks({
+            "type": "response_item", "payload": {"type": "message",
+                "role": "user", "content": [
+                    {"type": "input_text", "text": ""},
+                    {"type": "text", "text": ""},
+                ]}}), [])
+        self.assertEqual(census.codex_user_blocks({
+            "type": "response_item", "payload": {"type": "message",
+                "role": "user", "content": "not a production Codex shape"}}), [])
 
     def test_cli_prints_aggregate_counts_without_content_or_paths(self):
         with tempfile.TemporaryDirectory() as root:

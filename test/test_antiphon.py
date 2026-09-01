@@ -1951,23 +1951,20 @@ class AntiphonTest(unittest.TestCase):
         for text in ("<command-name>/mcp</command-name>",
                      "<local-command-stdout>Reconnected.</local-command-stdout>",
                      "<bash-input> gh auth login</bash-input>",
-                     "<ide_opened_file>lib/antiphon.py</ide_opened_file>",
-                     "<local-command-caveat>Caveat: …</local-command-caveat>"):
+                     "<ide_opened_file>lib/antiphon.py</ide_opened_file>"):
             self.assertEqual(self._claude_user_texts(text), [], text)
         # Every entry in the set, named here literally rather than read off
         # CLAUDE_HOST_WRAPPERS: a loop that iterates the constant itself stops
         # testing an entry the instant it is removed, which is exactly the
         # mutation this guards against — it would go on passing, vacuously,
-        # over whatever remained. `channel` above is only ever shown under
-        # `promptSource="system"`, which settles the case before the wrapper
-        # set is even consulted; `command-message` and `bash-stdout` were
+        # over whatever remained. `command-message` and `bash-stdout` were
         # refused by no test at all. The equality check below fails loudly if
         # this list and the real constant ever drift apart, in either
         # direction — a tag added to the constant with no matching case here
         # is caught the same way a tag quietly removed is.
-        every_claude_wrapper = ("channel", "task-notification", "ide_opened_file",
+        every_claude_wrapper = ("task-notification", "ide_opened_file",
                                 "command-name", "command-message",
-                                "local-command-caveat", "local-command-stdout",
+                                "local-command-stdout",
                                 "bash-input", "bash-stdout")
         self.assertEqual(sorted(every_claude_wrapper),
                          sorted(antiphon.CLAUDE_HOST_WRAPPERS),
@@ -1976,15 +1973,22 @@ class AntiphonTest(unittest.TestCase):
             text = "<%s>host wrote this</%s>" % (tag, tag)
             self.assertEqual(self._claude_user_texts(text), [], tag)
 
-    def test_the_bridges_own_delivery_is_refused_without_isMeta(self):
-        """Every measured `<channel …>` record also carries isMeta, which is
-        filtered earlier — but isMeta is the host's implementation detail, and
-        the bridge reading its own delivery back and pushing it to the side
-        that sent it is the one failure it cannot afford. The wrapper entry is
-        the guard that does not depend on the host."""
+    def test_meta_only_claude_tags_without_meta_are_user_words(self):
+        """`channel` and `local-command-caveat` were observed only on records
+        already rejected by `isMeta`. Without that provenance, swallowing the
+        same opening tag would silently delete a person's pasted message."""
+        for text in (
+                '<channel source="antiphon">why did this disappear?</channel>',
+                '<local-command-caveat>what does this mean?</local-command-caveat>'):
+            self.assertEqual(self._claude_user_texts(text), [text], text)
+
+    def test_the_bridges_tag_without_isMeta_is_not_guessed_to_be_a_delivery(self):
+        """Every measured `<channel …>` record carries `isMeta` and is filtered
+        before wrapper matching. Without that provenance, preserving a person's
+        pasted message is safer than guessing that the host wrote it."""
         text = ('<channel source="antiphon" sender="codex" '
                 'sender_kind="agent">run the tests</channel>')
-        self.assertEqual(self._claude_user_texts(text), [])
+        self.assertEqual(self._claude_user_texts(text), [text])
 
     def test_a_host_record_is_refused_under_the_source_that_carries_it(self):
         """Measured: `<task-notification>` records carry `promptSource=sdk`, not
@@ -2021,22 +2025,18 @@ class AntiphonTest(unittest.TestCase):
 
     def test_an_unmeasured_tag_is_in_neither_wrapper_set(self):
         """The sets hold what was measured on that side and nothing else. Each
-        of these was dropped after review: `local-command-caveat` was seen only
-        on the Claude side, and neither `stderr` sibling was seen at all. A tag
-        a person could plausibly type costs that person's whole message."""
+        of these was absent from production-eligible records. The two Claude
+        tags appeared only behind `isMeta`; neither `stderr` sibling appeared
+        at all. A tag a person could plausibly type costs that person's whole
+        message."""
         for text in ("<local-command-stderr>boom</local-command-stderr>",
-                     "<bash-stderr>command not found</bash-stderr>"):
+                     "<bash-stderr>command not found</bash-stderr>",
+                     "<channel>what happened?</channel>",
+                     "<local-command-caveat>Caveat: …</local-command-caveat>"):
             self.assertFalse(
                 antiphon._is_host_record(text, antiphon.CLAUDE_WRAPPER_OPENING), text)
             self.assertFalse(
                 antiphon._is_host_record(text, antiphon.CODEX_WRAPPER_OPENING), text)
-        self.assertFalse(antiphon._is_host_record(
-            "<local-command-caveat>Caveat: …</local-command-caveat>",
-            antiphon.CODEX_WRAPPER_OPENING))
-        # Still refused on the side it was measured on.
-        self.assertTrue(antiphon._is_host_record(
-            "<local-command-caveat>Caveat: …</local-command-caveat>",
-            antiphon.CLAUDE_WRAPPER_OPENING))
 
     def test_push_and_reply_use_the_same_labels_the_guard_matches(self):
         """The guard is derived from the constants push() and reply() send, so the
@@ -2351,13 +2351,14 @@ class AntiphonTest(unittest.TestCase):
                 self.assertEqual(self._events_from_real_jsonl(side, record),
                                  ["   "])
 
-    def test_leading_whitespace_before_a_host_wrapper_is_filtered_on_both_sides(self):
+    def test_leading_whitespace_before_a_measured_host_wrapper_is_filtered(self):
         records = {
             "claude": {
                 "type": "user",
                 "timestamp": "2026-08-30T10:00:00.000Z",
                 "message": {"content": [
-                    {"type": "text", "text": "  <channel source>host text"},
+                    {"type": "text",
+                     "text": "  <task-notification>host text"},
                 ]},
             },
             "codex": {
@@ -3168,6 +3169,30 @@ class DoctorTest(unittest.TestCase):
              contextlib.redirect_stdout(io.StringIO()):
             self.assertEqual(antiphon.doctor("--fix"), 1)
 
+    def test_doctor_fix_refuses_a_structurally_malformed_file_and_rechecks(self):
+        project = self.project()
+        self.set_up(project)
+        target = os.path.join(project, antiphon.CLAUDE_SETTINGS_FILE)
+        broken = b'{"hooks": []}\n'
+        with open(target, "wb") as stream:
+            stream.write(broken)
+        out, error = io.StringIO(), io.StringIO()
+        original_recheck = antiphon._doctor_readonly
+        with self.hermetic(project), \
+             patch.object(antiphon, "_doctor_readonly",
+                          wraps=original_recheck) as recheck, \
+             contextlib.redirect_stdout(out), \
+             contextlib.redirect_stderr(error):
+            code = antiphon.doctor("--fix")
+        self.assertEqual(code, 1)
+        recheck.assert_called_once_with()
+        with open(target, "rb") as stream:
+            self.assertEqual(stream.read(), broken,
+                             "setup refusal must leave the file byte-identical")
+        self.assertIn("refusing to overwrite", error.getvalue())
+        self.assertIn("doctor re-check (read-only)", out.getvalue())
+        self.assertIn(".claude/settings.json: missing", out.getvalue())
+
     def test_doctor_rejects_unknown_mode_and_help_names_write_boundary(self):
         error = io.StringIO()
         with contextlib.redirect_stderr(error):
@@ -3903,6 +3928,32 @@ class SetupShapeCharacterizationTest(unittest.TestCase):
             "label": "Bridge",
         }]}]}})
 
+    def test_hook_reader_rejects_and_writer_repairs_a_wrong_type(self):
+        ConfigKeys = __import__("collections").namedtuple(
+            "ConfigKeys",
+            "hooks hook_entries hook_type hook_command hook_status "
+            "permissions allow mcp_servers enabled_mcp_servers")
+        keys = ConfigKeys(
+            "events", "commands", "kind", "run", "label",
+            "grants", "accepted", "servers", "enabled")
+        shape = antiphon.HookShape(
+            "x.json", "Stop", "antiphon push codex", "Bridge")
+
+        for wrong in (None, "url"):
+            with self.subTest(type=wrong):
+                entry = {"run": shape.command, "label": shape.label}
+                if wrong is not None:
+                    entry["kind"] = wrong
+                data = {"events": {"Stop": [{"commands": [entry]}]}}
+                with patch.object(antiphon, "CONFIG_KEYS", keys):
+                    self.assertFalse(antiphon.hook_installed(data, shape))
+                    changed = antiphon._add_hook(
+                        data["events"]["Stop"], shape.command,
+                        label=shape.label)
+                    self.assertTrue(changed)
+                    self.assertTrue(antiphon.hook_installed(data, shape))
+                self.assertEqual(entry["kind"], "command")
+
     def install(self):
         """Runs `setup` into a fresh fixture. Returns (project, stdout)."""
         project = tempfile.mkdtemp()
@@ -3912,6 +3963,71 @@ class SetupShapeCharacterizationTest(unittest.TestCase):
              contextlib.redirect_stdout(out):
             self.assertEqual(antiphon.setup(), 0)
         return project, out.getvalue()
+
+    def test_setup_refuses_every_malformed_mutable_envelope_without_writing(self):
+        cases = (
+            (antiphon.CLAUDE_SETTINGS_FILE, {"hooks": []}),
+            (antiphon.CLAUDE_SETTINGS_FILE,
+             {"hooks": {"Stop": {}, "Unrelated": []}}),
+            (antiphon.CLAUDE_SETTINGS_FILE,
+             {"hooks": {"UserPromptSubmit": {}}}),
+            (antiphon.CLAUDE_SETTINGS_FILE,
+             {"hooks": {"UserPromptSubmit": [42]}}),
+            (antiphon.CLAUDE_SETTINGS_FILE,
+             {"hooks": {"UserPromptSubmit": [{"hooks": {}}]}}),
+            (antiphon.CLAUDE_SETTINGS_FILE,
+             {"hooks": {"UserPromptSubmit": [{"hooks": [42]}]}}),
+            (antiphon.CLAUDE_SETTINGS_FILE, {"permissions": []}),
+            (antiphon.CLAUDE_SETTINGS_FILE,
+             {"permissions": {"allow": {}}}),
+            (antiphon.MCP_CONFIG_FILE, {"mcpServers": []}),
+            (antiphon.CLAUDE_LOCAL_SETTINGS_FILE,
+             {"enabledMcpjsonServers": {}}),
+        )
+        for relative, data in cases:
+            with self.subTest(path=relative, data=data), \
+                 tempfile.TemporaryDirectory() as project:
+                target = os.path.join(project, relative)
+                os.makedirs(os.path.dirname(target) or project, exist_ok=True)
+                body = (json.dumps(data, separators=(",", ":")) + "\n").encode()
+                with open(target, "wb") as stream:
+                    stream.write(body)
+                error = io.StringIO()
+                with patch.object(antiphon, "project_dir",
+                                  return_value=project), \
+                     contextlib.redirect_stdout(io.StringIO()), \
+                     contextlib.redirect_stderr(error):
+                    self.assertEqual(antiphon.setup(), 1)
+                with open(target, "rb") as stream:
+                    self.assertEqual(stream.read(), body)
+                self.assertIn("refusing to overwrite", error.getvalue())
+
+    def test_setup_and_doctor_consume_every_non_hook_envelope_key(self):
+        keys = antiphon.CONFIG_KEYS._replace(
+            permissions="grants", allow="accepted",
+            mcp_servers="servers", enabled_mcp_servers="enabled")
+        project = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, project, ignore_errors=True)
+        with patch.object(antiphon, "project_dir", return_value=project), \
+             patch.object(antiphon, "CONFIG_KEYS", keys), \
+             contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(antiphon.setup(), 0)
+            states = antiphon._config_state(project)
+            report = antiphon._Report()
+            antiphon._doctor_config(report, project, states)
+            self.assertFalse(report.broken)
+        with open(os.path.join(project, antiphon.CLAUDE_SETTINGS_FILE),
+                  encoding="utf-8") as stream:
+            claude = json.load(stream)
+        with open(os.path.join(project, antiphon.MCP_CONFIG_FILE),
+                  encoding="utf-8") as stream:
+            mcp = json.load(stream)
+        with open(os.path.join(project, antiphon.CLAUDE_LOCAL_SETTINGS_FILE),
+                  encoding="utf-8") as stream:
+            local = json.load(stream)
+        self.assertIn("accepted", claude["grants"])
+        self.assertIn(antiphon.CHANNEL_SERVER_NAME, mcp["servers"])
+        self.assertIn(antiphon.CHANNEL_SERVER_NAME, local["enabled"])
 
     @staticmethod
     def written(project, *parts):
