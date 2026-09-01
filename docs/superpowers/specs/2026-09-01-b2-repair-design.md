@@ -150,6 +150,29 @@ most **one** wakeup, to the previous current alias, and that one is bounded at
 previous current alias is the only one with a live listener worth waking, and
 the others are already inert because routing consults the proof.
 
+## 2b. What this contract does NOT touch
+
+`peers.register` is shared: by Claude and Codex, and by automatic and explicit
+records alike. Everything in this document is scoped to **automatic Claude
+endpoints only**, and that scoping is structural rather than inferred from which
+caller happens to reach it today.
+
+- The owner-current proof carries kind exactly `claude`. A proof whose kind is
+  `codex` is **invalid**, not merely irrelevant.
+- The composite verdict and the `initial`/`reassert` mode gate of §2a apply only
+  when `kind == "claude"` **and** the endpoint is automatic — that is, it
+  carries the automatic identity digest.
+- Explicit and legacy Claude registration, reassert and routing keep their
+  present semantics exactly. They require no proof and no mode.
+- Every Codex path — registration, observation, projection, routing — is
+  untouched by this repair.
+
+This is written down because the failure it prevents is a faithful
+implementation, not a careless one: a reader told "automatic endpoint" about a
+shared function could reasonably require the proof on an explicit Claude peer or
+a Codex registration and silently break working behaviour that this repair was
+never about.
+
 ## 3. The proof record
 
 - One file per owner under the project's registry area, named from a digest of
@@ -415,10 +438,10 @@ path because it is actionable for them, while automatic peers may not.
 
 ## 10. Verification
 
-The A→B red crosses the real Codex/Claude hook, the real Python resolver and a
-real Node channel — not registry units. T2 uses the real hook with a positively
-held writer lock. T3 uses real children that keep writing on stdout and on
-stderr. Full Python and Node suites, static checks, a clean commit, and
+The A→B red crosses the real Claude hook, the real Python resolver and a real
+Node channel — not registry units. The configured-name work (plan Task 7) uses
+the real Codex hook with a positively held writer lock. The probe work (plan
+Task 8) uses real children that keep writing on stdout and on stderr. Full Python and Node suites, static checks, a clean commit, and
 `fresh-user.sh` on that exact SHA, then independent review.
 
 No push, merge, version, publish, or live cursor, registry, config or socket
