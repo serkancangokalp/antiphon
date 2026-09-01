@@ -1195,7 +1195,8 @@ def _open_safe_source(root, candidate, cwd):
     if candidate.kind not in ("claude", "codex"):
         return SourceRefusal("invalid-kind")
     relative = candidate.relative_path
-    if not isinstance(relative, str) or not relative or os.path.isabs(relative):
+    if (not _filesystem_safe_relative(relative)
+            or os.path.isabs(relative)):
         return SourceRefusal("outside-root")
     parts = relative.split(os.sep)
     if any(part in ("", ".", "..") for part in parts):
@@ -1247,6 +1248,8 @@ def _open_safe_source(root, candidate, cwd):
                 source.close()
                 return SourceRefusal("project-mismatch")
         return source
+    except (ValueError, UnicodeError):
+        return SourceRefusal("invalid-candidate")
     except OSError as error:
         return _source_open_refusal(error)
     finally:
@@ -1391,6 +1394,22 @@ def _catalog_manifest_name(kind, generation, phase):
     return f"{generation}-{kind}-{phase}.json"
 
 
+def _filesystem_safe_relative(value):
+    """Whether a JSON path string can reach path validation without raising."""
+    if not isinstance(value, str) or not value or "\0" in value:
+        return False
+    try:
+        os.fsencode(value)
+    except (UnicodeError, ValueError):
+        return False
+    return True
+
+
+def _finite_number(value):
+    return ((isinstance(value, int) and not isinstance(value, bool))
+            or (isinstance(value, float) and math.isfinite(value)))
+
+
 def _valid_catalog_entry_shape(kind, entry):
     """Validate nested state without opening anything it points at."""
     if not isinstance(entry, dict):
@@ -1459,7 +1478,7 @@ def _write_catalog_manifest(cwd, filename, data):
 
 def _read_catalog_manifest(cwd, filename, kind=None, generation=None,
                            phase=None):
-    if (not isinstance(filename, str) or not filename
+    if (not _filesystem_safe_relative(filename)
             or os.path.basename(filename) != filename):
         return None
     try:
@@ -1474,7 +1493,7 @@ def _read_catalog_manifest(cwd, filename, kind=None, generation=None,
             or not _catalog_generation(data.get("generation"))
             or data.get("phase") not in ("base", "delta")
             or not isinstance(data.get("paths"), list)
-            or any(not isinstance(path, str) or not path
+            or any(not _filesystem_safe_relative(path)
                    for path in data["paths"])
             or len(set(data["paths"])) != len(data["paths"])
             or (kind is not None and data.get("kind") != kind)
@@ -1542,6 +1561,8 @@ def _catalog_record_path(cwd, kind, relative):
 
 
 def _read_catalog_record(cwd, kind, relative):
+    if not _filesystem_safe_relative(relative):
+        return None
     try:
         with open(_catalog_record_path(cwd, kind, relative),
                   encoding="utf-8") as stream:
@@ -1559,7 +1580,7 @@ def _read_catalog_record(cwd, kind, relative):
             or value.get("source") != source_id(relative)
             or status not in ("ready", "unrelated", "refused")
             or (status == "unrelated" and kind != "codex")
-            or not isinstance(value.get("observed"), (int, float))
+            or not _finite_number(value.get("observed"))
             or (status == "ready"
                 and (not isinstance(generation, str) or not generation
                      or isinstance(complete_size, bool)
@@ -1579,7 +1600,7 @@ def _read_catalog_record(cwd, kind, relative):
         if (not isinstance(old_generation, str) or not old_generation
                 or isinstance(old_size, bool) or not isinstance(old_size, int)
                 or old_size < 0
-                or not isinstance(old_observed, (int, float))):
+                or not _finite_number(old_observed)):
             return None
     return value
 
@@ -1817,7 +1838,14 @@ def _install_reconciliation(cwd, kind, enumeration):
         "paths": unseen, "root_stamp": enumeration.root_stamp,
     }
     if not _write_catalog_manifest(cwd, filename, manifest):
-        return False
+        existing = _read_catalog_manifest(
+            cwd, filename, kind, entry["generation"], "delta")
+        if existing != manifest:
+            # The immutable publication landed, but the host snapshot changed
+            # before state could name it. Leave that orphan untouched and
+            # start a finite generation from the new snapshot; retrying the
+            # deterministic old filename could never converge.
+            return _start_catalog_generation(cwd, kind, enumeration)
     entry["delta_manifest"] = filename
     entry["delta_next"] = 0
     entry["root_stamp"] = enumeration.root_stamp
@@ -1836,8 +1864,12 @@ def _catalog_refresh_needed(cwd, kind, entry):
     view = _catalog_view(cwd, kind)
     if view.state == "degraded":
         return False
-    _records, issues = _catalog_record_inventory(cwd, kind, view)
-    if issues:
+    records, structural, _retryable = _catalog_record_inventory(
+        cwd, kind, view)
+    if structural or any(
+            record.get("status") == "refused"
+            and record.get("reason") != "missing"
+            for record in records):
         return True
     if kind == "claude":
         directory = claude_project_dir(cwd)
@@ -1865,6 +1897,9 @@ def _catalog_scan_step(cwd, kind, force=False):
         enumeration = _enumerate_catalog_candidates(cwd, kind)
         if enumeration is None:
             return CatalogProgress("degraded", 0, 0, 1, 0)
+        if entry is not None:
+            enumeration = enumeration._replace(relative_paths=tuple(sorted(
+                set(enumeration.relative_paths).union(view.candidates))))
         result = _catalog_phase(
             cwd, lambda: _start_catalog_generation(cwd, kind, enumeration))
         if not result.ok or not result.value:
@@ -1892,8 +1927,15 @@ def _catalog_scan_step(cwd, kind, force=False):
         view = _catalog_view(cwd, kind, loaded)
         if view.state == "degraded":
             return CatalogProgress("degraded", 0, 0, 1, 0)
-        _records, unproved = _catalog_record_inventory(cwd, kind, view)
-        state = "degraded" if unproved else view.state
+        records, structural, retryable = _catalog_record_inventory(
+            cwd, kind, view)
+        unproved = structural + retryable
+        retry_now = any(
+            record.get("status") == "refused"
+            and record.get("reason") != "missing"
+            for record in records)
+        state = ("degraded" if structural else
+                 "building" if retry_now else view.state)
         return CatalogProgress(state, view.pending, 0, unproved, 0)
     observations = [
         _observe_catalog_candidate(cwd, kind, relative)
@@ -1903,11 +1945,15 @@ def _catalog_scan_step(cwd, kind, force=False):
     if not merged.ok or not merged.value:
         return CatalogProgress("degraded", _catalog_pending(cwd, kind), 0, 1, 0)
     refusals = sum(record.get("status") == "refused" for record in observations)
+    observed_refusals = refusals
     loaded = _read_source_catalog(cwd)
     view = _catalog_view(cwd, kind, loaded)
-    _records, unproved = _catalog_record_inventory(cwd, kind, view)
+    _records, structural, retryable = _catalog_record_inventory(
+        cwd, kind, view)
+    unproved = structural + retryable
     refusals = max(refusals, unproved)
-    state = ("degraded" if view.state == "degraded" or refusals else
+    state = ("degraded" if (view.state == "degraded" or structural
+                            or observed_refusals) else
              view.state)
     return CatalogProgress(
         state,
@@ -1946,7 +1992,7 @@ def _catalog_records(cwd, kind):
             malformed += 1
             continue
         relative = value.get("relative") if isinstance(value, dict) else None
-        if (not isinstance(relative, str)
+        if (not _filesystem_safe_relative(relative)
                 or _read_catalog_record(cwd, kind, relative) != value
                 or os.path.abspath(_catalog_record_path(cwd, kind, relative))
                 != os.path.abspath(path)):
@@ -1957,15 +2003,15 @@ def _catalog_records(cwd, kind):
 
 
 def _catalog_record_inventory(cwd, kind, view):
-    """Return valid records and count every missing or unproved terminal row."""
+    """Return records, structural gaps, and retryable stored refusals."""
     records, malformed = _catalog_records(cwd, kind)
     by_relative = {record["relative"]: record for record in records}
     missing = set(view.candidates) - set(by_relative)
-    unproved = {
+    retryable = {
         record["relative"] for record in records
         if record.get("status") not in ("ready", "unrelated")
     }
-    return records, malformed + len(missing) + len(unproved)
+    return records, malformed + len(missing), len(retryable)
 
 
 def _catalog_marker(cwd, kind, relative):
@@ -1990,7 +2036,7 @@ def _gone_irrelevant(records, positions, boundary):
                     and isinstance(position.get("offset"), int)
                     and isinstance(size, int)
                     and position["offset"] >= size)
-        aged_out = (isinstance(observed, (int, float)) and observed < boundary)
+        aged_out = _finite_number(observed) and observed < boundary
         if not consumed and not aged_out:
             return False
     return True
@@ -2004,8 +2050,9 @@ def _discover_sources(cwd, kind, reader_side, positions, since):
     base_state, pending = view.state, view.pending
     structural = 1 if view.state == "degraded" else 0
     trust_inventory = view.state != "degraded"
-    records, record_issues = (_catalog_record_inventory(cwd, kind, view)
-                              if trust_inventory else ([], 0))
+    records, record_issues, _retryable = (
+        _catalog_record_inventory(cwd, kind, view)
+        if trust_inventory else ([], 0, 0))
     structural += record_issues
     by_relative = {record["relative"]: record for record in records}
     markers = {}

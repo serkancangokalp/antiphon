@@ -4974,6 +4974,64 @@ class SourceCatalogStateTest(unittest.TestCase):
                 self._state()["kinds"]["claude"]["generation"], generation)
             self.assertLessEqual(refreshed.processed, 2)
 
+    def test_reconciliation_resumes_after_manifest_publish_before_state(self):
+        self._source(1)
+        first = antiphon._catalog_scan_step(self.project, "claude")
+        self.assertEqual(first.state, "building")
+        self.assertEqual(
+            self._state()["kinds"]["claude"]["phase"], "reconcile")
+        enumeration = antiphon._enumerate_catalog_candidates(
+            self.project, "claude")
+
+        with patch.object(antiphon, "_write_catalog_state",
+                          return_value=False):
+            with antiphon.catalog_lock(self.project) as held:
+                self.assertTrue(held)
+                self.assertFalse(antiphon._install_reconciliation(
+                    self.project, "claude", enumeration))
+        entry = self._state()["kinds"]["claude"]
+        delta = os.path.join(
+            self.project, ".antiphon", "sources", "manifests",
+            f"{entry['generation']}-claude-delta.json")
+        self.assertTrue(os.path.isfile(delta))
+
+        with antiphon.catalog_lock(self.project) as held:
+            self.assertTrue(held)
+            self.assertTrue(antiphon._install_reconciliation(
+                self.project, "claude", enumeration))
+        self.assertEqual(
+            self._state()["kinds"]["claude"]["phase"], "complete")
+
+    def test_changed_reconciliation_retry_starts_a_fresh_generation(self):
+        self._source(1)
+        self.assertEqual(
+            antiphon._catalog_scan_step(self.project, "claude").state,
+            "building")
+        original_generation = self._state()["kinds"]["claude"]["generation"]
+        before = antiphon._enumerate_catalog_candidates(
+            self.project, "claude")
+        with patch.object(antiphon, "_write_catalog_state",
+                          return_value=False):
+            with antiphon.catalog_lock(self.project) as held:
+                self.assertTrue(held)
+                self.assertFalse(antiphon._install_reconciliation(
+                    self.project, "claude", before))
+
+        _sid, added = self._source(2)
+        after = antiphon._enumerate_catalog_candidates(
+            self.project, "claude")
+        with antiphon.catalog_lock(self.project) as held:
+            self.assertTrue(held)
+            self.assertTrue(antiphon._install_reconciliation(
+                self.project, "claude", after))
+        state = self._state()["kinds"]["claude"]
+        self.assertNotEqual(state["generation"], original_generation)
+        self.assertEqual(state["phase"], "base")
+        manifest = antiphon._read_catalog_manifest(
+            self.project, state["base_manifest"], "claude",
+            state["generation"], "base")
+        self.assertIn(os.path.relpath(added, self.host), manifest["paths"])
+
     def test_a_reserved_batch_repeats_after_interruption_instead_of_skipping(self):
         for number in range(3):
             self._source(number)
@@ -5183,6 +5241,51 @@ class SourceCatalogStateTest(unittest.TestCase):
             antiphon._catalog_scan_step(self.project, "claude").state,
             "degraded")
 
+    def test_manifest_paths_must_be_filesystem_safe(self):
+        self._source(1)
+        while antiphon._catalog_scan_step(
+                self.project, "claude").state != "complete":
+            pass
+        entry = self._state()["kinds"]["claude"]
+        path = os.path.join(
+            self.project, ".antiphon", "sources", "manifests",
+            entry["base_manifest"])
+        with open(path, encoding="utf-8") as f:
+            original = json.load(f)
+        for unsafe in ("bad\0.jsonl", "bad\ud800.jsonl"):
+            manifest = json.loads(json.dumps(original))
+            manifest["paths"] = [unsafe]
+            with open(path, "w", encoding="utf-8") as f:
+                json.dump(manifest, f)
+            self.assertIsNone(antiphon._read_catalog_manifest(
+                self.project, entry["base_manifest"], "claude",
+                entry["generation"], "base"))
+
+            candidate = antiphon.SourceCandidate(
+                "claude", unsafe, antiphon.source_id(unsafe),
+                antiphon._claude_slug(self.project))
+            opened = antiphon._open_safe_source(
+                self.host, candidate, self.project)
+            self.assertIsInstance(opened, antiphon.SourceRefusal)
+
+    def test_record_observation_times_are_real_and_finite(self):
+        _sid, path = self._source(2)
+        self.assertTrue(antiphon._record_current_source(
+            self.project, "claude", path).ok)
+        relative = os.path.relpath(path, self.host)
+        record_path = antiphon._catalog_record_path(
+            self.project, "claude", relative)
+        with open(record_path, encoding="utf-8") as f:
+            original = json.load(f)
+        for key, value in (("observed", True),
+                           ("last_complete_observed", float("-inf"))):
+            record = json.loads(json.dumps(original))
+            record[key] = value
+            with open(record_path, "w", encoding="utf-8") as f:
+                json.dump(record, f)
+            self.assertIsNone(antiphon._read_catalog_record(
+                self.project, "claude", relative))
+
     def test_a_malformed_candidate_record_is_not_overwritten(self):
         _sid, path = self._source(2)
         relative = os.path.relpath(path, self.host)
@@ -5296,6 +5399,62 @@ class CatalogDiscoveryTest(unittest.TestCase):
 
         self.assertIn("oldest", text)
         self.assertIn("discovery: degraded", text)
+
+    def test_refresh_cannot_forget_a_missing_record_and_missing_source(self):
+        sid, path = self._claude(1, "must remain known")
+        self._scan()
+        relative = os.path.relpath(path, self.claude_root)
+        os.unlink(antiphon._catalog_record_path(
+            self.project, "claude", relative))
+        os.unlink(path)
+
+        with patch.object(antiphon, "project_dir", return_value=self.project), \
+             contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(antiphon.sources("scan"), 1)
+        discovery = antiphon._discover_sources(
+            self.project, "claude", "codex", {}, since=0)
+        self.assertEqual(discovery.state, "degraded")
+        loaded = antiphon._read_source_catalog(self.project)
+        view = antiphon._catalog_view(self.project, "claude", loaded)
+        self.assertIn(relative, view.candidates)
+        record = antiphon._read_catalog_record(
+            self.project, "claude", relative)
+        self.assertEqual(record["status"], "refused")
+        self.assertEqual(record["reason"], "missing")
+
+    def test_retained_refusal_can_be_consumed_or_aged_out(self):
+        sid, path = self._claude(2, "was readable")
+        self._scan()
+        relative = os.path.relpath(path, self.claude_root)
+        ready = antiphon._read_catalog_record(
+            self.project, "claude", relative)
+        refused = json.loads(json.dumps(ready))
+        refused.update({
+            "status": "refused", "reason": "unreadable",
+            "generation": None, "complete_size": None,
+            "observed": time.time(),
+        })
+        self.assertTrue(antiphon._write_catalog_record(
+            self.project, "claude", relative, refused))
+        retained = antiphon._read_catalog_record(
+            self.project, "claude", relative)
+        os.unlink(path)
+
+        consumed = {sid: {
+            "gen": retained["last_complete_generation"],
+            "offset": retained["last_complete_size"],
+        }}
+        self.assertEqual(antiphon._discover_sources(
+            self.project, "claude", "codex", consumed, since=0).state,
+            "complete")
+
+        retained["last_complete_observed"] = time.time() - antiphon.LOOKBACK - 1
+        self.assertTrue(antiphon._atomic_json(
+            antiphon._catalog_record_path(
+                self.project, "claude", relative), retained))
+        self.assertEqual(antiphon._discover_sources(
+            self.project, "claude", "codex", {}, since=0).state,
+            "complete")
 
     def test_claude_catalog_candidates_are_bound_to_the_selected_slug(self):
         sibling = os.path.join(self.claude_root, "another-project")

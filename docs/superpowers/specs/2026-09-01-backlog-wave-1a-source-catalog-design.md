@@ -77,7 +77,10 @@ distinct files for one source are a degraded collision and neither is selected,
 including through the recent-window fallback. Records are partitioned by the
 leading digest bytes so listing one directory does not scale to the entire
 catalog. The measured corpus creates about 563 small JSON records; this inode
-and directory footprint is the accepted price of bounded normal-hook writes.
+and directory footprint is the current snapshot, not a steady-state bound.
+The catalog is structurally monotone through Wave 1A: it retains every proved
+candidate until cursor-aware v4 retirement, the accepted price of bounded
+normal-hook writes without silent narrowing.
 
 Every mutation holds `.antiphon/sources/.lock` and persists through an adjacent
 temporary file plus `os.replace`. A normal hook rewrites at most its current
@@ -95,6 +98,13 @@ project/kind/generation/phase metadata, committed indices and terminal record
 coverage must agree. A manifest candidate whose record is missing is still
 opened through the descriptor-safe path so its content is not hidden, but the
 page is degraded until a later bounded scan restores the missing proof.
+The deterministic reconciliation manifest publication is restart-idempotent:
+if its atomic write landed but the following state write did not, a retry may
+adopt that file only after its complete immutable content matches the intended
+project, kind, generation, phase, candidates and root stamp.
+If it differs because the host snapshot changed, the old immutable file remains
+an orphan and the current enumeration starts a fresh finite generation; retry
+never loops forever against a deterministic filename it cannot overwrite.
 
 The lock-order invariant is explicit: any operation that needs catalog and
 cursor work acquires and releases the catalog lock before it acquires the cursor
@@ -170,6 +180,10 @@ directory change starts a new finite refresh generation, while the direct
 current-source record makes the ordinary newly active transcript available
 immediately. Thus continuous transcript creation can schedule later bounded
 refresh work but cannot keep one generation permanently `building`.
+Refresh generations retain every previously committed candidate as well as the
+current host enumeration. A record and its transcript disappearing together
+therefore becomes durable gone/unproved evidence instead of erasing the source
+from completeness.
 
 An explicit command, `antiphon sources scan`, performs the same resumable work
 outside the latency-sensitive hook and may run it to completion. It is safe to
@@ -315,7 +329,9 @@ catalog, because its Wave 0 contract is project configuration only.
 - No catalog operation deletes a transcript, peer record, cursor, queue,
   attachment or socket.
 - Catalog source records are not automatically retired in this unit. Safe
-  retirement needs cursor-aware evidence and belongs with the v4 design.
+  retirement needs cursor-aware evidence and belongs with the v4 design; until
+  then the manifest/record candidate set is deliberately monotone across
+  refreshes, including transcripts that disappeared months earlier.
 
 ## 8. Failure handling
 
@@ -331,6 +347,12 @@ can be classified irrelevant without degrading discovery; a gone source that
 may still contain unread bytes remains degraded. If two paths claim one source
 id, neither distinct object wins by mtime. If the catalog belongs to another
 absolute project root, it is unreadable for this project and is not rewritten.
+
+Stored `refused` is a retry hint, not an unconditional structural verdict.
+Discovery reopens the candidate and applies the same per-reader gone rule; this
+allows a retained refusal that is consumed or strictly outside lookback to stop
+degrading that reader. Catalog timestamps must be real finite numbers, and all
+manifest/record paths must be representable filesystem strings without NUL.
 
 The explicit scanner returns nonzero while pending/refused work remains or the
 catalog cannot be trusted. Hook delivery remains exit 0 when its page was

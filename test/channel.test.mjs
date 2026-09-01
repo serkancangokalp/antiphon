@@ -494,7 +494,8 @@ async function aReconnectRepairsTheLiveListenersMissingRecord() {
   const first = spawnChannel(dir, "ui");
   let second;
   try {
-    assert.ok(await waitFor(() => registeredPeers(dir).length === 1),
+    assert.ok(await waitFor(() => registeredPeers(dir).length === 1
+      && existsSync(first.socketPath)),
       `first listener never registered: ${first.stderr()}`);
     await rm(endpointFor(dir, "ui"), { force: true });
     assert.deepEqual(registeredPeers(dir), []);

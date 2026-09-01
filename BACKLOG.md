@@ -84,7 +84,12 @@ the write-and-flush-before-advance transaction.
   and bind every Claude candidate to the independently selected host project
   directory. The same review made reservation/write contention visible in the
   hook page and scanner result, and made a partial first record retryable rather
-  than durable `ready` state.
+  than durable `ready` state. The follow-up exact-SHA review closed the crash
+  edge after delta-manifest publication, retained a committed candidate when
+  both its record and transcript disappear, separated structural corruption
+  from a reader-specific retained refusal, and rejected non-filesystem paths
+  plus boolean/non-finite observation times before either can manufacture a
+  false `complete` result.
 
 ### Still open, by name
 
