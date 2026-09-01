@@ -1049,6 +1049,25 @@ without ever registering is **not root-caused from here**; `registryCall`
 writes its failure to stderr, which for an MCP server reaches the host's log
 and never the person. Their `mcp-logs-antiphon/` is where that evidence is.
 
+**A product path to exactly that state is now root-caused and reproduced.**
+`peers._process_info` inherited both timezone and locale from its caller and
+then assumed the rendered `ps lstart` occupied 24 characters. `birth` and
+`owner_key` both embedded that rendering. In a throwaway project with the real
+0.3.3 channel, one live pid recorded under `TZ=UTC` read three hours later under
+`TZ=Europe/Istanbul`; `_record_alive` called it recycled, `read_peers` pruned
+its endpoint, and the same Node process remained bound to the named socket.
+The `owner_key` for one real CLI root changed across the same two reads, so a
+Codex endpoint and session could also remain live while becoming permanently
+unjoinable. A non-C `LC_TIME` adds a second failure to the fixed-width slice.
+
+The socket failure is durable rather than a transient race. Once a live named
+listener has no endpoint, every new 0.3.3 channel process claims the alias,
+finds that listener's socket, releases its own claim and leaves the listener
+unadvertised. This exact chain was reproduced with a plain live listener and a
+real 0.3.3 `channel.mjs`. It explains a product route to the report's shape; it
+does **not** prove which environment the reporter's host supplied, because the
+artifact contains neither that process environment nor its MCP log.
+
 **What is a real defect, independent of that.** `channel.mjs:462-466` assigns
 `senderAlias = peerName` only in the branch that both won the claim and serves
 the socket. Every other route through startup — claim lost, socket already
@@ -1077,6 +1096,14 @@ channel ownership, and today one answers the other.
    that a peer attempted a send and was refused; both agents concluded the
    other was idle. Even a line on the next page would have collapsed a
    40-minute investigation.
+5. Canonicalise process identity at observation time, under `LC_ALL=C` and
+   `TZ=UTC`, and version both endpoint births and owner keys. An already-written
+   unversioned value has unknown rendering provenance and must not be read as a
+   corpse merely because the new canonical string differs.
+6. Let a current listener restore only its own missing endpoint through a
+   versioned, content-free control request. A bare connect or generic JSON reply
+   is not proof; routing must see the listener's matching pid and socket in the
+   registry before the original message can be sent.
 
 **What landed.** A valid Claude `ANTIPHON_NAME` now signs both of its outgoing
 roads — the channel's `reply_to_codex` subprocess and the Stop-hook push —
@@ -1100,14 +1127,35 @@ channel-outage refusal. The already-honest explicit-name refusal remains
 byte-identical.
 
 On that explicit-name refusal only, Antiphon makes one best-effort connection
-to `sha256(project\0alias)`'s socket. If it answers, the existing channel
-payload carries a bridge-authored notice with the attempt time and requested
-alias, no original message content and no new metadata field. The sender's
-refusal remains the result; an absent socket receives no bytes; no pending
-delivery state is created. README, both generated agent rules and the live
-channel instructions state the same identity/reachability and notice contract.
-Why the reporter's original serving process had no registration remains
-unexplained, exactly as above.
+to `sha256(project\0alias)`'s socket. It first sends a versioned, content-free
+reassert request. A current listener validates its own alias and writes its own
+pid/address through the existing atomic `register_peer` path; the caller checks
+the nonce and protocol response, re-reads the registry, resolves the alias
+again and only then sends the original payload, once. Generic `{ok:true}`, a
+mismatched nonce, a matching reply without the registry record, an old listener
+and an arbitrary socket binder all fail closed. If recovery fails but the
+socket answers, the existing channel payload carries a bridge-authored notice
+with the attempt time and requested alias, no original message content and no
+new metadata field. The sender's refusal remains the result; an absent socket
+receives no bytes; no pending delivery state is created.
+
+New process observations now run `ps` under `LC_ALL=C` and `TZ=UTC`, parse its
+fields rather than slicing inherited output, mark endpoint births with their
+fingerprint generation and generate owner keys as `pid:vN:start`. A legacy
+endpoint birth retains PID-only liveness until its owner refreshes it: its old
+rendered value is evidence of nothing under the new canon. Equal legacy owner
+keys still join, equal current keys join, and a mixed generation never joins by
+pid alone; `doctor` reports that rolling-upgrade state without writing either
+record. A reconnect that finds a live current named listener asks that listener
+to reassert itself before claiming or touching its socket, so the persistent
+no-record loop repairs itself. An old or unverified listener remains a visible
+restart requirement. Doctor only reports; it never performs recovery.
+
+README, both generated agent rules and the live channel instructions state the
+same identity, reachability, recovery and notice contract. Why the reporter's
+original serving process had no registration remains unproven from their
+artifact, exactly as above; the deterministic product reproduction is the
+evidence for this fix, not an attribution to logs we do not have.
 
 **Also reported, filed rather than fixed here.** A stale pid left in
 `endpoint.json` by a writer that exited without unregistering, which works

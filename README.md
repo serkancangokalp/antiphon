@@ -58,7 +58,7 @@ A valid Claude `ANTIPHON_NAME` is the session's configured identity, not proof t
 
 If a label carries `reply_to=<unavailable>`, do not reply to its `from` alias: that channel belongs to a different session. The sender remains identified, but there is deliberately no routable return alias until its Claude channel is restarted under a unique name.
 
-An `Antiphon delivery notice:` event is a bridge-authored diagnostic: it carries no original message content and does not turn the sender's refusal into delivery. Antiphon sends one only when an explicitly requested alias has no live endpoint record but that alias's deterministic socket still answers; the notice names the alias and attempt time, while the original send remains refused.
+An `Antiphon delivery notice:` event is a bridge-authored diagnostic: it carries no original message content and does not turn the sender's refusal into delivery. Before that refusal, Antiphon makes one content-free recovery request to the explicitly requested alias's deterministic socket. A current listener can restore its own endpoint; the original words are sent exactly once, and only if the registry resolves again. An old or unverified listener stays refused and may need a restart. Doctor only reports this state; it never performs the recovery. When recovery fails but the socket still answers, the notice names the alias and attempt time while the original send remains refused.
 
 A Codex → Claude message never pastes text into the terminal and never impersonates user input. The local MCP server sends Claude Code a `notifications/claude/channel` event. Its metadata looks like:
 

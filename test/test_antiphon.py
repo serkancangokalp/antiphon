@@ -8690,6 +8690,29 @@ class SenderIdentityTest(unittest.TestCase):
                 self.assertIn("no original message content", words)
                 self.assertIn("sender's refusal", words)
 
+    def test_every_agent_facing_surface_explains_listener_owned_recovery(self):
+        """Recovery changes a refusal into delivery only after the listener
+        itself restores the record routing trusts. Every agent-facing contract
+        must preserve that boundary, including doctor's read-only role."""
+        node = read_source("lib", "channel.mjs")
+        start = node.index("    instructions:")
+        end = node.index("\n  },\n);", start)
+        channel = re.sub(r'"\s*\+\s*\n\s*"', "", node[start:end])
+        surfaces = {
+            "AGENTS.md rule": antiphon.AGENTS_RULE,
+            "CLAUDE.md rule": antiphon.CLAUDE_RULE,
+            "channel instructions": channel,
+            "README": read_source("README.md"),
+        }
+        for name, surface in surfaces.items():
+            with self.subTest(surface=name):
+                words = surface.lower()
+                self.assertIn("content-free recovery", words)
+                self.assertIn("restore its own endpoint", words)
+                self.assertIn("registry resolves again", words)
+                self.assertIn("old or unverified listener", words)
+                self.assertIn("doctor only reports", words)
+
     def test_every_agent_facing_surface_makes_an_unavailable_reply_fail_closed(self):
         """`from` remains identity after a duplicate-name loss, so every agent
         instruction must teach the separate non-route before it teaches a
