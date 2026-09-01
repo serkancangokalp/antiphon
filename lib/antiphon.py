@@ -3095,11 +3095,16 @@ def codex_rollout_files(cwd, days=3):
     return matched
 
 
+CODEX_TOOL_ARGUMENT_KEYS = {
+    "custom_tool_call": "input",
+    "function_call": "arguments",
+}
+
+
 def _codex_tool_fields(payload):
     """Return validated host fields from one measured Codex call shape."""
     kind = payload.get("type")
-    argument_key = {"custom_tool_call": "input",
-                    "function_call": "arguments"}.get(kind)
+    argument_key = CODEX_TOOL_ARGUMENT_KEYS.get(kind)
     if argument_key is None or not isinstance(payload.get(argument_key), str):
         return None
     name = payload.get("name")
@@ -3142,6 +3147,61 @@ def _codex_invocation(payload, source, start, ordinal=0):
     return _make_invocation(
         "codex", kind, name, arguments, source, payload.get("call_id"),
         start, ordinal, namespace=namespace)
+
+
+def _rejected_codex_tool_shape(payload):
+    """Whether one call-like payload is omitted by the shared validator."""
+    if not isinstance(payload, dict):
+        return False
+    kind = payload.get("type")
+    call_like = (isinstance(kind, str)
+                 and (kind in CODEX_TOOL_ARGUMENT_KEYS
+                      or kind.endswith("_call")))
+    return call_like and _codex_tool_fields(payload) is None
+
+
+def _codex_tool_shape_count(cwd, discovery=None, source_paths=None):
+    """Rejected call-like Codex records, or None when the count is unproved.
+
+    This is an explicit-doctor full scan, never a hook path. It intentionally
+    shares `_codex_tool_fields` with production parsing and reports only an
+    aggregate; malformed and unrelated records are not guessed into calls.
+    """
+    if source_paths is not None:
+        paths = tuple(source_paths)
+    else:
+        if discovery is None:
+            cursor, cursor_state = _read_cursor_state(cwd, "claude")
+            discovery = _reader_discovery(
+                cwd, "claude", cursor, cursor_state)
+        if discovery.state != "complete":
+            return None
+        paths = discovery.sources
+
+    count = 0
+    for path in paths:
+        opened = _open_discovered_source(path, cwd, "codex", report=False)
+        if isinstance(opened, SourceRefusal):
+            return None
+        with opened as source:
+            try:
+                for _start, _end, raw in source.read_retrieval_records():
+                    try:
+                        line = raw.decode("utf-8", "strict")
+                    except UnicodeDecodeError:
+                        continue
+                    try:
+                        record = json.loads(line)
+                    except (json.JSONDecodeError, ValueError):
+                        continue
+                    if (isinstance(record, dict)
+                            and record.get("type") == "response_item"
+                            and _rejected_codex_tool_shape(
+                                record.get("payload"))):
+                        count += 1
+            except OSError:
+                return None
+    return count
 
 
 def codex_events(cwd, positions=None, since=None, visible_record_limit=None,
@@ -7825,6 +7885,22 @@ def _doctor_codex(report, cwd):
     _doctor_codex_queue(report, cwd)
 
 
+def _doctor_codex_tool_shapes(report, cwd):
+    """Expose fail-closed Codex schema drift without printing its payload."""
+    count = _codex_tool_shape_count(cwd)
+    if count is None:
+        report.note("codex tool shapes: amount unknown because source "
+                    "discovery or reading is incomplete")
+    elif count:
+        noun = "record" if count == 1 else "records"
+        report.bad(f"codex tool shapes: {count} unrecognized tool-call "
+                   f"{noun} are omitted from passive pages — Codex's host "
+                   "schema may have changed; update Antiphon")
+    else:
+        report.ok("codex tool shapes: 0 unrecognized tool-call records in "
+                  "the trusted complete source set")
+
+
 def _doctor_codex_queue(report, cwd):
     """Messages `codex queue` accepted for a thread that is no longer running.
 
@@ -7894,6 +7970,7 @@ def _doctor_readonly():
     _doctor_channel(report, cwd, _doctor_peers(report, cwd))
     _doctor_codex(report, cwd)
     _doctor_sources(report, cwd)
+    _doctor_codex_tool_shapes(report, cwd)
     _doctor_replay(report, cwd)
     return 1 if report.broken else 0
 

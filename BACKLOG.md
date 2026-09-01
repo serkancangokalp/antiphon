@@ -160,6 +160,19 @@ the write-and-flush-before-advance transaction.
   incrementing the human-message count. Failed delivery persists neither their
   frontier nor scheduler lane, and no output can move the frontier past a first
   undelivered visible call.
+- A candidate-only doctor diagnostic now protects the same failure boundary
+  that let roughly 6,400 real calls disappear while the old suite stayed green.
+  On explicit `antiphon doctor` only, it scans the trusted complete Codex
+  discovery set and counts aggregate call-like records the production
+  `_codex_tool_fields` validator rejects. A positive count is broken because
+  those records are omitted from passive pages; incomplete discovery or reads
+  report an unknown amount rather than a false green zero. No type, name,
+  argument, result, path, source or native id is printed or persisted. The
+  green claim is deliberately narrower than "no tools were missed": a future
+  host shape that abandons the `_call` suffix can evade both parser and counter.
+  The full scan remains out of hooks, paging, setup and status — the measured
+  indexless scan over 243 MB cost about 579 ms, acceptable for an explicit
+  diagnostic and not for every turn.
 
 ### Completed by Wave 1D stable tool invocation retrieval (candidate, not published)
 

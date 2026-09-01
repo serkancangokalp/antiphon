@@ -4217,6 +4217,90 @@ class DoctorTest(unittest.TestCase):
                             f"{name}: {self.line_for(printed, name)!r}")
         self.assertEqual(code, 0, printed)
 
+    def test_doctor_counts_rejected_codex_call_shapes_privately_and_read_only(self):
+        project = self.project()
+        source = "17efb035-5650-4c4a-a363-026420ece317"
+        path = os.path.join(project,
+                            "rollout-2026-09-01T00-00-00-%s.jsonl" % source)
+        records = [
+            {"type": "response_item", "payload": {
+                "type": "custom_tool_call", "name": "exec",
+                "call_id": "call_known", "input": "PRIVATE-KNOWN"}},
+            {"type": "response_item", "payload": {
+                "type": "custom_tool_call_output", "call_id": "call_known",
+                "output": "PRIVATE-OUTPUT"}},
+            {"type": "response_item", "payload": {
+                "type": "function_call", "name": "search",
+                "call_id": "call_changed", "arguments": {
+                    "secret": "PRIVATE-CHANGED"}}},
+            {"type": "response_item", "payload": {
+                "type": "future_tool_call", "name": "future",
+                "secret": "PRIVATE-FUTURE"}},
+            {"type": "response_item", "payload": {
+                "type": "message", "role": "assistant",
+                "content": [{"type": "output_text", "text": "ordinary"}]}}
+        ]
+        with open(path, "w", encoding="utf-8") as stream:
+            for record in records:
+                stream.write(json.dumps(record) + "\n")
+        self.set_up(project)
+        before = self.snapshot(project)
+
+        count = antiphon._codex_tool_shape_count(
+            project, source_paths=[path])
+        with patch.object(antiphon, "_codex_tool_shape_count",
+                          return_value=count):
+            code, printed = self.run_doctor(project)
+
+        self.assertEqual(count, 2)
+        lines = [line for line in printed.splitlines()
+                 if "codex tool shapes:" in line]
+        self.assertEqual(len(lines), 1)
+        self.assertTrue(lines[0].startswith("✗"), lines[0])
+        self.assertIn("2 unrecognized tool-call records", lines[0])
+        self.assertIn("omitted from passive pages", lines[0])
+        for secret in ("PRIVATE-KNOWN", "PRIVATE-OUTPUT", "PRIVATE-CHANGED",
+                       "PRIVATE-FUTURE", source, path, "future_tool_call"):
+            self.assertNotIn(secret, lines[0])
+        self.assertEqual(code, 1)
+        self.assertEqual(self.snapshot(project), before)
+
+        known_path = os.path.join(project, "known-" + source + ".jsonl")
+        with open(known_path, "w", encoding="utf-8") as stream:
+            for record in records[:2] + records[-1:]:
+                stream.write(json.dumps(record) + "\n")
+        self.assertEqual(antiphon._codex_tool_shape_count(
+            project, source_paths=[known_path]), 0)
+
+        for value, prefix in ((0, "✓"), (None, "·")):
+            with self.subTest(value=value):
+                report, out = antiphon._Report(), io.StringIO()
+                with patch.object(antiphon, "_codex_tool_shape_count",
+                                  return_value=value), \
+                     contextlib.redirect_stdout(out):
+                    antiphon._doctor_codex_tool_shapes(report, project)
+                line = self.line_for(out.getvalue(), "codex tool shapes:")
+                self.assertTrue(line.startswith(prefix), line)
+                if value is None:
+                    self.assertIn("amount unknown", line)
+                else:
+                    self.assertIn("0 unrecognized tool-call records", line)
+                self.assertFalse(report.broken)
+
+        building = antiphon.Discovery(
+            (path,), "building", 1, 0, 0, "catalog incomplete")
+        self.assertIsNone(antiphon._codex_tool_shape_count(
+            project, discovery=building))
+
+        def read_fault(_source):
+            raise OSError(errno.EIO, "injected diagnostic read fault")
+            yield
+
+        with patch.object(antiphon._PathSource, "read_retrieval_records",
+                          new=read_fault):
+            self.assertIsNone(antiphon._codex_tool_shape_count(
+                project, source_paths=[path]))
+
     def test_a_healthy_idle_project_prints_no_x(self):
         """A set-up project with no session running is not broken. No socket,
         no peers, no ✗, exit 0 — a diagnostic that warns about the normal
