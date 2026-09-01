@@ -43,8 +43,12 @@ the moment of delivery and emits no notification.
 
 - One file per owner under the project's registry area, named from a digest of
   the owner key, never from the raw key.
-- Fields: version, kind, owner-key digest, current canonical session id,
-  identity digest, written time.
+- Fields: version, kind, the validated canonical owner key, the owner-key
+  digest that names the path, the current canonical session id, the identity
+  digest, and the written time. The owner key is stored because liveness is a
+  fact about a pid and a start time, and a digest is one-way: without the key,
+  an owner's death can never be proved, only assumed. It is private and is
+  never rendered on any surface.
 - Written in full then atomically replaced, under the existing registry lock.
   Never rendered on any surface.
 - Read validation is strict and total. Wrong version, wrong kind, missing or
@@ -55,8 +59,17 @@ the moment of delivery and emits no notification.
   rather than inheriting trust, and old writers are never rewritten or guessed.
 - Explicit-name and configured-invalid hooks never write it. The proof is a
   fact about automatic identity alone.
-- Per owner and replaced in place, so it does not grow; removed when that
-  owner's last automatic peer is unregistered.
+- Per owner and replaced in place, so it does not grow.
+- **The proof deliberately outlives endpoints.** An owner with zero automatic
+  peers is not a reason to delete it: that is precisely the reconnect window of
+  §6, where B is the current identity and has no endpoint yet. Deleting the
+  proof there would erase the only evidence that B exists, and `status` and
+  `doctor` would have nothing to name.
+- It is removed only when its owner is **positively proved dead**, and only on
+  a mutation path that is already writing the registry. A read-only surface —
+  `status`, `doctor`, any resolver — never prunes it. Unproved or unknown
+  liveness leaves it alone: an unreclaimed record costs a file, and a wrongly
+  reclaimed one costs a live session its identity.
 
 ## 4. Withdrawal
 
@@ -126,8 +139,8 @@ signal past a boundary you failed to create.
 
 One central redactor per language, applied **before** truncation and preserving
 `refusal_class`. It removes unanchored UUIDs case-insensitively, full identity
-digests, and automatic routes, while preserving the public `auto-` alias and the
-remedy.
+digests, automatic routes, and raw owner keys, while preserving the public
+`auto-` alias and the remedy.
 
 Surfaces: `README.md`, `BACKLOG.md`, `CLAUDE_RULE`, `AGENTS_RULE` and the
 channel instructions. Behavioural fixtures for reply, Stop, startup, status,
