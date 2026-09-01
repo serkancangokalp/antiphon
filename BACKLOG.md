@@ -394,12 +394,20 @@ readiness, never an address, never a session id.
   its first hook — and those two call for opposite actions: one must wait, the
   other must retire. So the guaranteed cleanup never happened and an outgrown
   socket lived until its process exited. Withdrawal now writes a small
-  `retired.json` beside the halves: not joinable by anything, carrying only the
-  owner key and identity digest it belongs to, and validated in full before it
-  may authorise the one destructive action in this contract. Writing a half
-  again clears it, because a host can resume a session id; a tombstone whose
-  endpoint is gone has no reader left and is collected on the same locked pass
-  that writes them.
+  `retired.json` beside the halves: not joinable by anything, and validated in
+  full before it may authorise the one destructive action in this contract.
+  Two properties make it positive evidence rather than a mark. It names the
+  session it withdrew, and the owner's current session must be a different one
+  — a host that resumes a session id is not a rotation, and a listener
+  reconnecting under an identity its owner is on again must not read stale
+  about itself. And it is consulted only when the half is *genuinely absent*:
+  `_session_address` answers "no" for six different reasons, and a read that
+  failed or a record that is torn is evidence of nothing, which must never
+  destroy a listener. The evidence is written before the half is unlinked, so
+  a failure there keeps the half rather than leaving a deletion nothing
+  explains. Writing a half again clears the tombstone; one whose endpoint is
+  gone has no reader left and is collected on the same locked pass that writes
+  them.
 - **A rotation costs a reconnect, and that price is accepted.** There is no
   dynamic rename of a live listener: a process serving under one identity must
   not silently become another, because a sender that addressed the old name

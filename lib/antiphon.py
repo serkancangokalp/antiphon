@@ -551,7 +551,8 @@ def automatic_verdict(cwd, kind, peer, proof):
         # the rotation's own withdrawal made every outgrown peer read UNREADY,
         # so the self-retirement this contract guarantees never happened.
         if peers.retired_half(cwd, "claude", peer.get("name"),
-                              peer.get("owner"), digest):
+                              peer.get("owner"), digest,
+                              record.get("session_id")):
             return "PROVED_STALE"
         return "UNREADY"
     if (record.get("session_id") == bound
@@ -5356,7 +5357,19 @@ def send_to_claude(cwd, text, alias=None, sender_alias=None, message_id=None):
     try:
         with sock:
             sock.sendall(payload)
-            sock.shutdown(socket.SHUT_WR)
+            try:
+                sock.shutdown(socket.SHUT_WR)
+            except OSError as error:
+                # A proved-stale listener answers and withdraws, so its socket
+                # can be gone before this half-close. On this platform that
+                # raises ENOTCONN — and it sat in the arm below that relabels
+                # everything `transport`, discarding a classified answer that
+                # is often already in the receive buffer. Telling a sender to
+                # blame the socket when the listener said "the identity moved"
+                # is the exact substitution the class exists to prevent, so
+                # this one failure is swallowed and the read below decides.
+                if error.errno not in (errno.ENOTCONN, errno.EPIPE):
+                    raise
             reply_bytes = b""
             while len(reply_bytes) < 64 * 1024:
                 chunk = sock.recv(8192)
@@ -8685,9 +8698,18 @@ def _doctor_peers(report, cwd):
         # socket from the channel probe below.
         verdict = automatic_verdict(cwd, record.get("kind"), diagnostic,
                                     peers.read_identity_proof(cwd, owner))
-        if verdict is not None and verdict != "READY":
+        # The remedy belongs to the rotation window and nowhere else. `UNREADY`
+        # is the state every automatic channel passes through before its first
+        # Stop hook, and telling that operator to reconnect restarts the
+        # identical wait; a reconnect does not repair an unreadable proof
+        # either. Only `PROVED_STALE` names something a reconnect fixes.
+        if verdict == "PROVED_STALE":
             report.note(f"peer {who}: {_VERDICT_NOTE[verdict]} — "
                         f"{RECONNECT_REMEDY}")
+        elif verdict in ("UNKNOWN", "STRUCTURAL_INVALID"):
+            report.note(f"peer {who}: {_VERDICT_NOTE[verdict]}")
+        elif verdict == "UNREADY":
+            report.note(f"peer {who}: live, waiting for its first turn")
         elif peers._address_of(diagnostic) is None:
             if not mixed_owner_generation:
                 report.note(f"peer {who}: live, waiting for its first turn")
@@ -8701,8 +8723,8 @@ def _doctor_peers(report, cwd):
 # terminal.
 _VERDICT_NOTE = {
     "PROVED_STALE": "this alias is no longer its session's automatic identity",
-    "UNREADY": "this alias is not joined to a current session, so nothing "
-               "can be delivered to it",
+    # `UNREADY` is deliberately absent: it renders as the ordinary
+    # waiting-for-a-first-turn line, because that is what it is.
     "UNKNOWN": "this alias could not be checked because its identity proof "
                "could not be read; nothing is concluded from that",
     "STRUCTURAL_INVALID": "this alias has an identity proof that cannot be "

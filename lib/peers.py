@@ -273,24 +273,61 @@ def _valid_retired_half(record, owner, identity_digest):
     Total, like every other record read here. A tombstone from another owner or
     another identity says nothing about this one, and a record that cannot be
     trusted must never authorise the one destructive action in this contract.
+    The session id is part of that: a tombstone that names none cannot tell
+    "the owner moved on from me" from "the owner came back to me".
     """
     if not isinstance(record, dict):
         return False
     version = record.get("version")
-    return (version == RETIRED_HALF_VERSION and not isinstance(version, bool)
+    withdrawn = record.get("session_id")
+    return (isinstance(version, int) and not isinstance(version, bool)
+            and version == RETIRED_HALF_VERSION
             and record.get("kind") == "claude"
             and record.get("owner") == owner
             and valid_owner_key(owner)
             and record.get("identity_digest") == identity_digest
-            and valid_identity_digest(identity_digest))
+            and valid_identity_digest(identity_digest)
+            and valid_session_id(withdrawn)
+            and auto_identity(withdrawn) == (
+                auto_name_from_digest(identity_digest), identity_digest))
 
 
-def retired_half(cwd, kind, name, owner, identity_digest):
-    """True when this exact endpoint's half was withdrawn by a rotation."""
+def session_half_missing(cwd, kind, name):
+    """True only when the hook's half is genuinely absent.
+
+    `_session_address` answers None for six different reasons and only one of
+    them is "no half was ever written". A read that failed is evidence of
+    nothing, and a torn record is evidence of corruption — neither is evidence
+    that this owner moved on, and only that may retire a listener.
+    """
     if not (valid_kind(kind) and valid_key(kind, name)):
         return False
+    try:
+        os.stat(_session_file(cwd, kind, name))
+    except FileNotFoundError:
+        return True
+    except OSError:
+        return False
+    return False
+
+
+def retired_half(cwd, kind, name, owner, identity_digest, current_session_id):
+    """True when a rotation withdrew this endpoint's half and has not returned.
+
+    Positive on both halves of the question: the tombstone names the session it
+    withdrew, and the owner's current session must be a different one. A host
+    that resumes a session id is not a rotation, and a listener reconnecting
+    under an identity its owner is on again must not read stale about itself.
+    """
+    if not (valid_kind(kind) and valid_key(kind, name)):
+        return False
+    if not session_half_missing(cwd, kind, name):
+        return False
     record = _read_record(retired_half_path(cwd, kind, name))
-    return bool(record) and _valid_retired_half(record, owner, identity_digest)
+    if not (record and _valid_retired_half(record, owner, identity_digest)):
+        return False
+    return (valid_session_id(current_session_id)
+            and current_session_id != record.get("session_id"))
 
 
 def _session_file(cwd, kind, name):
@@ -658,6 +695,10 @@ def _withdraw_stale_automatic_sessions_locked(cwd, owner_key, current_digest):
         if not entry.startswith(prefix):
             continue
         name = entry[len(prefix):]
+        # Off disk, and about to become a path. `_scan` validates the
+        # same way; this is the one place in this module that did not.
+        if not valid_key("claude", name):
+            continue
         path = _session_file(cwd, "claude", name)
         record = _read_record(path)
         if not record or record.get("owner") != owner_key:
@@ -665,27 +706,43 @@ def _withdraw_stale_automatic_sessions_locked(cwd, owner_key, current_digest):
         digest = record.get("identity_digest")
         if not isinstance(digest, str) or digest == current_digest:
             continue
+        # Evidence first, then the deletion it explains. Unlinking first and
+        # failing to write left exactly the state the tombstone exists to end —
+        # a half that is gone with nothing saying why — while the rotation
+        # reported the withdrawal as done.
+        withdrawn = record.get("session_id")
+        if valid_session_id(withdrawn) and not _write_retired_half_locked(
+                cwd, name, owner_key, digest, withdrawn):
+            continue
         with contextlib.suppress(OSError):
             os.unlink(path)
-            _write_retired_half_locked(cwd, name, owner_key, digest)
             removed.append(name)
     _collect_retired_halves_locked(cwd, entries)
     return removed
 
 
-def _write_retired_half_locked(cwd, name, owner_key, identity_digest):
-    """Record that this peer was joined and is no longer. Lock held."""
+def _write_retired_half_locked(cwd, name, owner_key, identity_digest,
+                               session_id):
+    """Record that this peer was joined and is no longer. Lock held.
+
+    Returns whether the evidence is on disk. A withdrawal this cannot evidence
+    is not one the caller may make.
+    """
     path = retired_half_path(cwd, "claude", name)
     record = {"version": RETIRED_HALF_VERSION, "kind": "claude",
-              "owner": owner_key, "identity_digest": identity_digest}
+              "owner": owner_key, "identity_digest": identity_digest,
+              "session_id": session_id}
     tmp = f"{path}.{os.getpid()}.tmp"
     try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
         with open(tmp, "w", encoding="utf-8") as stream:
             json.dump(record, stream, ensure_ascii=False)
         os.replace(tmp, path)
     except OSError:
         with contextlib.suppress(OSError):
             os.unlink(tmp)
+        return False
+    return True
 
 
 def _collect_retired_halves_locked(cwd, entries):
@@ -702,6 +759,10 @@ def _collect_retired_halves_locked(cwd, entries):
         if not entry.startswith(prefix):
             continue
         name = entry[len(prefix):]
+        # Off disk, and about to become a path. `_scan` validates the
+        # same way; this is the one place in this module that did not.
+        if not valid_key("claude", name):
+            continue
         path = retired_half_path(cwd, "claude", name)
         if not os.path.exists(path):
             continue

@@ -2432,6 +2432,15 @@ class RetiredHalfTombstoneTest(unittest.TestCase):
                                 f"/t/{alias_a}.jsonl", owner, digest_a, True)
             self.assertEqual(self._verdict(project, alias_a), "READY",
                              "a rejoined peer is not haunted by its tombstone")
+            # The verdict alone cannot prove this: it consults the tombstone
+            # only when the half is missing, so with the half back it
+            # short-circuits and would read READY whether or not the unlink
+            # happened. Assert the file directly, which is what this test is
+            # named for.
+            self.assertFalse(
+                os.path.exists(
+                    peers.retired_half_path(project, "claude", alias_a)),
+                "writing a half is the event that ends `withdrawn`")
 
     def test_retired_half_a_tombstone_without_an_endpoint_is_collected(self):
         """Once the listener has withdrawn its endpoint the tombstone has no
@@ -2464,3 +2473,178 @@ class RetiredHalfTombstoneTest(unittest.TestCase):
                 os.path.exists(
                     peers.retired_half_path(project, "claude", alias_a)),
                 "another owner's peer is not this rotation's business")
+
+
+class TombstoneIsPositiveEvidenceTest(unittest.TestCase):
+    """A tombstone authorises the one destructive action here, so it must prove
+    a rotation happened — not merely that one once did.
+
+    Two ways the first version was weaker than the action it authorised.
+
+    `_session_address` returns None for six different reasons, and only one of
+    them is "no half was ever written". Upgrading all six to PROVED_STALE meant
+    an `EIO` on the half destroyed a healthy endpoint, which §2 forbids in so
+    many words: an unreadable record is evidence of nothing.
+
+    And a tombstone that names no session cannot tell "the owner moved on from
+    me" from "the owner came back to me". A host that resumes a session id —
+    or a listener that reconnects while a stale tombstone is still on disk —
+    then reads stale about itself and retires at bootstrap.
+    """
+
+    A = "8261c119-2c20-4bf4-87ab-f152ac87dbda"
+    B = "0199a1b2-2222-7000-8000-00000000000b"
+
+    def _verdict(self, project, alias):
+        sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "lib"))
+        import antiphon
+        peer = next((p for p in peers.read_peers(project, "claude")
+                     if p.get("name") == alias), None)
+        if peer is None:
+            return "NO-RECORD"
+        return antiphon.automatic_verdict(
+            project, "claude", peer,
+            peers.read_identity_proof(project, peer.get("owner")))
+
+    def _rotated(self, project):
+        """The real state: A joined, rotation to B, tombstone left behind."""
+        owner = peers.owner_key()
+        alias, digest = peers.auto_identity(self.A)
+        peers.register(project, "claude", alias,
+                       os.path.join(project, alias + ".sock"),
+                       pid=os.getpid(), owner_key=owner,
+                       identity_digest=digest, mode="initial")
+        peers.write_session(project, "claude", alias, self.A,
+                            f"/t/{alias}.jsonl", owner, digest, True)
+        peers.write_identity_proof(project, owner, self.A, digest)
+        peers.rotate_identity_proof(project, owner, self.B,
+                                    peers.auto_identity(self.B)[1])
+        return owner, alias
+
+    def test_tombstone_an_unreadable_half_never_authorises_retirement(self):
+        with tempfile.TemporaryDirectory() as project:
+            owner, alias = self._rotated(project)
+            self.assertEqual(self._verdict(project, alias), "PROVED_STALE")
+            # The half comes back, unreadable. Nothing about this says the
+            # owner moved on; it says one read failed.
+            half = peers._session_file(project, "claude", alias)
+            with open(half, "w", encoding="utf-8") as stream:
+                stream.write("{}")
+            os.chmod(half, 0)
+            try:
+                self.assertNotEqual(
+                    self._verdict(project, alias), "PROVED_STALE",
+                    "an unreadable record must not destroy a listener")
+            finally:
+                os.chmod(half, 0o600)
+
+    def test_tombstone_a_torn_half_never_authorises_retirement(self):
+        with tempfile.TemporaryDirectory() as project:
+            owner, alias = self._rotated(project)
+            self._write_half(project, alias, "{")
+            self.assertEqual(self._verdict(project, alias), "UNREADY",
+                             "a torn half reads exactly as it did before the "
+                             "tombstone existed")
+
+    def test_tombstone_a_half_from_another_owner_never_authorises_retirement(self):
+        with tempfile.TemporaryDirectory() as project:
+            owner, alias = self._rotated(project)
+            _n, digest = peers.auto_identity(self.A)
+            self._write_half(project, alias, json.dumps(
+                {"kind": "claude", "name": alias,
+                 "owner": "4243:v1:Mon Sep  1 00:00:00 2026",
+                 "session_id": self.A, "automatic": True,
+                 "identity_digest": digest}))
+            self.assertEqual(self._verdict(project, alias), "UNREADY")
+
+    def test_tombstone_the_owner_coming_back_is_not_a_rotation(self):
+        """The bootstrap failure this design exists to avoid. The tombstone
+        names the session it withdrew; when the proof names that same session
+        again, nothing was outgrown and nothing may be retired."""
+        with tempfile.TemporaryDirectory() as project:
+            owner, alias = self._rotated(project)
+            self.assertEqual(self._verdict(project, alias), "PROVED_STALE")
+            peers.rotate_identity_proof(project, owner, self.A,
+                                        peers.auto_identity(self.A)[1])
+            self.assertNotEqual(
+                self._verdict(project, alias), "PROVED_STALE",
+                "the owner is on this identity again; the stale tombstone must "
+                "not retire the listener that just reconnected")
+
+    def test_tombstone_records_the_session_it_withdrew(self):
+        with tempfile.TemporaryDirectory() as project:
+            owner, alias = self._rotated(project)
+            with open(peers.retired_half_path(project, "claude", alias),
+                      encoding="utf-8") as stream:
+                record = json.load(stream)
+            self.assertEqual(record.get("session_id"), self.A,
+                             "positive evidence: which session was withdrawn")
+
+    def test_tombstone_is_written_before_the_half_is_unlinked(self):
+        """A crash between the two recreates the bug the tombstone fixes, and
+        the rotation would have reported the withdrawal as done."""
+        with tempfile.TemporaryDirectory() as project:
+            owner = peers.owner_key()
+            alias, digest = peers.auto_identity(self.A)
+            peers.register(project, "claude", alias,
+                           os.path.join(project, alias + ".sock"),
+                           pid=os.getpid(), owner_key=owner,
+                           identity_digest=digest, mode="initial")
+            peers.write_session(project, "claude", alias, self.A,
+                                f"/t/{alias}.jsonl", owner, digest, True)
+            peers.write_identity_proof(project, owner, self.A, digest)
+            real = peers.os.replace
+            tombstone = peers.retired_half_path(project, "claude", alias)
+
+            def failing(src, dst, *a, **k):
+                if str(dst) == tombstone:
+                    raise OSError(errno.EIO, "Input/output error")
+                return real(src, dst, *a, **k)
+
+            with patch.object(peers.os, "replace", side_effect=failing):
+                outcome = peers.rotate_identity_proof(
+                    project, owner, self.B, peers.auto_identity(self.B)[1])
+            self.assertTrue(os.path.exists(
+                peers._session_file(project, "claude", alias)),
+                "the half is kept when its tombstone could not be written")
+            self.assertEqual(list(outcome.withdrawn), [],
+                             "and the rotation does not claim a withdrawal it "
+                             "could not make evidence of")
+
+    def _write_half(self, project, alias, body):
+        path = peers._session_file(project, "claude", alias)
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w", encoding="utf-8") as stream:
+            stream.write(body)
+
+
+class TombstoneRecordCeilingTest(unittest.TestCase):
+    """The strictness the proof reader has, the tombstone reader needs too.
+
+    Both authorise the same destructive action, and the tombstone's version
+    check accepted a JSON float where the proof's refuses one. Parity held only
+    because both languages were lax in the same place, which is agreement about
+    the wrong answer.
+    """
+
+    A = "8261c119-2c20-4bf4-87ab-f152ac87dbda"
+
+    def test_tombstone_a_float_version_is_not_a_tombstone(self):
+        _alias, digest = peers.auto_identity(self.A)
+        record = json.loads('{"version": 1.0, "kind": "claude", '
+                            f'"owner": "4242:v1:Mon Sep  1 00:00:00 2026", '
+                            f'"identity_digest": "{digest}", '
+                            f'"session_id": "{self.A}"}}')
+        self.assertFalse(
+            peers._valid_retired_half(
+                record, "4242:v1:Mon Sep  1 00:00:00 2026", digest),
+            "a version that is not exactly the current integer is not one")
+
+    def test_tombstone_a_true_version_is_not_a_tombstone(self):
+        """`True == 1` in Python, and a bool must never pass for a version."""
+        _alias, digest = peers.auto_identity(self.A)
+        record = {"version": True, "kind": "claude",
+                  "owner": "4242:v1:Mon Sep  1 00:00:00 2026",
+                  "identity_digest": digest, "session_id": self.A}
+        self.assertFalse(peers._valid_retired_half(
+            record, "4242:v1:Mon Sep  1 00:00:00 2026", digest))

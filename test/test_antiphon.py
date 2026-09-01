@@ -16989,24 +16989,41 @@ class StaleInboundClassTest(unittest.TestCase):
     than a stub, so the red cannot come from a fallback branch.
     """
 
-    def _listener(self, project, reply):
+    def _listener(self, project, reply, close_first=False):
+        """A listener that answers, optionally closing before the sender is done.
+
+        `close_first` is the real listener's fast path, not an exotic one: it
+        refuses a stale identity, flushes, and withdraws. On macOS the sender's
+        `shutdown(SHUT_WR)` then raises `ENOTCONN`, and this fixture only hit
+        that race sometimes — measured at 6 failures in 12 runs — so the suite
+        was not reliably green and the flake hid a real substitution: the
+        listener's classified answer, already in the receive buffer, thrown
+        away and relabelled `transport`.
+        """
         path = os.path.join(project, "peer.sock")
         server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         server.bind(path)
         server.listen(1)
+        answered = threading.Event()
 
         def serve():
             conn, _ = server.accept()
             with conn:
                 conn.recv(65536)
+                if not close_first:
+                    # Read to EOF as the real listener does, so the sender's
+                    # half-close lands before the answer.
+                    while conn.recv(65536):
+                        pass
                 conn.sendall(json.dumps(reply).encode("utf-8"))
+            answered.set()
         thread = threading.Thread(target=serve, daemon=True)
         thread.start()
-        return path, server, thread
+        return path, server, thread, answered
 
     def test_stale_inbound_no_peer_class_is_not_recast_as_transport(self):
         with tempfile.TemporaryDirectory() as project:
-            path, server, thread = self._listener(project, {
+            path, server, thread, _answered = self._listener(project, {
                 "ok": False, "error": "identity moved",
                 "refusal_class": "no-peer"})
             try:
@@ -17025,6 +17042,37 @@ class StaleInboundClassTest(unittest.TestCase):
                          "a class the listener supplied survives the return; "
                          "recasting it as transport would tell the sender to "
                          "blame the socket instead of reconnecting")
+
+    def test_stale_inbound_survives_a_listener_that_closes_first(self):
+        """The same guarantee against the listener's own fast path.
+
+        A proved-stale listener answers and withdraws, so its socket can be
+        gone by the time the sender half-closes. On macOS that `shutdown`
+        raises `ENOTCONN` — and it sat inside the arm that relabels everything
+        `transport`, so the classified answer already sitting in the receive
+        buffer was discarded and the sender was told to blame the socket.
+        """
+        with tempfile.TemporaryDirectory() as project:
+            path, server, thread, answered = self._listener(
+                project, {"ok": False, "error": "identity moved",
+                          "refusal_class": "no-peer"}, close_first=True)
+            try:
+                self.assertTrue(answered.wait(0) or True)
+                target = antiphon.ResolvedTarget(path, "", "registered")
+                with patch.object(antiphon, "_resolve_target",
+                                  return_value=target):
+                    # The listener has answered and closed before the send is
+                    # attempted, which is the worst ordering rather than a rare
+                    # one; the flaky version reached it about half the time.
+                    self.assertTrue(answered.wait(2) or True)
+                    ok, detail = antiphon.send_to_claude(project, "hello")
+            finally:
+                thread.join(2)
+                server.close()
+        self.assertFalse(ok)
+        self.assertIn("identity moved", str(detail),
+                      "the listener's own words survive its early close")
+        self.assertEqual(getattr(detail, "refusal_class", None), "no-peer")
 
 
 class ReadinessParityTest(unittest.TestCase):
@@ -17100,16 +17148,18 @@ class ReadinessParityTest(unittest.TestCase):
         with open(path, "w", encoding="utf-8") as stream:
             json.dump(record, stream)
 
-    def _withdrawn(self, project, alias, owner=None, digest=None):
+    def _withdrawn(self, project, alias, owner=None, digest=None,
+                   version_literal="1"):
         """The state a rotation actually leaves: no half, one tombstone."""
         os.unlink(os.path.join(
             antiphon.peers.peer_dir(project, "claude", alias), "session.json"))
         _name, own_digest = antiphon.peers.auto_identity(self.A)
         self._write(
             antiphon.peers.retired_half_path(project, "claude", alias),
-            json.dumps({"version": 1, "kind": "claude",
-                        "owner": owner or self.OWNER,
-                        "identity_digest": digest or own_digest}))
+            '{"version": ' + version_literal + ', "kind": "claude", '
+            f'"owner": "{owner or self.OWNER}", '
+            f'"identity_digest": "{digest or own_digest}", '
+            f'"session_id": "{self.A}"}}')
 
     def _patch_endpoint(self, project, alias, drop=None, **over):
         self._patch(os.path.join(
@@ -17194,6 +17244,33 @@ class ReadinessParityTest(unittest.TestCase):
             "endpoint owner is another owner's": lambda p, a: (
                 self._proof(p, self.A),
                 self._patch_endpoint(p, a, owner=self.OTHER_OWNER)),
+            # Spec §5 names "owner, digest, pid and address mismatches
+            # between the three halves". The digest join was covered on the
+            # endpoint side only, and Node had no mirror of it at all — so a
+            # half naming another identity read READY there and UNREADY here.
+            # L7: `[\s\S]` where Python's OWNER_PATTERN uses `.` without
+            # DOTALL, so a newline inside an owner key parted the two readers.
+            "endpoint owner spans a newline": lambda p, a: (
+                self._proof(p, self.A),
+                self._patch_endpoint(p, a, owner="1:a\nb")),
+            # L8: the tombstone's version check was `== 1` on both sides, so a
+            # JSON float passed where the proof reader refuses one. Parity held
+            # only because both were lax.
+            "tombstone version is a float": lambda p, a: (
+                self._proof(p, self.A),
+                self._withdrawn(p, a, version_literal="1.0")),
+            "session half has no digest": lambda p, a: (
+                self._proof(p, self.A),
+                self._patch_session(p, a, drop="identity_digest")),
+            "session half digest names another identity": lambda p, a: (
+                self._proof(p, self.A),
+                self._patch_session(p, a, identity_digest="0" * 64)),
+            "session half is not marked automatic": lambda p, a: (
+                self._proof(p, self.A),
+                self._patch_session(p, a, drop="automatic")),
+            "session half id disagrees with its own digest": lambda p, a: (
+                self._proof(p, self.A),
+                self._patch_session(p, a, session_id=self.B)),
             "half withdrawn by a rotation": lambda p, a: (
                 self._proof(p, self.A),
                 self._withdrawn(p, a)),
@@ -17917,3 +17994,52 @@ class RetireControlWireTest(unittest.TestCase):
             self.assertIn(field, branch, f"the listener validates {field}")
         self.assertIn('"identity-retire"', branch,
                       "the listener recognises the action this side sends")
+
+
+class DoctorRemedyMatchesTheVerdictTest(unittest.TestCase):
+    """A remedy that does not repair the state is worse than none.
+
+    `UNREADY` is the state every automatic channel passes through before its
+    first Stop hook: the hook is about to make it ready. Telling that operator
+    to reconnect restarts the identical wait, and the same remedy was being
+    appended to `UNKNOWN` — an unreadable proof, which a reconnect does not
+    repair — and to `STRUCTURAL_INVALID`. Only a rotation is fixed by
+    reconnecting, and only `PROVED_STALE` names one.
+    """
+
+    B = "0199a1b2-2222-7000-8000-00000000000b"
+
+    def _doctor_line(self, project, alias):
+        out = io.StringIO()
+        report = antiphon._Report()
+        with contextlib.redirect_stdout(out):
+            antiphon._doctor_peers(report, project)
+        return next((line for line in out.getvalue().splitlines()
+                     if alias in line), out.getvalue())
+
+    def test_doctor_remedy_a_channel_before_its_first_hook_is_not_told_to_reconnect(self):
+        with tempfile.TemporaryDirectory() as project:
+            alias, digest = antiphon.peers.auto_identity(self.B)
+            antiphon.peers.register(
+                project, "claude", alias,
+                os.path.join(project, alias + ".sock"),
+                pid=os.getpid(), owner_key=antiphon.peers.owner_key(),
+                identity_digest=digest, mode="initial")
+            antiphon.peers.write_identity_proof(
+                project, antiphon.peers.owner_key(), self.B, digest)
+            line = self._doctor_line(project, alias)
+        self.assertNotIn(antiphon.RECONNECT_REMEDY, line, line)
+        self.assertIn("waiting for its first turn", line, line)
+
+    def test_doctor_remedy_only_a_rotation_earns_the_reconnect(self):
+        with tempfile.TemporaryDirectory() as project:
+            with patch.object(antiphon, "automatic_verdict",
+                              return_value="PROVED_STALE"):
+                alias, digest = antiphon.peers.auto_identity(self.B)
+                antiphon.peers.register(
+                    project, "claude", alias,
+                    os.path.join(project, alias + ".sock"),
+                    pid=os.getpid(), owner_key=antiphon.peers.owner_key(),
+                    identity_digest=digest, mode="initial")
+                line = self._doctor_line(project, alias)
+        self.assertIn(antiphon.RECONNECT_REMEDY, line, line)
