@@ -3,7 +3,7 @@ import { createHash } from "node:crypto";
 import { execFileSync, spawn } from "node:child_process";
 import { existsSync, mkdirSync, readdirSync, readFileSync, statSync, symlinkSync, writeFileSync } from "node:fs";
 import { mkdtemp, rm } from "node:fs/promises";
-import { Socket, connect } from "node:net";
+import { Socket, connect, createServer } from "node:net";
 import { once } from "node:events";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -119,9 +119,17 @@ function spawnChannel(dir, name) {
   else delete env.ANTIPHON_NAME;
   const child = spawn("node", ["lib/channel.mjs"], { env, stdio: ["pipe", "pipe", "pipe"] });
   let stderr = "";
+  let stdout = "";
   child.stderr.setEncoding("utf8");
   child.stderr.on("data", (chunk) => { stderr += chunk; });
-  return { child, socketPath: socketFor(dir, name), stderr: () => stderr };
+  child.stdout.setEncoding("utf8");
+  child.stdout.on("data", (chunk) => { stdout += chunk; });
+  return {
+    child,
+    socketPath: socketFor(dir, name),
+    stderr: () => stderr,
+    stdout: () => stdout,
+  };
 }
 
 // Every test removes exactly the socket it created and nothing else. Killing
@@ -185,6 +193,135 @@ function registeredPeers(dir) {
     .map((entry) => join(root, entry, "endpoint.json"))
     .filter((path) => existsSync(path))
     .map((path) => JSON.parse(readFileSync(path, "utf8")));
+}
+
+function endpointFor(dir, name) {
+  return join(dir, ".antiphon", "peers", `claude-${name}`, "endpoint.json");
+}
+
+async function aLiveListenerReassertsItsOwnMissingEndpoint() {
+  // The durable outage: the process and named socket are both alive, but a
+  // reader rendered its process birth in another timezone and pruned the
+  // endpoint. Only the process actually serving the socket may restore it.
+  const dir = await mkdtemp(join(tmpdir(), "antiphon-reassert-"));
+  const session = spawnChannel(dir, "ui");
+  try {
+    assert.ok(await waitFor(() => registeredPeers(dir).length === 1),
+      `listener never registered: ${session.stderr()}`);
+    const endpoint = endpointFor(dir, "ui");
+    await rm(endpoint, { force: true });
+    assert.deepEqual(registeredPeers(dir), [], "fixture must reproduce no endpoint");
+
+    const wrong = JSON.parse(await sendTo(session.socketPath, JSON.stringify({
+      control: "antiphon.channel",
+      version: 1,
+      action: "reassert",
+      alias: "api",
+      nonce: "wrong-alias",
+    })));
+    assert.equal(wrong.ok, false);
+    assert.deepEqual(registeredPeers(dir), [],
+      "a request for another alias must write nothing");
+
+    const nonce = "reassert-own-endpoint";
+    const reply = JSON.parse(await sendTo(session.socketPath, JSON.stringify({
+      control: "antiphon.channel",
+      version: 1,
+      action: "reassert",
+      alias: "ui",
+      nonce,
+    })));
+    assert.deepEqual(reply, {
+      ok: true,
+      control: "antiphon.channel",
+      version: 1,
+      action: "reasserted",
+      alias: "ui",
+      nonce,
+      pid: session.child.pid,
+    });
+    assert.ok(await waitFor(() => registeredPeers(dir).length === 1),
+      `listener did not restore its endpoint: ${session.stderr()}`);
+    const [restored] = registeredPeers(dir);
+    assert.equal(restored.pid, session.child.pid,
+      "the caller must never register another process on its behalf");
+    assert.equal(restored.address, session.socketPath);
+    assert.ok(!session.stdout().includes("notifications/claude/channel"),
+      "a control request must never become a Claude channel notification");
+    console.log("a live listener reasserts its own endpoint: ok");
+  } finally {
+    await cleanUp(session, dir);
+  }
+}
+
+async function anArbitrarySocketBinderIsNotAdopted() {
+  const dir = await mkdtemp(join(tmpdir(), "antiphon-binder-"));
+  const path = socketFor(dir, "ui");
+  let received = "";
+  const binder = createServer({ allowHalfOpen: true }, (socket) => {
+    socket.on("error", () => {});
+    socket.setEncoding("utf8");
+    socket.on("data", (chunk) => { received += chunk; });
+    socket.on("end", () => socket.end(JSON.stringify({ ok: true })));
+  });
+  await new Promise((resolve, reject) => {
+    binder.once("error", reject);
+    binder.listen(path, resolve);
+  });
+  const session = spawnChannel(dir, "ui");
+  try {
+    assert.ok(await waitFor(() => /did not prove/.test(session.stderr())),
+      `the occupied path was not diagnosed: ${session.stderr()}`);
+    assert.deepEqual(registeredPeers(dir), [],
+      "generic JSON from a socket holder is not an endpoint claim");
+    const request = JSON.parse(received);
+    assert.equal(request.control, "antiphon.channel");
+    assert.equal(request.action, "reassert");
+    assert.equal(request.alias, "ui");
+    assert.ok(!Object.hasOwn(request, "content"),
+      "even an unverified listener learns no attempted message content");
+    console.log("an arbitrary socket binder is not adopted: ok");
+  } finally {
+    await new Promise((resolve) => binder.close(resolve));
+    await cleanUp(session, dir);
+  }
+}
+
+async function aReconnectRepairsTheLiveListenersMissingRecord() {
+  // This is the persistent production chain, not only the control primitive:
+  // a second MCP server starts while the first still owns the named socket but
+  // its endpoint has been pruned. The second must ask the first to advertise
+  // itself, never leave the project in the same invisible state again.
+  const dir = await mkdtemp(join(tmpdir(), "antiphon-reconnect-"));
+  const first = spawnChannel(dir, "ui");
+  let second;
+  try {
+    assert.ok(await waitFor(() => registeredPeers(dir).length === 1),
+      `first listener never registered: ${first.stderr()}`);
+    await rm(endpointFor(dir, "ui"), { force: true });
+    assert.deepEqual(registeredPeers(dir), []);
+
+    second = spawnChannel(dir, "ui");
+    assert.ok(await waitFor(() => registeredPeers(dir).length === 1
+      && /reasserted its endpoint/.test(second.stderr())),
+      `reconnect did not repair the first listener:\n${first.stderr()}\n${second.stderr()}`);
+    const [restored] = registeredPeers(dir);
+    assert.equal(restored.pid, first.child.pid,
+      "the process holding the socket must remain the registered peer");
+    assert.notEqual(restored.pid, second.child.pid,
+      "the reconnect must not advertise itself over somebody else's socket");
+    assert.ok(existsSync(first.socketPath));
+
+    second.child.kill("SIGTERM");
+    await once(second.child, "exit");
+    assert.equal(registeredPeers(dir)[0].pid, first.child.pid,
+      "the reconnect's shutdown must not release the listener's restored claim");
+    assert.ok(existsSync(first.socketPath));
+    console.log("a reconnect repairs the live listener's missing record: ok");
+  } finally {
+    await cleanUp(first, dir);
+    if (second) await cleanUp(second, dir);
+  }
 }
 
 // Four sessions, four real process trees, nothing planted. Every earlier test
@@ -803,6 +940,9 @@ await anOversizedMessageIsRefusedWithoutKillingTheSession();
 await aRefusedClientCannotKeepStreaming();
 await aStalledClientDoesNotBlockShutdown();
 await aSocketPathItCannotClearDoesNotKillTheSession();
+await aLiveListenerReassertsItsOwnMissingEndpoint();
+await anArbitrarySocketBinderIsNotAdopted();
+await aReconnectRepairsTheLiveListenersMissingRecord();
 await everySessionSignsTheValidNameItWasGiven();
 await fourLiveSessionsRouteByName();
 await onlyOneUnnamedSessionGetsTheChannel(false);   // a second terminal, later
