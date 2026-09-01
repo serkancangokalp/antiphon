@@ -2,7 +2,10 @@ import sys, os
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "lib"))
 import peers
 
+import contextlib
+import errno
 import hashlib
+import io
 import json
 import multiprocessing
 import subprocess
@@ -2020,3 +2023,215 @@ class AutomaticRegistrationModeTest(unittest.TestCase):
                               move_then_read):
                 ok, detail = self._claim(project, self.A, "initial")
             self.assertFalse(ok, detail)
+
+
+class ProofLifecycleTest(unittest.TestCase):
+    """A proof outlives endpoints, and is removed only on proved death.
+
+    Two failures are possible here and only one of them is visible. Deleting a
+    proof too early erases the only evidence that the current identity exists,
+    and `status` and `doctor` fall silent in exactly the window they were built
+    for. Never deleting one leaks a file per dead session forever, quietly.
+
+    So reclamation happens on the write path that already holds the lock —
+    `rotate_identity_proof`, which is what production actually calls — bounded,
+    cheap, and only on positive proof of death.
+    """
+
+    A = "8261c119-2c20-4bf4-87ab-f152ac87dbda"
+    B = "0199a1b2-2222-7000-8000-00000000000b"
+
+    def _owner(self, pid, start="Mon Sep  1 00:00:00 2026"):
+        return f"{pid}:v1:{start}"
+
+    def _proof(self, project, owner, session_id):
+        _alias, digest = peers.auto_identity(session_id)
+        self.assertTrue(
+            peers.write_identity_proof(project, owner, session_id, digest))
+        return peers.identity_proof_path(project, owner)
+
+    def _rotate(self, project, owner, session_id):
+        _alias, digest = peers.auto_identity(session_id)
+        return peers.rotate_identity_proof(project, owner, session_id, digest)
+
+    _reaped = 0
+
+    @classmethod
+    def _dead_pid(cls):
+        """A pid that raises ProcessLookupError: started, exited and reaped.
+
+        A real child rather than a made-up number. An arbitrary integer could
+        belong to a live process on the machine running this, and the test
+        would then measure the opposite of what it claims.
+        """
+        child = subprocess.Popen([sys.executable, "-c", "pass"])
+        child.wait()
+        cls._reaped += 1
+        return child.pid
+
+    def test_proof_lifecycle_survives_a_zero_endpoint_window(self):
+        """B is current and owns no endpoint at all. Deleting its proof here
+        because the owner has no automatic peer would erase the only evidence
+        that B exists — which is the reconnect window, not garbage."""
+        with tempfile.TemporaryDirectory() as project:
+            owner = self._owner(os.getpid())
+            self._proof(project, owner, self.A)
+            outcome = self._rotate(project, owner, self.B)
+            self.assertTrue(outcome.ok)
+            state, record = peers._read_identity_proof_file(
+                peers.identity_proof_path(project, owner),
+                peers._owner_digest(owner))
+            self.assertEqual(state, "valid", "the current proof survives")
+            self.assertEqual(record.get("session_id"), self.B)
+            self.assertEqual(peers.read_peers(project, "claude"), [],
+                             "the window under test has zero endpoints")
+
+    def test_proof_lifecycle_reclaims_a_dead_owner_through_a_real_hook(self):
+        """Driven through `rotate_identity_proof` — the call production makes.
+        A reclaimer with no real caller would let a unit test pass while
+        production collected nothing, forever."""
+        with tempfile.TemporaryDirectory() as project:
+            dead = self._owner(self._dead_pid())
+            stale = self._proof(project, dead, self.A)
+            self.assertTrue(os.path.exists(stale))
+            self._rotate(project, self._owner(os.getpid()), self.B)
+            self.assertFalse(os.path.exists(stale),
+                             "a proved-dead owner's proof is collected")
+
+    def test_proof_lifecycle_reclamation_spares_a_live_successor(self):
+        """Only ProcessLookupError proves death. A live owner, and the owner
+        doing the rotating, both survive every sweep."""
+        with tempfile.TemporaryDirectory() as project:
+            mine = self._owner(os.getpid())
+            neighbour = self._owner(os.getppid())
+            kept = self._proof(project, neighbour, self.A)
+            self._rotate(project, mine, self.B)
+            self.assertTrue(os.path.exists(kept),
+                            "a live neighbour is never reclaimed")
+            self.assertTrue(
+                os.path.exists(peers.identity_proof_path(project, mine)),
+                "a rotation never collects the proof it just wrote")
+
+    def test_proof_lifecycle_sweep_makes_progress_past_live_records(self):
+        """Scanning the first eight of a sorted inventory on every write is a
+        latency bound with no progress guarantee: eight live records at the
+        front would starve a dead one behind them forever. The cursor is what
+        turns the bound into progress."""
+        with tempfile.TemporaryDirectory() as project:
+            mine = self._owner(os.getpid())
+            live = [self._owner(os.getpid(), f"Mon Sep  1 00:00:{n:02d} 2026")
+                    for n in range(1, 12)]
+            for owner in live:
+                self._proof(project, owner, self.A)
+            dead_owner = self._owner(self._dead_pid())
+            dead = self._proof(project, dead_owner, self.A)
+            for attempt in range(12):
+                self._rotate(project, mine, self.B)
+                if not os.path.exists(dead):
+                    break
+            self.assertFalse(os.path.exists(dead),
+                             "a dead record behind eleven live ones is still "
+                             f"reached; {attempt + 1} writes were not enough")
+            for owner in live:
+                self.assertTrue(
+                    os.path.exists(peers.identity_proof_path(project, owner)),
+                    "every live record survives the sweep that passed it")
+
+    def test_proof_lifecycle_a_malformed_sweep_cursor_resets_to_the_start(self):
+        """The cursor is an optimisation with no correctness role. Refusing to
+        sweep because it cannot be parsed would stall reclamation forever over
+        a file nobody can repair."""
+        with tempfile.TemporaryDirectory() as project:
+            mine = self._owner(os.getpid())
+            dead = self._proof(project, self._owner(self._dead_pid()), self.A)
+            path = peers.identity_sweep_cursor_path(project)
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            with open(path, "w", encoding="utf-8") as stream:
+                stream.write("{not json")
+            self._rotate(project, mine, self.B)
+            self.assertFalse(os.path.exists(dead),
+                             "a malformed cursor resets rather than refusing")
+
+    def test_proof_lifecycle_sweep_uses_only_cheap_death_evidence(self):
+        """The five-second `ps` path must never be reached from a hook. Death
+        here is `ProcessLookupError` and nothing else: a recycled pid answers
+        signal 0 and is conservatively kept, which is the safe direction."""
+        with tempfile.TemporaryDirectory() as project:
+            self._proof(project, self._owner(self._dead_pid()), self.A)
+            with patch.object(peers, "_process_birth",
+                              side_effect=AssertionError("ps was consulted")), \
+                 patch.object(peers, "_process_info",
+                              side_effect=AssertionError("ps was consulted")):
+                self._rotate(project, self._owner(os.getpid()), self.B)
+
+    def test_proof_lifecycle_sweep_stops_on_its_cooperative_budget(self):
+        """A fake clock, never a real elapsed time: the budget is cooperative
+        rather than a wall-clock cap, and asserting on a real scheduler would
+        be flaky. At least one record of progress is made regardless."""
+        with tempfile.TemporaryDirectory() as project:
+            mine = self._owner(os.getpid())
+            owners = [self._owner(self._dead_pid()) for _ in range(4)]
+            paths = [self._proof(project, owner, self.A) for owner in owners]
+            ticks = iter([0.0] + [1.0] * 50)
+            with patch.object(peers, "_sweep_clock",
+                              side_effect=lambda: next(ticks)):
+                self._rotate(project, mine, self.B)
+            self.assertTrue(peers._read_sweep_cursor(project),
+                            "one record of progress was made and recorded")
+            remaining = [path for path in paths if os.path.exists(path)]
+            # Progress is a record examined, which is not the same as a record
+            # reclaimed: the one this window reached may be the rotation's own
+            # protected proof. What the budget promises is that the loop stopped
+            # between records — without it, one window would have swept all four.
+            self.assertGreaterEqual(
+                len(remaining), len(paths) - 1,
+                "the budget stops the loop after one record, not after eight")
+            # And the same project, on a real clock, still converges.
+            for _ in range(len(paths) + 2):
+                self._rotate(project, mine, self.B)
+            self.assertEqual([path for path in paths if os.path.exists(path)],
+                             [], "the budget delays reclamation, never ends it")
+
+    def test_proof_lifecycle_a_failing_sweep_never_costs_the_rotation(self):
+        """The sweep runs after the proof has committed. Every error it can
+        raise is swallowed there, because a hook that already made the routing
+        decision correct must not then report failure."""
+        with tempfile.TemporaryDirectory() as project:
+            mine = self._owner(os.getpid())
+            alias_a, digest_a = peers.auto_identity(self.A)
+            peers.register(project, "claude", alias_a,
+                           os.path.join(project, alias_a + ".sock"),
+                           pid=os.getpid(), owner_key=mine,
+                           identity_digest=digest_a, mode="initial")
+            peers.write_session(project, "claude", alias_a, self.A,
+                                f"/t/{alias_a}.jsonl", mine, digest_a, True)
+            peers.write_identity_proof(project, mine, self.A, digest_a)
+            printed = io.StringIO()
+            with patch.object(peers.os, "replace",
+                              side_effect=self._replace_that_fails_the_cursor(
+                                  project)), \
+                 contextlib.redirect_stderr(printed):
+                outcome = self._rotate(project, mine, self.B)
+            self.assertTrue(outcome.ok, "the rotation still succeeds")
+            state, record = peers._read_identity_proof_file(
+                peers.identity_proof_path(project, mine),
+                peers._owner_digest(mine))
+            self.assertEqual(state, "valid")
+            self.assertEqual(record.get("session_id"), self.B,
+                             "the current proof is the one just written")
+            self.assertEqual(list(outcome.withdrawn), [alias_a],
+                             "the session the rotation outgrew is still retired")
+            self.assertNotIn(project, printed.getvalue(),
+                             "a swallowed sweep failure prints no private path")
+
+    def _replace_that_fails_the_cursor(self, project):
+        """`os.replace` that works everywhere except the sweep cursor."""
+        real = os.replace
+        cursor = peers.identity_sweep_cursor_path(project)
+
+        def replace(src, dst, *args, **kwargs):
+            if str(dst) == cursor:
+                raise OSError(errno.EIO, "Input/output error")
+            return real(src, dst, *args, **kwargs)
+
+        return replace

@@ -20,6 +20,7 @@ than guessed at.
 """
 
 import base64
+import bisect
 import collections
 import contextlib
 import fcntl
@@ -414,6 +415,159 @@ def identity_proofs(cwd):
         tuple(found), "lower-bound" if found else "unknown")
 
 
+# ---- proof reclamation -----------------------------------------------------
+#
+# A proof outlives endpoints on purpose, so nothing on a read path may remove
+# one. Reclamation therefore lives on the write path that already holds the
+# lock — `rotate_identity_proof`, which is the call production actually makes.
+# A collector with no real caller would let a unit test pass while production
+# collected nothing, forever.
+#
+# Three properties, and each of them is a decision:
+#
+# - **Cheap evidence only.** Death is `ProcessLookupError` and nothing else.
+#   The `ps` fingerprint path costs seconds and this runs inside a hook; a
+#   recycled pid answers signal 0 and is conservatively kept, which is the safe
+#   direction. Keeping a dead owner's file costs one small file; deleting a live
+#   owner's erases the evidence `status` and `doctor` need.
+# - **Progress, not merely a bound.** Examining the first eight of a sorted
+#   inventory on every write bounds latency and guarantees nothing: eight live
+#   records at the front would starve a dead one behind them forever. A
+#   persistent cursor makes each write resume where the last stopped and wrap,
+#   so every record is reached within a bounded number of writes.
+# - **Cooperative, not wall-clock.** The budget is checked between records and
+#   only after one record of progress, so a slow machine finishes the record it
+#   started rather than being cut mid-decision.
+IDENTITY_SWEEP_WINDOW = 8              # records examined per rotation
+IDENTITY_SWEEP_BUDGET = 0.050          # seconds, checked between records
+
+# Indirection so a test can drive a deterministic clock. Asserting on real
+# elapsed time under a real scheduler would be flaky, and the budget is
+# cooperative rather than a cap anyone can measure from outside.
+_sweep_clock = time.monotonic
+
+
+def identity_sweep_cursor_path(cwd):
+    """Where the sweep remembers what it examined last.
+
+    Beside the proofs rather than among them: a cursor inside that directory
+    would be enumerated as a proof, read as invalid, and would permanently
+    downgrade the inventory's completeness to `lower-bound` — turning an
+    optimisation into a lie about how much of the truth an answer covers.
+    """
+    return os.path.join(cwd, ".antiphon", "identity", "sweep.json")
+
+
+def _read_sweep_cursor(cwd):
+    """The proof filename the last sweep stopped after, or "" to start over.
+
+    Malformed resets rather than refusing. The cursor has no correctness role —
+    it only decides where to look first — so refusing to sweep because it
+    cannot be parsed would stall reclamation forever over a file nobody can
+    repair.
+    """
+    try:
+        with open(identity_sweep_cursor_path(cwd), encoding="utf-8") as stream:
+            record = json.load(stream)
+    except (OSError, ValueError):
+        return ""
+    after = record.get("after") if isinstance(record, dict) else None
+    return after if isinstance(after, str) else ""
+
+
+def _write_sweep_cursor_locked(cwd, after):
+    """Persist where to resume. Best effort: the caller has already committed."""
+    path = identity_sweep_cursor_path(cwd)
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    tmp = f"{path}.{os.getpid()}.tmp"
+    with open(tmp, "w", encoding="utf-8") as stream:
+        json.dump({"version": IDENTITY_PROOF_VERSION, "after": after}, stream,
+                  ensure_ascii=False)
+    os.replace(tmp, path)
+
+
+def _proved_dead(owner_key):
+    """True only when the kernel says that pid does not exist.
+
+    Deliberately weaker than `_owner_liveness`: no start-time comparison, so no
+    `ps`. A recycled pid reads as not-dead here, and a proof whose owner is a
+    stranger simply survives another sweep.
+    """
+    if not valid_owner_key(owner_key):
+        return False
+    try:
+        pid = int(owner_key.split(":", 1)[0])
+    except (ValueError, AttributeError):
+        return False
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return True
+    except OSError:
+        # EPERM means somebody else's live process. Anything else is evidence
+        # of nothing, and neither is proof of death.
+        return False
+    return False
+
+
+def _sweep_identity_proofs_locked(cwd, protect):
+    """Reclaim proofs whose owner is proved dead. Lock held; never raises.
+
+    Runs after the rotation has committed, so every failure here is swallowed:
+    a hook that already made the routing decision correct must not then report
+    failure because a housekeeping pass could not finish.
+    """
+    reclaimed = 0
+    try:
+        directory = identity_proofs_dir(cwd)
+        names = sorted(entry.name for entry in os.scandir(directory)
+                       if entry.is_file() and entry.name.endswith(".json"))
+    except OSError:
+        return reclaimed
+    if not names:
+        return reclaimed
+    after = _read_sweep_cursor(cwd)
+    # Resume after the cursor and wrap: `bisect` gives the first name strictly
+    # greater, and a cursor naming a file since removed lands in the right place
+    # anyway, which is why the cursor holds a name rather than an index.
+    start = bisect.bisect_right(names, after) if after else 0
+    if start >= len(names):
+        start = 0
+    examined = None
+    deadline = _sweep_clock() + IDENTITY_SWEEP_BUDGET
+    for step in range(min(IDENTITY_SWEEP_WINDOW, len(names))):
+        # Between records, and never before the first: a slow machine finishes
+        # the record it started rather than being cut mid-decision, so the
+        # sweep always makes at least one record of progress.
+        if step and _sweep_clock() >= deadline:
+            break
+        name = names[(start + step) % len(names)]
+        examined = name
+        digest = name[: -len(".json")]
+        if digest in protect:
+            continue
+        state, record = _read_identity_proof_file(
+            os.path.join(directory, name), digest)
+        # An unreadable or invalid record is not proved dead. It survives: this
+        # sweep removes evidence only where death is positive, and a record it
+        # cannot read is not evidence of death but the absence of evidence.
+        if state != "valid" or not _proved_dead(record.get("owner_key")):
+            continue
+        try:
+            os.unlink(os.path.join(directory, name))
+            reclaimed += 1
+        except OSError:
+            continue
+    if examined is not None:
+        try:
+            _write_sweep_cursor_locked(cwd, examined)
+        except OSError:
+            # The cursor is an optimisation. Losing it costs a repeated window
+            # next time, never correctness.
+            pass
+    return reclaimed
+
+
 RotationOutcome = collections.namedtuple(
     "RotationOutcome", "ok prior current withdrawn")
 
@@ -476,6 +630,10 @@ def rotate_identity_proof(cwd, owner_key, session_id, identity_digest):
             cwd, owner_key, identity_digest)
         _state, current = _read_identity_proof_file(
             identity_proof_path(cwd, owner_key), digest)
+        # After the transaction, under the same acquisition, and unable to fail
+        # it: the proof this rotation just wrote is protected by name, and every
+        # other error is swallowed inside the sweep.
+        _sweep_identity_proofs_locked(cwd, {digest})
         return RotationOutcome(True, prior if prior_state == "valid" else None,
                                current, tuple(withdrawn))
 

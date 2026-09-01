@@ -17615,3 +17615,60 @@ class ReconnectNoticeTest(unittest.TestCase):
         self.assertTrue(counted, doctor)
         for line in counted:
             self.assertTrue(line.startswith("·"), line)
+
+
+class ProofLifecycleSurfaceTest(unittest.TestCase):
+    """Reclamation belongs to the write path, and to nothing else.
+
+    `status` and `doctor` exist to explain a quiet bridge without changing it.
+    A read that collected would remove the record it was about to explain, and
+    the operator would be told a confident zero by the very command they ran to
+    find out what was there.
+    """
+
+    A = "8261c119-2c20-4bf4-87ab-f152ac87dbda"
+    B = "0199a1b2-2222-7000-8000-00000000000b"
+
+    @staticmethod
+    def _dead_pid():
+        child = subprocess.Popen([sys.executable, "-c", "pass"])
+        child.wait()
+        return child.pid
+
+    def test_proof_lifecycle_read_only_surfaces_reclaim_nothing(self):
+        with tempfile.TemporaryDirectory() as project:
+            dead = f"{self._dead_pid()}:v1:Mon Sep  1 00:00:00 2026"
+            _alias, digest = antiphon.peers.auto_identity(self.A)
+            antiphon.peers.write_identity_proof(project, dead, self.A, digest)
+            path = antiphon.peers.identity_proof_path(project, dead)
+            before = open(path, "rb").read()
+            with patch.object(antiphon, "project_dir", return_value=project):
+                with contextlib.redirect_stdout(io.StringIO()):
+                    antiphon.status()
+                    antiphon.doctor()
+                # The resolver reads proofs on every send decision, and it is
+                # the hottest read path there is.
+                antiphon._resolve_target(project, "claude", None)
+            self.assertTrue(os.path.exists(path),
+                            "a read-only surface never collects a proof, not "
+                            "even one whose owner is proved dead")
+            self.assertEqual(before, open(path, "rb").read(),
+                             "nor rewrites one")
+
+    def test_proof_lifecycle_the_real_hook_collects(self):
+        """The whole point of putting the sweep on `rotate_identity_proof` is
+        that production reaches it. Driven through `record_claude_session` —
+        the Claude hook's own entry point — rather than the rotation helper,
+        because a caller that exists only in a test collects nothing."""
+        with tempfile.TemporaryDirectory() as project:
+            dead = f"{self._dead_pid()}:v1:Mon Sep  1 00:00:00 2026"
+            _alias, digest_a = antiphon.peers.auto_identity(self.A)
+            antiphon.peers.write_identity_proof(project, dead, self.A, digest_a)
+            stale = antiphon.peers.identity_proof_path(project, dead)
+            self.assertTrue(os.path.exists(stale))
+            env = {k: v for k, v in os.environ.items() if k != "ANTIPHON_NAME"}
+            with patch.dict(os.environ, env, clear=True), \
+                 contextlib.redirect_stderr(io.StringIO()):
+                antiphon.record_claude_session(project, self.B, "/t/b.jsonl")
+            self.assertFalse(os.path.exists(stale),
+                             "the hook production runs is what collects")
