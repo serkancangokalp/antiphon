@@ -16770,3 +16770,96 @@ class AutomaticReadyVerdictTest(unittest.TestCase):
                 resolved = antiphon._resolve_target(project, "claude", alias)
                 self.assertIsNone(resolved.address,
                                   "the resolver consults the predicate")
+
+
+class HookIdentityCommitTest(unittest.TestCase):
+    """The Claude hook rotates the proof before it decides anything else."""
+
+    OWNER = "4242:v1:Mon Sep  1 00:00:00 2026"
+    A = "8261c119-2c20-4bf4-87ab-f152ac87dbda"
+    B = "0199a1b2-2222-7000-8000-00000000000b"
+
+    def _half(self, project, session_id):
+        alias, digest = antiphon.peers.auto_identity(session_id)
+        antiphon.peers.register(project, "claude", alias,
+                                os.path.join(project, alias + ".sock"),
+                                pid=os.getpid(), owner_key=self.OWNER,
+                                identity_digest=digest)
+        antiphon.peers.write_session(project, "claude", alias, session_id,
+                                     f"/t/{alias}.jsonl", self.OWNER, digest,
+                                     True)
+        return alias
+
+    def test_hook_identity_commit_precedes_any_join_decision(self):
+        order = []
+        with tempfile.TemporaryDirectory() as project, \
+             patch.object(antiphon.peers, "owner_key",
+                          return_value=self.OWNER):
+            real_rotate = antiphon.peers.rotate_identity_proof
+            real_write = antiphon.peers.write_session
+
+            def rotate(*a, **k):
+                order.append("rotate")
+                return real_rotate(*a, **k)
+
+            def write(*a, **k):
+                order.append("join")
+                return real_write(*a, **k)
+
+            with patch.object(antiphon.peers, "rotate_identity_proof", rotate), \
+                 patch.object(antiphon.peers, "write_session", write):
+                antiphon.record_claude_session(project, self.A, "/t/a.jsonl")
+        self.assertEqual(order[:2], ["rotate", "join"],
+                         "the proof is current before anything is joined")
+
+    def test_hook_identity_is_never_written_for_explicit_or_invalid_names(self):
+        for name in ("build", "Not A Name!"):
+            with self.subTest(configured=name), \
+                 tempfile.TemporaryDirectory() as project, \
+                 patch.dict(os.environ, {"ANTIPHON_NAME": name}), \
+                 patch.object(antiphon.peers, "owner_key",
+                              return_value=self.OWNER):
+                antiphon.record_claude_session(project, self.A, "/t/a.jsonl")
+                self.assertEqual(
+                    antiphon.peers.read_identity_proof(project, self.OWNER),
+                    ("absent", None),
+                    "the proof is a fact about automatic identity only")
+
+    def test_hook_identity_sends_at_most_one_bounded_wakeup(self):
+        sent = []
+        with tempfile.TemporaryDirectory() as project, \
+             patch.object(antiphon.peers, "owner_key",
+                          return_value=self.OWNER):
+            self._half(project, self.A)
+            antiphon.peers.rotate_identity_proof(
+                project, self.OWNER, self.A,
+                antiphon.peers.auto_identity(self.A)[1])
+            self._half(project, self.B)
+            with patch.object(antiphon, "_retire_control",
+                              side_effect=lambda *a, **k: sent.append(a)):
+                antiphon.record_claude_session(project, self.B, "/t/b.jsonl")
+        self.assertEqual(len(sent), 1,
+                         "one wakeup, to the previous current alias only")
+
+    def test_hook_identity_survives_a_failed_wakeup(self):
+        with tempfile.TemporaryDirectory() as project, \
+             patch.object(antiphon.peers, "owner_key",
+                          return_value=self.OWNER):
+            self._half(project, self.A)
+            antiphon.peers.rotate_identity_proof(
+                project, self.OWNER, self.A,
+                antiphon.peers.auto_identity(self.A)[1])
+            self._half(project, self.B)
+
+            def explode(*_a, **_k):
+                raise OSError(5, "Input/output error")
+
+            with patch.object(antiphon, "_retire_control", explode):
+                self.assertTrue(
+                    antiphon.record_claude_session(project, self.B,
+                                                   "/t/b.jsonl"),
+                    "the Stop hook is the hottest path; a control that cannot "
+                    "be delivered may not fail it")
+            state, proof = antiphon.peers.read_identity_proof(project,
+                                                             self.OWNER)
+            self.assertEqual((state, proof["session_id"]), ("valid", self.B))

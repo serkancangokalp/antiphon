@@ -1803,3 +1803,116 @@ class IdentityProofTest(unittest.TestCase):
                              "one unreadable neighbour must not hide a live "
                              "peer, and must not be counted as complete")
             self.assertEqual(len(inventory.proofs), 1)
+
+
+class HookIdentityRotationTest(unittest.TestCase):
+    """One transaction: capture the prior proof, replace it, retire what it
+    made stale. Assembled from separately locked helpers it would not be a
+    transaction at all, and the registry lock is not reentrant, so it could not
+    be nested either."""
+
+    OWNER = "4242:v1:Mon Sep  1 00:00:00 2026"
+    OTHER_OWNER = "4243:v1:Mon Sep  1 00:00:00 2026"
+    A = "8261c119-2c20-4bf4-87ab-f152ac87dbda"
+    B = "0199a1b2-2222-7000-8000-00000000000b"
+    C = "0199a1b2-3333-7000-8000-00000000000c"
+
+    def _automatic_half(self, project, session_id, owner=None):
+        alias, digest = peers.auto_identity(session_id)
+        owner = owner or self.OWNER
+        peers.register(project, "claude", alias,
+                       os.path.join(project, alias + ".sock"),
+                       pid=os.getpid(), owner_key=owner,
+                       identity_digest=digest)
+        peers.write_session(project, "claude", alias, session_id,
+                            f"/t/{alias}.jsonl", owner, digest, True)
+        return alias
+
+    def _half_exists(self, project, session_id):
+        alias = peers.auto_identity(session_id)[0]
+        return os.path.exists(peers._session_file(project, "claude", alias))
+
+    def test_hook_identity_rotation_returns_prior_and_current(self):
+        with tempfile.TemporaryDirectory() as project:
+            first = peers.rotate_identity_proof(
+                project, self.OWNER, self.A, peers.auto_identity(self.A)[1])
+            self.assertTrue(first.ok)
+            self.assertIsNone(first.prior, "nothing preceded the first proof")
+            self.assertEqual(first.current["session_id"], self.A)
+
+            second = peers.rotate_identity_proof(
+                project, self.OWNER, self.B, peers.auto_identity(self.B)[1])
+            self.assertTrue(second.ok)
+            self.assertEqual(second.prior["session_id"], self.A)
+            self.assertEqual(second.current["session_id"], self.B)
+
+    def test_hook_identity_withdraws_only_same_owner_stale_halves(self):
+        with tempfile.TemporaryDirectory() as project:
+            self._automatic_half(project, self.A)
+            self._automatic_half(project, self.C, owner=self.OTHER_OWNER)
+            peers.register(project, "claude", "build",
+                           os.path.join(project, "build.sock"),
+                           pid=os.getpid(), owner_key=self.OWNER)
+            peers.write_session(project, "claude", "build", self.A,
+                                "/t/build.jsonl", self.OWNER)
+
+            peers.rotate_identity_proof(project, self.OWNER, self.B,
+                                        peers.auto_identity(self.B)[1])
+
+            self.assertFalse(self._half_exists(project, self.A),
+                             "the same owner's stale automatic half goes")
+            self.assertTrue(self._half_exists(project, self.C),
+                            "another owner's half is untouched")
+            self.assertTrue(
+                os.path.exists(peers._session_file(project, "claude", "build")),
+                "an explicit peer is never withdrawn by this rotation")
+            self.assertTrue(
+                os.path.exists(os.path.join(
+                    peers.peer_dir(project, "claude",
+                                   peers.auto_identity(self.A)[0]),
+                    "endpoint.json")),
+                "the hook withdraws a session half, never an endpoint")
+
+    def test_hook_identity_rotation_is_one_locked_transaction(self):
+        """A gate inside the lock, so the interleaving is proved rather than
+        raced: B acquires and holds, C is shown blocked, B commits, then C."""
+        import threading
+        with tempfile.TemporaryDirectory() as project:
+            self._automatic_half(project, self.A)
+            entered, release = threading.Event(), threading.Event()
+            real = peers._write_identity_proof_locked
+
+            def gated(cwd, owner, session_id, digest):
+                if session_id == self.B:
+                    entered.set()
+                    release.wait(5)
+                return real(cwd, owner, session_id, digest)
+
+            outcomes = {}
+
+            def rotate(session_id):
+                outcomes[session_id] = peers.rotate_identity_proof(
+                    project, self.OWNER, session_id,
+                    peers.auto_identity(session_id)[1])
+
+            with patch.object(peers, "_write_identity_proof_locked", gated):
+                b = threading.Thread(target=rotate, args=(self.B,))
+                b.start()
+                self.assertTrue(entered.wait(5), "B never entered the lock")
+                c = threading.Thread(target=rotate, args=(self.C,))
+                c.start()
+                c.join(0.5)
+                self.assertTrue(c.is_alive(),
+                                "C must be blocked behind B's lock, not racing")
+                release.set()
+                b.join(5)
+                c.join(5)
+
+            state, proof = peers.read_identity_proof(project, self.OWNER)
+            self.assertEqual(state, "valid")
+            self.assertEqual(proof["session_id"], self.C,
+                             "the last committed transaction is current")
+            self.assertTrue(self._half_exists(project, self.C)
+                            or not self._half_exists(project, self.A),
+                            "A's stale half did not survive both rotations")
+            self.assertFalse(self._half_exists(project, self.A))

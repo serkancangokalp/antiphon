@@ -414,6 +414,72 @@ def identity_proofs(cwd):
         tuple(found), "lower-bound" if found else "unknown")
 
 
+RotationOutcome = collections.namedtuple(
+    "RotationOutcome", "ok prior current withdrawn")
+
+
+def _withdraw_stale_automatic_sessions_locked(cwd, owner_key, current_digest):
+    """Retire this owner's outgrown automatic session halves. Lock held.
+
+    Only a half that is automatic — it carries an identity digest — belongs to
+    this owner, and no longer matches the current identity. An explicit or
+    legacy record carries no digest and is never touched; another owner's
+    record is never touched; and an endpoint is never touched at all, because
+    only the process serving it may withdraw its own registration.
+    """
+    removed = []
+    try:
+        entries = sorted(os.listdir(peers_dir(cwd)))
+    except OSError:
+        return removed
+    prefix = "claude-"
+    for entry in entries:
+        if not entry.startswith(prefix):
+            continue
+        name = entry[len(prefix):]
+        path = _session_file(cwd, "claude", name)
+        record = _read_record(path)
+        if not record or record.get("owner") != owner_key:
+            continue
+        digest = record.get("identity_digest")
+        if not isinstance(digest, str) or digest == current_digest:
+            continue
+        with contextlib.suppress(OSError):
+            os.unlink(path)
+            removed.append(name)
+    return removed
+
+
+def rotate_identity_proof(cwd, owner_key, session_id, identity_digest):
+    """Make this session current for its owner, in one locked transaction.
+
+    Capture the prior proof, replace it, and retire the session halves that
+    replacement made stale — all inside one acquisition. It cannot be assembled
+    from helpers that each take the lock: the registry lock is not reentrant,
+    and two concurrent rotations would interleave between acquisitions and
+    corrupt both the prior-proof answer and the judgement of which half is now
+    stale.
+
+    Returns the prior and current records so the caller can wake exactly one
+    listener — the previous current alias — rather than every stale half, which
+    would grow hook latency with history.
+    """
+    with _registry_lock(cwd):
+        digest = _owner_digest(owner_key) if valid_owner_key(owner_key) else ""
+        prior_state, prior = _read_identity_proof_file(
+            identity_proof_path(cwd, owner_key), digest
+        ) if valid_owner_key(owner_key) else ("invalid", None)
+        if not _write_identity_proof_locked(cwd, owner_key, session_id,
+                                            identity_digest):
+            return RotationOutcome(False, prior, None, ())
+        withdrawn = _withdraw_stale_automatic_sessions_locked(
+            cwd, owner_key, identity_digest)
+        _state, current = _read_identity_proof_file(
+            identity_proof_path(cwd, owner_key), digest)
+        return RotationOutcome(True, prior if prior_state == "valid" else None,
+                               current, tuple(withdrawn))
+
+
 def observations_dir(cwd):
     """Hook-owned Codex sightings, separate from the routable peer registry."""
     return os.path.join(cwd, ".antiphon", "observations", "codex")

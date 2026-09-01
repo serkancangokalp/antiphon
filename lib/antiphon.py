@@ -6298,6 +6298,52 @@ def _endpoint_owner(cwd, kind, name):
     return None
 
 
+RETIRE_CONTROL_PATIENCE = 0.25
+RETIRE_CONTROL_VERSION = 1
+
+
+def _retire_control(cwd, alias, address):
+    """Tell one listener its identity moved. Content-free, bounded, best effort.
+
+    Single-shot and non-patient, and every error is swallowed: the Stop hook is
+    the hottest path on the bridge, and the proof has already made routing safe
+    without this. The control can delay the hook by at most the patience below,
+    which is a cost, but a bounded and known one.
+
+    It carries no message, and it is not authentication: the listener decides
+    by re-reading the proof for itself, never by trusting who connected.
+    """
+    payload = json.dumps({"antiphon": "control",
+                          "version": RETIRE_CONTROL_VERSION,
+                          "action": "identity-retire",
+                          "alias": alias}) + "\n"
+    try:
+        sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        sock.settimeout(RETIRE_CONTROL_PATIENCE)
+        try:
+            sock.connect(address)
+            sock.sendall(payload.encode("utf-8"))
+        finally:
+            sock.close()
+    except Exception:
+        return False
+    return True
+
+
+def _wake_retired_listener(cwd, alias):
+    """One bounded wakeup to the alias this rotation just made stale.
+
+    Only the previous current alias, never every stale half: waking each one
+    would grow hook latency with history, and the others are already inert
+    because routing consults the proof.
+    """
+    for peer in peers.read_peers(cwd, "claude"):
+        if peer.get("name") == alias and peer.get("address"):
+            with contextlib.suppress(Exception):
+                _retire_control(cwd, alias, peer["address"])
+            return
+
+
 def record_claude_session(cwd, session_id, transcript):
     """Writes the Claude hook's half: which session is behind this alias.
 
@@ -6337,6 +6383,17 @@ def record_claude_session(cwd, session_id, transcript):
         owner = peers.owner_key()
         if not owner:
             return False
+        if automatic:
+            # The proof is current before any join decision is made, so a
+            # message addressed to the alias this rotation retires already
+            # fails closed even if nothing below succeeds.
+            rotation = peers.rotate_identity_proof(cwd, owner, session_id,
+                                                   identity_digest)
+            prior = rotation.prior if rotation.ok else None
+            if prior and prior.get("session_id") != session_id:
+                prior_identity = peers.auto_identity(prior.get("session_id"))
+                if prior_identity:
+                    _wake_retired_listener(cwd, prior_identity[0])
         ok, detail = peers.write_session(cwd, "claude", alias, session_id,
                                          transcript, owner,
                                          identity_digest=identity_digest,
