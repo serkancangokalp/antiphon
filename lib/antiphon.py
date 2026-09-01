@@ -5136,6 +5136,9 @@ def _notify_unregistered_claude(cwd, alias, sender_alias, message_id):
             sock.close()
 
 
+LISTENER_REFUSAL_CLASSES = ("no-peer", "oversize")
+
+
 def send_to_claude(cwd, text, alias=None, sender_alias=None, message_id=None):
     """Sends a Codex message to a Claude peer's MCP Channel socket.
 
@@ -5239,9 +5242,14 @@ def send_to_claude(cwd, text, alias=None, sender_alias=None, message_id=None):
         return False, _ClassifiedRefusal(
             "Claude MCP Channel returned an invalid response", "transport")
     if not result.get("ok"):
+        # A class the listener supplied is kept. "The socket failed" and "that
+        # alias is not this session any more" call for different actions, and
+        # only the second tells a sender to reconnect; recasting everything as
+        # transport threw that away.
+        supplied = result.get("refusal_class")
         return False, _ClassifiedRefusal(
             str(result.get("error") or "channel delivery failed")[:200],
-            "transport")
+            supplied if supplied in LISTENER_REFUSAL_CLASSES else "transport")
     return True, ""
 
 

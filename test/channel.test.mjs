@@ -1769,3 +1769,120 @@ async function automaticRegistrationDeclaresItsMode() {
 }
 
 await automaticRegistrationDeclaresItsMode();
+
+// --- Task 5: delivery linearizes at the listener --------------------------
+// The retire control is best effort, so a sender can resolve A while A is
+// current, the hook can then move the proof, and the sender can connect
+// afterwards. The only point that closes that window is the listener's own
+// check, taken on every inbound delivery before anything is emitted.
+const STALE_A = "8261c119-2c20-4bf4-87ab-f152ac87dbda";
+const STALE_A_ALIAS = "auto-tkurihzklryexeppduqsfllv4y";
+const STALE_A_DIGEST =
+  "9aa9141f2a5c704b91ef1d2122ad75e67a1ca8be84b7fe119a6edeca9f0b6937";
+const STALE_B = "0199a1b2-2222-7000-8000-00000000000b";
+
+function pythonBridge() {
+  return execFileSync("python3", ["-c", "import sys; print(sys.executable)"],
+    { encoding: "utf8" }).trim();
+}
+
+function runPeers(dir, code) {
+  execFileSync(pythonBridge(), ["-c",
+    `import sys; sys.path.insert(0, "lib"); import peers\n${code}`],
+    { cwd: process.cwd(), env: { ...process.env, ANTIPHON_CWD: dir } });
+}
+
+async function boundSocketOf(session) {
+  // The channel derives its own name, so the path is whatever it announces.
+  await waitFor(() => /channel ready: (\S+)/.test(session.stderr()));
+  const found = /channel ready: (\S+)/.exec(session.stderr());
+  return found ? found[1] : null;
+}
+
+async function staleInboundSession(dir) {
+  const stub = await makeAutomaticIdentityPython({
+    alias: STALE_A_ALIAS, identity_digest: STALE_A_DIGEST,
+    session_id: STALE_A,
+  });
+  const session = spawnChannel(dir, undefined, stub.env);
+  return { session, stub };
+}
+
+async function aStaleInboundIsRefusedAsNoPeerAndEmitsNothing() {
+  const dir = await mkdtemp(join(tmpdir(), "antiphon-stale-"));
+  const { session, stub } = await staleInboundSession(dir);
+  try {
+    const bound = await boundSocketOf(session);
+    assert.ok(bound && existsSync(bound),
+      `channel never bound; stderr=${session.stderr()}`);
+    // The owner's proof now names another session: PROVED_STALE.
+    runPeers(dir, `
+owner = peers.owner_key() or "1:v1:x"
+peers.write_identity_proof(${JSON.stringify(dir)}, owner,
+                           ${JSON.stringify(STALE_B)},
+                           peers.auto_identity(${JSON.stringify(STALE_B)})[1])
+`);
+    const before = session.stdout();
+    const reply = await new Promise((resolve, reject) => {
+      const socket = connect(bound);
+      let out = "";
+      socket.setEncoding("utf8");
+      socket.on("connect", () => socket.end(JSON.stringify({
+        content: "hello", sender_alias: "build",
+      })));
+      socket.on("data", (chunk) => { out += chunk; });
+      socket.on("end", () => resolve(out ? JSON.parse(out) : null));
+      socket.on("error", reject);
+    });
+    assert.equal(reply?.ok, false, "a stale listener must refuse");
+    assert.equal(reply?.refusal_class, "no-peer",
+      "classified, not a transport error: the peer that alias named is gone");
+    assert.ok(!session.stdout().slice(before.length)
+      .includes("notifications/claude/channel"),
+      "a stale inbound emits zero channel notifications");
+  } finally {
+    session.child.kill("SIGKILL");
+    await waitForExit(session.child, 2_000);
+    await rm(dir, { recursive: true, force: true }).catch(() => {});
+    await rm(stub.dir, { recursive: true, force: true }).catch(() => {});
+  }
+}
+
+async function anUnreadyInboundRefusesWithoutRetiringAnything() {
+  const dir = await mkdtemp(join(tmpdir(), "antiphon-unready-"));
+  const { session, stub } = await staleInboundSession(dir);
+  let socket = null;
+  try {
+    socket = await boundSocketOf(session);
+    assert.ok(socket && existsSync(socket),
+      `channel never bound; stderr=${session.stderr()}`);
+    // No hook has run, so there is no proof at all: UNREADY, never destructive.
+    const reply = await sendToSocketAt(socket, { content: "hi" });
+    assert.equal(reply?.ok, false, "unready refuses");
+    assert.ok(existsSync(socket), "an unready listener keeps its socket");
+    assert.ok(existsSync(join(dir, ".antiphon", "peers",
+      `claude-${STALE_A_ALIAS}`, "endpoint.json")),
+      "an unready listener keeps its endpoint: the next hook makes it ready");
+  } finally {
+    session.child.kill("SIGKILL");
+    await waitForExit(session.child, 2_000);
+    if (socket) await rm(socket, { force: true }).catch(() => {});
+    await rm(dir, { recursive: true, force: true }).catch(() => {});
+    await rm(stub.dir, { recursive: true, force: true }).catch(() => {});
+  }
+}
+
+function sendToSocketAt(path, payload) {
+  return new Promise((resolve, reject) => {
+    const socket = connect(path);
+    let out = "";
+    socket.setEncoding("utf8");
+    socket.on("connect", () => socket.end(JSON.stringify(payload)));
+    socket.on("data", (chunk) => { out += chunk; });
+    socket.on("end", () => resolve(out ? JSON.parse(out) : null));
+    socket.on("error", reject);
+  });
+}
+
+await aStaleInboundIsRefusedAsNoPeerAndEmitsNothing();
+await anUnreadyInboundRefusesWithoutRetiringAnything();

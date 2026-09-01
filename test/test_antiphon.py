@@ -16920,3 +16920,50 @@ class AutomaticRegistrationBridgeTest(unittest.TestCase):
                 "pid": os.getpid(),
             })
             self.assertEqual(code, 0, printed)
+
+
+class StaleInboundClassTest(unittest.TestCase):
+    """A refusal the listener classified must not be recast as transport.
+
+    "The socket failed" and "that alias is not this session any more" call for
+    different actions, and only the second tells a sender to reconnect. This
+    drives the real `send_to_claude` against a real listening socket rather
+    than a stub, so the red cannot come from a fallback branch.
+    """
+
+    def _listener(self, project, reply):
+        path = os.path.join(project, "peer.sock")
+        server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        server.bind(path)
+        server.listen(1)
+
+        def serve():
+            conn, _ = server.accept()
+            with conn:
+                conn.recv(65536)
+                conn.sendall(json.dumps(reply).encode("utf-8"))
+        thread = threading.Thread(target=serve, daemon=True)
+        thread.start()
+        return path, server, thread
+
+    def test_stale_inbound_no_peer_class_is_not_recast_as_transport(self):
+        with tempfile.TemporaryDirectory() as project:
+            path, server, thread = self._listener(project, {
+                "ok": False, "error": "identity moved",
+                "refusal_class": "no-peer"})
+            try:
+                target = antiphon.ResolvedTarget(path, "", "registered")
+                with patch.object(antiphon, "_resolve_target",
+                                  return_value=target):
+                    ok, detail = antiphon.send_to_claude(project, "hello")
+            finally:
+                thread.join(2)
+                server.close()
+        self.assertFalse(ok)
+        self.assertIn("identity moved", str(detail),
+                      "the listener's own words, not a fallback refusal that "
+                      "happens to carry the same class")
+        self.assertEqual(getattr(detail, "refusal_class", None), "no-peer",
+                         "a class the listener supplied survives the return; "
+                         "recasting it as transport would tell the sender to "
+                         "blame the socket instead of reconnecting")
