@@ -48,6 +48,7 @@ import socket
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import uuid
 
@@ -536,6 +537,26 @@ def state_path(cwd, kind):
 
 CURSOR_LOCK_PATIENCE = 2.0        # seconds; a stuck holder must not hang a turn
 CURSOR_LOCK_RETRY_DELAY = 0.05
+CATALOG_LOCK_PATIENCE = 2.0       # same turn-safety boundary as delivery
+
+_PROJECT_LOCK_STATE = threading.local()
+
+
+def _refuse_nested_project_lock(kind):
+    """Fail before catalog/cursor nesting can create an AB/BA deadlock."""
+    held = getattr(_PROJECT_LOCK_STATE, "kind", None)
+    if held is not None and held != kind:
+        raise RuntimeError(
+            f"nested project locks are forbidden: holding {held}, asked for {kind}")
+
+
+def _mark_project_lock(kind):
+    _PROJECT_LOCK_STATE.kind = kind
+
+
+def _unmark_project_lock(kind):
+    if getattr(_PROJECT_LOCK_STATE, "kind", None) == kind:
+        del _PROJECT_LOCK_STATE.kind
 
 
 @contextlib.contextmanager
@@ -575,6 +596,7 @@ def cursor_lock(cwd, kind, patience=None):
     attempt from this same process on a fresh descriptor blocks exactly as
     another process would. Nothing called while this is held may take it again.
     """
+    _refuse_nested_project_lock("cursor")
     if patience is None:
         # Read at call time, not bound in the signature, so the constant stays
         # the single place this is set — and a test can lower it.
@@ -616,11 +638,79 @@ def cursor_lock(cwd, kind, patience=None):
                 # stopped delivering for no stated reason.
                 print(f"antiphon: cannot lock {path}: {exc}", file=sys.stderr)
                 break
+        if held:
+            _mark_project_lock("cursor")
         yield held
     finally:
         if held:
+            _unmark_project_lock("cursor")
             fcntl.flock(fd, fcntl.LOCK_UN)
         os.close(fd)
+
+
+@contextlib.contextmanager
+def catalog_lock(cwd, patience=None):
+    """Take the source-catalog lock without ever hanging a prompt turn."""
+    _refuse_nested_project_lock("catalog")
+    if patience is None:
+        patience = CATALOG_LOCK_PATIENCE
+    path = os.path.join(cwd, ".antiphon", "sources", ".lock")
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        fd = os.open(path, os.O_CREAT | os.O_RDWR, 0o600)
+    except OSError as exc:
+        print(f"antiphon: source catalog lock could not be opened: {exc}",
+              file=sys.stderr)
+        yield False
+        return
+    held = False
+    deadline = time.monotonic() + patience
+    try:
+        while True:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                held = True
+                break
+            except BlockingIOError:
+                if time.monotonic() >= deadline:
+                    print("antiphon: source catalog is still busy after "
+                          f"{patience:g}s; catalog work was skipped",
+                          file=sys.stderr)
+                    break
+                time.sleep(CURSOR_LOCK_RETRY_DELAY)
+            except OSError as exc:
+                print(f"antiphon: source catalog cannot be locked: {exc}",
+                      file=sys.stderr)
+                break
+        if held:
+            _mark_project_lock("catalog")
+        yield held
+    finally:
+        if held:
+            _unmark_project_lock("catalog")
+            fcntl.flock(fd, fcntl.LOCK_UN)
+        os.close(fd)
+
+
+CatalogPhaseResult = collections.namedtuple(
+    "CatalogPhaseResult", "ok reason value")
+
+
+def _catalog_phase(cwd, operation):
+    """Run one bounded catalog mutation phase, classified for hook callers."""
+    with catalog_lock(cwd) as locked:
+        if not locked:
+            return CatalogPhaseResult(False, "lock-contention", None)
+        try:
+            return CatalogPhaseResult(True, None, operation())
+        except OSError as exc:
+            print(f"antiphon: source catalog work failed: {exc}", file=sys.stderr)
+            return CatalogPhaseResult(False, "catalog-error", None)
+
+
+def _hook_catalog_update(cwd, side, payload):
+    """Wave 1A hook seam; the bounded state-machine work lands in Task 3."""
+    return None
 
 
 def sender_side(target):
@@ -1720,6 +1810,11 @@ def hook(side="claude"):
         except OSError as error:
             print(f"antiphon: the attachment sweep failed: {error}",
                   file=sys.stderr)
+
+    # The catalog phase is deliberately complete before any cursor lock is
+    # attempted. Future source inspection happens outside both locks; this
+    # small mutation seam only reserves/merges bounded catalog state.
+    _catalog_phase(cwd, lambda: _hook_catalog_update(cwd, side, input_data))
 
     if side == "codex":
         # On every event, not only `SessionStart`. A missed one then costs a

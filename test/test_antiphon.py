@@ -4666,6 +4666,112 @@ class OffsetReadingTest(unittest.TestCase):
         self.assertEqual(err.getvalue(), "")
 
 
+class SourceCatalogLockTest(unittest.TestCase):
+    """The catalog phase ends before the cursor transaction begins."""
+
+    def test_catalog_and_cursor_locks_refuse_either_nested_order(self):
+        with tempfile.TemporaryDirectory() as project:
+            with antiphon.catalog_lock(project) as catalogued:
+                self.assertTrue(catalogued)
+                with self.assertRaisesRegex(RuntimeError, "nested project locks"):
+                    with antiphon.cursor_lock(project, "claude"):
+                        pass
+            with antiphon.cursor_lock(project, "claude") as delivered:
+                self.assertTrue(delivered)
+                with self.assertRaisesRegex(RuntimeError, "nested project locks"):
+                    with antiphon.catalog_lock(project):
+                        pass
+
+    def test_two_hooks_finish_the_catalog_phase_before_the_cursor_phase(self):
+        trace = []
+
+        @contextlib.contextmanager
+        def catalog_lock(_cwd, patience=None):
+            trace.append("catalog enter")
+            yield True
+            trace.append("catalog exit")
+
+        @contextlib.contextmanager
+        def cursor_lock(_cwd, _kind, patience=None):
+            self.assertNotEqual(trace[-1], "catalog enter",
+                                "the cursor entered while catalog was held")
+            trace.append("cursor enter")
+            yield True
+            trace.append("cursor exit")
+
+        def catalog_update(_cwd, _side, _payload):
+            trace.append("catalog operation")
+            return True
+
+        payload = json.dumps({"cwd": "/tmp/catalog-order",
+                              "hook_event_name": "UserPromptSubmit"})
+        with patch.object(antiphon, "catalog_lock", catalog_lock, create=True), \
+             patch.object(antiphon, "cursor_lock", cursor_lock), \
+             patch.object(antiphon, "_hook_catalog_update", catalog_update,
+                          create=True), \
+             patch.object(antiphon, "record_claude_session"), \
+             patch.object(antiphon, "sweep_attachments"), \
+             patch.object(antiphon, "_read_cursor_state",
+                          return_value=({}, "valid")), \
+             patch.object(antiphon, "build_summary",
+                          return_value=("", None, 0)), \
+             contextlib.redirect_stdout(io.StringIO()):
+            for _ in range(2):
+                with patch.object(antiphon.sys, "stdin", io.StringIO(payload)):
+                    self.assertEqual(antiphon.hook("claude"), 0)
+
+        one = ["catalog enter", "catalog operation", "catalog exit",
+               "cursor enter", "cursor exit"]
+        self.assertEqual(trace, one + one)
+
+    def test_catalog_contention_is_bounded_and_skips_the_operation(self):
+        ran = []
+        with tempfile.TemporaryDirectory() as project:
+            path = os.path.join(project, ".antiphon", "sources", ".lock")
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            holder = os.open(path, os.O_CREAT | os.O_RDWR, 0o600)
+            fcntl.flock(holder, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            try:
+                with patch.object(antiphon, "CATALOG_LOCK_PATIENCE", 0.01), \
+                     patch.object(antiphon, "CURSOR_LOCK_RETRY_DELAY", 0.001), \
+                     contextlib.redirect_stderr(io.StringIO()) as err:
+                    result = antiphon._catalog_phase(
+                        project, lambda: ran.append(True))
+            finally:
+                fcntl.flock(holder, fcntl.LOCK_UN)
+                os.close(holder)
+        self.assertFalse(result.ok)
+        self.assertEqual(result.reason, "lock-contention")
+        self.assertEqual(ran, [])
+        self.assertIn("catalog", err.getvalue().lower())
+
+    def test_catalog_contention_does_not_drop_an_otherwise_empty_hook(self):
+        payload = {"hook_event_name": "UserPromptSubmit"}
+        with tempfile.TemporaryDirectory() as project:
+            payload["cwd"] = project
+            path = os.path.join(project, ".antiphon", "sources", ".lock")
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            holder = os.open(path, os.O_CREAT | os.O_RDWR, 0o600)
+            fcntl.flock(holder, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            try:
+                with patch.object(antiphon, "CATALOG_LOCK_PATIENCE", 0.01), \
+                     patch.object(antiphon, "CURSOR_LOCK_RETRY_DELAY", 0.001), \
+                     patch.object(antiphon, "record_claude_session"), \
+                     patch.object(antiphon, "sweep_attachments"), \
+                     patch.object(antiphon, "build_summary",
+                                  return_value=("", None, 0)), \
+                     patch.object(antiphon.sys, "stdin",
+                                  io.StringIO(json.dumps(payload))), \
+                     contextlib.redirect_stdout(io.StringIO()), \
+                     contextlib.redirect_stderr(io.StringIO()) as err:
+                    code = antiphon.hook("claude")
+            finally:
+                fcntl.flock(holder, fcntl.LOCK_UN)
+                os.close(holder)
+        self.assertEqual(code, 0)
+        self.assertIn("catalog", err.getvalue().lower())
+
+
 class PositionCursorTest(unittest.TestCase):
     """Paging records a safe delivered prefix for every discovered source.
 
