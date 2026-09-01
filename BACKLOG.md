@@ -372,6 +372,21 @@ readiness, never an address, never a session id.
   extra `HookShape` row is declined as out of scope here — both `setup` and
   `doctor` read that table — and nothing false ships: the label is absent, not
   wrong.
+- **The proof sweep degrades to its first window if its cursor cannot be
+  written.** Reclamation runs inside the rotation the Claude hook already
+  performs, examines at most eight proof records per write, and resumes where
+  the last write stopped — that cursor is what turns a latency bound into a
+  guarantee that the whole inventory is covered in a finite number of writes.
+  A failed cursor write is swallowed, and must be: the rotation has already
+  committed, and a hook that made the routing decision correct must not then
+  report failure over housekeeping. If that cursor can never be written —
+  a read-only `.antiphon/identity`, a full disk, a permission fault — the sweep
+  silently falls back to examining the same first eight records on every write,
+  and a dead owner's proof sorted beyond them is never collected. Nothing is
+  lost and nothing is misrouted; the leak is one small file per dead session.
+  The degradation is bounded and named here rather than detected, because
+  detecting it would mean a surface that reports a housekeeping fault the
+  operator cannot act on.
 - **A rotation costs a reconnect, and that price is accepted.** There is no
   dynamic rename of a live listener: a process serving under one identity must
   not silently become another, because a sender that addressed the old name

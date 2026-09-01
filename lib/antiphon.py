@@ -4820,9 +4820,14 @@ def push(target="codex"):
 _PRIVATE_UUID = re.compile(
     r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-"
     r"[0-9a-fA-F]{4}-[0-9a-fA-F]{12}")
-_PRIVATE_DIGEST = re.compile(r"\b[0-9a-fA-F]{64}\b")
+# `re.ASCII`, and not for tidiness: `\b` and `\d` are Unicode-aware in a
+# Python `str` pattern and ASCII-only in a JS RegExp, so an owner key or a
+# digest written immediately after a non-ASCII letter satisfied `\b` on one
+# side and not the other. Python was the leakier side, and Python is the one
+# that prints to a person's terminal. One flag aligns both classes at once.
+_PRIVATE_DIGEST = re.compile(r"\b[0-9a-fA-F]{64}\b", re.ASCII)
 _PRIVATE_OWNER = re.compile(r"\b\d+:(?:v\d+:)?[A-Z][a-z]{2} [A-Z][a-z]{2} "
-                            r"[ \d]?\d \d{2}:\d{2}:\d{2} \d{4}")
+                            r"[ \d]?\d \d{2}:\d{2}:\d{2} \d{4}", re.ASCII)
 _PRIVATE_ROUTE = re.compile(r"\S*antiphon-channel-[0-9a-f]+\.sock")
 
 
@@ -6585,10 +6590,18 @@ def _retire_control(cwd, alias, address):
     It carries no message, and it is not authentication: the listener decides
     by re-reading the proof for itself, never by trusting who connected.
     """
-    payload = json.dumps({"antiphon": "control",
-                          "version": RETIRE_CONTROL_VERSION,
+    # The envelope the listener actually validates, not one of its own. This
+    # sent `{"antiphon": "control", ...}` while `channel.mjs` branches on
+    # `control === "antiphon.channel"`, so every wakeup fell through to the
+    # content check and was refused as a malformed message — a control nothing
+    # anywhere received. The nonce is part of the validated shape and not a
+    # secret: there is no shared secret here, and the listener's safety comes
+    # from re-reading the proof itself, never from trusting who connected.
+    payload = json.dumps({"control": CHANNEL_CONTROL,
+                          "version": CHANNEL_CONTROL_VERSION,
                           "action": "identity-retire",
-                          "alias": alias}) + "\n"
+                          "alias": alias,
+                          "nonce": delivery_id()}) + "\n"
     try:
         sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         sock.settimeout(RETIRE_CONTROL_PATIENCE)
@@ -8656,12 +8669,37 @@ def _doctor_peers(report, cwd):
                     session.get("session_id") if session else None)):
             diagnostic["address"] = session["session_id"]
         live.append(diagnostic)
-        if peers._address_of(diagnostic) is None:
+        # The same verdict the resolver and `status` consult. Doctor kept its
+        # own copy — record liveness alone — and so printed `✓ live and
+        # addressed` for the very alias delivery was refusing, to the operator
+        # who ran doctor *because* delivery was failing. The record stays in
+        # `live`: this is about what the reader is told, not about hiding a
+        # socket from the channel probe below.
+        verdict = automatic_verdict(cwd, record.get("kind"), diagnostic,
+                                    peers.read_identity_proof(cwd, owner))
+        if verdict is not None and verdict != "READY":
+            report.note(f"peer {who}: {_VERDICT_NOTE[verdict]} — "
+                        f"{RECONNECT_REMEDY}")
+        elif peers._address_of(diagnostic) is None:
             if not mixed_owner_generation:
                 report.note(f"peer {who}: live, waiting for its first turn")
         else:
             report.ok(f"peer {who}: live and addressed")
     return live
+
+
+# One sentence per verdict, in the words a person acts on. The class names are
+# for two readers agreeing with each other; nobody types `PROVED_STALE` at a
+# terminal.
+_VERDICT_NOTE = {
+    "PROVED_STALE": "this alias is no longer its session's automatic identity",
+    "UNREADY": "this alias is not joined to a current session, so nothing "
+               "can be delivered to it",
+    "UNKNOWN": "this alias could not be checked because its identity proof "
+               "could not be read; nothing is concluded from that",
+    "STRUCTURAL_INVALID": "this alias has an identity proof that cannot be "
+                          "trusted",
+}
 
 
 def _doctor_identity_window(report, cwd, registered):

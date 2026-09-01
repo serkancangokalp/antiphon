@@ -16804,6 +16804,30 @@ class AutomaticReadyVerdictTest(unittest.TestCase):
                 resolved = antiphon._resolve_target(project, "claude", alias)
                 self.assertIsNone(resolved.address,
                                   "the resolver consults the predicate")
+                # This docstring named three surfaces and measured one, and
+                # doctor was the one that had kept its own copy: it read
+                # record liveness alone and printed `✓ live and addressed`
+                # for the very alias the resolver had just refused. An
+                # operator runs doctor precisely because delivery is failing.
+                out = io.StringIO()
+                with patch.object(antiphon, "project_dir",
+                                  return_value=project), \
+                     contextlib.redirect_stdout(out):
+                    antiphon.status()
+                self.assertNotIn(alias, out.getvalue(),
+                                 "status consults the predicate")
+                out = io.StringIO()
+                report = antiphon._Report()
+                with contextlib.redirect_stdout(out):
+                    antiphon._doctor_peers(report, project)
+                lines = [line for line in out.getvalue().splitlines()
+                         if alias in line]
+                self.assertTrue(lines, out.getvalue())
+                for line in lines:
+                    self.assertNotIn("live and addressed", line,
+                                     "doctor consults the predicate too")
+                    self.assertIn(antiphon.RECONNECT_REMEDY, line,
+                                  "and offers the remedy the others do")
 
 
 class HookIdentityCommitTest(unittest.TestCase):
@@ -17050,14 +17074,57 @@ class ReadinessParityTest(unittest.TestCase):
         with open(path, "w", encoding="utf-8") as stream:
             stream.write(body)
 
+    OTHER_OWNER = "4243:v1:Mon Sep  1 00:00:00 2026"
+
+    def _body(self, project, session_id, version_literal="1"):
+        """One proof as text, so a spelling JSON cannot preserve can be tested.
+
+        JSON has one number type: `1.0` parses to the same `1` an integer does,
+        so no check on the parsed value can tell them apart. Python's
+        `isinstance(version, int)` refuses the float and Node could not see it
+        at all — the divergence is only reachable through the source text.
+        """
+        _alias, digest = antiphon.peers.auto_identity(session_id)
+        return ('{"version": ' + version_literal + ', "kind": "claude", '
+                f'"owner_key": "{self.OWNER}", '
+                f'"owner_digest": "{antiphon.peers._owner_digest(self.OWNER)}", '
+                f'"session_id": "{session_id}", '
+                f'"identity_digest": "{digest}"}}')
+
+    def _patch(self, path, drop=None, **over):
+        with open(path, encoding="utf-8") as stream:
+            record = json.load(stream)
+        if drop:
+            record.pop(drop, None)
+        record.update(over)
+        with open(path, "w", encoding="utf-8") as stream:
+            json.dump(record, stream)
+
+    def _patch_endpoint(self, project, alias, drop=None, **over):
+        self._patch(os.path.join(
+            antiphon.peers.peer_dir(project, "claude", alias),
+            "endpoint.json"), drop=drop, **over)
+
+    def _patch_session(self, project, alias, drop=None, **over):
+        self._patch(os.path.join(
+            antiphon.peers.peer_dir(project, "claude", alias),
+            "session.json"), drop=drop, **over)
+
     def _python(self, project, alias):
         peer = next((p for p in antiphon.peers.read_peers(project, "claude")
                      if p.get("name") == alias), None)
         if peer is None:
-            return "UNREADY"
+            # Not a verdict: there is no record to reach one about. Saying
+            # "UNREADY" here would make Python agree with Node by fiat rather
+            # than by code, which is the one thing a parity suite must not do.
+            return "NO-RECORD"
+        # The peer's own owner, exactly as `_automatic_ready` reads it in
+        # production. Reading a fixed owner here hid a real divergence: with
+        # the endpoint's owner dropped, the harness still found OWNER's proof
+        # and answered UNREADY, while production has no key to look one up by.
         verdict = antiphon.automatic_verdict(
             project, "claude", peer,
-            antiphon.peers.read_identity_proof(project, self.OWNER))
+            antiphon.peers.read_identity_proof(project, peer.get("owner")))
         return verdict or "READY"
 
     def _node(self, project, alias, digest):
@@ -17097,7 +17164,63 @@ class ReadinessParityTest(unittest.TestCase):
                 self._write(os.path.join(
                     antiphon.peers.peer_dir(p, "claude", a),
                     "session.json"), "{")),
+            # The seven §5 fixtures the first pass omitted. Three of them found
+            # real disagreements, two of which were Node saying READY where
+            # Python said STRUCTURAL_INVALID — the strongest possible
+            # divergence, and invisible while the suite only drove ten cases.
+            "proof non-canonical id": lambda p, a: self._raw(
+                p, self._body(p, self.A).replace(self.A, "not-a-uuid", 1)),
+            "proof version is a float": lambda p, a: self._raw(
+                p, self._body(p, self.A, version_literal="1.0")),
+            "proof owner key not canonical": lambda p, a: self._proof(
+                p, self.A, owner_key="not-an-owner-key"),
+            "endpoint owner missing": lambda p, a: (
+                self._proof(p, self.A),
+                self._patch_endpoint(p, a, drop="owner")),
+            "endpoint owner not canonical": lambda p, a: (
+                self._proof(p, self.A),
+                self._patch_endpoint(p, a, owner="not-an-owner-key")),
+            "endpoint owner is another owner's": lambda p, a: (
+                self._proof(p, self.A),
+                self._patch_endpoint(p, a, owner=self.OTHER_OWNER)),
+            "session half from another owner": lambda p, a: (
+                self._proof(p, self.A),
+                self._patch_session(p, a, owner=self.OTHER_OWNER)),
         }
+        # One case cannot be compared by equality, and saying so is more
+        # honest than bending either side to match. With the endpoint's digest
+        # replaced, the record no longer derives its own alias: `read_peers`
+        # will not return it at all, so Python has no record to reach a verdict
+        # about, while Node — handed the listener's digest directly — answers
+        # `null`, meaning "not this contract's record". Both refuse; neither
+        # reports READY; there is no shared verdict to be equal to.
+        ungovernable = {
+            "endpoint digest mismatched": lambda p, a: (
+                self._proof(p, self.A),
+                self._patch_endpoint(p, a, identity_digest="0" * 64)),
+            "endpoint torn": lambda p, a: (
+                self._proof(p, self.A),
+                self._write(os.path.join(
+                    antiphon.peers.peer_dir(p, "claude", a),
+                    "endpoint.json"), "{")),
+            "endpoint missing": lambda p, a: (
+                self._proof(p, self.A),
+                os.unlink(os.path.join(
+                    antiphon.peers.peer_dir(p, "claude", a),
+                    "endpoint.json"))),
+        }
+        for name, mutate in ungovernable.items():
+            with self.subTest(fixture=name):
+                with tempfile.TemporaryDirectory() as project:
+                    alias, digest = self._peer(project)
+                    mutate(project, alias)
+                    for reader, verdict in (
+                            ("python", self._python(project, alias)),
+                            ("node", self._node(project, alias, digest))):
+                        self.assertNotEqual(
+                            verdict, "READY",
+                            f"{name}: {reader} must not call this routable")
+
         disagreements = []
         for name, mutate in cases.items():
             with tempfile.TemporaryDirectory() as project:
@@ -17458,6 +17581,13 @@ class IdentityPrivacyTest(unittest.TestCase):
             "automatic route": f"could not clear {route}",
             "the alias survives": f"{self.ALIAS} is not this session",
             "the remedy survives": "restart that Claude session",
+            # `\b` and `\d` are Unicode-aware in a Python `str` pattern and
+            # ASCII-only in a JS RegExp. A private shape glued to a non-ASCII
+            # letter therefore survived Python's redactor and not Node's —
+            # and Python is the side that prints to a person's terminal.
+            "owner key after a non-ASCII letter": f"iş{self.OWNER} refused",
+            "digest after a non-ASCII letter": f"iş{self.DIGEST} refused",
+            "digest before a non-ASCII letter": f"{self.DIGEST}ş refused",
         }
         script = (
             'import { redactPrivate } from "./lib/identity.mjs";'
@@ -17672,3 +17802,95 @@ class ProofLifecycleSurfaceTest(unittest.TestCase):
                 antiphon.record_claude_session(project, self.B, "/t/b.jsonl")
             self.assertFalse(os.path.exists(stale),
                              "the hook production runs is what collects")
+
+
+class TornProofDoesNotWedgeTheHookTest(unittest.TestCase):
+    """One unreadable byte sequence must not cost a project its identity.
+
+    The rotation commits first, so the old alias correctly stops resolving. If
+    the sweep then raises, the hook's own `except Exception` catches it before
+    `write_session` — the new identity never becomes routable, and because the
+    sweep bailed before advancing its cursor, every later hook repeats it. The
+    terminal is unnamed from then on, and nothing anywhere says why.
+    """
+
+    B = "0199a1b2-2222-7000-8000-00000000000b"
+
+    def test_a_torn_proof_leaves_the_new_identity_routable(self):
+        with tempfile.TemporaryDirectory() as project:
+            torn = antiphon.peers.identity_proof_path(
+                project, f"{os.getpid()}:v1:Tue Sep  2 00:00:00 2026")
+            os.makedirs(os.path.dirname(torn), exist_ok=True)
+            with open(torn, "wb") as stream:
+                stream.write(b'{"kind": "\xff\xfe\x00bad"}')
+            # The channel registers the endpoint; the hook writes the half.
+            # An automatic half requires its endpoint, so without this the hook
+            # would refuse for a reason that has nothing to do with the wedge.
+            alias, digest = antiphon.peers.auto_identity(self.B)
+            antiphon.peers.register(
+                project, "claude", alias, os.path.join(project, alias + ".sock"),
+                pid=os.getpid(), owner_key=antiphon.peers.owner_key(),
+                identity_digest=digest, mode="initial")
+            env = {k: v for k, v in os.environ.items() if k != "ANTIPHON_NAME"}
+            printed = io.StringIO()
+            with patch.dict(os.environ, env, clear=True), \
+                 contextlib.redirect_stderr(printed):
+                recorded = antiphon.record_claude_session(
+                    project, self.B, "/t/b.jsonl")
+            self.assertTrue(recorded, printed.getvalue())
+            self.assertTrue(
+                os.path.exists(
+                    antiphon.peers._session_file(project, "claude", alias)),
+                "the new session half is written, so the alias can be joined")
+            self.assertNotIn("could not be joined", printed.getvalue())
+
+
+class RetireControlWireTest(unittest.TestCase):
+    """The retire control has to be recognised as a control, or it is nothing.
+
+    The listener validates the envelope on magic, version, action, alias and
+    nonce. A payload that misses the magic never reaches that branch at all: it
+    falls through to the content check and is refused as malformed content, so
+    the wakeup this bridge sends after every rotation has been landing in the
+    void. That is not authentication — there is no shared secret here — it is
+    the shape that makes the message legible as its own action.
+    """
+
+    def _sent(self, alias="auto-tkurihzklryexeppduqsfllv4y"):
+        captured = {}
+
+        class _Socket:
+            def settimeout(self, _): pass
+            def connect(self, _): pass
+            def sendall(self, payload): captured["raw"] = payload
+            def close(self): pass
+
+        with patch.object(antiphon.socket, "socket", return_value=_Socket()):
+            antiphon._retire_control("/tmp/p", alias, "/tmp/p.sock")
+        return json.loads(captured["raw"].decode())
+
+    def test_the_retire_control_carries_the_envelope_the_listener_validates(self):
+        payload = self._sent()
+        self.assertEqual(payload.get("control"), antiphon.CHANNEL_CONTROL,
+                         "without the magic the listener never reaches the "
+                         "control branch")
+        self.assertEqual(payload.get("version"),
+                         antiphon.CHANNEL_CONTROL_VERSION)
+        self.assertEqual(payload.get("action"), "identity-retire")
+        self.assertEqual(payload.get("alias"),
+                         "auto-tkurihzklryexeppduqsfllv4y")
+        self.assertRegex(str(payload.get("nonce")), r"^[A-Za-z0-9_-]{1,128}$",
+                         "the nonce is part of the validated shape")
+        self.assertNotIn("content", payload,
+                         "content-free: a control is not a message")
+
+    def test_the_retire_control_is_validated_on_exactly_these_fields(self):
+        """Read from `channel.mjs` rather than restated here. Two literals in
+        two languages drift silently; this fails the moment they do."""
+        node = read_source("lib", "channel.mjs")
+        branch = node[node.index('payload?.control === CHANNEL_CONTROL'):]
+        branch = branch[:branch.index("if (typeof payload.content")]
+        for field in ("version", "action", "alias", "nonce"):
+            self.assertIn(field, branch, f"the listener validates {field}")
+        self.assertIn('"identity-retire"', branch,
+                      "the listener recognises the action this side sends")

@@ -1866,7 +1866,11 @@ async function aStaleInboundIsRefusedAsNoPeerAndEmitsNothing() {
     const bound = await boundSocketOf(session);
     assert.ok(bound && existsSync(bound),
       `channel never bound; stderr=${session.stderr()}`);
-    // The owner's proof now names another session: PROVED_STALE.
+    // No hook has written this listener's session half, so this is UNREADY
+    // rather than PROVED_STALE — the comment here used to claim the latter and
+    // the fixture never built it. Both refuse with the same class, which is
+    // what this test is about; the wording below is what tells them apart, and
+    // `aRetiringListenerNamesItsAliasAndTheRemedy` builds the stale one.
     runPeers(dir, `
 owner = peers.owner_key() or "1:v1:x"
 peers.write_identity_proof(${JSON.stringify(dir)}, owner,
@@ -1888,6 +1892,8 @@ peers.write_identity_proof(${JSON.stringify(dir)}, owner,
     assert.equal(reply?.ok, false, "a stale listener must refuse");
     assert.equal(reply?.refusal_class, "no-peer",
       "classified, not a transport error: the peer that alias named is gone");
+    assert.match(String(reply?.error), /not established yet/,
+      `an unready listener says so in its own words: ${reply?.error}`);
     assert.ok(!session.stdout().slice(before.length)
       .includes("notifications/claude/channel"),
       "a stale inbound emits zero channel notifications");
@@ -2047,3 +2053,71 @@ peers.write_identity_proof(${JSON.stringify(dir)}, owner,
 }
 
 await aRetiringListenerNamesItsAliasAndTheRemedy();
+
+// --- the retire control, over real bytes ------------------------------------
+// Every existing test of this path patches `_retire_control` away, so the wire
+// shape was never exercised: Python sent an envelope the listener does not
+// branch on, and the wakeup was answered as a malformed message instead. Its
+// safety is not authentication — anyone who can reach a Unix socket can send
+// this — it is that the listener decides by re-reading the proof itself.
+async function theRetireControlIsRecognisedAndNonDestructive() {
+  const dir = await mkdtemp(join(tmpdir(), "antiphon-retire-control-"));
+  const { session, stub } = await staleInboundSession(dir);
+  let socket = null;
+  try {
+    socket = await boundSocketOf(session);
+    assert.ok(socket && existsSync(socket),
+      `channel never bound; stderr=${session.stderr()}`);
+    const endpoint = join(dir, ".antiphon", "peers",
+      `claude-${STALE_A_ALIAS}`, "endpoint.json");
+    assert.ok(existsSync(endpoint), "the listener registered before the test");
+
+    // No proof at all: UNREADY. A control must not retire this — the next hook
+    // is about to make it ready, and that is the bootstrap case the verdict
+    // exists to keep apart from a stale one.
+    const ack = await sendToSocketAt(socket, {
+      control: "antiphon.channel",
+      version: 1,
+      action: "identity-retire",
+      alias: STALE_A_ALIAS,
+      nonce: "n0nce_test-1",
+    });
+    assert.equal(ack?.ok, true, `recognised as a control: ${JSON.stringify(ack)}`);
+    assert.equal(ack?.action, "identity-retire-ack");
+    assert.equal(ack?.nonce, "n0nce_test-1", "the nonce is echoed");
+    assert.notEqual(ack?.error, "content must be a non-empty string");
+    assert.ok(existsSync(endpoint),
+      "an UNREADY listener keeps its endpoint through a retire control");
+
+    // A malformed control is refused as a control, not treated as content.
+    const bad = await sendToSocketAt(socket, {
+      control: "antiphon.channel",
+      version: 1,
+      action: "identity-retire",
+      alias: STALE_A_ALIAS,
+    });
+    assert.equal(bad?.ok, false, "a missing nonce fails the shape check");
+    assert.match(String(bad?.error), /control request/,
+      `refused as a control: ${JSON.stringify(bad)}`);
+    assert.ok(existsSync(endpoint), "and nothing was withdrawn");
+
+    // Another peer's alias is not this listener's business.
+    const other = await sendToSocketAt(socket, {
+      control: "antiphon.channel",
+      version: 1,
+      action: "identity-retire",
+      alias: "auto-yzmcrss6whnnsjxthq2pclz3l4",
+      nonce: "n0nce_test-2",
+    });
+    assert.equal(other?.ok, false, "an alias this listener does not hold is refused");
+    assert.ok(existsSync(endpoint), "and nothing was withdrawn");
+  } finally {
+    session.child.kill("SIGKILL");
+    await waitForExit(session.child, 2_000);
+    if (socket) await rm(socket, { force: true }).catch(() => {});
+    await rm(dir, { recursive: true, force: true }).catch(() => {});
+    await rm(stub.dir, { recursive: true, force: true }).catch(() => {});
+  }
+}
+
+await theRetireControlIsRecognisedAndNonDestructive();

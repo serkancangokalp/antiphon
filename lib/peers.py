@@ -320,16 +320,22 @@ def _read_identity_proof_file(path, owner_digest):
     there and cannot be trusted. Collapsing them would let a corrupt file read
     as absent and open the claim it must have refused.
     """
+    # Read bytes and decode beside the parse, not at `open`. A text-mode read
+    # raises `UnicodeDecodeError`, which subclasses `ValueError` and not
+    # `OSError`, so it escaped both arms above and travelled out of every
+    # caller — including the sweep, which runs after the rotation has committed
+    # and promises never to raise. Non-UTF-8 bytes are a torn record: `invalid`
+    # is exactly what "a record is there and cannot be trusted" means.
     try:
-        with open(path, encoding="utf-8") as stream:
+        with open(path, "rb") as stream:
             raw = stream.read()
     except FileNotFoundError:
         return "absent", None
     except OSError:
         return "unreadable", None
     try:
-        record = json.loads(raw)
-    except ValueError:
+        record = json.loads(raw.decode("utf-8"))
+    except (ValueError, UnicodeDecodeError):
         return "invalid", None
     if not _valid_identity_proof(record, owner_digest):
         return "invalid", None
@@ -395,8 +401,9 @@ def identity_proofs(cwd):
     """
     directory = identity_proofs_dir(cwd)
     try:
-        names = sorted(entry.name for entry in os.scandir(directory)
-                       if entry.is_file() and entry.name.endswith(".json"))
+        with os.scandir(directory) as entries:
+            names = sorted(entry.name for entry in entries
+                           if entry.is_file() and entry.name.endswith(".json"))
     except FileNotFoundError:
         return IdentityProofInventory((), "exact")
     except OSError:
@@ -480,10 +487,20 @@ def _write_sweep_cursor_locked(cwd, after):
     path = identity_sweep_cursor_path(cwd)
     os.makedirs(os.path.dirname(path), exist_ok=True)
     tmp = f"{path}.{os.getpid()}.tmp"
-    with open(tmp, "w", encoding="utf-8") as stream:
-        json.dump({"version": IDENTITY_PROOF_VERSION, "after": after}, stream,
-                  ensure_ascii=False)
-    os.replace(tmp, path)
+    try:
+        with open(tmp, "w", encoding="utf-8") as stream:
+            json.dump({"version": IDENTITY_PROOF_VERSION, "after": after},
+                      stream, ensure_ascii=False)
+        os.replace(tmp, path)
+    except OSError:
+        # Same discipline as the proof write beside it: a failed replace must
+        # not leave its temporary behind. The name is per-pid and the file
+        # lives outside the enumerated proofs directory, so this is tidiness
+        # rather than correctness — but the asymmetry was the kind that reads
+        # as an oversight later.
+        with contextlib.suppress(OSError):
+            os.unlink(tmp)
+        raise
 
 
 def _proved_dead(owner_key):
@@ -503,9 +520,13 @@ def _proved_dead(owner_key):
         os.kill(pid, 0)
     except ProcessLookupError:
         return True
-    except OSError:
-        # EPERM means somebody else's live process. Anything else is evidence
-        # of nothing, and neither is proof of death.
+    except (OSError, OverflowError, ValueError):
+        # EPERM means somebody else's live process. `OWNER_PATTERN` puts no
+        # ceiling on the pid, so a key naming one above the platform's signed
+        # int raises `OverflowError` — not an `OSError` — and would otherwise
+        # escape a sweep that promises never to raise. Anything that is not
+        # `ProcessLookupError` is evidence of nothing, and none of it is proof
+        # of death.
         return False
     return False
 
@@ -520,8 +541,9 @@ def _sweep_identity_proofs_locked(cwd, protect):
     reclaimed = 0
     try:
         directory = identity_proofs_dir(cwd)
-        names = sorted(entry.name for entry in os.scandir(directory)
-                       if entry.is_file() and entry.name.endswith(".json"))
+        with os.scandir(directory) as entries:
+            names = sorted(entry.name for entry in entries
+                           if entry.is_file() and entry.name.endswith(".json"))
     except OSError:
         return reclaimed
     if not names:
@@ -546,17 +568,22 @@ def _sweep_identity_proofs_locked(cwd, protect):
         digest = name[: -len(".json")]
         if digest in protect:
             continue
-        state, record = _read_identity_proof_file(
-            os.path.join(directory, name), digest)
-        # An unreadable or invalid record is not proved dead. It survives: this
-        # sweep removes evidence only where death is positive, and a record it
-        # cannot read is not evidence of death but the absence of evidence.
-        if state != "valid" or not _proved_dead(record.get("owner_key")):
-            continue
+        # One record's failure is one record skipped, never the whole sweep and
+        # never the rotation above it. The classification below is total today;
+        # this belt is here so that staying total is not a precondition for the
+        # promise in this function's docstring.
         try:
+            state, record = _read_identity_proof_file(
+                os.path.join(directory, name), digest)
+            # An unreadable or invalid record is not proved dead. It survives:
+            # this sweep removes evidence only where death is positive, and a
+            # record it cannot read is not evidence of death but the absence
+            # of evidence.
+            if state != "valid" or not _proved_dead(record.get("owner_key")):
+                continue
             os.unlink(os.path.join(directory, name))
             reclaimed += 1
-        except OSError:
+        except Exception:
             continue
     if examined is not None:
         try:

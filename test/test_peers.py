@@ -2069,6 +2069,15 @@ class ProofLifecycleTest(unittest.TestCase):
         cls._reaped += 1
         return child.pid
 
+    def _sorting_after(self, pid, floor):
+        """An owner key for `pid` whose proof filename sorts after `floor`."""
+        for n in range(60 * 60 * 24):
+            owner = self._owner(pid, f"Wed Sep  3 {n // 3600:02d}:"
+                                     f"{(n // 60) % 60:02d}:{n % 60:02d} 2026")
+            if peers._owner_digest(owner) > floor:
+                return owner
+        raise AssertionError("no owner key digest sorted after the fixture")
+
     def test_proof_lifecycle_survives_a_zero_endpoint_window(self):
         """B is current and owns no endpoint at all. Deleting its proof here
         because the owner has no automatic peer would erase the only evidence
@@ -2086,10 +2095,12 @@ class ProofLifecycleTest(unittest.TestCase):
             self.assertEqual(peers.read_peers(project, "claude"), [],
                              "the window under test has zero endpoints")
 
-    def test_proof_lifecycle_reclaims_a_dead_owner_through_a_real_hook(self):
+    def test_proof_lifecycle_reclaims_a_dead_owner_through_the_rotation(self):
         """Driven through `rotate_identity_proof` — the call production makes.
         A reclaimer with no real caller would let a unit test pass while
-        production collected nothing, forever."""
+        production collected nothing, forever. The hook above that call has its
+        own gate in `ProofLifecycleSurfaceTest.test_proof_lifecycle_the_real_
+        hook_collects`; this one names the transaction it actually drives."""
         with tempfile.TemporaryDirectory() as project:
             dead = self._owner(self._dead_pid())
             stale = self._proof(project, dead, self.A)
@@ -2123,7 +2134,15 @@ class ProofLifecycleTest(unittest.TestCase):
                     for n in range(1, 12)]
             for owner in live:
                 self._proof(project, owner, self.A)
-            dead_owner = self._owner(self._dead_pid())
+            # Proof files are named from a digest, so their sort order is
+            # effectively random — and with 13 records the dead one landed
+            # inside the fixed first-eight window most of the time. Measured
+            # over 20 fresh fixtures, a cursor-less sweep survived 14 of them.
+            # Placing the dead record beyond every other digest is what makes
+            # this test about the cursor rather than about luck.
+            dead_owner = self._sorting_after(
+                self._dead_pid(),
+                max(peers._owner_digest(o) for o in live + [mine]))
             dead = self._proof(project, dead_owner, self.A)
             for attempt in range(12):
                 self._rotate(project, mine, self.B)
@@ -2158,11 +2177,27 @@ class ProofLifecycleTest(unittest.TestCase):
         signal 0 and is conservatively kept, which is the safe direction."""
         with tempfile.TemporaryDirectory() as project:
             self._proof(project, self._owner(self._dead_pid()), self.A)
+            # A *live* owner in the same window is what makes this bite. Asked
+            # about a dead pid alone, even the `ps` path short-circuits on
+            # `alive()` and never reaches a fingerprint — so a sweep rewritten
+            # to use it would have passed this guard untouched. The live record
+            # is the one where a start-time comparison would happen.
+            self._proof(project, self._owner(os.getpid(), "Tue Sep  2 "
+                                             "00:00:00 2026"), self.A)
+            # Recorded, never raised. The sweep swallows every exception a
+            # record can produce — that is its promise to the rotation above
+            # it — so a guard that raises is a guard the sweep hides. Asking
+            # afterwards whether the call happened is observable either way.
+            calls = []
             with patch.object(peers, "_process_birth",
-                              side_effect=AssertionError("ps was consulted")), \
+                              side_effect=lambda *a: calls.append(a)), \
                  patch.object(peers, "_process_info",
-                              side_effect=AssertionError("ps was consulted")):
-                self._rotate(project, self._owner(os.getpid()), self.B)
+                              side_effect=lambda *a: calls.append(a)):
+                for _ in range(4):
+                    self._rotate(project, self._owner(os.getpid()), self.B)
+            self.assertEqual(calls, [],
+                             "the five-second `ps` path is never reached from "
+                             "a hook; death here is ProcessLookupError alone")
 
     def test_proof_lifecycle_sweep_stops_on_its_cooperative_budget(self):
         """A fake clock, never a real elapsed time: the budget is cooperative
@@ -2235,3 +2270,72 @@ class ProofLifecycleTest(unittest.TestCase):
             return real(src, dst, *args, **kwargs)
 
         return replace
+
+
+class ProofDecodeTest(unittest.TestCase):
+    """Bytes that are not UTF-8 are a torn record, not an unclassified event.
+
+    `UnicodeDecodeError` subclasses `ValueError`, not `OSError`, so it escapes
+    both arms of the read and travels out of every caller: the inventory
+    `status` and `doctor` read, the resolver's proof lookup, and — worst — the
+    sweep, which runs after the rotation has committed and promises never to
+    raise. There it is not a crash but a wedge: the hook's `except Exception`
+    catches it before the new session half is written, so the new identity
+    never becomes routable, and the sweep bails before advancing its cursor, so
+    every later hook in that project repeats the same failure forever.
+    """
+
+    A = "8261c119-2c20-4bf4-87ab-f152ac87dbda"
+    B = "0199a1b2-2222-7000-8000-00000000000b"
+
+    def _torn(self, project, owner):
+        path = peers.identity_proof_path(project, owner)
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "wb") as stream:
+            stream.write(b'{"kind": "\xff\xfe\x00bad"}')
+        return path
+
+    def test_proof_decode_a_non_utf8_record_reads_invalid(self):
+        with tempfile.TemporaryDirectory() as project:
+            owner = f"{os.getpid()}:v1:Mon Sep  1 00:00:00 2026"
+            self._torn(project, owner)
+            state, record = peers.read_identity_proof(project, owner)
+            self.assertEqual(state, "invalid",
+                             "a torn record is invalid, never unclassified")
+            self.assertIsNone(record)
+
+    def test_proof_decode_the_inventory_survives_a_torn_record(self):
+        with tempfile.TemporaryDirectory() as project:
+            self._torn(project, f"{os.getpid()}:v1:Mon Sep  1 00:00:00 2026")
+            inventory = peers.identity_proofs(project)
+            self.assertEqual(inventory.proofs, ())
+            self.assertEqual(inventory.completeness, "unknown",
+                             "one unreadable neighbour is a lower bound, not "
+                             "a crash and not a confident zero")
+
+    def test_proof_decode_the_sweep_never_raises(self):
+        with tempfile.TemporaryDirectory() as project:
+            mine = f"{os.getpid()}:v1:Mon Sep  1 00:00:00 2026"
+            self._torn(project, f"{os.getpid()}:v1:Tue Sep  2 00:00:00 2026")
+            _alias, digest = peers.auto_identity(self.B)
+            outcome = peers.rotate_identity_proof(project, mine, self.B, digest)
+            self.assertTrue(outcome.ok, "the rotation still commits")
+
+    def test_proof_decode_the_sweep_cursor_still_advances(self):
+        """Bailing before the cursor write is what turns one bad file into a
+        permanent wedge: the same window is retried forever and nothing behind
+        it is ever reached."""
+        with tempfile.TemporaryDirectory() as project:
+            mine = f"{os.getpid()}:v1:Mon Sep  1 00:00:00 2026"
+            self._torn(project, f"{os.getpid()}:v1:Tue Sep  2 00:00:00 2026")
+            _alias, digest = peers.auto_identity(self.B)
+            peers.rotate_identity_proof(project, mine, self.B, digest)
+            self.assertTrue(peers._read_sweep_cursor(project),
+                            "the sweep recorded where it got to")
+
+    def test_proof_decode_an_out_of_range_pid_is_not_proved_dead(self):
+        """`OWNER_PATTERN` puts no ceiling on the pid, and `os.kill` raises
+        `OverflowError` — not an `OSError` — above the platform's signed int.
+        Unproved is the only safe answer, and it must not escape the sweep."""
+        self.assertFalse(peers._proved_dead(
+            "2147483653:v1:Mon Sep  1 00:00:00 2026"))

@@ -957,6 +957,16 @@ class IdentityPrivacyContractTest(unittest.TestCase):
                 self.assertRegex(words, r"(?i)counted, never addressed",
                                  f"{where}: an unprovable owner fails closed")
 
+    def test_proof_lifecycle_backlog_bounds_the_sweep_s_degradation(self):
+        """The sweep swallows a cursor-write failure, which is right — the
+        rotation has already committed and must not fail over housekeeping.
+        But a *persistent* failure silently reduces the guarantee from "the
+        whole inventory in a finite number of writes" to "the first eight
+        records, forever". An unwritten limitation reads as a bug later."""
+        words = " ".join(read("BACKLOG.md").split())
+        self.assertIn("If that cursor can never be written", words)
+        self.assertRegex(words, r"(?i)first eight")
+
     def test_identity_privacy_backlog_names_what_is_deliberately_not_redacted(self):
         """A blanket promise would be the wrong one, and an unwritten exception
         reads as an oversight later. Two shapes stay visible on purpose: an
