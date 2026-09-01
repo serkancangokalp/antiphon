@@ -135,8 +135,24 @@ the others are already inert because routing consults the proof.
   never rendered on any surface.
 - Written in full then atomically replaced, under the existing registry lock.
   Never rendered on any surface.
-- Read validation is strict and total. Every one of these reads as **no
-  proof**: a version that is not exactly the current integer (a bool is not an
+- **The read is classified, not boolean-by-absence.** A `dict | None` reader
+  would collapse three different facts into one answer: the file is absent
+  (ENOENT), the file cannot be read (EIO), and the file is present but does not
+  parse or does not validate. The verdict layer must tell those apart —
+  absent is `UNREADY`, unreadable is `UNKNOWN`, and present-but-wrong is
+  `STRUCTURAL_INVALID` — and none of that is recoverable once they are all
+  `None`.
+  It is also a safety hole, not only a modelling one: §2a lets a first
+  automatic endpoint register as a candidate **only** when the proof is
+  genuinely absent. A corrupt proof collapsing to `None` would read as absent
+  and open a claim it must have refused.
+  So the reader returns a state — `valid`, `absent`, `unreadable`, `invalid` —
+  with the proof attached only in the `valid` case. There is no second lossy
+  convenience reader: one that returned `dict | None` would be the path every
+  safety decision eventually drifted back onto. Parity is over that state and
+  its reason, in both languages.
+- Read validation is strict and total. Every one of these is `invalid`, never
+  `absent`: a version that is not exactly the current integer (a bool is not an
   int); wrong kind; a missing or non-canonical session id; a malformed digest;
   an owner key that is not canonical under the versioned fingerprint; a
   filename that is not the digest of the stored owner key; an identity digest
