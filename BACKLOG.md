@@ -160,7 +160,7 @@ the write-and-flush-before-advance transaction.
   incrementing the human-message count. Failed delivery persists neither their
   frontier nor scheduler lane, and no output can move the frontier past a first
   undelivered visible call.
-- A candidate-only doctor diagnostic now protects the same failure boundary
+- A doctor diagnostic, released in 0.4.0, protects the same failure boundary
   that let roughly 6,400 real calls disappear while the old suite stayed green.
   On explicit `antiphon doctor` only, it scans the trusted complete Codex
   discovery set and counts aggregate call-like records the production
@@ -1351,10 +1351,11 @@ inherited-locale `ps lstart` fingerprint defect reproduced above. The candidate
 branch beginning at `a4533d1` and completed for migration by `6902546`
 canonicalises new observations under `LC_ALL=C` and `TZ=UTC`, versions both
 endpoint births and owner keys, and treats an unversioned fingerprint as
-unverifiable rather than dead. This wording remains candidate-only until a
-later release actually contains those commits.
+unverifiable rather than dead. Those commits ship in 0.4.0; published
+0.3.3 and earlier still carry the defect, which is what an operator on an
+older install is reading when they meet it.
 
-**What landed on the candidate branch.** A valid Claude `ANTIPHON_NAME` now
+**What ships in 0.4.0.** A valid Claude `ANTIPHON_NAME` now
 signs both of its outgoing roads — the channel's `reply_to_codex` subprocess
 and the Stop-hook push —
 without treating ownership of the return socket as identity. Codex keeps the
@@ -1630,7 +1631,7 @@ name is ignored, and `ANTIPHON_NAME` is the explicit override. Older peers that
 cannot supply the new proof remain on the existing unnamed/explicit paths; no
 mixed-version guess or automatic migration rewrites their records.
 
-**What is implemented on the candidate branch.** The registry derives the
+**What ships in 0.4.0.** The registry derives the
 pinned 31-character alias, stores and validates the complete digest, rejects
 explicit/automatic and same-prefix/full-digest collisions, and refuses an
 automatic session whose digest does not belong to its canonical UUID. Codex
