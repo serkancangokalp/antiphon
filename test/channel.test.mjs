@@ -113,8 +113,8 @@ function socketFor(dir, name) {
   return join(process.env.TMPDIR || "/tmp", `antiphon-channel-${key}.sock`);
 }
 
-function spawnChannel(dir, name) {
-  const env = { ...process.env, ANTIPHON_CWD: dir };
+function spawnChannel(dir, name, extraEnv = {}) {
+  const env = { ...process.env, ...extraEnv, ANTIPHON_CWD: dir };
   if (name) env.ANTIPHON_NAME = name;
   else delete env.ANTIPHON_NAME;
   const child = spawn("node", ["lib/channel.mjs"], { env, stdio: ["pipe", "pipe", "pipe"] });
@@ -129,6 +129,66 @@ function spawnChannel(dir, name) {
     socketPath: socketFor(dir, name),
     stderr: () => stderr,
     stdout: () => stdout,
+  };
+}
+
+async function makeDelayedRegistryPython() {
+  const dir = await mkdtemp(join(tmpdir(), "antiphon-python-"));
+  const armed = join(dir, "armed");
+  const registerStarted = join(dir, "register-started");
+  const registerFinished = join(dir, "register-finished");
+  const releaseRegister = join(dir, "release-register");
+  const unregisterStarted = join(dir, "unregister-started");
+  const realPython = execFileSync("python3", [
+    "-c", "import sys; print(sys.executable)",
+  ], { encoding: "utf8" }).trim();
+  writeFileSync(join(dir, "python3"), `#!${realPython}
+import os
+import subprocess
+import sys
+import time
+
+command = sys.argv[2] if len(sys.argv) > 2 else ""
+armed = os.environ["ANTIPHON_TEST_REGISTER_ARMED"]
+register_started = os.environ["ANTIPHON_TEST_REGISTER_STARTED"]
+register_finished = os.environ["ANTIPHON_TEST_REGISTER_FINISHED"]
+release_register = os.environ["ANTIPHON_TEST_REGISTER_RELEASE"]
+unregister_started = os.environ["ANTIPHON_TEST_UNREGISTER_STARTED"]
+real_python = os.environ["ANTIPHON_TEST_REAL_PYTHON"]
+
+if command == "register_peer" and os.path.exists(armed):
+    open(register_started, "w").close()
+    while not os.path.exists(release_register):
+        time.sleep(0.01)
+
+if command == "unregister_peer":
+    open(unregister_started, "w").close()
+    result = subprocess.run([real_python, *sys.argv[1:]])
+    raise SystemExit(result.returncode)
+
+if command == "register_peer":
+    result = subprocess.run([real_python, *sys.argv[1:]])
+    open(register_finished, "w").close()
+    raise SystemExit(result.returncode)
+
+os.execv(real_python, [real_python, *sys.argv[1:]])
+`, { mode: 0o755 });
+  return {
+    dir,
+    armed,
+    registerStarted,
+    registerFinished,
+    releaseRegister,
+    unregisterStarted,
+    env: {
+      PATH: `${dir}:${process.env.PATH}`,
+      ANTIPHON_TEST_REGISTER_ARMED: armed,
+      ANTIPHON_TEST_REGISTER_STARTED: registerStarted,
+      ANTIPHON_TEST_REGISTER_FINISHED: registerFinished,
+      ANTIPHON_TEST_REGISTER_RELEASE: releaseRegister,
+      ANTIPHON_TEST_UNREGISTER_STARTED: unregisterStarted,
+      ANTIPHON_TEST_REAL_PYTHON: realPython,
+    },
   };
 }
 
@@ -251,6 +311,79 @@ async function aLiveListenerReassertsItsOwnMissingEndpoint() {
     console.log("a live listener reasserts its own endpoint: ok");
   } finally {
     await cleanUp(session, dir);
+  }
+}
+
+async function aStartupClaimCannotOutliveSignalShutdown() {
+  const dir = await mkdtemp(join(tmpdir(), "antiphon-claim-signal-"));
+  const delayed = await makeDelayedRegistryPython();
+  writeFileSync(delayed.armed, "");
+  const session = spawnChannel(dir, "ui", delayed.env);
+  let stale = false;
+  try {
+    assert.ok(await waitFor(() => existsSync(delayed.registerStarted)),
+      `startup never entered register_peer: ${session.stderr()}`);
+
+    session.child.kill("SIGTERM");
+    // The broken implementation starts unregister_peer beside the blocked
+    // registration. The corrected implementation deliberately does not, so
+    // this bounded wait is only a deterministic observation window before the
+    // test lets the registration finish.
+    await waitFor(() => existsSync(delayed.unregisterStarted), 2_000);
+    writeFileSync(delayed.releaseRegister, "");
+
+    assert.ok(await waitFor(() => existsSync(delayed.registerFinished)),
+      "the delayed startup registration never finished");
+    assert.ok(await waitForExit(session.child, 5_000),
+      "shutdown did not finish after startup registration was released");
+    stale = registeredPeers(dir).length !== 0;
+    return stale;
+  } finally {
+    writeFileSync(delayed.releaseRegister, "");
+    await cleanUp(session, dir);
+    await rm(delayed.dir, { recursive: true, force: true });
+  }
+}
+
+async function aControlClaimCannotOutliveEofShutdown() {
+  const dir = await mkdtemp(join(tmpdir(), "antiphon-claim-eof-"));
+  const delayed = await makeDelayedRegistryPython();
+  const session = spawnChannel(dir, "ui", delayed.env);
+  let stale = false;
+  try {
+    assert.ok(await waitFor(() => registeredPeers(dir).length === 1
+      && existsSync(delayed.registerFinished)),
+    `listener never completed its startup claim: ${session.stderr()}`);
+    await rm(endpointFor(dir, "ui"), { force: true });
+    await rm(delayed.registerStarted, { force: true });
+    await rm(delayed.registerFinished, { force: true });
+    writeFileSync(delayed.armed, "");
+
+    const reply = sendTo(session.socketPath, JSON.stringify({
+      control: "antiphon.channel",
+      version: 1,
+      action: "reassert",
+      alias: "ui",
+      nonce: "shutdown-during-reassert",
+    }));
+    assert.ok(await waitFor(() => existsSync(delayed.registerStarted)),
+      "control request never entered register_peer");
+
+    session.child.stdin.end();
+    await waitFor(() => existsSync(delayed.unregisterStarted), 2_000);
+    writeFileSync(delayed.releaseRegister, "");
+
+    assert.ok(await waitFor(() => existsSync(delayed.registerFinished)),
+      "the delayed control registration never finished");
+    assert.ok(await waitForExit(session.child, 5_000),
+      "EOF shutdown did not finish after control registration was released");
+    await reply;
+    stale = registeredPeers(dir).length !== 0;
+    return stale;
+  } finally {
+    writeFileSync(delayed.releaseRegister, "");
+    await cleanUp(session, dir);
+    await rm(delayed.dir, { recursive: true, force: true });
   }
 }
 
@@ -940,6 +1073,13 @@ await anOversizedMessageIsRefusedWithoutKillingTheSession();
 await aRefusedClientCannotKeepStreaming();
 await aStalledClientDoesNotBlockShutdown();
 await aSocketPathItCannotClearDoesNotKillTheSession();
+const startupClaimOutlivedShutdown = await aStartupClaimCannotOutliveSignalShutdown();
+const controlClaimOutlivedShutdown = await aControlClaimCannotOutliveEofShutdown();
+assert.deepEqual(
+  { startupClaimOutlivedShutdown, controlClaimOutlivedShutdown },
+  { startupClaimOutlivedShutdown: false, controlClaimOutlivedShutdown: false },
+  "no register_peer operation may recreate an endpoint after shutdown unregisters it",
+);
 await aLiveListenerReassertsItsOwnMissingEndpoint();
 await anArbitrarySocketBinderIsNotAdopted();
 await aReconnectRepairsTheLiveListenersMissingRecord();
