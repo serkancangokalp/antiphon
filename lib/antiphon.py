@@ -38,6 +38,8 @@ server runs on Node.js with the official MCP SDK.
 import base64
 import glob
 import collections
+import selectors
+import signal as signal_module
 import contextlib
 import errno
 import fcntl
@@ -6154,7 +6156,132 @@ def _retrieve_mcp_bridge(public_id=None):
 
 
 CLAUDE_IDENTITY_TIMEOUT = 2.0
-CLAUDE_IDENTITY_MAX_OUTPUT = 1024 * 1024
+# Literal, not adjectival. The ceilings bound what is *retained*, so they
+# trigger on the byte that would exceed them rather than after a read
+# completes; captured pipe bytes therefore stay at or under their sum, and
+# every allocation past that stays O(bound) rather than O(child).
+CLAUDE_IDENTITY_STDOUT_CEILING = 32 * 1024
+CLAUDE_IDENTITY_STDERR_CEILING = 8 * 1024
+CLAUDE_IDENTITY_TERMINATE_GRACE = 0.25
+CLAUDE_IDENTITY_REAP_WAIT = 0.25
+
+ProbeResult = collections.namedtuple("ProbeResult",
+                                     "text captured returncode reason")
+
+
+def _stop_probe_child(child, isolated):
+    """Terminate, then kill, then reap. Bounded at every step.
+
+    The signal widens to the process group only when this process created that
+    group. Where `setsid` failed there is no boundary of ours to signal, and
+    widening past one we did not create could reach the session this probe
+    belongs to. Descendant death is therefore promised only in the isolated
+    case, and not claimed in the other.
+    """
+    def signal(sig):
+        try:
+            if isolated:
+                os.killpg(os.getpgid(child.pid), sig)
+            else:
+                child.send_signal(sig)
+        except (OSError, ProcessLookupError):
+            pass
+
+    signal(signal_module.SIGTERM)
+    try:
+        child.wait(timeout=CLAUDE_IDENTITY_TERMINATE_GRACE)
+        return child.returncode
+    except subprocess.TimeoutExpired:
+        pass
+    signal(signal_module.SIGKILL)
+    try:
+        child.wait(timeout=CLAUDE_IDENTITY_REAP_WAIT)
+    except subprocess.TimeoutExpired:
+        # A child that cannot be reaped is reported, never awaited forever.
+        return None
+    return child.returncode
+
+
+def _bounded_identity_probe(argv, cwd):
+    """Read a child's stdout under a byte ceiling and a deadline.
+
+    `capture_output=True` buffered whatever the child wrote and only then
+    compared a length, so the cap bounded nothing: a child that kept writing
+    kept being read. This reads incrementally and stops at the byte that would
+    cross a ceiling, so a flooding child costs a bounded amount of memory and a
+    bounded amount of time whatever it does.
+    """
+    isolated = True
+    try:
+        child = subprocess.Popen(
+            argv, cwd=cwd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            start_new_session=True, shell=False)
+    except OSError:
+        # No session of our own to signal. Run without one and narrow every
+        # later signal to the child itself.
+        isolated = False
+        try:
+            child = subprocess.Popen(
+                argv, cwd=cwd, stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE, shell=False)
+        except OSError:
+            return ProbeResult(None, b"", None, "spawn-failed")
+
+    streams = {child.stdout: (bytearray(), CLAUDE_IDENTITY_STDOUT_CEILING),
+               child.stderr: (bytearray(), CLAUDE_IDENTITY_STDERR_CEILING)}
+    selector = selectors.DefaultSelector()
+    for stream in streams:
+        os.set_blocking(stream.fileno(), False)
+        selector.register(stream, selectors.EVENT_READ)
+    deadline = time.monotonic() + CLAUDE_IDENTITY_TIMEOUT
+    reason = "complete"
+    try:
+        while selector.get_map():
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                reason = "deadline"
+                break
+            for key, _events in selector.select(timeout=remaining):
+                buffer, ceiling = streams[key.fileobj]
+                chunk = key.fileobj.read(4096)
+                if not chunk:
+                    selector.unregister(key.fileobj)
+                    continue
+                if len(buffer) + len(chunk) > ceiling:
+                    buffer.extend(chunk[:max(0, ceiling - len(buffer))])
+                    reason = "overflow"
+                    break
+                buffer.extend(chunk)
+            if reason != "complete":
+                break
+    finally:
+        selector.close()
+
+    captured = bytes(streams[child.stdout][0])
+
+    def close_streams():
+        for stream in (child.stdout, child.stderr):
+            with contextlib.suppress(Exception):
+                stream.close()
+
+    if reason != "complete":
+        returncode = _stop_probe_child(child, isolated)
+        close_streams()
+        return ProbeResult(None, captured, returncode, reason)
+    try:
+        returncode = child.wait(timeout=max(0.0, deadline - time.monotonic()))
+    except subprocess.TimeoutExpired:
+        stopped = _stop_probe_child(child, isolated)
+        close_streams()
+        return ProbeResult(None, captured, stopped, "deadline")
+    close_streams()
+    if returncode != 0:
+        return ProbeResult(None, captured, returncode, "exit")
+    try:
+        text = captured.decode("utf-8")
+    except UnicodeDecodeError:
+        return ProbeResult(None, captured, returncode, "decode")
+    return ProbeResult(text, captured, returncode, "complete")
 
 
 def _claude_auto_identity(cwd):
@@ -6172,17 +6299,12 @@ def _claude_auto_identity(cwd):
     root_pid, _separator, _fingerprint = owner.partition(":")
     if not root_pid.isdigit():
         return None
-    try:
-        result = subprocess.run(
-            ["claude", "agents", "--json", "--cwd", cwd],
-            capture_output=True, text=True, timeout=CLAUDE_IDENTITY_TIMEOUT,
-            shell=False)
-    except (OSError, subprocess.SubprocessError):
-        return None
-    if result.returncode != 0 or len(result.stdout) > CLAUDE_IDENTITY_MAX_OUTPUT:
+    probe = _bounded_identity_probe(
+        ["claude", "agents", "--json", "--cwd", cwd], cwd)
+    if probe.text is None:
         return None
     try:
-        records = json.loads(result.stdout)
+        records = json.loads(probe.text)
     except (TypeError, ValueError):
         return None
     if not isinstance(records, list):

@@ -11355,8 +11355,13 @@ class ClaudeAutomaticIdentityProbeTest(unittest.TestCase):
 
     @staticmethod
     def result(records, returncode=0):
-        return subprocess.CompletedProcess(
-            ["claude"], returncode, stdout=json.dumps(records), stderr="")
+        # The probe is bounded at the read now, so the seam is the bounded
+        # reader rather than subprocess.run. What these tests check is the
+        # record filtering, which is unchanged.
+        body = json.dumps(records)
+        return antiphon.ProbeResult(
+            body if returncode == 0 else None, body.encode("utf-8"),
+            returncode, "complete" if returncode == 0 else "exit")
 
     def test_the_probe_accepts_one_exact_interactive_cli_root(self):
         records = [{"pid": 10566, "cwd": self.CWD, "kind": "interactive",
@@ -11364,7 +11369,7 @@ class ClaudeAutomaticIdentityProbeTest(unittest.TestCase):
                     "name": "host-display-name-is-ignored"}]
         with patch.object(antiphon.peers, "owner_key",
                           return_value=self.OWNER), \
-             patch.object(antiphon.subprocess, "run",
+             patch.object(antiphon, "_bounded_identity_probe",
                           return_value=self.result(records)) as run:
             found = antiphon._claude_auto_identity(self.CWD)
         alias, digest = antiphon.peers.auto_identity(self.UUID)
@@ -11372,9 +11377,8 @@ class ClaudeAutomaticIdentityProbeTest(unittest.TestCase):
                          {"alias": alias, "identity_digest": digest})
         self.assertNotIn("host-display", json.dumps(found))
         self.assertEqual(run.call_args.args[0],
-                         ["claude", "agents", "--json", "--cwd", self.CWD])
-        self.assertIs(run.call_args.kwargs.get("shell"), False)
-        self.assertGreater(run.call_args.kwargs.get("timeout", 0), 0)
+                         ["claude", "agents", "--json", "--cwd", self.CWD],
+                         "fixed argv, still")
 
     def test_the_probe_filters_background_and_requires_one_exact_match(self):
         exact = {"pid": 10566, "cwd": self.CWD, "kind": "interactive",
@@ -11383,12 +11387,12 @@ class ClaudeAutomaticIdentityProbeTest(unittest.TestCase):
                       "sessionId": "2e6b14f1-1659-544a-98d4-56d6eca8fa48"}
         with patch.object(antiphon.peers, "owner_key",
                           return_value=self.OWNER), \
-             patch.object(antiphon.subprocess, "run",
+             patch.object(antiphon, "_bounded_identity_probe",
                           return_value=self.result([background, exact])):
             self.assertIsNotNone(antiphon._claude_auto_identity(self.CWD))
         with patch.object(antiphon.peers, "owner_key",
                           return_value=self.OWNER), \
-             patch.object(antiphon.subprocess, "run",
+             patch.object(antiphon, "_bounded_identity_probe",
                           return_value=self.result([exact, dict(exact)])):
             self.assertIsNone(antiphon._claude_auto_identity(self.CWD))
 
@@ -11402,14 +11406,18 @@ class ClaudeAutomaticIdentityProbeTest(unittest.TestCase):
             (self.OWNER, self.result([dict(exact, cwd=self.CWD + "-other")])),
             (self.OWNER, self.result([dict(exact, sessionId=self.UUID.upper())])),
             (self.OWNER, self.result({"agents": [exact]})),
-            (self.OWNER, subprocess.CompletedProcess(
-                ["claude"], 1, stdout="[]", stderr="private failure")),
+            (self.OWNER, antiphon.ProbeResult(None, b"[]", 1, "exit")),
+            # Nothing captured is emitted, so an overflow or deadline reaches
+            # the caller as no identity at all.
+            (self.OWNER, antiphon.ProbeResult(None, b"x" * 64, None,
+                                              "overflow")),
+            (self.OWNER, antiphon.ProbeResult(None, b"", None, "deadline")),
         )
         for owner, result in cases:
-            with self.subTest(owner=owner, stdout=result.stdout), \
+            with self.subTest(owner=owner, reason=result.reason), \
                  patch.object(antiphon.peers, "owner_key",
                               return_value=owner), \
-                 patch.object(antiphon.subprocess, "run",
+                 patch.object(antiphon, "_bounded_identity_probe",
                               return_value=result):
                 self.assertIsNone(antiphon._claude_auto_identity(self.CWD))
 
@@ -17157,3 +17165,81 @@ class ConfiguredNameTest(unittest.TestCase):
             self._hook(project, "Not A Name!")
             self.assertEqual(len(self._observations(project)), 1,
                              "withdrawal is idempotent")
+
+
+class IdentityProbeBoundsTest(unittest.TestCase):
+    """The probe is bounded at the read, not after it.
+
+    `capture_output=True` buffers whatever the child writes and only then
+    compares a length, so the cap bounded nothing. A child that keeps writing
+    keeps being read.
+    """
+
+    def _probe(self, script, cwd=None):
+        """Run the real probe against a real child that misbehaves."""
+        argv = [sys.executable, "-c", script]
+        with patch.object(antiphon, "_claude_identity_argv",
+                          return_value=argv, create=True):
+            return antiphon._bounded_identity_probe(argv, cwd or os.getcwd())
+
+    def test_identity_probe_bounds_a_flooding_stdout_child(self):
+        flood = ("import sys\n"
+                 "while True:\n"
+                 "    sys.stdout.write('x' * 4096)\n"
+                 "    sys.stdout.flush()\n")
+        started = time.monotonic()
+        result = self._probe(flood)
+        elapsed = time.monotonic() - started
+        self.assertIsNone(result.text, "an overflowing probe returns nothing")
+        self.assertLessEqual(len(result.captured),
+                             antiphon.CLAUDE_IDENTITY_STDOUT_CEILING,
+                             "captured bytes stay inside the literal ceiling")
+        self.assertLess(elapsed, 10, "it returns promptly, not on child exit")
+        self.assertIsNotNone(result.returncode, "the child was reaped")
+
+    def test_identity_probe_bounds_a_flooding_stderr_child(self):
+        flood = ("import sys\n"
+                 "while True:\n"
+                 "    sys.stderr.write('e' * 4096)\n"
+                 "    sys.stderr.flush()\n")
+        result = self._probe(flood)
+        self.assertIsNone(result.text)
+        self.assertIsNotNone(result.returncode, "the child was reaped")
+
+    def test_identity_probe_kills_and_reaps_a_child_past_the_deadline(self):
+        result = self._probe("import time; time.sleep(60)")
+        self.assertIsNone(result.text)
+        self.assertIsNotNone(result.returncode,
+                             "a child past the deadline is killed and reaped, "
+                             "never left behind")
+
+    def test_identity_probe_resolves_a_child_under_the_ceiling(self):
+        result = self._probe("print('{\"ok\": true}')")
+        self.assertEqual((result.text or "").strip(), '{"ok": true}')
+
+    def test_identity_probe_signals_only_the_child_when_isolation_fails(self):
+        """When the group could not be created, the signal must not widen.
+
+        Nothing is asserted about descendants here: spec §8 does not promise
+        their death in this case, and promising it would be a promise this
+        branch cannot keep.
+        """
+        group_signals = []
+        real_popen = antiphon.subprocess.Popen
+
+        def refuse_new_session(*args, **kwargs):
+            # `start_new_session` is applied in the child after fork, so the
+            # only honest seam is the spawn itself.
+            if kwargs.pop("start_new_session", False):
+                raise OSError(1, "operation not permitted")
+            return real_popen(*args, **kwargs)
+
+        with patch.object(antiphon.os, "killpg",
+                          side_effect=lambda *a: group_signals.append(a)), \
+             patch.object(antiphon.subprocess, "Popen", refuse_new_session):
+            result = self._probe("import time; time.sleep(60)")
+        self.assertIsNone(result.text)
+        self.assertEqual(group_signals, [],
+                         "never widen a signal past a boundary you failed to "
+                         "create")
+        self.assertIsNotNone(result.returncode, "the child itself was reaped")
