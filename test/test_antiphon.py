@@ -6089,6 +6089,380 @@ class CatalogDiscoveryTest(unittest.TestCase):
         self.assertEqual(DoctorTest.snapshot(self.project), before)
 
 
+class SourceCompactionTest(unittest.TestCase):
+    def setUp(self):
+        self.stack = contextlib.ExitStack()
+        self.addCleanup(self.stack.close)
+        self.project = self.stack.enter_context(tempfile.TemporaryDirectory())
+        self.claude_root = self.stack.enter_context(tempfile.TemporaryDirectory())
+        self.codex_root = self.stack.enter_context(tempfile.TemporaryDirectory())
+        self.claude_dir = os.path.join(
+            self.claude_root, antiphon._claude_slug(self.project))
+        os.makedirs(self.claude_dir)
+        self.stack.enter_context(
+            patch.object(antiphon, "CLAUDE_PROJECTS", self.claude_root))
+        self.stack.enter_context(
+            patch.object(antiphon, "CODEX_SESSIONS", self.codex_root))
+        self.stack.enter_context(patch.dict(os.environ, {}, clear=False))
+        os.environ.pop("ANTIPHON_NAME", None)
+
+    def _source(self, number=1, text="private source text"):
+        sid = f"{number:08x}-5555-4555-8555-{number:012x}"
+        path = os.path.join(self.claude_dir, sid + ".jsonl")
+        with open(path, "w", encoding="utf-8") as stream:
+            stream.write(json.dumps({
+                "type": "assistant", "timestamp": "2026-09-01T00:00:00Z",
+                "message": {"content": [{"type": "text", "text": text}]},
+            }) + "\n")
+        return sid, path
+
+    def _scan(self):
+        with patch.object(antiphon, "project_dir", return_value=self.project), \
+             contextlib.redirect_stdout(io.StringIO()), \
+             contextlib.redirect_stderr(io.StringIO()):
+            return antiphon.sources("scan")
+
+    def _aged_gone(self, number=1):
+        sid, path = self._source(number)
+        self.assertEqual(self._scan(), 0)
+        relative = os.path.relpath(path, self.claude_root)
+        record_path = antiphon._catalog_record_path(
+            self.project, "claude", relative)
+        record = antiphon._read_catalog_record(
+            self.project, "claude", relative)
+        old = time.time() - antiphon.LOOKBACK - 60
+        record["observed"] = old
+        record["last_complete_observed"] = old
+        self.assertTrue(antiphon._atomic_json(record_path, record))
+        proof = (record["last_complete_generation"],
+                 record["last_complete_size"])
+        os.unlink(path)
+        return sid, relative, record_path, proof
+
+    def _shared_v4(self, sid=None, proof=None, siblings=None):
+        sources = {}
+        if sid is not None:
+            generation, size = proof
+            sources[sid] = {
+                "gen": generation, "offset": size,
+                "anchor": {"start": max(0, size - 1), "sha256": "a" * 64},
+            }
+        cursor = dict(siblings or {})
+        cursor[antiphon.anchored_page_cursor_key("codex")] = {
+            "v": antiphon.ANCHORED_PAGE_CURSOR_VERSION,
+            "sources": sources, "adopting_v3": {}, "next_lane": "active",
+        }
+        path = os.path.join(self.project, ".antiphon", "cursor.json")
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w", encoding="utf-8") as stream:
+            json.dump(cursor, stream)
+        return path
+
+    def _compact(self):
+        out = io.StringIO()
+        with patch.object(antiphon, "project_dir", return_value=self.project), \
+             contextlib.redirect_stdout(out), \
+             contextlib.redirect_stderr(io.StringIO()):
+            code = antiphon.sources("compact")
+        return code, out.getvalue()
+
+    def _named_cursor(self, name, cursor, owner=None):
+        directory = antiphon.peers.peer_dir(self.project, "codex", name)
+        os.makedirs(directory, exist_ok=True)
+        cursor_path = os.path.join(directory, "cursor.json")
+        with open(cursor_path, "w", encoding="utf-8") as stream:
+            json.dump(cursor, stream)
+        if owner is not None:
+            with open(os.path.join(directory, "session.json"), "w",
+                      encoding="utf-8") as stream:
+                json.dump({"kind": "codex", "name": name,
+                           "session_id": self._source_id,
+                           "owner": owner}, stream)
+        return cursor_path
+
+    def test_compact_retires_one_cursor_proved_aged_gone_source(self):
+        sid, relative, record_path, proof = self._aged_gone()
+        self._shared_v4(sid, proof, siblings={
+            "codex_pages": {"v": antiphon.V3_PAGE_CURSOR_VERSION,
+                            "sources": {sid: {"gen": "old", "offset": 0}}},
+            "codex_seen": {sid: {"gen": "older", "offset": 0}},
+        })
+
+        code, printed = self._compact()
+
+        self.assertEqual(code, 0, printed)
+        self.assertFalse(os.path.exists(record_path))
+        view = antiphon._catalog_snapshot(self.project, "claude").view
+        self.assertNotIn(relative, view.candidates)
+        self.assertIn("1 retired", printed)
+        self.assertRegex(printed, r"1 files? / [1-9][0-9]* bytes reclaimed")
+        for secret in (sid, relative, record_path, "private source text"):
+            self.assertNotIn(secret, printed)
+
+    def test_compact_refuses_readable_recent_and_unconsumed_sources_by_class(self):
+        live_sid, _live = self._source(2, "live secret")
+        self.assertEqual(self._scan(), 0)
+        gone_sid, _relative, record_path, proof = self._aged_gone(3)
+        self._shared_v4(gone_sid, ("different-generation", proof[1]))
+
+        code, printed = self._compact()
+
+        self.assertEqual(code, 1, printed)
+        self.assertTrue(os.path.exists(record_path))
+        self.assertIn("source-not-gone=1", printed)
+        self.assertIn("unconsumed-v4=1", printed)
+        self.assertNotIn(live_sid, printed)
+        self.assertNotIn(gone_sid, printed)
+
+    def test_a_proved_dead_named_reader_is_dormant_and_preserved(self):
+        sid, _relative, record_path, proof = self._aged_gone(4)
+        self._source_id = sid
+        self._shared_v4(sid, proof)
+        directory = antiphon.peers.peer_dir(
+            self.project, "codex", "sleeping")
+        os.makedirs(directory)
+        cursor_path = os.path.join(directory, "cursor.json")
+        cursor_raw = json.dumps({"codex_seen": 1}).encode()
+        with open(cursor_path, "wb") as stream:
+            stream.write(cursor_raw)
+        owner = "99999:v1:Mon Sep  1 00:00:00 2026"
+        with open(os.path.join(directory, "session.json"), "w",
+                  encoding="utf-8") as stream:
+            json.dump({"kind": "codex", "name": "sleeping",
+                       "session_id": sid, "owner": owner}, stream)
+
+        with patch.object(antiphon.peers, "_owner_liveness",
+                          return_value="dead"):
+            code, printed = self._compact()
+
+        self.assertEqual(code, 0, printed)
+        self.assertFalse(os.path.exists(record_path))
+        with open(cursor_path, "rb") as stream:
+            self.assertEqual(stream.read(), cursor_raw)
+        self.assertIn("1 dormant readers ignored", printed)
+
+    def test_shared_legacy_and_invalid_or_newer_cursors_block_compaction(self):
+        cases = {
+            "legacy": ({"codex_pages": {
+                "v": antiphon.V3_PAGE_CURSOR_VERSION, "sources": {}}},
+                       "selected-legacy=1"),
+            "malformed": ({"codex_pages_v4": {"v": 4}},
+                          "invalid-or-unreadable=1"),
+            "newer": ({"codex_pages_v4": {
+                "v": 99, "sources": {}, "adopting_v3": {},
+                "next_lane": "active"}}, "invalid-or-unreadable=1"),
+        }
+        for label, (cursor, expected) in cases.items():
+            with self.subTest(label=label):
+                item = antiphon.CompactionCursor(
+                    "/private/cursor", "valid", json.dumps(cursor).encode(),
+                    False, "missing", b"", "live", False)
+                blocker, dormant = antiphon._compaction_cursor_block(
+                    item, "codex", "source", "generation", 10)
+                self.assertFalse(dormant)
+                self.assertEqual(f"{blocker}=1", expected)
+
+    def test_unknown_named_owner_blocks_only_when_its_cursor_is_unsafe(self):
+        sid, _relative, record_path, proof = self._aged_gone(20)
+        self._source_id = sid
+        self._shared_v4(sid, proof)
+        legacy = {"codex_pages": {
+            "v": antiphon.V3_PAGE_CURSOR_VERSION, "sources": {}}}
+        self._named_cursor("uncertain", legacy)
+
+        code, printed = self._compact()
+
+        self.assertEqual(code, 1, printed)
+        self.assertTrue(os.path.exists(record_path))
+        self.assertIn("selected-legacy=1", printed)
+
+        safe = {antiphon.anchored_page_cursor_key("codex"): {
+            "v": antiphon.ANCHORED_PAGE_CURSOR_VERSION,
+            "sources": {}, "adopting_v3": {}, "next_lane": "active",
+        }}
+        self._named_cursor("uncertain", safe)
+        code, printed = self._compact()
+        self.assertEqual(code, 0, printed)
+        self.assertFalse(os.path.exists(record_path))
+
+    def test_unknown_owner_is_the_blocker_for_an_unconsumed_named_v4(self):
+        sid, _relative, record_path, proof = self._aged_gone(21)
+        self._source_id = sid
+        self._shared_v4(sid, proof)
+        unsafe = {antiphon.anchored_page_cursor_key("codex"): {
+            "v": antiphon.ANCHORED_PAGE_CURSOR_VERSION,
+            "sources": {sid: {"gen": "wrong", "offset": 0,
+                               "anchor": None}},
+            "adopting_v3": {}, "next_lane": "active",
+        }}
+        self._named_cursor("uncertain", unsafe)
+
+        code, printed = self._compact()
+
+        self.assertEqual(code, 1, printed)
+        self.assertTrue(os.path.exists(record_path))
+        self.assertIn("unknown-owner=1", printed)
+
+    def test_recent_gone_source_is_not_retired(self):
+        sid, path = self._source(22)
+        self.assertEqual(self._scan(), 0)
+        relative = os.path.relpath(path, self.claude_root)
+        record = antiphon._read_catalog_record(
+            self.project, "claude", relative)
+        proof = (record["last_complete_generation"],
+                 record["last_complete_size"])
+        record_path = antiphon._catalog_record_path(
+            self.project, "claude", relative)
+        os.unlink(path)
+        self._shared_v4(sid, proof)
+
+        code, printed = self._compact()
+
+        self.assertEqual(code, 1, printed)
+        self.assertTrue(os.path.exists(record_path))
+        self.assertIn("source-not-gone=1", printed)
+
+    def test_cursor_change_during_commit_rolls_back_the_catalog_switch(self):
+        sid, relative, record_path, proof = self._aged_gone(23)
+        cursor_path = self._shared_v4(sid, proof)
+        self.assertEqual(self._scan(), 0)
+        before_generation = antiphon._read_source_catalog(
+            self.project).state["kinds"]["claude"]["generation"]
+        real_inputs = antiphon._compaction_cursor_inputs
+        unlocked_reads = 0
+
+        def race(cwd, side, locked=True):
+            nonlocal unlocked_reads
+            if not locked:
+                unlocked_reads += 1
+            if not locked and unlocked_reads == 2:
+                with open(cursor_path, "w", encoding="utf-8") as stream:
+                    json.dump({"codex_pages": {
+                        "v": antiphon.V3_PAGE_CURSOR_VERSION,
+                        "sources": {}}}, stream)
+            return real_inputs(cwd, side, locked)
+
+        with patch.object(antiphon, "_scan_source_catalogs",
+                          return_value=(False, 0, 0, 0)), \
+             patch.object(antiphon, "_compaction_cursor_inputs",
+                          side_effect=race):
+            code, printed = self._compact()
+
+        self.assertEqual(code, 1, printed)
+        self.assertTrue(os.path.exists(record_path))
+        self.assertIn(relative, antiphon._catalog_snapshot(
+            self.project, "claude").view.candidates)
+        self.assertEqual(antiphon._read_source_catalog(
+            self.project).state["kinds"]["claude"]["generation"],
+                         before_generation)
+        self.assertIn("snapshot-raced=1", printed)
+
+    def test_owner_evidence_change_during_commit_rolls_back_the_switch(self):
+        sid, relative, record_path, proof = self._aged_gone(25)
+        self._source_id = sid
+        self._shared_v4(sid, proof)
+        owner = "99998:v1:Mon Sep  1 00:00:00 2026"
+        safe = {antiphon.anchored_page_cursor_key("codex"): {
+            "v": antiphon.ANCHORED_PAGE_CURSOR_VERSION,
+            "sources": {}, "adopting_v3": {}, "next_lane": "active",
+        }}
+        named = self._named_cursor("moving", safe, owner)
+        session_path = os.path.join(os.path.dirname(named), "session.json")
+        self.assertEqual(self._scan(), 0)
+        before_generation = antiphon._read_source_catalog(
+            self.project).state["kinds"]["claude"]["generation"]
+        real_inputs = antiphon._compaction_cursor_inputs
+        unlocked_reads = 0
+
+        def race(cwd, side, locked=True):
+            nonlocal unlocked_reads
+            if not locked:
+                unlocked_reads += 1
+            if not locked and unlocked_reads == 2:
+                with open(session_path, "w", encoding="utf-8") as stream:
+                    json.dump({"kind": "codex", "name": "moving",
+                               "session_id": sid,
+                               "owner": "99997:v1:new-birth"}, stream)
+            return real_inputs(cwd, side, locked)
+
+        with patch.object(antiphon, "_scan_source_catalogs",
+                          return_value=(False, 0, 0, 0)), \
+             patch.object(antiphon.peers, "_owner_liveness",
+                          return_value="live"), \
+             patch.object(antiphon, "_compaction_cursor_inputs",
+                          side_effect=race):
+            code, printed = self._compact()
+
+        self.assertEqual(code, 1, printed)
+        self.assertTrue(os.path.exists(record_path))
+        self.assertIn(relative, antiphon._catalog_snapshot(
+            self.project, "claude").view.candidates)
+        self.assertEqual(antiphon._read_source_catalog(
+            self.project).state["kinds"]["claude"]["generation"],
+                         before_generation)
+        self.assertIn("snapshot-raced=1", printed)
+
+    def test_source_reappearing_at_commit_time_is_not_retired(self):
+        sid, relative, record_path, proof = self._aged_gone(26)
+        self._shared_v4(sid, proof)
+        self.assertEqual(self._scan(), 0)
+        ready = {
+            "v": antiphon.CATALOG_VERSION,
+            "project": os.path.abspath(self.project), "kind": "claude",
+            "relative": relative, "source": sid, "status": "ready",
+            "reason": None, "observed": time.time(),
+            "generation": "changed", "complete_size": proof[1],
+        }
+        with patch.object(antiphon, "_scan_source_catalogs",
+                          return_value=(False, 0, 0, 0)), \
+             patch.object(antiphon, "_observe_catalog_candidate",
+                          return_value=ready):
+            code, printed = self._compact()
+
+        self.assertEqual(code, 1, printed)
+        self.assertTrue(os.path.exists(record_path))
+        self.assertIn(relative, antiphon._catalog_snapshot(
+            self.project, "claude").view.candidates)
+        self.assertIn("snapshot-raced=1", printed)
+
+    def test_manifest_before_state_failure_and_record_cleanup_retry_converge(self):
+        sid, _relative, record_path, proof = self._aged_gone(24)
+        self._shared_v4(sid, proof)
+        real_write = antiphon._write_catalog_state
+        failed = False
+
+        def fail_compact_state(cwd, state, cleanup=True):
+            nonlocal failed
+            if cleanup is False and not failed:
+                failed = True
+                return False
+            return real_write(cwd, state, cleanup)
+
+        with patch.object(antiphon, "_write_catalog_state",
+                          side_effect=fail_compact_state):
+            first_code, first_out = self._compact()
+        self.assertEqual(first_code, 1, first_out)
+        self.assertTrue(os.path.exists(record_path))
+        self.assertIn("snapshot-raced=1", first_out)
+
+        real_unlink = os.unlink
+
+        def leave_record(path):
+            if path == record_path:
+                raise OSError("simulated crash before record deletion")
+            return real_unlink(path)
+
+        with patch.object(antiphon.os, "unlink", side_effect=leave_record):
+            second_code, second_out = self._compact()
+        self.assertEqual(second_code, 0, second_out)
+        self.assertTrue(os.path.exists(record_path))
+
+        third_code, third_out = self._compact()
+        self.assertEqual(third_code, 0, third_out)
+        self.assertFalse(os.path.exists(record_path))
+        self.assertRegex(third_out, r"1 files? / [1-9][0-9]* bytes reclaimed")
+
+
 class SourceCatalogLockTest(unittest.TestCase):
     """The catalog phase ends before the cursor transaction begins."""
 

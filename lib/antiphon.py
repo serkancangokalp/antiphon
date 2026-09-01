@@ -1657,9 +1657,9 @@ def _new_catalog_state(cwd):
     return {"v": CATALOG_VERSION, "project": os.path.abspath(cwd), "kinds": {}}
 
 
-def _write_catalog_state(cwd, state):
+def _write_catalog_state(cwd, state, cleanup=True):
     written = _atomic_json(_catalog_state_path(cwd), state)
-    if (written
+    if (written and cleanup
             and getattr(_PROJECT_LOCK_STATE, "kind", None) == "catalog"):
         # State is already durable. Cleanup is best effort and can only remove
         # grammar-valid manifests the just-written state does not reference.
@@ -2232,7 +2232,10 @@ def _catalog_scan_step(cwd, kind, force=False):
         cwd, lambda: _merge_catalog_batch(cwd, reservation, observations))
     if not merged.ok or not merged.value:
         return CatalogProgress("degraded", _catalog_pending(cwd, kind), 0, 1, 0)
-    refusals = sum(record.get("status") == "refused" for record in observations)
+    refusals = sum(
+        record.get("status") == "refused"
+        and record.get("reason") != "missing"
+        for record in observations)
     observed_refusals = refusals
     loaded = _read_source_catalog(cwd)
     view = _catalog_view(cwd, kind, loaded)
@@ -2297,7 +2300,10 @@ def _catalog_record_inventory(cwd, kind, view):
     missing = set(view.candidates) - set(by_relative)
     retryable = {
         record["relative"] for record in records
-        if record.get("status") not in ("ready", "unrelated")
+        if (record.get("status") not in ("ready", "unrelated")
+            and not (record.get("status") == "refused"
+                     and record.get("reason") == "missing"
+                     and record.get("last_complete_generation") is not None))
     }
     return records, malformed + len(missing), len(retryable)
 
@@ -7664,13 +7670,379 @@ def catch_up(side=None):
     return status
 
 
-def sources(action=None):
-    """Build or refresh the durable transcript-source catalog explicitly."""
-    if action != "scan":
-        print("antiphon: sources takes exactly `scan`: `antiphon sources scan`",
-              file=sys.stderr)
-        return 2
-    cwd = project_dir()
+COMPACTION_BLOCKERS = (
+    "selected-legacy", "invalid-or-unreadable", "unconsumed-v4",
+    "unknown-owner", "source-not-gone", "snapshot-raced",
+)
+COMPACTION_INPUT_LIMIT = 4 * 1024 * 1024
+CompactionCursor = collections.namedtuple(
+    "CompactionCursor",
+    "path status raw named owner_status owner_raw owner_state owner_unknown")
+
+
+def _read_compaction_file(path):
+    """Read one bounded regular file without following a final symlink."""
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        fd = os.open(path, flags)
+    except FileNotFoundError:
+        return "missing", b""
+    except OSError:
+        return "invalid", b""
+    try:
+        info = os.fstat(fd)
+        if not stat.S_ISREG(info.st_mode):
+            return "invalid", b""
+        chunks, total = [], 0
+        while total <= COMPACTION_INPUT_LIMIT:
+            chunk = os.read(fd, min(65536, COMPACTION_INPUT_LIMIT + 1 - total))
+            if not chunk:
+                return "valid", b"".join(chunks)
+            chunks.append(chunk)
+            total += len(chunk)
+        return "invalid", b""
+    except OSError:
+        return "invalid", b""
+    finally:
+        os.close(fd)
+
+
+@contextlib.contextmanager
+def _compaction_cursor_lock(path, patience=None):
+    """Take one existing or future cursor's ordinary adjacent lock."""
+    _refuse_nested_project_lock("cursor")
+    if patience is None:
+        patience = CURSOR_LOCK_PATIENCE
+    lock_path = path + ".lock"
+    try:
+        os.makedirs(os.path.dirname(lock_path), exist_ok=True)
+        fd = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o600)
+    except OSError:
+        yield False
+        return
+    held = False
+    deadline = time.monotonic() + patience
+    try:
+        while True:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                held = True
+                break
+            except BlockingIOError:
+                if time.monotonic() >= deadline:
+                    break
+                time.sleep(CURSOR_LOCK_RETRY_DELAY)
+            except OSError:
+                break
+        if held:
+            _mark_project_lock("cursor")
+        yield held
+    finally:
+        if held:
+            _unmark_project_lock("cursor")
+            fcntl.flock(fd, fcntl.LOCK_UN)
+        os.close(fd)
+
+
+def _compaction_cursor_paths(cwd, side):
+    """The shared reader plus named reader cursors, with no symlink traversal."""
+    paths = [(os.path.join(cwd, ".antiphon", "cursor.json"), None)]
+    try:
+        entries = list(os.scandir(peers.peers_dir(cwd)))
+    except FileNotFoundError:
+        return paths
+    except OSError:
+        return None
+    prefix = side + "-"
+    for entry in entries:
+        if not entry.name.startswith(prefix):
+            continue
+        name = entry.name[len(prefix):]
+        if not peers.valid_name(name):
+            continue
+        try:
+            if not entry.is_dir(follow_symlinks=False):
+                return None
+        except OSError:
+            return None
+        cursor_path = os.path.join(entry.path, "cursor.json")
+        if os.path.lexists(cursor_path):
+            paths.append((cursor_path, name))
+    return sorted(paths, key=lambda item: (item[1] is not None, item[1] or ""))
+
+
+def _parse_compaction_json(status, raw):
+    if status == "missing":
+        return {}, "missing"
+    if status != "valid":
+        return None, "invalid"
+    try:
+        value = json.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError, ValueError):
+        return None, "invalid"
+    if not isinstance(value, dict):
+        return None, "invalid"
+    return _translate_cursor_keys(value), "valid"
+
+
+def _compaction_cursor_inputs(cwd, side, locked=True):
+    """Snapshot cursor and owner bytes; process liveness is sampled once."""
+    candidates = _compaction_cursor_paths(cwd, side)
+    if candidates is None:
+        return None, None
+    evidence = []
+    for path, name in candidates:
+        if locked:
+            with _compaction_cursor_lock(path) as held:
+                if not held:
+                    return None, None
+                status, raw = _read_compaction_file(path)
+                owner_path = (os.path.join(os.path.dirname(path), "session.json")
+                              if name is not None else None)
+                owner_status, owner_raw = (
+                    _read_compaction_file(owner_path)
+                    if owner_path is not None else ("missing", b""))
+        else:
+            status, raw = _read_compaction_file(path)
+            owner_path = (os.path.join(os.path.dirname(path), "session.json")
+                          if name is not None else None)
+            owner_status, owner_raw = (
+                _read_compaction_file(owner_path)
+                if owner_path is not None else ("missing", b""))
+
+        owner_state, owner_unknown = "live", False
+        if name is not None:
+            owner = None
+            if owner_status == "valid":
+                try:
+                    session = json.loads(owner_raw.decode("utf-8"))
+                except (UnicodeDecodeError, json.JSONDecodeError, ValueError):
+                    session = None
+                if (isinstance(session, dict)
+                        and session.get("kind") == side
+                        and session.get("name") == name):
+                    owner = peers._owner_of(session)
+            if (owner is None
+                    or peers.owner_key_version(owner)
+                    != peers.PROCESS_FINGERPRINT_VERSION):
+                owner_state, owner_unknown = "unknown", True
+            elif locked:
+                owner_state = peers._owner_liveness(owner)
+                owner_unknown = owner_state == "unknown"
+            else:
+                # Revalidation compares the captured owner bytes. It must not
+                # repeat a process probe while the catalog lock is held.
+                owner_state = "captured"
+        evidence.append(CompactionCursor(
+            path, status, raw, name is not None, owner_status, owner_raw,
+            owner_state, owner_unknown))
+    signature = tuple(
+        (os.path.relpath(item.path, cwd), item.status,
+         hashlib.sha256(item.raw).hexdigest(), item.owner_status,
+         hashlib.sha256(item.owner_raw).hexdigest())
+        for item in evidence)
+    return evidence, signature
+
+
+def _compaction_cursor_block(item, reader_side, source, generation, size):
+    """Why one relevant reader cannot release one gone source, if anything."""
+    if item.named and item.owner_state == "dead":
+        return None, True
+    cursor, state = _parse_compaction_json(item.status, item.raw)
+    if state == "invalid":
+        return "invalid-or-unreadable", False
+    if state == "missing":
+        return None, False
+    v4_key = anchored_page_cursor_key(reader_side)
+    v3_key = page_cursor_key(reader_side)
+    legacy_key = reader_side + "_seen"
+    if v4_key in cursor:
+        value = cursor.get(v4_key)
+        if not _valid_v4_page_cursor(value):
+            return "invalid-or-unreadable", False
+        position = value["sources"].get(source)
+        consumed = (position is None and source not in value["adopting_v3"])
+        if position is not None:
+            consumed = (position.get("gen") == generation
+                        and position.get("offset", -1) >= size)
+        if consumed:
+            return None, False
+        return ("unknown-owner" if item.named and item.owner_unknown
+                else "unconsumed-v4"), False
+    if v3_key in cursor:
+        value = cursor.get(v3_key)
+        if (not isinstance(value, dict)
+                or value.get("v") != V3_PAGE_CURSOR_VERSION
+                or not isinstance(value.get("sources"), dict)
+                or not all(_valid_position(entry)
+                           for entry in value["sources"].values())):
+            return "invalid-or-unreadable", False
+        return "selected-legacy", False
+    if legacy_key in cursor:
+        return "selected-legacy", False
+    return None, False
+
+
+def _compaction_result():
+    return {
+        "considered": 0, "retired": 0, "files": 0, "bytes": 0,
+        "dormant": 0, "blockers": {name: 0 for name in COMPACTION_BLOCKERS},
+    }
+
+
+def _compact_catalog_kind(cwd, kind):
+    """Conservatively retire cursor-proved, aged, already-gone candidates."""
+    result = _compaction_result()
+    reader_side = "codex" if kind == "claude" else "claude"
+    snapshot = _catalog_snapshot(cwd, kind)
+    loaded, view = snapshot.loaded, snapshot.view
+    if (loaded.status != "valid" or view.state != "complete"
+            or kind not in loaded.state["kinds"]):
+        result["blockers"]["source-not-gone"] += 1
+        return result
+    records, structural, _retryable = _catalog_record_inventory(cwd, kind, view)
+    by_relative = {record["relative"]: record for record in records}
+    if structural:
+        result["blockers"]["source-not-gone"] += structural
+        return result
+    groups = collections.defaultdict(list)
+    for relative in view.candidates:
+        record = by_relative.get(relative)
+        if record is not None:
+            groups[record["source"]].append(record)
+    result["considered"] = len(groups)
+    cursor_inputs, cursor_signature = _compaction_cursor_inputs(
+        cwd, reader_side, locked=True)
+    if cursor_inputs is None:
+        result["blockers"]["snapshot-raced"] += 1
+        return result
+    result["dormant"] = sum(
+        item.named and item.owner_state == "dead" for item in cursor_inputs)
+
+    boundary = time.time() - LOOKBACK
+    eligible = {}
+    for source, source_records in groups.items():
+        proofs = {
+            (record.get("last_complete_generation"),
+             record.get("last_complete_size"))
+            for record in source_records
+        }
+        aged = all(
+            _finite_number(record.get("last_complete_observed"))
+            and record["last_complete_observed"] < boundary
+            for record in source_records)
+        gone = all(record.get("status") == "refused"
+                   and record.get("reason") == "missing"
+                   for record in source_records)
+        if not (gone and aged and len(proofs) == 1
+                and next(iter(proofs))[0] is not None
+                and isinstance(next(iter(proofs))[1], int)):
+            result["blockers"]["source-not-gone"] += 1
+            continue
+        generation, size = next(iter(proofs))
+        blocker = None
+        for item in cursor_inputs:
+            reason, _ignored = _compaction_cursor_block(
+                item, reader_side, source, generation, size)
+            if reason is not None:
+                blocker = reason
+                break
+        if blocker:
+            result["blockers"][blocker] += 1
+            continue
+        eligible[source] = tuple(record["relative"] for record in source_records)
+
+    detached = [record for record in records
+                if record["relative"] not in set(view.candidates)]
+    if not eligible and not detached:
+        return result
+
+    old_state = json.loads(json.dumps(loaded.state))
+    old_entry = old_state["kinds"][kind]
+    old_generation = old_entry["generation"]
+    retired_relatives = {
+        relative for relatives in eligible.values() for relative in relatives}
+    retained = tuple(relative for relative in view.candidates
+                     if relative not in retired_relatives)
+
+    with catalog_lock(cwd) as locked:
+        if not locked:
+            result["blockers"]["snapshot-raced"] += max(1, len(eligible))
+            return result
+        current = _read_source_catalog(cwd)
+        current_view = _catalog_view(cwd, kind, current)
+        current_entry = (((current.state or {}).get("kinds") or {}).get(kind))
+        if (current.status != "valid" or current_view.state != "complete"
+                or not isinstance(current_entry, dict)
+                or current.state != old_state
+                or current_entry.get("generation") != old_generation
+                or tuple(current_view.candidates) != tuple(view.candidates)):
+            result["blockers"]["snapshot-raced"] += max(1, len(eligible))
+            return result
+        _inputs, signature = _compaction_cursor_inputs(
+            cwd, reader_side, locked=False)
+        if signature != cursor_signature:
+            result["blockers"]["snapshot-raced"] += max(1, len(eligible))
+            return result
+        for relatives in eligible.values():
+            if any(_observe_catalog_candidate(cwd, kind, relative).get("reason")
+                   != "missing" for relative in relatives):
+                result["blockers"]["snapshot-raced"] += 1
+                return result
+
+        if eligible:
+            generation = uuid.uuid4().hex
+            base_name = _catalog_manifest_name(kind, generation, "base")
+            delta_name = _catalog_manifest_name(kind, generation, "delta")
+            common = {
+                "v": CATALOG_VERSION, "project": os.path.abspath(cwd),
+                "kind": kind, "generation": generation,
+                "root_stamp": old_entry.get("root_stamp"),
+            }
+            base_manifest = dict(common, phase="base", paths=list(retained))
+            delta_manifest = dict(common, phase="delta", paths=[])
+            if (not _write_catalog_manifest(cwd, base_name, base_manifest)
+                    or not _write_catalog_manifest(
+                        cwd, delta_name, delta_manifest)):
+                result["blockers"]["snapshot-raced"] += len(eligible)
+                return result
+            new_state = json.loads(json.dumps(old_state))
+            new_state["kinds"][kind] = {
+                "generation": generation, "phase": "complete",
+                "base_manifest": base_name, "base_next": len(retained),
+                "delta_manifest": delta_name, "delta_next": 0,
+                "root_stamp": old_entry.get("root_stamp"), "inflight": None,
+            }
+            if not _write_catalog_state(cwd, new_state, cleanup=False):
+                result["blockers"]["snapshot-raced"] += len(eligible)
+                return result
+            _inputs, after_signature = _compaction_cursor_inputs(
+                cwd, reader_side, locked=False)
+            if after_signature != cursor_signature:
+                _write_catalog_state(cwd, old_state, cleanup=False)
+                result["blockers"]["snapshot-raced"] += len(eligible)
+                return result
+
+        removable = list(retired_relatives)
+        removable.extend(record["relative"] for record in detached)
+        for relative in sorted(set(removable)):
+            path = _catalog_record_path(cwd, kind, relative)
+            try:
+                info = os.lstat(path)
+                if not stat.S_ISREG(info.st_mode):
+                    continue
+                os.unlink(path)
+            except OSError:
+                continue
+            result["files"] += 1
+            result["bytes"] += info.st_size
+        _cleanup_catalog_manifests(cwd)
+    result["retired"] = len(eligible)
+    return result
+
+
+def _scan_source_catalogs(cwd):
+    """Complete both catalogs and return scanner totals without printing."""
     processed = refused = gone = 0
     failed = False
     for kind in ("claude", "codex"):
@@ -7692,6 +8064,40 @@ def sources(action=None):
         else:
             failed = True
         refused += kind_refused
+    return failed, processed, refused, gone
+
+
+def sources(action=None):
+    """Build or refresh the durable transcript-source catalog explicitly."""
+    if action not in ("scan", "compact"):
+        print("antiphon: sources takes `scan` or `compact`: "
+              "`antiphon sources scan` | `antiphon sources compact`",
+              file=sys.stderr)
+        return 2
+    cwd = project_dir()
+    failed, processed, refused, gone = _scan_source_catalogs(cwd)
+    if action == "compact":
+        combined = _compaction_result()
+        if failed or refused:
+            combined["blockers"]["source-not-gone"] = max(1, refused)
+        else:
+            for kind in ("claude", "codex"):
+                partial = _compact_catalog_kind(cwd, kind)
+                for key in ("considered", "retired", "files", "bytes"):
+                    combined[key] += partial[key]
+                combined["dormant"] += partial["dormant"]
+                for key in COMPACTION_BLOCKERS:
+                    combined["blockers"][key] += partial["blockers"][key]
+        blockers = ", ".join(
+            f"{key}={combined['blockers'][key]}"
+            for key in COMPACTION_BLOCKERS)
+        blocked = sum(combined["blockers"].values())
+        state = "refused" if blocked else "complete"
+        print(f"source compaction: {state}; {combined['considered']} considered; "
+              f"{combined['retired']} retired; {combined['files']} files / "
+              f"{combined['bytes']} bytes reclaimed; {combined['dormant']} "
+              f"dormant readers ignored; blockers {blockers}")
+        return 1 if blocked else 0
     state = "degraded" if failed or refused else "complete"
     cleanup_pending = _catalog_cleanup_pending(cwd)
     cleanup = ("cleanup pending unknown" if cleanup_pending is None else
