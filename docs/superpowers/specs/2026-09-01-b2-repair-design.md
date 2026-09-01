@@ -141,6 +141,26 @@ the others are already inert because routing consults the proof.
   beside the proofs and advanced atomically under the same lock, so each
   mutation examines the next window of at most eight and the whole inventory is
   covered in a finite number of writes.
+- **The sweep uses only cheap positive-death evidence.** The ordinary liveness
+  path shells out to `ps` with a five-second timeout, so eight of those under
+  the global registry lock could hold a hook for forty seconds — measured in
+  `lib/peers.py`, not supposed. Garbage collection therefore asks one question
+  only, with a syscall rather than a subprocess: does any process hold that
+  pid? `ProcessLookupError` proves the owner is gone. Every other outcome —
+  the pid exists, permission denied, anything unexpected — is *not proved
+  dead*, and nothing is reclaimed.
+  Pid reuse can only make a dead owner look alive, which costs one lingering
+  file. It can never make a live owner look dead, which would cost a session
+  its identity. The cheap check is sound in the direction that matters.
+- The sweep also carries a literal total patience of **50 ms**. It stops when
+  that is spent, whatever it has covered, and the cursor keeps the position for
+  the next mutation. The bound exists so the guarantee survives someone later
+  making the check more expensive.
+- **A failing sweep never costs the rotation.** Once the new proof has been
+  committed atomically, any garbage-collection or cursor read/write error is
+  swallowed: the hook still succeeds, the current proof stands, the correct
+  session withdrawal stands, the delivery path is not lost, and no private path
+  is printed. Cleanup is best effort and the next mutation retries it.
 - A malformed or unreadable cursor **resets to the start** rather than
   refusing. Rescanning is harmless here — every reclamation still requires
   positive death proof for the record it touches — so the safe failure is to
