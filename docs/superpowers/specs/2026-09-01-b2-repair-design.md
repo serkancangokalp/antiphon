@@ -39,6 +39,29 @@ validation. With it the invariant holds even if cleanup never runs and the
 wakeup never arrives: a connection arriving after the proof moved is refused at
 the moment of delivery and emits no notification.
 
+### The verdict is classified, because one `false` hides two opposite answers
+
+A boolean readiness answer cannot drive self-retirement. The same `false` covers
+two situations that demand opposite handling:
+
+- **UNREADY / UNKNOWN** — no proof yet (bootstrap, before the first hook ever
+  runs) or the proof could not be read (a transient I/O error). Routing and
+  signing fail closed, but destroying the listener would be wrong: the first
+  hook is about to make it ready, and an `EIO` must not force a reconnect.
+- **PROVED_STALE** — a valid current proof names a different session or digest.
+  This is the only case where `no-peer`, flush and self-retire are correct.
+
+So the single shared function returns a **verdict with a reason**, not a bool:
+`READY`, `UNREADY`, `UNKNOWN`, `PROVED_STALE`, `STRUCTURAL_INVALID`. The
+resolver, `status`, `doctor` and Node signing all consume the same verdict, and
+**only `PROVED_STALE` retires anything destructively.** A bool here would have
+made the listener either kill itself at bootstrap or never retire at all — the
+original bug in the other direction.
+
+Parity is therefore proved over the verdict and its reason, not over a boolean:
+two readers agreeing on `false` for different reasons would still diverge on
+what to do about it.
+
 That refusal is **classified**, not a transport error. The class is literally
 `no-peer` — the existing one, not a new spelling. It is the true statement: the
 peer that alias named is no longer this session, so there is no such peer to
