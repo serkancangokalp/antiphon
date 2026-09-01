@@ -222,8 +222,12 @@ Observe the command/interface missing before implementation.
   rollback must preserve the safe old view; invoke safe manifest cleanup only
   after the journal no longer needs either generation.
 - Refuse on any uncertainty and preserve the old complete catalog.
-- Tell the operator to retry an aggregate `snapshot-raced` refusal without
-  exposing a path, identity, hash or content on stdout or stderr.
+- Keep `snapshot-raced` as the frozen aggregate blocker while tracking a
+  retryable subset that can never exceed it. Tell the operator to retry only
+  when a revalidated input snapshot changed. For persistent proof failures,
+  say that the evidence could not be interpreted as a transient change and no
+  automatic remedy was attempted. Neither route exposes a path, identity, hash
+  or content on stdout or stderr; mixed results print both independent lines.
 
 Run command, cursor, catalog and interruption tests and commit compaction.
 

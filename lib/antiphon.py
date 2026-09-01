@@ -8153,9 +8153,18 @@ def _compaction_cursor_block(item, reader_side, source, generation, size):
 def _compaction_result():
     return {
         "considered": 0, "retired": 0, "files": 0, "bytes": 0,
-        "dormant": 0, "pending": 0,
+        "dormant": 0, "pending": 0, "retryable": 0,
         "blockers": {name: 0 for name in COMPACTION_BLOCKERS},
     }
+
+
+def _compaction_snapshot_race(result, count=1, retryable=False):
+    """Classify an uncertain snapshot without widening blocker contracts."""
+    if not isinstance(count, int) or isinstance(count, bool) or count <= 0:
+        return
+    result["blockers"]["snapshot-raced"] += count
+    if retryable:
+        result["retryable"] += count
 
 
 def _analyze_compaction_kind(cwd, kind, lock_cursors):
@@ -8188,7 +8197,7 @@ def _analyze_compaction_kind(cwd, kind, lock_cursors):
         cursor_inputs, cursor_signature = _compaction_cursor_inputs(
             cwd, reader_side, locked=False, classify_owners=True)
     if cursor_inputs is None:
-        result["blockers"]["snapshot-raced"] += 1
+        _compaction_snapshot_race(result)
         return CompactionAnalysis(
             result, {}, (), loaded, view, tuple(records), None)
     result["dormant"] = sum(
@@ -8237,8 +8246,8 @@ def _analyze_compaction_kind(cwd, kind, lock_cursors):
         result["pending"] = 1
     # A record detached without a committed retirement journal has no cursor
     # proof attached to it. Leaking metadata is safer than guessing it retired.
-    result["blockers"]["snapshot-raced"] += sum(
-        record["relative"] not in proved_detached for record in detached)
+    _compaction_snapshot_race(result, sum(
+        record["relative"] not in proved_detached for record in detached))
     return CompactionAnalysis(
         result, eligible, detached, loaded, view, tuple(records),
         cursor_signature)
@@ -8326,18 +8335,18 @@ def _resume_compaction_kind(cwd, kind):
     result = _compaction_result()
     with catalog_lock(cwd) as locked:
         if not locked:
-            result["blockers"]["snapshot-raced"] += 1
+            _compaction_snapshot_race(result, retryable=True)
             return result, True
         journal, status = _read_compaction_journal(cwd, kind)
         if status == "missing":
             return result, False
         if status != "valid":
-            result["blockers"]["snapshot-raced"] += 1
+            _compaction_snapshot_race(result)
             result["pending"] = 1
             return result, True
         if journal["phase"] == "prepared":
             if not _recover_prepared_compactions_locked(cwd):
-                result["blockers"]["snapshot-raced"] += 1
+                _compaction_snapshot_race(result)
             pending = os.path.lexists(_compaction_journal_path(cwd, kind))
             result["pending"] = 1 if pending else 0
             return result, pending
@@ -8345,7 +8354,7 @@ def _resume_compaction_kind(cwd, kind):
             cwd, kind, journal)
         result["files"] += files
         result["bytes"] += reclaimed
-        result["blockers"]["snapshot-raced"] += raced
+        _compaction_snapshot_race(result, raced)
         result["pending"] = 1 if pending else 0
     return result, pending
 
@@ -8356,7 +8365,7 @@ def _compact_catalog_kind(cwd, kind):
     if result["blockers"]["snapshot-raced"] or pending_receipt:
         return result
     analysis = _analyze_compaction_kind(cwd, kind, lock_cursors=True)
-    for key in ("considered", "dormant", "pending"):
+    for key in ("considered", "dormant", "pending", "retryable"):
         result[key] += analysis.result[key]
     for key in COMPACTION_BLOCKERS:
         result["blockers"][key] += analysis.result["blockers"][key]
@@ -8379,14 +8388,15 @@ def _compact_catalog_kind(cwd, kind):
         analyzed_records.values())
     if (set(analyzed_records) != retired_relatives
             or record_signature is None):
-        result["blockers"]["snapshot-raced"] += max(1, len(eligible))
+        _compaction_snapshot_race(result, max(1, len(eligible)))
         return result
     retained = tuple(relative for relative in view.candidates
                      if relative not in retired_relatives)
 
     with catalog_lock(cwd) as locked:
         if not locked:
-            result["blockers"]["snapshot-raced"] += max(1, len(eligible))
+            _compaction_snapshot_race(
+                result, max(1, len(eligible)), retryable=True)
             return result
         current = _read_source_catalog_raw(cwd)
         current_view = _catalog_view(cwd, kind, current)
@@ -8396,7 +8406,8 @@ def _compact_catalog_kind(cwd, kind):
                 or current.state != old_state
                 or current_entry.get("generation") != old_generation
                 or tuple(current_view.candidates) != tuple(view.candidates)):
-            result["blockers"]["snapshot-raced"] += max(1, len(eligible))
+            _compaction_snapshot_race(
+                result, max(1, len(eligible)), retryable=True)
             return result
         current_records = [
             _read_catalog_record(cwd, kind, relative)
@@ -8404,17 +8415,19 @@ def _compact_catalog_kind(cwd, kind):
         if (any(record is None for record in current_records)
                 or _compaction_record_signature(current_records)
                 != record_signature):
-            result["blockers"]["snapshot-raced"] += max(1, len(eligible))
+            _compaction_snapshot_race(
+                result, max(1, len(eligible)), retryable=True)
             return result
         _inputs, signature = _compaction_cursor_inputs(
             cwd, reader_side, locked=False)
         if signature != cursor_signature:
-            result["blockers"]["snapshot-raced"] += max(1, len(eligible))
+            _compaction_snapshot_race(
+                result, max(1, len(eligible)), retryable=True)
             return result
         for relatives in eligible.values():
             if any(_observe_catalog_candidate(cwd, kind, relative).get("reason")
                    != "missing" for relative in relatives):
-                result["blockers"]["snapshot-raced"] += 1
+                _compaction_snapshot_race(result, retryable=True)
                 return result
 
         generation = uuid.uuid4().hex
@@ -8430,7 +8443,7 @@ def _compact_catalog_kind(cwd, kind):
         if (not _write_catalog_manifest(cwd, base_name, base_manifest)
                 or not _write_catalog_manifest(
                     cwd, delta_name, delta_manifest)):
-            result["blockers"]["snapshot-raced"] += len(eligible)
+            _compaction_snapshot_race(result, len(eligible))
             return result
         new_state = json.loads(json.dumps(old_state))
         new_state["kinds"][kind] = {
@@ -8441,7 +8454,7 @@ def _compact_catalog_kind(cwd, kind):
         }
         receipts = _compaction_receipts(cwd, kind, eligible)
         if receipts is None:
-            result["blockers"]["snapshot-raced"] += len(eligible)
+            _compaction_snapshot_race(result, len(eligible))
             return result
         journal = {
             "v": COMPACTION_JOURNAL_VERSION,
@@ -8450,14 +8463,14 @@ def _compact_catalog_kind(cwd, kind):
             "new_state": new_state, "records": receipts,
         }
         if not _write_compaction_journal(cwd, journal):
-            result["blockers"]["snapshot-raced"] += len(eligible)
+            _compaction_snapshot_race(result, len(eligible))
             return result
         if not _write_catalog_state(cwd, new_state, cleanup=False):
             # A failed caller may have reached os.replace and then lost its
             # acknowledgement. Inspect through the prepared journal recovery;
             # never delete the only durable route back to the old view.
             _recover_prepared_compactions_locked(cwd)
-            result["blockers"]["snapshot-raced"] += len(eligible)
+            _compaction_snapshot_race(result, len(eligible))
             return result
 
         _inputs, after_signature = _compaction_cursor_inputs(
@@ -8470,21 +8483,22 @@ def _compact_catalog_kind(cwd, kind):
             _recover_prepared_compactions_locked(cwd)
             # On rollback failure the prepared journal remains. Every current
             # reader overlays its old state until a later mutation recovers it.
-            result["blockers"]["snapshot-raced"] += len(eligible)
+            _compaction_snapshot_race(
+                result, len(eligible), retryable=True)
             return result
 
         committed = json.loads(json.dumps(journal))
         committed["phase"] = "committed"
         if not _write_compaction_journal(cwd, committed):
             _recover_prepared_compactions_locked(cwd)
-            result["blockers"]["snapshot-raced"] += len(eligible)
+            _compaction_snapshot_race(result, len(eligible))
             return result
 
         files, reclaimed, raced, pending = _finish_committed_compaction_locked(
             cwd, kind, committed)
         result["files"] += files
         result["bytes"] += reclaimed
-        result["blockers"]["snapshot-raced"] += raced
+        _compaction_snapshot_race(result, raced)
         result["pending"] = 1 if pending else 0
         result["retired"] += len(eligible)
     return result
@@ -8533,7 +8547,7 @@ def sources(action=None):
             for kind in ("claude", "codex"):
                 partial = _compact_catalog_kind(cwd, kind)
                 for key in ("considered", "retired", "files", "bytes",
-                            "pending"):
+                            "pending", "retryable"):
                     combined[key] += partial[key]
                 combined["dormant"] += partial["dormant"]
                 for key in COMPACTION_BLOCKERS:
@@ -8549,9 +8563,21 @@ def sources(action=None):
               f"{combined['bytes']} bytes reclaimed; {combined['dormant']} "
               f"dormant readers ignored; {combined['pending']} cleanup "
               f"transaction(s) pending; blockers {blockers}")
-        if combined["blockers"]["snapshot-raced"]:
-            print("source compaction: inputs changed while proofs were checked; "
-                  "retry `antiphon sources compact`")
+        snapshot_raced = combined["blockers"]["snapshot-raced"]
+        retryable = combined["retryable"]
+        if (not isinstance(retryable, int) or isinstance(retryable, bool)
+                or retryable < 0 or retryable > snapshot_raced):
+            print("source compaction: snapshot classification could not be "
+                  "trusted; no automatic remedy was attempted")
+            return 1
+        persistent = snapshot_raced - retryable
+        if retryable:
+            print(f"source compaction: {retryable} input snapshot(s) changed "
+                  "while proofs were checked; retry `antiphon sources compact`")
+        if persistent:
+            print(f"source compaction: {persistent} proof failure(s) could not "
+                  "be interpreted as a transient snapshot change; no automatic "
+                  "remedy was attempted")
         return 1 if blocked or combined["pending"] else 0
     state = "degraded" if failed or refused else "complete"
     cleanup_pending = _catalog_cleanup_pending(cwd)

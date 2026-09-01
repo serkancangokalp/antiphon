@@ -328,8 +328,10 @@ stays relevant. The command revalidates every value its decision read —
 including the deeply typed values of the candidate records it would retire —
 under the catalog lock around its atomic state switch. Unrelated record updates
 do not block it. Output reports only aggregate blocker classes and reclaimed
-files/bytes, tells the operator to retry a snapshot race, and preserves all
-cursor files. A durable prepared/committed journal keeps the old catalog visible
+files/bytes, tells the operator to retry only when a revalidated input snapshot
+changed, and preserves all cursor files. A proof failure that cannot be
+interpreted as a transient change reports that no automatic remedy was
+attempted. A durable prepared/committed journal keeps the old catalog visible
 until post-switch proof succeeds; a crash or failed rollback therefore retries
 or rolls back instead of turning an unproved detached record into deletion proof.
 Hooks never retire candidates; they may only recover a prepared safe view.

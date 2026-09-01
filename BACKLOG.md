@@ -132,8 +132,11 @@ the write-and-flush-before-advance transaction.
   a crash or failed rollback and authorizes cleanup only after post-switch
   proof; an unjournaled detached record is never guessed safe. Output exposes
   only aggregate blocker classes and reclaimed files/bytes across stdout and
-  stderr, and tells the operator to retry a snapshot race. Hooks never retire
-  candidates.
+  stderr. It tells the operator to retry only the subset of `snapshot-raced`
+  blockers caused by a revalidated input change; persistent proof failures say
+  that no automatic remedy was attempted. The internal retryable count is a
+  narrowing classification and can never exceed `snapshot-raced`.
+  Hooks never retire candidates.
 
 ### Still open, by name
 

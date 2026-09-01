@@ -280,7 +280,11 @@ a cursor created immediately after the census cannot make its bytes readable;
 the command nevertheless refuses if the rechecked cursor-file set changed.
 Output is aggregate only: candidates considered/retired/refused and bytes/files
 reclaimed, never paths, source ids, cursor hashes or transcript content. A
-`snapshot-raced` refusal explicitly tells the operator to retry.
+`snapshot-raced` refusal is narrowed internally into retryable and persistent
+counts. A revalidated input change explicitly tells the operator to retry;
+evidence that cannot be interpreted as a transient change instead says no
+automatic remedy was attempted. The retryable count cannot exceed the frozen
+`snapshot-raced` blocker, and mixed results print both guidance lines.
 
 Ordinary `sources scan` does not retire candidates. It may reclaim unreferenced
 manifests because that proof is catalog-local; it cannot infer that all readers
