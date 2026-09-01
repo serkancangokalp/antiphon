@@ -126,8 +126,9 @@ on register and reassert rather than on delivery alone.
 
 The whole rotation is **one transaction under one lock acquisition**, exposed
 as a single production call — capture the prior proof, validate and write the
-new one, withdraw every same-owner stale automatic session half relative to the
-new current proof, and run the bounded GC window. It cannot be assembled from
+new one, and withdraw every same-owner stale automatic session half relative to the
+new current proof. The bounded sweep is part of that same transaction once it
+exists. It cannot be assembled from
 helpers that each take the lock, because the registry lock is not reentrant and
 because two concurrent hooks would interleave between acquisitions and corrupt
 both the prior-proof answer and the judgement of which half is stale.
