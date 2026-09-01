@@ -1001,6 +1001,24 @@ class IdentityPrivacyContractTest(unittest.TestCase):
         self.assertNotIn(".trim().slice(0, 500)", node)
         self.assertNotIn("detail.slice(0, 500)", node)
 
+    def test_the_lockfile_agrees_with_the_package_it_locks(self):
+        """A version lives in two tracked files, and one of them is easy to
+        forget: `npm version` writes both, a hand-edit writes one. The lockfile
+        is not published, so nothing about npm catches the drift — but
+        `npm ci` installs from it, and a repository that states two versions of
+        itself is one nobody can reason about.
+        """
+        root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        with open(os.path.join(root, "package.json"), encoding="utf-8") as f:
+            declared = json.load(f)["version"]
+        with open(os.path.join(root, "package-lock.json"), encoding="utf-8") as f:
+            lock = json.load(f)
+        self.assertEqual(lock.get("version"), declared,
+                         "the lockfile's own version")
+        self.assertEqual(lock.get("packages", {}).get("", {}).get("version"),
+                         declared, "and the root package it records")
+        self.assertEqual(lock.get("name"), declared and "antiphon")
+
     def test_identity_proof_has_one_validator_on_each_side(self):
         """The verdict reads the proof twice — once before it observes the
         halves, once after, to close the window a rotation can land in. Two
