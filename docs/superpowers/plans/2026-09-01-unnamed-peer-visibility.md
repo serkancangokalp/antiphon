@@ -127,9 +127,10 @@ Start with failing status/doctor tests for:
 - no claim of zero when the census is unknown;
 - one registry/observation snapshot per command, preventing split views.
 
-Update the old blanket session-id secrecy test to preserve secrecy for cursor,
-rollout and named-peer internals while permitting only explicit unnamed
-diagnostic rows. Update README, `AGENTS_RULE`, `CLAUDE_RULE`, channel
+Narrow the old blanket session-id secrecy test to one rule and one carve-out: a
+session id may appear only in its labelled unnamed-observation diagnostic row;
+its appearance anywhere else — any other status or doctor line, any refusal,
+or any error path — is a failure. Update README, `AGENTS_RULE`, `CLAUDE_RULE`, channel
 instructions and BACKLOG together, with contract tests binding their shared
 rules. Mark B1 shipped but leave B2/B3 open and record why the order is a
 dependency.
