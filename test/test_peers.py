@@ -396,13 +396,15 @@ class OwnerKeyTest(unittest.TestCase):
                 ("200", "Sat Aug 30 01:00:02 2026", "python3 antiphon.py mcp"),
                 ("300", "Sat Aug 30 01:00:01 2026", "node antiphon mcp"),
                 ("1", "Sat Aug 30 01:00:00 2026", "/usr/local/bin/codex")]):
-            self.assertEqual(peers.owner_key(100), "300:Sat Aug 30 01:00:00 2026")
+            self.assertEqual(peers.owner_key(100),
+                             "300:v1:Sat Aug 30 01:00:00 2026")
 
     def test_a_claude_root_is_recognised_too(self):
         with patch.object(peers, "_process_info", side_effect=[
                 ("200", "Sat Aug 30 01:00:01 2026", "node lib/channel.mjs"),
                 ("300", "Sat Aug 30 01:00:00 2026", "/usr/local/bin/claude")]):
-            self.assertEqual(peers.owner_key(100), "200:Sat Aug 30 01:00:00 2026")
+            self.assertEqual(peers.owner_key(100),
+                             "200:v1:Sat Aug 30 01:00:00 2026")
 
     def test_an_orphan_has_nothing_to_join_on(self):
         """A server whose parent died reports parent 1 — observed on this
@@ -427,14 +429,43 @@ class OwnerKeyTest(unittest.TestCase):
             self.assertIsNone(peers.owner_key(100))
 
     def test_a_real_ps_line_parses_into_its_three_parts(self):
-        """The 24-character slice is `lstart`'s fixed width. Taken from a live
-        line on this machine."""
+        """The C-locale fields, not an inherited-width slice, divide the line."""
         line = "74544 Sun Aug 30 05:20:57 2026     /bin/zsh -c something"
         with patch.object(peers.subprocess, "run",
                           return_value=SimpleNamespace(stdout=line)):
             self.assertEqual(peers._process_info(1),
                              ("74544", "Sun Aug 30 05:20:57 2026",
                               "/bin/zsh -c something"))
+
+    def test_process_table_is_rendered_in_one_canonical_environment(self):
+        """A writer and reader inherit different host environments routinely.
+
+        The environment belongs on the `ps` child itself: changing Python's
+        idea of a timezone after the fact cannot recover how an old string was
+        rendered.
+        """
+        line = "1 Sun Aug 30 05:20:57 2026 /bin/zsh"
+        with patch.dict(os.environ, {"KEEP_ME": "yes", "TZ": "Europe/Istanbul",
+                                     "LC_ALL": "tr_TR.UTF-8"}, clear=True), \
+             patch.object(peers.subprocess, "run",
+                          return_value=SimpleNamespace(stdout=line)) as run:
+            self.assertEqual(peers._process_info(1),
+                             ("1", "Sun Aug 30 05:20:57 2026", "/bin/zsh"))
+        env = run.call_args.kwargs["env"]
+        self.assertEqual(env["TZ"], "UTC")
+        self.assertEqual(env["LC_ALL"], "C")
+        self.assertEqual(env["KEEP_ME"], "yes")
+
+    def test_one_live_process_has_one_birth_across_reader_timezones(self):
+        """The exact product fault: the same pid must not look recycled merely
+        because two hosts supplied different `TZ` values to their MCP server."""
+        with patch.dict(os.environ, {"TZ": "UTC"}):
+            utc = peers._process_birth(os.getpid())
+        with patch.dict(os.environ, {"TZ": "Europe/Istanbul"}):
+            istanbul = peers._process_birth(os.getpid())
+        if utc is None or istanbul is None:
+            self.skipTest("no readable process table")
+        self.assertEqual(utc, istanbul)
 
     def test_a_dead_pid_reads_as_nothing_rather_than_raising(self):
         with patch.object(peers.subprocess, "run",
@@ -462,7 +493,8 @@ class OwnerKeyTest(unittest.TestCase):
             self.skipTest("not running under a claude or codex process")
         pid, _, start = key.partition(":")
         self.assertTrue(pid.isdigit())
-        self.assertTrue(start.strip())
+        self.assertTrue(start.startswith("v1:"), start)
+        self.assertTrue(start.removeprefix("v1:").strip())
 
 
 class RecycledPidTest(unittest.TestCase):
@@ -518,6 +550,7 @@ class RecycledPidTest(unittest.TestCase):
             self._register(project, self.LIVE)
             record = self._read(project)
         self.assertEqual(record["birth"], self.LIVE)
+        self.assertEqual(record["birth_version"], 1)
         self.assertIsInstance(record["started_at"], float,
                               "when the claim was made is a different fact from "
                               "when the process was born, and stays its own field")
@@ -620,6 +653,26 @@ class RecycledPidTest(unittest.TestCase):
                 ok, _ = peers.register(project, "claude", "ui", "/tmp/other.sock",
                                        pid=os.getppid())
             self.assertFalse(ok, "and it still holds its name")
+            self.assertTrue(os.path.exists(self._endpoint(project)))
+
+    def test_an_unversioned_fingerprint_is_legacy_not_a_recycled_pid(self):
+        """0.3.3 wrote a rendered time without recording its TZ or locale.
+
+        A new UTC/C reader cannot compare that string honestly. Treating the
+        mismatch as death deletes a live endpoint once during every upgrade.
+        """
+        with tempfile.TemporaryDirectory() as project:
+            directory = peers.peer_dir(project, "claude", "ui")
+            os.makedirs(directory)
+            with open(os.path.join(directory, "endpoint.json"), "w",
+                      encoding="utf-8") as f:
+                json.dump({"kind": "claude", "name": "ui",
+                           "pid": os.getpid(), "address": "/tmp/ui.sock",
+                           "birth": self.LIVE, "started_at": 1.0}, f)
+            with patch.object(peers, "alive", return_value=True), \
+                 self._ps(self.RECYCLED):
+                self.assertEqual([p["name"] for p in peers.read_peers(project)],
+                                 ["ui"])
             self.assertTrue(os.path.exists(self._endpoint(project)))
 
     def test_a_fingerprint_that_cannot_be_read_now_does_not_release_a_peer(self):

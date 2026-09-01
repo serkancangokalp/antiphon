@@ -38,6 +38,8 @@ KIND_PATTERN = re.compile(r"claude|codex")
 # below produces it. A bare pid is refused deliberately: it is the recycled
 # number the start time exists to rule out.
 OWNER_PATTERN = re.compile(r"[1-9][0-9]*:\S(?:.*\S)?")
+PROCESS_FINGERPRINT_VERSION = 1
+OWNER_KEY_VERSION = f"v{PROCESS_FINGERPRINT_VERSION}"
 # The canonical UUID a Codex session is named by, lowercase as the CLI writes it
 # and as `antiphon.SESSION_ID` reads it back off a rollout file name. A contract
 # test keeps the two spellings from drifting apart.
@@ -293,6 +295,17 @@ def _birth_of(record):
     return birth
 
 
+def _birth_is_current(record):
+    """Whether `birth` was rendered by the canonical process reader.
+
+    Records written before this marker carry a local-time, local-locale string.
+    A mismatch with today's UTC/C rendering says nothing about their process,
+    so only a current marker makes strict comparison safe.
+    """
+    return (hasattr(record, "get")
+            and record.get("birth_version") == PROCESS_FINGERPRINT_VERSION)
+
+
 def alive(pid):
     """True if the process still exists. Signal 0 checks without delivering.
 
@@ -338,7 +351,7 @@ def _record_alive(record):
     if pid is None or not alive(pid):
         return False
     recorded = _birth_of(record)
-    if recorded is None:
+    if recorded is None or not _birth_is_current(record):
         return True
     observed = _process_birth(pid)
     return observed is None or observed == recorded
@@ -545,6 +558,7 @@ def register(cwd, kind, name, address, pid=None, owner_key=None):
             # is what the listing sorts on. This is when the process was born,
             # and it is the half of its identity the number does not carry.
             record["birth"] = birth
+            record["birth_version"] = PROCESS_FINGERPRINT_VERSION
         tmp = f"{path}.{os.getpid()}.tmp"
         with open(tmp, "w", encoding="utf-8") as f:
             json.dump(record, f, ensure_ascii=False)
@@ -646,20 +660,30 @@ def _process_info(pid):
     """(ppid, start time, command) for a live pid, or None.
 
     Separated from the walk so tests can drive it without building real process
-    trees. The start time is `ps`'s `lstart`, a fixed 24 characters wide.
+    trees. `ps` renders in UTC and the C locale regardless of its caller, so the
+    same live process has one spelling in every host process. The C fields are
+    split structurally instead of slicing at a locale-dependent width.
     """
+    env = os.environ.copy()
+    env.update({"LC_ALL": "C", "TZ": "UTC"})
     try:
         out = subprocess.run(["ps", "-o", "ppid=,lstart=,command=", "-p", str(pid)],
-                             capture_output=True, text=True, timeout=5).stdout.strip()
+                             capture_output=True, text=True, timeout=5,
+                             env=env).stdout.strip()
     except (OSError, subprocess.SubprocessError):
         return None
     if not out:
         return None
-    try:
-        ppid, rest = out.split(None, 1)
-    except ValueError:
+    fields = out.split(None, 6)
+    if len(fields) != 7:
         return None
-    return ppid, rest[:24].strip(), rest[24:].strip()
+    ppid, weekday, month, day, clock, year, command = fields
+    if not (ppid.isdigit() and day.isdigit() and year.isdigit()
+            and re.fullmatch(r"[0-9]{2}:[0-9]{2}:[0-9]{2}", clock)):
+        return None
+    start = " ".join((weekday, month, day, clock, year))
+    command = command.strip()
+    return (ppid, start, command) if command else None
 
 
 def _process_birth(pid):
@@ -676,7 +700,7 @@ def _process_birth(pid):
 
 
 def owner_key(pid=None):
-    """`"<root pid>:<start time>"` for the CLI session above `pid`, or None.
+    """A versioned `"<root pid>:vN:<start>"` for the CLI above `pid`.
 
     On the Codex side no single process knows which session it belongs to: the
     hook is handed a session id and exits, and the long-lived server is handed
@@ -699,7 +723,7 @@ def owner_key(pid=None):
         parent, start, command = info
         head = os.path.basename((command.split() or [""])[0])
         if head in CLI_ROOTS:
-            return f"{current}:{start}"
+            return f"{current}:{OWNER_KEY_VERSION}:{start}"
         if parent in ("0", "1", current):
             return None
         current = parent
