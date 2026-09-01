@@ -1020,6 +1020,33 @@ class IdentityPrivacyContractTest(unittest.TestCase):
                           + antiphon._VERDICT_NOTE["STRUCTURAL_INVALID"],
                           verdict)
 
+    def test_the_birth_authority_never_comes_from_the_record_it_judges(self):
+        """A listener that learns what it published by re-reading its own
+        endpoint has no authority at all: the same bytes anyone could have
+        changed answer both questions, and the comparison that follows always
+        agrees with itself. The fingerprint comes from the register operation's
+        own return instead.
+
+        Pinned on the source, and the reason is that the difference is only
+        observable inside the window between the claim returning and a
+        read-back — a race a test cannot hold open without a production seam
+        put there for it. What *is* measured behaviourally is the fail-closed
+        beside it: `channel.test.mjs` drives a registry whose claim succeeds
+        and returns no fingerprint, and the listener refuses.
+        """
+        node = read("lib", "channel.mjs")
+        claim = node[node.index('if (subcommand === "register_peer")'):]
+        claim = claim[:claim.index("return true;")]
+        self.assertIn("JSON.parse(String(stdout)", claim,
+                      "the fingerprint comes from the operation's return")
+        self.assertNotIn("endpoint.json", claim,
+                         "and never from the record the verdict will judge")
+        python = read("lib", "antiphon.py")
+        register = python[python.index("def register_peer("):]
+        register = register[:register.index("\ndef ")]
+        self.assertIn('json.dumps({"birth"', register,
+                      "and the operation returns it")
+
     def test_the_socket_path_is_never_unlinked_after_a_close(self):
         """`close()` removes the socket file the server bound. An explicit
         unlink after it is a second removal with an await in front of it, and

@@ -215,6 +215,47 @@ os.execv(real_python, [real_python, *sys.argv[1:]])
 // automatic alias, and a `unregister_peer` that blocks until released. Two
 // separate stubs cannot be used together — each installs its own `python3` on
 // PATH — and the retirement race needs both at once.
+// A registry whose register succeeds and returns no fingerprint — what a
+// platform where the process table cannot be read looks like from here.
+async function makeBirthlessRegistryHarness(identity) {
+  const dir = await mkdtemp(join(tmpdir(), "antiphon-birthless-"));
+  const realPython = execFileSync("python3", [
+    "-c", "import sys; print(sys.executable)",
+  ], { encoding: "utf8" }).trim();
+  writeFileSync(join(dir, "python3"), `#!${realPython}
+import json
+import os
+import subprocess
+import sys
+
+command = sys.argv[2] if len(sys.argv) > 2 else ""
+real_python = os.environ["ANTIPHON_TEST_REAL_PYTHON"]
+
+if command == "claude_identity":
+    print(os.environ["ANTIPHON_TEST_IDENTITY_RESULT"])
+    raise SystemExit(0)
+
+if command == "register_peer":
+    payload = sys.stdin.read()
+    result = subprocess.run([real_python, *sys.argv[1:]], input=payload,
+                            text=True, capture_output=True)
+    sys.stderr.write(result.stderr)
+    if result.returncode == 0:
+        print(json.dumps({}))          # registered, fingerprint unavailable
+    raise SystemExit(result.returncode)
+
+os.execv(real_python, [real_python, *sys.argv[1:]])
+`, { mode: 0o755 });
+  return {
+    dir,
+    env: {
+      PATH: `${dir}:${process.env.PATH}`,
+      ANTIPHON_TEST_IDENTITY_RESULT: JSON.stringify(identity),
+      ANTIPHON_TEST_REAL_PYTHON: realPython,
+    },
+  };
+}
+
 async function makeRetireRaceHarness(identity) {
   const dir = await mkdtemp(join(tmpdir(), "antiphon-retire-race-"));
   const unregisterStarted = join(dir, "unregister-started");
@@ -2562,3 +2603,105 @@ async function anOrdinaryShutdownRemovesItsOwnSocket() {
 }
 
 await anOrdinaryShutdownRemovesItsOwnSocket();
+
+// --- the birth authority comes from the claim, not from the record ---------
+// A listener that re-reads its own endpoint to learn what it published has no
+// authority: the same bytes anyone could have changed answer both questions,
+// and the comparison always agrees with itself. Driven through the real
+// `claimPeer` and the real channel, with the record rewritten after the claim.
+async function aRewrittenEndpointIsNotThisListenersOwn() {
+  const dir = await mkdtemp(join(tmpdir(), "antiphon-birth-authority-"));
+  const { session, stub } = await staleInboundSession(dir);
+  let socket = null;
+  try {
+    socket = await boundSocketOf(session);
+    const endpoint = join(dir, ".antiphon", "peers",
+      `claude-${STALE_A_ALIAS}`, "endpoint.json");
+    // The hook half and a current proof, so the only thing left to decide the
+    // verdict is whether this endpoint is the one the listener published.
+    runPeers(dir, `
+import json, os
+root = os.path.join(${JSON.stringify(dir)}, ".antiphon", "peers",
+                    "claude-${STALE_A_ALIAS}")
+path = os.path.join(root, "endpoint.json")
+owner = json.load(open(path))["owner"]
+peers.write_session(${JSON.stringify(dir)}, "claude", "${STALE_A_ALIAS}",
+                    ${JSON.stringify(STALE_A)}, "/t/a.jsonl", owner,
+                    ${JSON.stringify(STALE_A_DIGEST)}, True)
+peers.write_identity_proof(${JSON.stringify(dir)}, owner,
+                           ${JSON.stringify(STALE_A)},
+                           ${JSON.stringify(STALE_A_DIGEST)})
+# The record now names another process's birth. The pid still matches, which
+# is exactly the recycled-number case the pairing exists for.
+record = json.load(open(path))
+record["birth"] = "Thu Jan  1 00:00:00 1970"
+record["birth_version"] = 1
+json.dump(record, open(path, "w"))
+`);
+    const reply = await sendToSocketAt(socket, { content: "hi" });
+    assert.equal(reply?.ok, false,
+      `a rewritten endpoint is not this listener's own: ${JSON.stringify(reply)}`);
+    assert.equal(reply?.refusal_class, "no-peer");
+    // Refused, and not retired: a record this listener cannot claim is not a
+    // record it may act destructively on either.
+    assert.ok(existsSync(endpoint), "nothing is withdrawn");
+    assert.ok(existsSync(socket), "and the socket stays");
+  } finally {
+    session.child.kill("SIGKILL");
+    await waitForExit(session.child, 2_000);
+    if (socket) await rm(socket, { force: true }).catch(() => {});
+    await rm(dir, { recursive: true, force: true }).catch(() => {});
+    await rm(stub.dir, { recursive: true, force: true }).catch(() => {});
+  }
+}
+
+await aRewrittenEndpointIsNotThisListenersOwn();
+
+// --- no authority, no delivery ---------------------------------------------
+// The claim can succeed while the fingerprint of the process it named is
+// unavailable — a platform where the process table cannot be read. Without an
+// authority this listener cannot tell its own endpoint from one an earlier
+// process left behind, and answering anyway is the fail-open the contract is
+// written against.
+async function aListenerWithoutItsFingerprintRefuses() {
+  const dir = await mkdtemp(join(tmpdir(), "antiphon-no-authority-"));
+  const harness = await makeBirthlessRegistryHarness({
+    alias: STALE_A_ALIAS, identity_digest: STALE_A_DIGEST,
+    session_id: STALE_A,
+  });
+  const session = spawnChannel(dir, undefined, harness.env);
+  let socket = null;
+  try {
+    socket = await boundSocketOf(session);
+    const endpoint = join(dir, ".antiphon", "peers",
+      `claude-${STALE_A_ALIAS}`, "endpoint.json");
+    runPeers(dir, `
+import json, os
+root = os.path.join(${JSON.stringify(dir)}, ".antiphon", "peers",
+                    "claude-${STALE_A_ALIAS}")
+owner = json.load(open(os.path.join(root, "endpoint.json")))["owner"]
+peers.write_session(${JSON.stringify(dir)}, "claude", "${STALE_A_ALIAS}",
+                    ${JSON.stringify(STALE_A)}, "/t/a.jsonl", owner,
+                    ${JSON.stringify(STALE_A_DIGEST)}, True)
+peers.write_identity_proof(${JSON.stringify(dir)}, owner,
+                           ${JSON.stringify(STALE_A)},
+                           ${JSON.stringify(STALE_A_DIGEST)})
+`);
+    const before = session.stdout();
+    const reply = await sendToSocketAt(socket, { content: "hi" });
+    assert.equal(reply?.ok, false,
+      `everything else is in order; only the authority is missing: ${JSON.stringify(reply)}`);
+    assert.ok(!session.stdout().slice(before.length)
+      .includes("notifications/claude/channel"),
+      "and nothing is emitted");
+    assert.ok(existsSync(endpoint), "nor withdrawn");
+  } finally {
+    session.child.kill("SIGKILL");
+    await waitForExit(session.child, 2_000);
+    if (socket) await rm(socket, { force: true }).catch(() => {});
+    await rm(dir, { recursive: true, force: true }).catch(() => {});
+    await rm(harness.dir, { recursive: true, force: true }).catch(() => {});
+  }
+}
+
+await aListenerWithoutItsFingerprintRefuses();

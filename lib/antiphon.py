@@ -6113,6 +6113,12 @@ def register_peer(*_):
     if not ok:
         print(f"register_peer: {detail}", file=sys.stderr)
         return 1
+    # The fingerprint of the process this endpoint names, returned by the
+    # operation rather than read back out of the file it wrote. A caller that
+    # re-reads the record to learn what it published has no authority at all:
+    # the same bytes anyone could have changed would answer both questions, and
+    # the comparison that follows would always agree with itself.
+    print(json.dumps({"birth": peers._process_birth(data.get("pid"))}))
     return 0
 
 
