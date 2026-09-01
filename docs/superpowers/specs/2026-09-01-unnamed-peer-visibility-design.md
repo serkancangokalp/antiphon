@@ -111,14 +111,63 @@ The measurement result and the selected branch are appended to this design in
 a separate commit and returned to Claude for a second approval before product
 code begins.
 
+### 2.3 Probe result: unmeasured at the trust boundary
+
+The approved probe was attempted with Codex CLI 0.151.0 as
+`codex -s read-only -a never --no-alt-screen` in the fresh temporary Git
+project. In at most 1.2 seconds the TUI reached its directory-trust screen,
+before the project hook or an interactive session started. The operator chose
+`No, quit`; no trust was accepted.
+
+The safety checks held:
+
+- the bounded `SessionStart` capture was never written;
+- the thread-writer-lock count remained four and the probe added no lock;
+- a structured scan of every rollout `session_meta` found zero records whose
+  cwd was the probe project;
+- the launched pid exited;
+- SHA-256 remained byte-identical for `config.toml`,
+  `.codex-global-state.json`, `session_index.jsonl` and `history.jsonl`.
+
+This is **not branch D**. The probe did not reach the pre-turn boundary, so it
+measured neither the hook timing nor the process/file/lock observables. The
+result is `U — unmeasured, blocked by trust`, and no claim from A/B/C/D follows
+from it.
+
+A possible retry at a deleted path that still has a persisted trust entry was
+explicitly rejected. New bytes at an old trusted path inherit a security
+decision made about different content; using that fact to avoid the prompt is
+the shape of a stale-trust attack even when this hook is benign. The stale
+entries are recorded in BACKLOG for the user rather than used by the probe.
+
+The selected B1 branch is therefore deliberately conservative:
+
+- assume the pre-first-turn blind window may exist;
+- write a non-routable observation whenever a hook actually supplies a
+  canonical session id, without claiming when the first such hook occurs;
+- use the already feature-detected exact thread-writer lock only to prove that
+  an observed id is live; a missing/unavailable lock is unknown, not dead;
+- always render the census as a lower bound, including zero;
+- refuse only ambiguity proved by two or more live observations or by a live
+  observation alongside a registered candidate.
+
+Branch A is excluded because pre-turn hook and lock timing were not observed;
+B is excluded because even hook-before-turn was not observed; C and D are
+excluded because the process-observable questions were never reached. This is
+evidence-based exclusion, not preference. A later probe performed with the
+user present may select A and tighten wording, but it cannot retroactively make
+this run evidence of completeness.
+
 ## 3. Proposed B1 data and privacy contract
 
-Subject to branch A, an unnamed Codex hook writes a versioned, hook-owned
-observation beneath the project's `.antiphon` state, keyed by the full
-canonical host session id. It contains only kind, session id, observed time and
-the project identity implicit in its directory. It never stores prompt text,
-transcript content or a transcript path. Atomic per-session files avoid a
-shared read-modify-write document. A malformed id writes nothing.
+Under selected branch U, an unnamed Codex hook writes a versioned, hook-owned
+observation beneath the project's `.antiphon` state whenever the host supplies
+a canonical session id, keyed by that full id. It contains only kind, session
+id, observed time and the project identity implicit in its directory. It never
+stores prompt text, transcript content or a transcript path. Atomic per-session
+files avoid a shared read-modify-write document. A malformed id writes nothing.
+The observation is currently live only when the existing feature-detected
+exact thread-writer lock proves it; absence of that proof is unknown.
 
 Observation records are not peer records:
 
@@ -138,11 +187,11 @@ person distinguish two observed terminals. Addresses, transcript paths and
 content remain forbidden. Delivery refusals use counts, not ids, because an
 agent cannot route to them; they include restart-to-name guidance.
 
-No screen says simply "N sessions are live" unless the selected measurement
-branch can exclude the pre-turn blind window. Otherwise it says `at least N
+No screen says simply "N sessions are live" in branch U. It says `at least N
 Codex sessions observed` and, where relevant, that additional sessions before
 their first hook/turn may be invisible. Zero observations is never rendered as
-proof that zero sessions exist.
+proof that zero sessions exist. A later branch-A measurement would require a
+new contract change before any wording became exact.
 
 ## 4. Routing contract
 

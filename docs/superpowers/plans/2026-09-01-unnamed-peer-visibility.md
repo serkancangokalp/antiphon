@@ -26,6 +26,20 @@ if its shared instructions change.
 - Preserve the legacy single-unnamed-session road unless ambiguity is proved.
 - Stop at a locally reviewed exact commit. No push, merge, version or publish.
 
+## Recorded measurement outcome
+
+The exact pre-measurement contract was approved at `7562e3b`. The real
+interactive probe then stopped at the directory-trust screen within 1.2
+seconds. `No, quit` was selected; no hook, lock or probe rollout appeared and
+the four guarded global files remained byte-identical. Reusing an absent path
+with stale persisted trust was rejected rather than used.
+
+The selected product branch is `U — unmeasured, blocked by trust`: assume the
+pre-turn blind window exists, write observations only when hooks actually
+supply ids, use exact writer locks only as positive liveness proof, always use
+lower-bound wording, and refuse only ambiguity positively observed. A later
+user-present probe may tighten this contract in a separate wave.
+
 ### Task 1: Commit and approve the measurement contract
 
 1. Commit only this design and plan.
@@ -34,7 +48,7 @@ if its shared instructions change.
 4. Do not launch an interactive probe until Claude explicitly approves that
    exact documentation commit.
 
-### Task 2: Measure the real interactive pre-turn window
+### Task 2: Attempt the real interactive pre-turn window — complete, blocked
 
 After approval, inspect only the installed CLI's version/help needed to choose
 non-mutating launch flags. Create a fresh temporary Git project. Add a
@@ -54,21 +68,22 @@ accepting trust or mutating global state. Preserve an unexpected-failure temp
 root for diagnosis; otherwise remove only the exact temp project created for
 the probe after recording the evidence. Do not delete host rollout history.
 
-Append an evidence table to the design, choose branch A/B/C/D exactly as
-predeclared, and narrow the product/test plan to that branch. Commit this as a
-measurement-only change, record hashes, and obtain Claude approval again.
+The trust boundary prevented the ready state. The design records this as U,
+not as an invented A/B/C/D result, and excludes each measured branch by the
+evidence that was unavailable. Commit this measurement-only change, record
+hashes, and obtain Claude approval again.
 
 ### Task 3: Pin observation semantics red-before-green
 
-Only after the second approval, add focused failing tests for the selected
-branch. For branch A these must prove:
+Only after the second approval, add focused failing tests for selected branch
+U. They must prove:
 
-- an unnamed SessionStart with a canonical UUID creates one versioned,
+- an unnamed hook event with a canonical UUID creates one versioned,
   transcript-free observation atomically;
 - replaying the hook is idempotent and refreshes only that session's record;
 - malformed/missing ids create nothing;
-- a held exact writer lock makes the observation live; released/missing locks
-  do not;
+- a held exact writer lock makes the observation live; released, missing or
+  unavailable lock evidence is unknown and cannot make a live claim;
 - explicit named endpoint/session ownership suppresses the corresponding
   unnamed presentation without deleting evidence owned by another writer;
 - malformed or unreadable observation files cannot make a live claim and do
@@ -78,9 +93,8 @@ Implement the smallest observation writer/reader and one pure liveness
 classifier. Keep observation ids outside `valid_name`, `valid_key` and the
 peer endpoint/session join. Do not store transcript paths or content.
 
-For another selected branch, replace lock assertions only with its predeclared
-unknown/lower-bound behavior; do not improvise a new identity source without a
-fresh spec approval.
+Do not claim that `SessionStart` ran before the first turn. Do not improvise a
+new identity source without a fresh spec approval.
 
 ### Task 4: Refuse only proved ambiguity
 

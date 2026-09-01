@@ -1442,6 +1442,28 @@ cost lands on the default install, where naming is the thing nobody did yet.
   `ANTIPHON_NAME=x codex` registers before its first turn is **unmeasured**,
   and it is the measurement this entry needs first.
 
+**The interactive measurement was stopped at the trust boundary on
+2026-09-01.** Codex CLI 0.151.0 showed its directory-trust prompt before the
+fresh temporary project's `SessionStart` hook ran. The probe chose `No, quit`;
+no hook capture, writer lock or project rollout appeared, and the guarded Codex
+global files remained byte-identical. This is not evidence that the pre-turn
+observable is absent. B1 therefore assumes the blind window may exist and uses
+lower-bound wording until a user-present measurement can settle it.
+
+That safe stop exposed a separate machine-local security finding. The user's
+Codex config still explicitly trusts four deleted probe directories:
+
+- `/private/tmp/antiphon-name-probe.4eaFUC`
+- `/Users/serkancangokalp/Documents/antiphon/.antiphon-hook-probe/project`
+- `/private/tmp/antiphon-delivery-measure.N5smiV/hook-probe`
+- `/private/tmp/antiphon-hook-order-probe-20260830`
+
+Recreating any of them would load new project content under an old trust
+decision, so this work will not use them. This is an operator-visible cleanup
+item, not an Antiphon product migration: tell the user and remove or re-evaluate
+the stale entries only with their direct participation; do not silently edit
+their global Codex configuration.
+
 **The option, and why it is not the guess the project refuses.** The Codex hook
 receives `session_id` at `SessionStart`, before any turn — the same id
 `codex queue --thread` needs. Registering an unnamed session under that id
