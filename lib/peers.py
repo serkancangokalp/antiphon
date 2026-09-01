@@ -509,6 +509,39 @@ def write_observation(cwd, session_id):
     return True
 
 
+def configured_name_present():
+    """Whether this session was configured with a name at all.
+
+    Presence and usability are different facts. Empty and whitespace-only are
+    absence — `explicit_name` documents that, and the end-to-end harness uses a
+    bare `ANTIPHON_NAME=` in ten places as the way to run unnamed — but a
+    person who wrote anything else meant to be named, and must not be given a
+    different identity silently.
+    """
+    raw = os.environ.get("ANTIPHON_NAME")
+    return isinstance(raw, str) and bool(raw.strip())
+
+
+def withdraw_observation(cwd, session_id):
+    """Retire this session's own observation. Idempotent, and only its own.
+
+    An observation carries version, kind, session id and time — nothing about
+    which environment wrote it — so no later predicate can tell a
+    configured-invalid record from a legitimate one. The hook that created it
+    is the only thing that can say, so it withdraws durably rather than hoping
+    a reader will ignore it.
+    """
+    if not valid_session_id(session_id):
+        return False
+    try:
+        os.unlink(_observation_file(cwd, session_id))
+    except FileNotFoundError:
+        return True                       # already withdrawn: idempotent
+    except OSError:
+        return False
+    return True
+
+
 def read_observations(cwd):
     """Validated Codex sightings in deterministic host-id order, read-only."""
     try:

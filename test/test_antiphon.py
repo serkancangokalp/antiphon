@@ -12073,12 +12073,23 @@ class CodexPeerWiringTest(unittest.TestCase):
                              [self.UUID])
             self.assertNotIn("transcript", observed[0])
 
-    def test_an_invalid_explicit_alias_is_observed_but_never_becomes_a_name(self):
+    def test_an_invalid_explicit_alias_is_neither_observed_nor_named(self):
+        """Deliberately reversed from what this test used to assert.
+
+        It required an invalid explicit alias to be observed, and observation
+        is what projects an automatic identity — so a person who wrote a name
+        and got it wrong was silently given a different one. The B2 review
+        called that the invalid-no-fallback violation, and the approved spec
+        changed it: presence and usability are different facts, and a
+        configured name that cannot be used means no automatic identity rather
+        than another one. It still never becomes a name.
+        """
         with tempfile.TemporaryDirectory() as project:
             self._hook(project, event="SessionStart", session_id=self.UUID,
                        name="NOT VALID")
             observed = antiphon.peers.read_observations(project)
-        self.assertEqual([record["session_id"] for record in observed], [self.UUID])
+        self.assertEqual(observed, [],
+                         "a configured-invalid name projects nothing")
         self.assertEqual(antiphon.peers.read_peers(project), [])
 
     def test_a_named_hook_does_not_create_a_new_unnamed_observation(self):
@@ -17076,3 +17087,73 @@ class ReadinessParityTest(unittest.TestCase):
         self.assertEqual(disagreements, [],
                          "one file format, two readers, and their agreement is "
                          "enforced here rather than assumed")
+
+
+class ConfiguredNameTest(unittest.TestCase):
+    """Presence and usability are different facts.
+
+    A person who wrote a name meant to be named. Falling through to an
+    automatic identity substitutes one silently, which is the same family as
+    delivering to the wrong recipient. Absence alone enables automatic
+    identity, and empty or whitespace is absence: `explicit_name` documents
+    that and `fresh-user.sh` relies on it in ten places.
+    """
+
+    SESSION = "8261c119-2c20-4bf4-87ab-f152ac87dbda"
+    OTHER = "0199a1b2-2222-7000-8000-00000000000b"
+
+    def _observations(self, project):
+        directory = antiphon.peers.observations_dir(project)
+        return sorted(os.listdir(directory)) if os.path.isdir(directory) else []
+
+    def _hook(self, project, name):
+        # Only ANTIPHON_NAME moves; clearing the whole environment would take
+        # PATH with it and the owner-key probe shells out to `ps`.
+        with patch.dict(os.environ, {}):
+            os.environ.pop("ANTIPHON_NAME", None)
+            if name is not None:
+                os.environ["ANTIPHON_NAME"] = name
+            return antiphon.record_codex_session(project, self.SESSION, None)
+
+    def test_configured_name_absent_empty_and_whitespace_may_observe(self):
+        for name in (None, "", "   ", "\t"):
+            with self.subTest(configured=name), \
+                 tempfile.TemporaryDirectory() as project:
+                self._hook(project, name)
+                self.assertEqual(len(self._observations(project)), 1,
+                                 "absence enables automatic identity")
+
+    def test_configured_name_uppercase_normalizes_and_joins(self):
+        with tempfile.TemporaryDirectory() as project:
+            self._hook(project, "BUILD")
+            self.assertEqual(self._observations(project), [],
+                             "'BUILD' normalizes to the valid name 'build'; "
+                             "it was never the invalid case")
+
+    def test_configured_name_invalid_creates_no_observation_or_route(self):
+        for name in ("Not A Name!", "a" * 40, "büyük"):
+            with self.subTest(configured=name), \
+                 tempfile.TemporaryDirectory() as project:
+                self._hook(project, name)
+                self.assertEqual(
+                    self._observations(project), [],
+                    "a configured-invalid name never falls through to an "
+                    "automatic identity")
+
+    def test_configured_name_invalid_withdraws_its_own_legacy_observation(self):
+        """An observation records nothing about which environment wrote it, so
+        no later predicate can ignore a bug-created one. The hook withdraws its
+        own session id durably, and only its own."""
+        with tempfile.TemporaryDirectory() as project:
+            antiphon.peers.write_observation(project, self.SESSION)
+            antiphon.peers.write_observation(project, self.OTHER)
+            self.assertEqual(len(self._observations(project)), 2)
+            self._hook(project, "Not A Name!")
+            remaining = self._observations(project)
+            self.assertEqual(len(remaining), 1,
+                             "its own stale observation is withdrawn")
+            self.assertIn(self.OTHER, remaining[0],
+                          "another session's observation is never touched")
+            self._hook(project, "Not A Name!")
+            self.assertEqual(len(self._observations(project)), 1,
+                             "withdrawal is idempotent")

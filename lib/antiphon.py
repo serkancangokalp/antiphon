@@ -6272,6 +6272,13 @@ def record_codex_session(cwd, session_id, transcript):
     """
     alias = peers.explicit_name()
     if not peers.valid_name(alias):
+        if peers.configured_name_present():
+            # Configured and unusable. Falling through to an automatic identity
+            # would substitute one silently for a person who asked to be named,
+            # and a stale observation from before this rule would keep
+            # projecting, so withdraw this session's own record durably.
+            peers.withdraw_observation(cwd, session_id)
+            return False
         if not peers.valid_session_id(session_id):
             return False
         try:
