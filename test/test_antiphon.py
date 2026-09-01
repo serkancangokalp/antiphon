@@ -16967,3 +16967,112 @@ class StaleInboundClassTest(unittest.TestCase):
                          "a class the listener supplied survives the return; "
                          "recasting it as transport would tell the sender to "
                          "blame the socket instead of reconnecting")
+
+
+class ReadinessParityTest(unittest.TestCase):
+    """Python and Node must reach the same verdict, with the same reason.
+
+    Agreement on a boolean would not be agreement at all: two readers returning
+    "not ready" for different reasons still disagree about whether to retire.
+    """
+
+    OWNER = "4242:v1:Mon Sep  1 00:00:00 2026"
+    A = "8261c119-2c20-4bf4-87ab-f152ac87dbda"
+    B = "0199a1b2-2222-7000-8000-00000000000b"
+    ROOT = os.path.dirname(os.path.dirname(os.path.abspath(antiphon.__file__)))
+
+    def _peer(self, project):
+        alias, digest = antiphon.peers.auto_identity(self.A)
+        antiphon.peers.register(project, "claude", alias,
+                                os.path.join(project, alias + ".sock"),
+                                pid=os.getpid(), owner_key=self.OWNER,
+                                identity_digest=digest)
+        antiphon.peers.write_session(project, "claude", alias, self.A,
+                                     f"/t/{alias}.jsonl", self.OWNER,
+                                     digest, True)
+        return alias, digest
+
+    def _proof(self, project, session_id, **over):
+        antiphon.peers.write_identity_proof(
+            project, self.OWNER, session_id,
+            antiphon.peers.auto_identity(session_id)[1])
+        if not over:
+            return
+        path = antiphon.peers.identity_proof_path(project, self.OWNER)
+        with open(path, encoding="utf-8") as stream:
+            record = json.load(stream)
+        record.update(over)
+        with open(path, "w", encoding="utf-8") as stream:
+            json.dump(record, stream)
+
+    @staticmethod
+    def _write(path, body):
+        with open(path, "w", encoding="utf-8") as stream:
+            stream.write(body)
+
+    def _raw(self, project, body):
+        path = antiphon.peers.identity_proof_path(project, self.OWNER)
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w", encoding="utf-8") as stream:
+            stream.write(body)
+
+    def _python(self, project, alias):
+        peer = next((p for p in antiphon.peers.read_peers(project, "claude")
+                     if p.get("name") == alias), None)
+        if peer is None:
+            return "UNREADY"
+        verdict = antiphon.automatic_verdict(
+            project, "claude", peer,
+            antiphon.peers.read_identity_proof(project, self.OWNER))
+        return verdict or "READY"
+
+    def _node(self, project, alias, digest):
+        script = (
+            'import { automaticProofVerdict } from "./lib/identity.mjs";'
+            'const [d, a, g] = process.argv.slice(-3);'
+            'process.stdout.write(String(automaticProofVerdict(d, a, g)));'
+        )
+        done = subprocess.run(
+            ["node", "--input-type=module", "-e", script, "--",
+             project, alias, digest],
+            capture_output=True, text=True, cwd=self.ROOT)
+        if done.returncode != 0:
+            self.fail("node verdict failed: "
+                      + done.stderr.strip()[:400])
+        return done.stdout.strip()
+
+    def test_readiness_parity_holds_across_every_fixture(self):
+        cases = {
+            "proof valid and current": lambda p, a: self._proof(p, self.A),
+            "proof names another session": lambda p, a: self._proof(p, self.B),
+            "proof absent": lambda p, a: None,
+            "proof wrong kind": lambda p, a: self._proof(p, self.A,
+                                                         kind="codex"),
+            "proof wrong version": lambda p, a: self._proof(p, self.A,
+                                                            version=99),
+            "proof malformed digest": lambda p, a: self._proof(
+                p, self.A, identity_digest="zz"),
+            "proof torn": lambda p, a: self._raw(p, "{"),
+            "proof empty": lambda p, a: self._raw(p, ""),
+            "session half missing": lambda p, a: (
+                self._proof(p, self.A),
+                os.unlink(os.path.join(
+                    antiphon.peers.peer_dir(p, "claude", a), "session.json"))),
+            "session half torn": lambda p, a: (
+                self._proof(p, self.A),
+                self._write(os.path.join(
+                    antiphon.peers.peer_dir(p, "claude", a),
+                    "session.json"), "{")),
+        }
+        disagreements = []
+        for name, mutate in cases.items():
+            with tempfile.TemporaryDirectory() as project:
+                alias, digest = self._peer(project)
+                mutate(project, alias)
+                python, node = (self._python(project, alias),
+                                self._node(project, alias, digest))
+                if python != node:
+                    disagreements.append(f"{name}: python={python} node={node}")
+        self.assertEqual(disagreements, [],
+                         "one file format, two readers, and their agreement is "
+                         "enforced here rather than assumed")
