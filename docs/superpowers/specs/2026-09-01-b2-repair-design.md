@@ -327,6 +327,24 @@ hook, `status`, `doctor` and the written surfaces must say so with the public
 alias and an actionable remedy, and must never show a UUID, an identity digest
 or a route while saying it.
 
+## 6a. Where the guarantee starts, and what it does not cover
+
+The owner-current proof changes only when the new session's first unnamed hook
+commits it. Between the host rotating A→B and that commit, the listener and the
+proof still agree on A, and Antiphon holds no project-scoped evidence that B
+exists at all — the same blind window branch U named for observations, arriving
+here for the same reason.
+
+So the guarantee is stated with its start point rather than as "immediately":
+**from the first unnamed hook of the new session onward**, a message addressed
+to the stale alias is refused rather than delivered. Before that commit the
+window is unmeasured and, with today's host observables, unavoidable. The
+critical red begins after hook B commits, and nothing in this repair should be
+read as closing the pre-hook interval.
+
+If a host ever exposes a project-scoped signal for a session before its first
+hook, this is the limitation to revisit.
+
 ## 7. Configured names
 
 Presence and usability are different facts. A normalized non-empty unusable
