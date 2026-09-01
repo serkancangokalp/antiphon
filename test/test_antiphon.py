@@ -3827,6 +3827,31 @@ class SetupShapeCharacterizationTest(unittest.TestCase):
     key that was added, an entry that was duplicated, or a hook that moved to
     another event."""
 
+    def test_hook_writer_and_reader_consume_one_envelope(self):
+        ConfigKeys = __import__("collections").namedtuple(
+            "ConfigKeys",
+            "hooks hook_entries hook_type hook_command hook_status "
+            "permissions allow mcp_servers enabled_mcp_servers")
+        keys = ConfigKeys(
+            "events", "commands", "kind", "run", "label",
+            "grants", "accepted", "servers", "enabled")
+        data = {}
+        shape = antiphon.HookShape(
+            "x.json", "Stop", "antiphon push codex", "Bridge")
+
+        with patch.object(antiphon, "CONFIG_KEYS", keys, create=True):
+            groups = data.setdefault(keys.hooks, {}).setdefault(
+                shape.event, [])
+            antiphon._add_hook(groups, shape.command, label=shape.label)
+            installed = antiphon.hook_installed(data, shape)
+
+        self.assertTrue(installed)
+        self.assertEqual(data, {"events": {"Stop": [{"commands": [{
+            "kind": "command",
+            "run": "antiphon push codex",
+            "label": "Bridge",
+        }]}]}})
+
     def install(self):
         """Runs `setup` into a fresh fixture. Returns (project, stdout)."""
         project = tempfile.mkdtemp()

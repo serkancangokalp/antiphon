@@ -3882,6 +3882,14 @@ MCP_CONFIG_FILE = ".mcp.json"
 CODEX_MCP_TABLE = "mcp_servers.antiphon"
 CODEX_MCP_ENV_TABLE = CODEX_MCP_TABLE + ".env"
 
+ConfigKeys = collections.namedtuple(
+    "ConfigKeys",
+    "hooks hook_entries hook_type hook_command hook_status "
+    "permissions allow mcp_servers enabled_mcp_servers")
+CONFIG_KEYS = ConfigKeys(
+    "hooks", "hooks", "type", "command", "statusMessage",
+    "permissions", "allow", "mcpServers", "enabledMcpjsonServers")
+
 # Each assignment in `[mcp_servers.antiphon]` with the comment that precedes it
 # in the written file. The comments belong to the writer alone: `doctor` looks
 # up the assignments and never the prose, so re-wording a comment is not drift.
@@ -3954,18 +3962,20 @@ def hook_installed(data, shape):
     Everything here comes off disk, so every level is type-checked rather than
     indexed — a hand-edited file may hold any shape at all and a diagnostic
     must not raise on one."""
-    events = data.get("hooks") if isinstance(data, dict) else None
+    events = data.get(CONFIG_KEYS.hooks) if isinstance(data, dict) else None
     groups = events.get(shape.event) if isinstance(events, dict) else None
     if not isinstance(groups, list):
         return False
     for group in groups:
-        entries = group.get("hooks") if isinstance(group, dict) else None
+        entries = (group.get(CONFIG_KEYS.hook_entries)
+                   if isinstance(group, dict) else None)
         for entry in entries if isinstance(entries, list) else []:
             if not isinstance(entry, dict):
                 continue
-            if entry.get("command") != shape.command:
+            if entry.get(CONFIG_KEYS.hook_command) != shape.command:
                 continue
-            if shape.label is not None and entry.get("statusMessage") != shape.label:
+            if (shape.label is not None
+                    and entry.get(CONFIG_KEYS.hook_status) != shape.label):
                 continue
             return True
     return False
@@ -4188,12 +4198,13 @@ def _dedupe_hooks(hooks, command):
     dropped = False
     emptied = []
     for group in hooks:
-        entries = group.get("hooks")
+        entries = group.get(CONFIG_KEYS.hook_entries)
         if not isinstance(entries, list):
             continue
         kept = []
         for entry in entries:
-            if isinstance(entry, dict) and entry.get("command") == command:
+            if (isinstance(entry, dict)
+                    and entry.get(CONFIG_KEYS.hook_command) == command):
                 if seen:
                     dropped = True
                     continue          # a duplicate of one we already keep
@@ -4201,7 +4212,7 @@ def _dedupe_hooks(hooks, command):
             kept.append(entry)
         if len(kept) == len(entries):
             continue
-        group["hooks"] = kept
+        group[CONFIG_KEYS.hook_entries] = kept
         if not kept:
             emptied.append(id(group))
     if emptied:
@@ -4223,31 +4234,32 @@ def _add_hook(hooks, command, legacy_commands=None, label=None):
         if isinstance(legacy_commands, (str, re.Pattern)):
             legacy_commands = [legacy_commands]
         for group in hooks:
-            for entry in group.get("hooks") or []:
-                current = entry.get("command", "")
+            for entry in group.get(CONFIG_KEYS.hook_entries) or []:
+                current = entry.get(CONFIG_KEYS.hook_command, "")
                 matched = any(
                     (candidate.fullmatch(current) if isinstance(candidate, re.Pattern)
                      else current == candidate)
                     for candidate in legacy_commands
                 )
                 if matched:
-                    entry["command"] = command
+                    entry[CONFIG_KEYS.hook_command] = command
                     if label:
-                        entry["statusMessage"] = label
+                        entry[CONFIG_KEYS.hook_status] = label
                     changed = True
     if _dedupe_hooks(hooks, command):
         changed = True
     for group in hooks:
-        for entry in group.get("hooks") or []:
-            if entry.get("command") == command:
-                if label and entry.get("statusMessage") != label:
-                    entry["statusMessage"] = label
+        for entry in group.get(CONFIG_KEYS.hook_entries) or []:
+            if entry.get(CONFIG_KEYS.hook_command) == command:
+                if label and entry.get(CONFIG_KEYS.hook_status) != label:
+                    entry[CONFIG_KEYS.hook_status] = label
                     changed = True
                 return changed
-    new_entry = {"type": "command", "command": command}
+    new_entry = {CONFIG_KEYS.hook_type: "command",
+                 CONFIG_KEYS.hook_command: command}
     if label:
-        new_entry["statusMessage"] = label
-    hooks.append({"hooks": [new_entry]})
+        new_entry[CONFIG_KEYS.hook_status] = label
+    hooks.append({CONFIG_KEYS.hook_entries: [new_entry]})
     return True
 
 
@@ -4353,9 +4365,11 @@ def setup():
     legacy_commands = _legacy_commands(script, "kanca", "claude")
 
     def claude_mutate(data):
-        hooks = data.setdefault("hooks", {}).setdefault(claude_pull.event, [])
+        hooks = data.setdefault(CONFIG_KEYS.hooks, {}).setdefault(
+            claude_pull.event, [])
         changed = _add_hook(hooks, claude_pull.command, legacy_commands)
-        allowed = data.setdefault("permissions", {}).setdefault("allow", [])
+        allowed = data.setdefault(CONFIG_KEYS.permissions, {}).setdefault(
+            CONFIG_KEYS.allow, [])
         if REPLY_TOOL_PERMISSION not in allowed:
             allowed.append(REPLY_TOOL_PERMISSION)
             changed = True
@@ -4368,7 +4382,8 @@ def setup():
     legacy_push_commands = _legacy_commands(script, "it", "codex")
 
     def push_mutate(data):
-        hooks = data.setdefault("hooks", {}).setdefault(claude_push.event, [])
+        hooks = data.setdefault(CONFIG_KEYS.hooks, {}).setdefault(
+            claude_push.event, [])
         return _add_hook(hooks, claude_push.command, legacy_push_commands)
 
     install(claude_target, push_mutate,
@@ -4380,7 +4395,8 @@ def setup():
     legacy_codex_commands = _legacy_commands(script, "kanca", "codex")
 
     def codex_mutate(data):
-        hooks = data.setdefault("hooks", {}).setdefault(codex_pull.event, [])
+        hooks = data.setdefault(CONFIG_KEYS.hooks, {}).setdefault(
+            codex_pull.event, [])
         return _add_hook(hooks, codex_pull.command, legacy_codex_commands,
                          label=codex_pull.label)
 
@@ -4395,7 +4411,8 @@ def setup():
     # deliberately not installed: it can be delayed or missed, so nothing may
     # depend on it.
     def codex_session_mutate(data):
-        hooks = data.setdefault("hooks", {}).setdefault(codex_session.event, [])
+        hooks = data.setdefault(CONFIG_KEYS.hooks, {}).setdefault(
+            codex_session.event, [])
         return _add_hook(hooks, codex_session.command, label=codex_session.label)
 
     install(codex_target, codex_session_mutate,
@@ -4406,7 +4423,8 @@ def setup():
     legacy_reverse_push_commands = _legacy_commands(script, "it", "claude")
 
     def reverse_push_mutate(data):
-        hooks = data.setdefault("hooks", {}).setdefault(codex_push.event, [])
+        hooks = data.setdefault(CONFIG_KEYS.hooks, {}).setdefault(
+            codex_push.event, [])
         return _add_hook(hooks, codex_push.command, legacy_reverse_push_commands)
 
     install(codex_target, reverse_push_mutate,
@@ -4424,7 +4442,7 @@ def setup():
     channel_config = channel_server_entry(cwd)
 
     def mcp_mutate(data):
-        servers = data.setdefault("mcpServers", {})
+        servers = data.setdefault(CONFIG_KEYS.mcp_servers, {})
         if servers.get(CHANNEL_SERVER_NAME) == channel_config:
             return False
         servers[CHANNEL_SERVER_NAME] = channel_config
@@ -4437,7 +4455,7 @@ def setup():
     local_target = os.path.join(cwd, CLAUDE_LOCAL_SETTINGS_FILE)
 
     def local_mutate(data):
-        enabled = data.setdefault("enabledMcpjsonServers", [])
+        enabled = data.setdefault(CONFIG_KEYS.enabled_mcp_servers, [])
         if CHANNEL_SERVER_NAME in enabled:
             return False
         enabled.append(CHANNEL_SERVER_NAME)
@@ -5256,8 +5274,9 @@ def _doctor_config(report, cwd, states):
                    for shape in hooks_by_file[name]
                    if not hook_installed(data, shape)]
         if name == CLAUDE_SETTINGS_FILE:
-            allowed = (data or {}).get("permissions") or {}
-            allowed = allowed.get("allow") if isinstance(allowed, dict) else None
+            allowed = (data or {}).get(CONFIG_KEYS.permissions) or {}
+            allowed = (allowed.get(CONFIG_KEYS.allow)
+                       if isinstance(allowed, dict) else None)
             if not (isinstance(allowed, list)
                     and REPLY_TOOL_PERMISSION in allowed):
                 missing.append(f"the `{REPLY_TOOL_PERMISSION}` permission")
@@ -5267,12 +5286,12 @@ def _doctor_config(report, cwd, states):
     # the entry the server never starts, no socket appears, and the channel
     # check reports a true "no socket" with a useless repair.
     enabled = (states[CLAUDE_LOCAL_SETTINGS_FILE].data or {}).get(
-        "enabledMcpjsonServers")
+        CONFIG_KEYS.enabled_mcp_servers)
     verdict(CLAUDE_LOCAL_SETTINGS_FILE,
             [] if isinstance(enabled, list) and CHANNEL_SERVER_NAME in enabled
             else [f"`{CHANNEL_SERVER_NAME}` in enabledMcpjsonServers"])
 
-    servers = (states[MCP_CONFIG_FILE].data or {}).get("mcpServers")
+    servers = (states[MCP_CONFIG_FILE].data or {}).get(CONFIG_KEYS.mcp_servers)
     servers = servers if isinstance(servers, dict) else {}
     verdict(MCP_CONFIG_FILE,
             [] if servers.get(CHANNEL_SERVER_NAME) == channel_server_entry(cwd)
