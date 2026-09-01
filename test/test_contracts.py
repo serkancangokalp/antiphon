@@ -980,6 +980,50 @@ class IdentityPrivacyContractTest(unittest.TestCase):
                                 r"path")
         self.assertRegex(words, r"(?i)`antiphon channel ready:` line")
 
+    def test_every_node_error_surface_redacts_before_it_truncates(self):
+        """Node prints and returns its own refusals and never crosses back into
+        Python to have them cleaned. Three surfaces carried arbitrary detail —
+        the retrieval bridge's stderr, the reply bridge's stderr, and whatever
+        went wrong on the way to an emission — and two of them cut to 500
+        characters first, which can leave half a session id behind where a
+        whole-shape check finds nothing to remove."""
+        node = read("lib", "channel.mjs")
+        surfaces = [m.start() for m in
+                    re.finditer(r"String\(error\?\.(?:stderr|message)", node)]
+        self.assertGreaterEqual(len(surfaces), 3,
+                                "the error surfaces are still here")
+        for at in surfaces:
+            # `redactPrivate(` wraps the expression, so it precedes it.
+            self.assertIn("redactPrivate", node[max(0, at - 160):at],
+                          "unredacted error surface at "
+                          f"{node[at:at + 70]!r}")
+        # And no surface cuts before it redacts.
+        self.assertNotIn(".trim().slice(0, 500)", node)
+        self.assertNotIn("detail.slice(0, 500)", node)
+
+    def test_identity_proof_has_one_validator_on_each_side(self):
+        """The verdict reads the proof twice — once before it observes the
+        halves, once after, to close the window a rotation can land in. Two
+        readers of one file was already the hazard this whole module exists to
+        manage; two *validators* inside one reader is the same hazard at a
+        smaller scale, and it happened: the second read was parse-plus-session-id
+        while the first was total, so a malformed proof carrying the same
+        session id could authorise a retirement on one side alone.
+        """
+        node = read("lib", "identity.mjs")
+        self.assertEqual(node.count("function readIdentityProof("), 1,
+                         "one validator")
+        # Its definition plus the two call sites.
+        self.assertEqual(node.count("readIdentityProof(projectDir"), 3,
+                         "and both reads go through it")
+        # Nothing may reach the proof file except that validator.
+        self.assertEqual(
+            node.count('".antiphon", "identity", "claude"'), 1,
+            "no second path to the proof file")
+        python = read("lib", "peers.py")
+        self.assertEqual(python.count("def _read_identity_proof_file("), 1)
+        self.assertEqual(python.count("def read_identity_proof("), 1)
+
     def test_reconnect_notice_backlog_records_the_accepted_cost(self):
         """A live listener is never renamed, so a rotation costs a person a
         reconnect. That is a decision with a price, not an oversight, and the

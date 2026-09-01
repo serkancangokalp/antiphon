@@ -2778,3 +2778,86 @@ class TombstoneReadSkewTest(unittest.TestCase):
                                    self.B),
                 "a decision taken against a proof that has since moved is not "
                 "a decision this may act on")
+
+
+class WithdrawalRequiresAValidAutomaticHalfTest(unittest.TestCase):
+    """Withdrawal deletes a record, so it needs the same proof everything else
+    here needs before deleting anything.
+
+    The predicate was: same owner, and some string digest that differs from the
+    current one. That admits a half that is not automatic at all, one whose
+    digest derives a different alias than the directory it sits in, and one
+    whose session id is not canonical — and for the last, no tombstone is
+    written either, so the record is silently gone and the listener that owned
+    it can never learn why.
+    """
+
+    A = "8261c119-2c20-4bf4-87ab-f152ac87dbda"
+    B = "0199a1b2-2222-7000-8000-00000000000b"
+
+    def _half(self, project, alias, record):
+        path = peers._session_file(project, "claude", alias)
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w", encoding="utf-8") as stream:
+            json.dump(record, stream)
+        return path
+
+    def test_withdrawal_leaves_a_half_it_cannot_structurally_trust(self):
+        owner = peers.owner_key()
+        alias, digest = peers.auto_identity(self.A)
+        cases = {
+            "not marked automatic": {
+                "kind": "claude", "name": alias, "owner": owner,
+                "session_id": self.A, "identity_digest": "0" * 64},
+            "digest derives another alias": {
+                "kind": "claude", "name": alias, "owner": owner,
+                "session_id": self.A, "automatic": True,
+                "identity_digest": peers.auto_identity(self.B)[1]},
+            "session id is not canonical": {
+                "kind": "claude", "name": alias, "owner": owner,
+                "session_id": "not-a-uuid", "automatic": True,
+                "identity_digest": "0" * 64},
+            "digest is not a digest": {
+                "kind": "claude", "name": alias, "owner": owner,
+                "session_id": self.A, "automatic": True,
+                "identity_digest": "zz"},
+        }
+        for name, record in cases.items():
+            with self.subTest(half=name):
+                with tempfile.TemporaryDirectory() as project:
+                    path = self._half(project, alias, record)
+                    before = open(path, "rb").read()
+                    outcome = peers.rotate_identity_proof(
+                        project, owner, self.B,
+                        peers.auto_identity(self.B)[1])
+                    self.assertTrue(outcome.ok)
+                    self.assertTrue(
+                        os.path.exists(path),
+                        f"{name}: a record this cannot read is not one to "
+                        "delete")
+                    self.assertEqual(before, open(path, "rb").read(),
+                                     f"{name}: byte-identical")
+                    self.assertEqual(list(outcome.withdrawn), [], name)
+
+    def test_withdrawal_still_takes_a_structurally_valid_stale_half(self):
+        """The positive control: the case it is meant to take, it still takes."""
+        with tempfile.TemporaryDirectory() as project:
+            owner = peers.owner_key()
+            alias, digest = peers.auto_identity(self.A)
+            # With no endpoint the tombstone has no reader and is collected on
+            # the same pass that writes it, which is right — so the positive
+            # control has to be the realistic state, not half of it.
+            peers.register(project, "claude", alias,
+                           os.path.join(project, alias + ".sock"),
+                           pid=os.getpid(), owner_key=owner,
+                           identity_digest=digest, mode="initial")
+            path = self._half(project, alias, {
+                "kind": "claude", "name": alias, "owner": owner,
+                "session_id": self.A, "automatic": True,
+                "identity_digest": digest})
+            outcome = peers.rotate_identity_proof(
+                project, owner, self.B, peers.auto_identity(self.B)[1])
+            self.assertEqual(list(outcome.withdrawn), [alias])
+            self.assertFalse(os.path.exists(path))
+            self.assertTrue(os.path.exists(
+                peers.retired_half_path(project, "claude", alias)))

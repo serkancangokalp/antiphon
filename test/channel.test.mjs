@@ -2098,9 +2098,15 @@ async function theRetireControlIsRecognisedAndNonDestructive() {
       alias: STALE_A_ALIAS,
       nonce: "n0nce_test-1",
     });
-    assert.equal(ack?.ok, true, `recognised as a control: ${JSON.stringify(ack)}`);
-    assert.equal(ack?.action, "identity-retire-ack");
+    // Recognised as a control — the ack shape and the echoed nonce say so —
+    // but `ok` reports whether this listener acted, and it did not. Asserting
+    // `ok:true` here pinned a contradiction: a success that changed nothing,
+    // which a sender cannot tell from a wakeup that was honoured.
+    assert.equal(ack?.action, "identity-retire-ack",
+      `recognised as a control: ${JSON.stringify(ack)}`);
     assert.equal(ack?.nonce, "n0nce_test-1", "the nonce is echoed");
+    assert.equal(ack?.verdict, "UNREADY", "and says why it did nothing");
+    assert.equal(ack?.ok, false, "an UNREADY listener retires nothing");
     assert.notEqual(ack?.error, "content must be a non-empty string");
     assert.ok(existsSync(endpoint),
       "an UNREADY listener keeps its endpoint through a retire control");
@@ -2158,6 +2164,21 @@ peers.rotate_identity_proof(${JSON.stringify(dir)}, owner,
       "the listener reached the verdict by reading the proof itself");
     assert.ok(await waitFor(() => !existsSync(endpoint)),
       "and only then withdrew, after its answer was flushed");
+    // Withdrawal must be the last registry mutation this process makes. The
+    // release happens before the socket is fully torn down, so a reassert that
+    // lands in that window would re-create the record naming a listener on its
+    // way out. Nothing may bring the endpoint back.
+    for (let attempt = 0; attempt < 10; attempt += 1) {
+      await sendToSocketAt(socket, {
+        control: "antiphon.channel",
+        version: 1,
+        action: "reassert",
+        alias: STALE_A_ALIAS,
+        nonce: `n0nce_revive-${attempt}`,
+      }).catch(() => {});
+      assert.ok(!existsSync(endpoint),
+        `attempt ${attempt}: a retired listener must not republish itself`);
+    }
   } finally {
     session.child.kill("SIGKILL");
     await waitForExit(session.child, 2_000);
@@ -2168,3 +2189,55 @@ peers.rotate_identity_proof(${JSON.stringify(dir)}, owner,
 }
 
 await theRetireControlIsRecognisedAndNonDestructive();
+
+// --- an automatic listener must not read `null` as permission ---------------
+// `null` from the shared verdict means "this contract does not govern that
+// record". For a listener that has no automatic identity at all — an explicit
+// peer — that is right, and delivery proceeds. For a listener that *does* hold
+// an automatic digest it means something else entirely: the endpoint on disk
+// no longer describes this process. The delivery gate treated both the same
+// and emitted, which is the wrong-recipient delivery this whole repair exists
+// to end. The prior test measured only that the string "null" is not "READY".
+async function anAutomaticListenerRefusesWhenItsEndpointStopsDescribingIt() {
+  for (const [name, mutation] of [
+    ["endpoint is explicit-shaped", "record.pop('automatic', None)"],
+    ["endpoint digest moved", "record['identity_digest'] = '0' * 64"],
+  ]) {
+    const dir = await mkdtemp(join(tmpdir(), "antiphon-null-verdict-"));
+    const { session, stub } = await staleInboundSession(dir);
+    let socket = null;
+    try {
+      socket = await boundSocketOf(session);
+      assert.ok(socket && existsSync(socket),
+        `${name}: channel never bound; stderr=${session.stderr()}`);
+      const endpoint = join(dir, ".antiphon", "peers",
+        `claude-${STALE_A_ALIAS}`, "endpoint.json");
+      runPeers(dir, `
+import json
+path = ${JSON.stringify(endpoint)}
+record = json.load(open(path))
+${mutation}
+json.dump(record, open(path, "w"))
+`);
+      const before = session.stdout();
+      const reply = await sendToSocketAt(socket, { content: "hello" });
+      assert.equal(reply?.ok, false,
+        `${name}: an endpoint that does not describe this listener must refuse`);
+      assert.equal(reply?.refusal_class, "no-peer", name);
+      assert.ok(!session.stdout().slice(before.length)
+        .includes("notifications/claude/channel"),
+        `${name}: zero notifications are emitted`);
+      // `null` is not PROVED_STALE and authorises nothing destructive.
+      assert.ok(existsSync(endpoint), `${name}: nothing is withdrawn`);
+      assert.ok(existsSync(socket), `${name}: the socket stays`);
+    } finally {
+      session.child.kill("SIGKILL");
+      await waitForExit(session.child, 2_000);
+      if (socket) await rm(socket, { force: true }).catch(() => {});
+      await rm(dir, { recursive: true, force: true }).catch(() => {});
+      await rm(stub.dir, { recursive: true, force: true }).catch(() => {});
+    }
+  }
+}
+
+await anAutomaticListenerRefusesWhenItsEndpointStopsDescribingIt();

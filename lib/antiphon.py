@@ -6328,11 +6328,21 @@ def _stop_probe_child(child, isolated):
     widening past one we did not create could reach the session this probe
     belongs to. Descendant death is therefore promised only in the isolated
     case, and not claimed in the other.
+
+    The group id is taken once, from the pid, and not looked up again. With
+    `start_new_session` the child *is* the group leader, so its pid is the
+    group id — but only while it is alive. Re-deriving it with `getpgid` after
+    a leader that exits on SIGTERM raises `ProcessLookupError`, the follow-up
+    SIGKILL was swallowed with it, and a descendant that ignores SIGTERM
+    outlived the probe. That is the promise in the paragraph above going
+    unkept in exactly the case it was written for.
     """
+    pgid = child.pid if isolated else None
+
     def signal(sig):
         try:
-            if isolated:
-                os.killpg(os.getpgid(child.pid), sig)
+            if pgid is not None:
+                os.killpg(pgid, sig)
             else:
                 child.send_signal(sig)
         except (OSError, ProcessLookupError):
@@ -6341,10 +6351,19 @@ def _stop_probe_child(child, isolated):
     signal(signal_module.SIGTERM)
     try:
         child.wait(timeout=CLAUDE_IDENTITY_TERMINATE_GRACE)
-        return child.returncode
+        reaped = child.returncode
     except subprocess.TimeoutExpired:
-        pass
+        reaped = None
+    # A group outlives its leader. Returning as soon as the leader was reaped
+    # skipped the SIGKILL entirely, so a descendant that ignores SIGTERM
+    # survived the probe — the one case the isolation was created for. With
+    # nothing but the child to signal there is nothing left to do; with a group
+    # there is, and signalling an empty one costs an ESRCH nobody reads.
+    if reaped is not None and pgid is None:
+        return reaped
     signal(signal_module.SIGKILL)
+    if reaped is not None:
+        return reaped
     try:
         child.wait(timeout=CLAUDE_IDENTITY_REAP_WAIT)
     except subprocess.TimeoutExpired:
@@ -8185,7 +8204,7 @@ def _toml_table_text(text, table):
 
 Probe = collections.namedtuple("Probe", "error answered")
 ChannelTarget = collections.namedtuple(
-    "ChannelTarget", "name path state patient")
+    "ChannelTarget", "name path state patient automatic")
 
 
 def _probe_channel(path, patient):
@@ -8253,17 +8272,23 @@ def _channel_targets(cwd, live):
               if record.get("kind") == "claude"]
     requested = sender_alias(peers.explicit_name())
     registered_names = {record.get("name") for record in claude}
+    # Automatic comes off the record's own marker, never off the alias. The
+    # name grammar allows `auto-...` as a configured name, and reading identity
+    # from a shape is the guess this whole contract refuses everywhere else —
+    # here it hid an operator's own socket path and offered them the remedy for
+    # a rotation that cannot happen to an explicitly named peer.
     targets = [ChannelTarget(record.get("name"),
                              peers._address_of(record),
-                             "registered", True)
+                             "registered", True,
+                             peers._identity_digest_of(record) is not None)
                for record in claude if peers._address_of(record) is not None]
     if requested and requested not in registered_names:
         targets.insert(0, ChannelTarget(
             requested, claude_socket_path(cwd, requested),
-            "unregistered", False))
+            "unregistered", False, False))
     if not claude and not requested:
         targets.append(ChannelTarget(
-            None, claude_socket_path(cwd), "legacy", False))
+            None, claude_socket_path(cwd), "legacy", False, False))
     return targets
 
 
@@ -8770,7 +8795,7 @@ def _doctor_channel(report, cwd, live):
         # path is derived from a host session id nobody typed, so printing it
         # publishes a private route in exchange for a remedy that was always
         # "restart that session" anyway.
-        automatic = bool(name) and name.startswith(peers.AUTO_NAME_PREFIX)
+        automatic = target.automatic
         route = "its address" if automatic else path
         probe = _probe_channel(path, patient=target.patient)
         if probe.answered and state == "unregistered":

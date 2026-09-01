@@ -276,7 +276,7 @@ def _valid_retired_half(record, owner, identity_digest):
     The session id is part of that: a tombstone that names none cannot tell
     "the owner moved on from me" from "the owner came back to me".
     """
-    if not isinstance(record, dict):
+    if not isinstance(record, dict) or set(record) != RETIRED_HALF_KEYS:
         return False
     version = record.get("version")
     withdrawn = record.get("session_id")
@@ -369,6 +369,13 @@ def identity_proof_path(cwd, owner_key):
                         _owner_digest(owner_key) + ".json")
 
 
+IDENTITY_PROOF_KEYS = frozenset({
+    "version", "kind", "owner_key", "owner_digest", "session_id",
+    "identity_digest"})
+RETIRED_HALF_KEYS = frozenset({
+    "version", "kind", "owner", "identity_digest", "session_id"})
+
+
 def _valid_identity_proof(record, owner_digest):
     """Whether a record is a usable proof for the owner whose digest names it.
 
@@ -379,6 +386,13 @@ def _valid_identity_proof(record, owner_digest):
     the stored session id, so the two halves cannot disagree about who this is.
     """
     if not isinstance(record, dict):
+        return False
+    # Exactly these keys. An ignored key is still a key somebody wrote, and it
+    # can carry text — the Node reader takes the version's spelling from the
+    # source, so a value holding a `"version": 1.0` literal parted the two
+    # readers. The version field is how a shape change gets coordinated; until
+    # it is bumped, an unknown key means this is not that shape.
+    if set(record) != IDENTITY_PROOF_KEYS:
         return False
     version = record.get("version")
     if (not isinstance(version, int) or isinstance(version, bool)
@@ -715,8 +729,17 @@ def _withdraw_stale_automatic_sessions_locked(cwd, owner_key, current_digest):
         record = _read_record(path)
         if not record or record.get("owner") != owner_key:
             continue
-        digest = record.get("identity_digest")
-        if not isinstance(digest, str) or digest == current_digest:
+        # Deleting a record needs the same structural proof reading one does.
+        # "Same owner, and some string digest that differs" admitted a half
+        # that is not automatic at all, one whose digest derives a different
+        # alias than the directory it sits in, and one whose session id is not
+        # canonical — and that last one takes the silent path, because a
+        # tombstone cannot be written without a session id to name.
+        digest = _identity_digest_of(record)
+        if (digest is None or digest == current_digest
+                or not _record_identity_valid(record)
+                or auto_name_from_digest(digest) != name
+                or not valid_session_id(record.get("session_id"))):
             continue
         # Evidence first, then the deletion it explains. Unlinking first and
         # failing to write left exactly the state the tombstone exists to end —
@@ -1056,9 +1079,12 @@ def _pid_of(record):
     Anything that is not a positive integer names no process, so it cannot be
     checked for liveness and must not hold a name hostage either.
     """
-    try:
-        pid = int(record.get("pid"))
-    except (AttributeError, TypeError, ValueError):
+    # A real integer, not something `int()` will accept. A numeric string and
+    # an integral float both passed here and were refused by the Node reader,
+    # so the same record made one side route and the other refuse — and `True`
+    # is `1` in Python, which would have named pid 1.
+    pid = record.get("pid") if hasattr(record, "get") else None
+    if not isinstance(pid, int) or isinstance(pid, bool):
         return None
     return pid if pid > 0 else None
 

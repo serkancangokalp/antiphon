@@ -10,6 +10,7 @@ import hashlib
 import io
 import json
 import shutil
+import signal
 import socket
 import subprocess
 import tempfile
@@ -17165,7 +17166,7 @@ class ReadinessParityTest(unittest.TestCase):
             json.dump(record, stream)
 
     def _withdrawn(self, project, alias, owner=None, digest=None,
-                   version_literal="1"):
+                   version_literal="1", extra=""):
         """The state a rotation actually leaves: no half, one tombstone."""
         os.unlink(os.path.join(
             antiphon.peers.peer_dir(project, "claude", alias), "session.json"))
@@ -17175,7 +17176,7 @@ class ReadinessParityTest(unittest.TestCase):
             '{"version": ' + version_literal + ', "kind": "claude", '
             f'"owner": "{owner or self.OWNER}", '
             f'"identity_digest": "{digest or own_digest}", '
-            f'"session_id": "{self.A}"}}')
+            f'"session_id": "{self.A}"{extra}}}')
 
     @staticmethod
     def _pad(path):
@@ -17386,6 +17387,29 @@ class ReadinessParityTest(unittest.TestCase):
             "endpoint pid is not a number": lambda p, a: (
                 self._proof(p, self.A),
                 self._patch_endpoint(p, a, pid="many")),
+            # I5: `int()` accepts a numeric string, an integral float and a
+            # bool; Node wants a real integer. Python routed to peers Node
+            # would refuse, which is the same file read two ways again.
+            # I7: extra keys were ignored, and an ignored key can carry text.
+            # Node reads the version's spelling from the source, so a value
+            # holding a `"version": 1.0` literal could part the two readers —
+            # and a record nobody wrote is not one either should trust. The
+            # version field exists so a shape change can be coordinated; until
+            # it is bumped, an unknown key means this is not that shape.
+            "proof carries an extra key": lambda p, a: self._raw(
+                p, self._body(p, self.A)[:-1] + ', "note": "hello"}'),
+            "tombstone carries an extra key": lambda p, a: (
+                self._proof(p, self.B),
+                self._withdrawn(p, a, extra=', "note": "hello"')),
+            "endpoint pid is a numeric string": lambda p, a: (
+                self._proof(p, self.A),
+                self._patch_endpoint(p, a, pid=str(os.getpid()))),
+            "endpoint pid is a float": lambda p, a: (
+                self._proof(p, self.A),
+                self._patch_endpoint(p, a, pid=float(os.getpid()))),
+            "endpoint pid is a bool": lambda p, a: (
+                self._proof(p, self.A),
+                self._patch_endpoint(p, a, pid=True)),
             "endpoint address dropped": lambda p, a: (
                 self._proof(p, self.A),
                 self._patch_endpoint(p, a, drop="address")),
@@ -17716,7 +17740,12 @@ class IdentityPrivacyTest(unittest.TestCase):
         with self.project() as project:
             auto, digest = antiphon.peers.auto_identity(self.UUID)
             live = [
-                {"kind": "claude", "name": auto, "identity_digest": digest,
+                # `automatic: True` is what makes this an automatic record.
+                # The fixture leaned on the `auto-` prefix, which is a public
+                # name anyone may configure — and doctor was reading identity
+                # off that shape rather than off the marker.
+                {"kind": "claude", "name": auto, "automatic": True,
+                 "identity_digest": digest,
                  "address": antiphon.claude_socket_path(project, auto)},
                 {"kind": "claude", "name": "ui",
                  "address": antiphon.claude_socket_path(project, "ui")},
@@ -18132,3 +18161,116 @@ class DoctorRemedyMatchesTheVerdictTest(unittest.TestCase):
                     identity_digest=digest, mode="initial")
                 line = self._doctor_line(project, alias)
         self.assertIn(antiphon.RECONNECT_REMEDY, line, line)
+
+
+class DoctorAutomaticIsStructuralTest(unittest.TestCase):
+    """`auto-` is a public prefix, not a fact about a record.
+
+    The alias grammar allows `auto-...` as a configured name, and this project
+    refuses everywhere else to read identity off a shape — that is the whole
+    argument for the endpoint's own `automatic` marker. Doctor inferred it from
+    the prefix, so an operator who set `ANTIPHON_NAME=auto-...` had their
+    socket path hidden and was offered a remedy for a rotation that cannot
+    happen to them.
+    """
+
+    ALIAS = "auto-tkurihzklryexeppduqsfllv4y"
+
+    def test_doctor_automatic_an_explicit_peer_named_auto_keeps_its_path(self):
+        with tempfile.TemporaryDirectory() as project:
+            live = [{"kind": "claude", "name": self.ALIAS,
+                     "address": antiphon.claude_socket_path(project,
+                                                            self.ALIAS)}]
+            printed = io.StringIO()
+            report = antiphon._Report()
+            with patch.object(antiphon, "_probe_channel",
+                              return_value=antiphon.Probe(errno.ECONNREFUSED,
+                                                          False)), \
+                 contextlib.redirect_stdout(printed):
+                antiphon._doctor_channel(report, project, live)
+            line = next(l for l in printed.getvalue().splitlines()
+                        if self.ALIAS in l)
+        self.assertIn("antiphon-channel-", line,
+                      "no `automatic` marker on the record, so this is an "
+                      "explicitly named peer and its path is actionable")
+
+    def test_doctor_automatic_a_real_automatic_peer_still_hides_its_route(self):
+        with tempfile.TemporaryDirectory() as project:
+            digest = antiphon.peers.auto_identity(
+                "8261c119-2c20-4bf4-87ab-f152ac87dbda")[1]
+            live = [{"kind": "claude", "name": self.ALIAS, "automatic": True,
+                     "identity_digest": digest,
+                     "address": antiphon.claude_socket_path(project,
+                                                            self.ALIAS)}]
+            printed = io.StringIO()
+            report = antiphon._Report()
+            with patch.object(antiphon, "_probe_channel",
+                              return_value=antiphon.Probe(errno.ECONNREFUSED,
+                                                          False)), \
+                 contextlib.redirect_stdout(printed):
+                antiphon._doctor_channel(report, project, live)
+            line = next(l for l in printed.getvalue().splitlines()
+                        if self.ALIAS in l)
+        self.assertNotIn("antiphon-channel-", line)
+        self.assertIn("restart", line)
+
+
+class ProbeDescendantTerminationTest(unittest.TestCase):
+    """Isolation is promised to kill descendants; it has to actually do it.
+
+    The group signal recomputed the group from the leader's pid every time. A
+    leader that exits on SIGTERM therefore takes its own group id with it: the
+    follow-up `getpgid` raises, the SIGKILL is swallowed, and a descendant that
+    ignores SIGTERM outlives the probe. The pid is the group id only while the
+    leader is alive, so it has to be captured when the group is created.
+    """
+
+    CHILD = (
+        "import os, signal, subprocess, sys, time\n"
+        "grandchild = subprocess.Popen([sys.executable, '-c',\n"
+        "    \"import signal, time\\n\"\n"
+        "    \"signal.signal(signal.SIGTERM, signal.SIG_IGN)\\n\"\n"
+        "    \"import sys; sys.stdout.write(str(__import__('os').getpid()))\\n\"\n"
+        "    \"sys.stdout.flush()\\n\"\n"
+        "    \"time.sleep(60)\\n\"],\n"
+        "    stdout=open(os.environ['ANTIPHON_TEST_PIDFILE'], 'w'))\n"
+        "time.sleep(60)\n"
+    )
+
+    def test_identity_probe_kills_a_descendant_that_ignores_sigterm(self):
+        with tempfile.TemporaryDirectory() as scratch:
+            pidfile = os.path.join(scratch, "grandchild.pid")
+            argv = [sys.executable, "-c", self.CHILD]
+            env = {**os.environ, "ANTIPHON_TEST_PIDFILE": pidfile}
+            with patch.dict(os.environ, env):
+                antiphon._bounded_identity_probe(argv, os.getcwd())
+            deadline = time.monotonic() + 3
+            grandchild = None
+            while time.monotonic() < deadline:
+                try:
+                    with open(pidfile, encoding="utf-8") as stream:
+                        raw = stream.read().strip()
+                    if raw:
+                        grandchild = int(raw)
+                        break
+                except (OSError, ValueError):
+                    pass
+                time.sleep(0.05)
+            self.assertIsNotNone(grandchild,
+                                 "the fixture never produced a descendant, so "
+                                 "it would measure nothing")
+            deadline = time.monotonic() + 3
+            alive = True
+            while time.monotonic() < deadline:
+                try:
+                    os.kill(grandchild, 0)
+                except ProcessLookupError:
+                    alive = False
+                    break
+                time.sleep(0.05)
+            if alive:
+                with contextlib.suppress(ProcessLookupError):
+                    os.kill(grandchild, signal.SIGKILL)
+            self.assertFalse(alive,
+                             "isolation promises descendant death; a leader "
+                             "that exits must not take the group with it")
