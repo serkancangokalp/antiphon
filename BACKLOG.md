@@ -60,10 +60,15 @@ the write-and-flush-before-advance transaction.
   fixed number of writes and bytes independent of catalog size. Starting or
   refreshing a generation still publishes one full immutable manifest and is
   O(retained candidates); monotone retention makes that transition grow until
-  cursor-aware v4 retirement. Superseded manifests are also retained in 1A:
-  if each refresh adds one candidate, their worst-case on-disk total is
-  quadratic in the retained candidate count. Reclamation belongs to that same
-  v4 retirement rather than to a deletion rule this wave cannot yet prove.
+  cursor-aware v4 retirement. Superseded manifests are also retained in 1A,
+  so their on-disk total is O(retained candidates × refresh generations) and
+  is not bounded by candidate count alone. Every completed explicit
+  `antiphon sources scan` forces a refresh even when membership is unchanged,
+  and retry-driven refreshes can add generations too; if candidates and
+  generations grow together, the special case is quadratic. V4 therefore has
+  two reclamation jobs with different proof: retiring a candidate record needs
+  per-reader cursor evidence, while removing a superseded manifest needs only
+  proof that no active catalog state references it.
   Hooks record their current source first, then inspect one bounded batch
   through finite base/reconcile/delta generations;
   `antiphon sources scan` completes or refreshes the same catalog without

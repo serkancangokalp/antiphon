@@ -337,9 +337,15 @@ catalog, because its Wave 0 contract is project configuration only.
   retirement needs cursor-aware evidence and belongs with the v4 design; until
   then the manifest/record candidate set is deliberately monotone across
   refreshes, including transcripts that disappeared months earlier.
-- Superseded immutable manifests are retained too. If each refresh adds one
-  candidate, their worst-case on-disk total is quadratic in the retained
-  candidate count; cursor-aware v4 retirement owns their reclamation.
+- Superseded immutable manifests are retained too. Their on-disk total is
+  O(retained candidates × refresh generations), not bounded by candidate count
+  alone: every completed explicit `antiphon sources scan` forces a refresh
+  even when membership is unchanged, and retry-driven refreshes may add more
+  generations. When candidates and generations grow together, the special
+  case is quadratic. V4 has two separate reclamation proofs: a candidate
+  record needs per-reader cursor evidence before retirement, while a
+  superseded manifest needs only proof that no active catalog state references
+  it and may therefore be reclaimed independently.
 
 ## 8. Failure handling
 
