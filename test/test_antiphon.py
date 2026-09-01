@@ -2868,12 +2868,22 @@ class CatchUpTest(unittest.TestCase):
                 self.assertEqual(antiphon.catch_up(), 0)
             cursor = self.stored(project)
             self.assertEqual(cursor["claude_pages"], {
-                "v": 3, "sources": {self.SID_CODEX: {"gen": gen_codex,
-                                                     "offset": os.path.getsize(codex)}}})
-            self.assertEqual(cursor["codex_pages"], {
-                "v": 3, "sources": {self.SID_CLAUDE: {
-                    "gen": antiphon.source_generation(claude),
-                    "offset": os.path.getsize(claude)}}})
+                "v": 3, "replay": "legacy_upgrade",
+                "sources": {self.SID_CODEX: {"gen": gen_codex,
+                                               "offset": 0}}},
+                "the preserved v3 sibling is not advanced")
+            claude_v4 = cursor[antiphon.anchored_page_cursor_key("claude")]
+            codex_v4 = cursor[antiphon.anchored_page_cursor_key("codex")]
+            self.assertEqual(
+                claude_v4["sources"][self.SID_CODEX]["offset"],
+                os.path.getsize(codex))
+            self.assertEqual(
+                codex_v4["sources"][self.SID_CLAUDE]["offset"],
+                os.path.getsize(claude))
+            self.assertIsNotNone(
+                claude_v4["sources"][self.SID_CODEX]["anchor"])
+            self.assertIsNotNone(
+                codex_v4["sources"][self.SID_CLAUDE]["anchor"])
             self.assertEqual(cursor["claude_seen"]["sources"]["legacy"]["offset"], 7,
                              "the v2 value is left for pre-v3 processes")
             self.assertIn(f"{os.path.getsize(codex):,} bytes", out.getvalue(),
@@ -2903,8 +2913,9 @@ class CatchUpTest(unittest.TestCase):
             with contextlib.redirect_stdout(io.StringIO()):
                 self.assertEqual(antiphon.catch_up("claude"), 0)
             cursor = self.stored(project)
-            self.assertEqual(cursor["claude_pages"]["sources"][self.SID_CODEX]["offset"],
-                             complete)
+            self.assertEqual(
+                cursor[antiphon.anchored_page_cursor_key("claude")]
+                ["sources"][self.SID_CODEX]["offset"], complete)
             with open(codex, "a", encoding="utf-8") as f:
                 f.write(tail[20:] + "\n")
             positions, since, replay = antiphon.positions_for(cursor, "claude")
@@ -2961,7 +2972,7 @@ class CatchUpTest(unittest.TestCase):
             with contextlib.redirect_stdout(out):
                 antiphon.status()
             printed = out.getvalue()
-            unread_codex_rollouts = os.path.getsize(codex) - 10
+            unread_codex_rollouts = os.path.getsize(codex)
             claude_size = os.path.getsize(claude)
         line = next((l for l in printed.splitlines() if l.startswith("unread claude_pages:")), "")
         self.assertIn(f"{unread_codex_rollouts:,} raw bytes", line, printed)
@@ -2979,7 +2990,7 @@ class CatchUpTest(unittest.TestCase):
     def backlog_after(self, project, cursor_value, key="claude_pages"):
         antiphon.write_cursor(project, {key: cursor_value}, "claude")
         cursor, state = antiphon._read_cursor_state(project, "claude")
-        side = "claude" if key == "claude_pages" else "codex"
+        side = "claude" if key.startswith("claude_pages") else "codex"
         return antiphon.reader_backlog(project, side, cursor, state)
 
     def test_backlog_counts_from_where_the_reader_will_actually_start(self):
@@ -3019,10 +3030,21 @@ class CatchUpTest(unittest.TestCase):
                     "v": 3, "sources": {self.SID_CODEX: {"gen": "other:gen:0000", "offset": 10}}})
                 self.assertEqual((unread, positioned, unpositioned), (total, 0, 1))
 
-            with self.subTest(case="a trusted position counts the remainder"):
-                unread, positioned, unpositioned, _ = self.backlog_after(project, {
-                    "v": 3, "sources": {self.SID_CODEX: {"gen": gen, "offset": 10}}})
-                self.assertEqual((unread, positioned, unpositioned), (total - 10, 1, 0))
+            with self.subTest(case="an anchored v4 position counts the remainder"):
+                first_end = list(antiphon.read_records(codex))[0][1]
+                unread, positioned, unpositioned, _ = self.backlog_after(
+                    project, {
+                        "v": 4,
+                        "sources": {self.SID_CODEX: {
+                            "gen": gen,
+                            "offset": first_end,
+                            "anchor": antiphon._path_anchor_at(codex, first_end),
+                        }},
+                        "adopting_v3": {},
+                        "next_lane": "active",
+                    }, key=antiphon.anchored_page_cursor_key("claude"))
+                self.assertEqual((unread, positioned, unpositioned),
+                                 (total - first_end, 1, 0))
 
             with self.subTest(case="a malformed page key recovers from byte zero: the whole file"):
                 unread, positioned, unpositioned, replay = self.backlog_after(
@@ -4215,10 +4237,20 @@ class PagedSummaryModelTest(unittest.TestCase):
 
     def event(self, text, source="source", generation="generation", offset=0,
               end=100, when=10.0, kind="codex"):
-        return antiphon.Event(when, kind, text, source, generation, offset, end)
+        before = (None if offset == 0 else {
+            "start": max(0, offset - 100), "sha256": "a" * 64})
+        anchor = {"start": offset, "sha256": "b" * 64}
+        return antiphon.Event(
+            when, kind, text, source, generation, offset, end, before, anchor)
 
     def scanned(self, *sources):
-        return {source: {"gen": generation, "offset": offset}
+        return {source: {
+                    "gen": generation,
+                    "offset": offset,
+                    "anchor": (None if offset == 0 else {
+                        "start": max(0, offset - 100),
+                        "sha256": "c" * 64}),
+                }
                 for source, generation, offset in sources}
 
     def page(self, events, scanned=None, side="claude", replay_reason=None):
@@ -4342,8 +4374,10 @@ class PagedSummaryModelTest(unittest.TestCase):
         scanned = self.scanned(("a", "ga", 400), ("b", "gb", 500))
         with patch.object(antiphon, "EVENT_LIMIT", 2):
             _text, advance, _count = self.page(events, scanned)
-        self.assertEqual(advance.sources["a"], {"gen": "ga", "offset": 200})
-        self.assertEqual(advance.sources["b"], {"gen": "gb", "offset": 500})
+        self.assertEqual(advance.sources["a"], {
+            "gen": "ga", "offset": 200,
+            "anchor": {"start": 100, "sha256": "a" * 64}})
+        self.assertEqual(advance.sources["b"], scanned["b"])
 
     def test_a_filtered_only_source_advances_to_its_scanned_position(self):
         scanned = self.scanned(("filtered", "g", 700))
@@ -4714,6 +4748,55 @@ class SafeSourceTest(unittest.TestCase):
             with self.assertRaises(OSError):
                 os.fstat(fd)
 
+    def test_descriptor_anchor_hashes_one_complete_raw_record(self):
+        with tempfile.TemporaryDirectory() as root:
+            path = os.path.join(root, self.UUID + ".jsonl")
+            self._write(path, [{"type": "user", "message": {"content": "first"}},
+                               {"type": "assistant",
+                                "message": {"content": "second"}}])
+            spans = list(antiphon.read_records(path))
+            opened = antiphon._open_safe_source(
+                root, self._candidate(), "/repo")
+            with opened as source:
+                anchor = source.anchor_at(spans[1][1])
+            with open(path, "rb") as f:
+                f.seek(spans[1][0])
+                raw = f.read(spans[1][1] - spans[1][0])
+        self.assertEqual(anchor, {
+            "start": spans[1][0],
+            "sha256": hashlib.sha256(raw).hexdigest(),
+        })
+
+    def test_anchor_hash_reads_a_large_record_in_bounded_chunks(self):
+        with tempfile.TemporaryDirectory() as root:
+            path = os.path.join(root, self.UUID + ".jsonl")
+            self._write(path, [{"type": "user",
+                                "message": {"content": "X" * 2_000_000}}])
+            opened = antiphon._open_safe_source(
+                root, self._candidate(), "/repo")
+            reads = []
+            real_reader = opened._reader
+
+            @contextlib.contextmanager
+            def tracked(offset=0):
+                with real_reader(offset) as stream:
+                    class Reader:
+                        def read(self, size=-1):
+                            reads.append(size)
+                            return stream.read(size)
+
+                        def seek(self, *args):
+                            return stream.seek(*args)
+                    yield Reader()
+
+            opened._reader = tracked
+            with opened as source:
+                anchor = source.anchor_at(os.path.getsize(path))
+        self.assertIsNotNone(anchor)
+        self.assertTrue(reads)
+        self.assertTrue(all(size <= antiphon.ANCHOR_HASH_CHUNK
+                            for size in reads if size >= 0))
+
     def test_path_replacement_after_open_cannot_redirect_the_reader(self):
         with tempfile.TemporaryDirectory() as root:
             path = os.path.join(root, self.UUID + ".jsonl")
@@ -4890,6 +4973,9 @@ class SafeSourceTest(unittest.TestCase):
                 self.assertEqual(antiphon.catch_up("codex"), 0)
             after = antiphon.read_cursor(project, "codex")
         self.assertEqual(after["codex_pages"]["sources"][self.UUID], held)
+        self.assertEqual(
+            after[antiphon.anchored_page_cursor_key("codex")]
+            ["adopting_v3"][self.UUID], held)
         self.assertIn("1 source(s) could not be measured safely", out.getvalue())
 
 
@@ -5743,10 +5829,12 @@ class CatalogDiscoveryTest(unittest.TestCase):
              contextlib.redirect_stdout(io.StringIO()):
             self.assertEqual(antiphon.catch_up("codex"), 0)
         after = antiphon.read_cursor(self.project, "codex")
-        positions = after["codex_pages"]["sources"]
-        self.assertEqual(positions["unresolved"], held)
+        v4 = after[antiphon.anchored_page_cursor_key("codex")]
+        positions = v4["sources"]
+        self.assertEqual(v4["adopting_v3"]["unresolved"], held)
         for sid, path in sources:
             self.assertEqual(positions[sid]["offset"], os.path.getsize(path))
+            self.assertIsNotNone(positions[sid]["anchor"])
 
     def test_status_reports_catalog_truth_per_reader_without_writing(self):
         sid, path = self._claude(6, "consumed before removal")
@@ -5998,6 +6086,59 @@ class PositionCursorTest(unittest.TestCase):
     only after delivery and therefore drains each source in offset order.
     """
 
+    def test_v4_is_selected_while_preserved_siblings_remain(self):
+        anchored = {"gen": "g4", "offset": 9, "anchor": {
+            "start": 0, "sha256": "a" * 64}}
+        adopting = {"gen": "g3", "offset": 17}
+        cursor = {
+            "claude_seen": 123.0,
+            "claude_pages": {"v": 3, "sources": {
+                "legacy": {"gen": "old", "offset": 99}}},
+            "claude_pages_v4": {"v": 4, "sources": {"anchored": anchored},
+                                "adopting_v3": {"adopting": adopting},
+                                "next_lane": "active"},
+        }
+        positions, since, replay = antiphon.positions_for(cursor, "claude")
+        self.assertIsInstance(positions, antiphon.RuntimePositions)
+        self.assertEqual(positions["anchored"], anchored)
+        self.assertEqual(positions["adopting"], adopting)
+        self.assertEqual(positions.adopting, frozenset({"adopting"}))
+        self.assertNotIn("legacy", positions)
+        self.assertIsNotNone(since)
+        self.assertIsNone(replay)
+
+    def test_malformed_v4_never_falls_back_to_a_valid_v3_sibling(self):
+        cursor = {
+            "claude_pages": {"v": 3, "sources": {
+                "legacy": {"gen": "old", "offset": 99}}},
+            "claude_pages_v4": {"v": 4, "sources": {"broken": {
+                "gen": "g4", "offset": 9,
+                "anchor": {"start": 0, "sha256": "not-a-digest"}}},
+                "adopting_v3": {}, "next_lane": "active"},
+        }
+        positions, since, replay = antiphon.positions_for(cursor, "claude")
+        self.assertEqual(positions, {})
+        self.assertIsNone(since)
+        self.assertEqual(replay, "cursor_recovery")
+
+    def test_v4_zero_position_requires_a_null_anchor(self):
+        good = {"v": 4, "sources": {
+            "zero": {"gen": "g", "offset": 0, "anchor": None}},
+            "adopting_v3": {}, "next_lane": "dead"}
+        cursor = {"codex_pages_v4": good}
+        positions, _since, replay = antiphon.positions_for(cursor, "codex")
+        self.assertEqual(positions["zero"], good["sources"]["zero"])
+        self.assertIsNone(replay)
+
+        bad = json.loads(json.dumps(good))
+        bad["sources"]["zero"]["anchor"] = {
+            "start": 0, "sha256": "b" * 64}
+        positions, since, replay = antiphon.positions_for(
+            {"codex_pages_v4": bad}, "codex")
+        self.assertEqual(positions, {})
+        self.assertIsNone(since)
+        self.assertEqual(replay, "cursor_recovery")
+
     def test_an_event_carries_the_source_and_offset_it_came_from(self):
         """A timestamp cannot resume inside a group of records written in the
         same second. An offset can, which is what this field is for."""
@@ -6018,6 +6159,34 @@ class PositionCursorTest(unittest.TestCase):
         self.assertEqual(events[0].end, events[1].offset,
                          "one record ends where the next begins")
         self.assertEqual(reached[sid]["offset"], events[1].end)
+        self.assertEqual(reached[sid]["anchor"], {
+            "start": events[1].offset,
+            "sha256": hashlib.sha256(
+                (lines[1] + "\n").encode("utf-8")).hexdigest(),
+        })
+
+    def test_an_in_place_rewrite_repeats_only_the_anchored_record(self):
+        sid = "4eecac24-1c21-47ad-ab11-a650708f3098"
+        first = json.dumps({"type": "assistant", "message": {"content": "first"}})
+        old = json.dumps({"type": "assistant", "message": {"content": "old___"}})
+        new = json.dumps({"type": "assistant", "message": {"content": "new___"}})
+        self.assertEqual(len(old), len(new))
+        with tempfile.TemporaryDirectory() as root:
+            path = os.path.join(root, sid + ".jsonl")
+            with open(path, "w", encoding="utf-8") as f:
+                f.write(first + "\n" + old + "\n")
+            generation = antiphon.source_generation(path)
+            boundary = len((first + "\n").encode("utf-8"))
+            position = {"gen": generation, "offset": os.path.getsize(path),
+                        "anchor": {"start": boundary, "sha256": hashlib.sha256(
+                            (old + "\n").encode("utf-8")).hexdigest()}}
+            with open(path, "r+b") as f:
+                f.seek(boundary)
+                f.write((new + "\n").encode("utf-8"))
+            opened = antiphon._PathSource(path, "claude")
+            start, reason = antiphon._resolve_source_start(
+                opened, {sid: position}, since=None)
+        self.assertEqual((start, reason), (boundary, "rewritten"))
 
     def test_a_source_resumes_from_its_recorded_offset(self):
         lines = [json.dumps({"type": "assistant",
@@ -6241,7 +6410,9 @@ class PositionCursorTest(unittest.TestCase):
         self.assertEqual((first_code, second_code), (0, 0))
         self.assertEqual(first_out, "")
         self.assertEqual(second_out, "")
-        self.assertEqual(cursor["codex_pages"]["sources"][sid]["offset"], size,
+        self.assertEqual(
+            cursor[antiphon.anchored_page_cursor_key("codex")]["sources"]
+            [sid]["offset"], size,
                          "the position passed the filtered records after "
                          "the first run")
 
@@ -6408,7 +6579,8 @@ class PositionCursorTest(unittest.TestCase):
                 project, "codex", cursor, "codex", positions,
                 page_advance(reached)))
             written = antiphon.read_cursor(project, "codex")
-        sources = written["codex_pages"]["sources"]
+        sources = written[antiphon.anchored_page_cursor_key(
+            "codex")]["adopting_v3"]
         self.assertEqual(sources["s1"], {"gen": "g1", "offset": 150},
                          "the rediscovered source's position moved forward")
         self.assertEqual(sources["s2"], {"gen": "g2", "offset": 200},
@@ -6736,8 +6908,9 @@ class InvalidCursorFilePagingTest(unittest.TestCase):
             cursor = antiphon.read_cursor(project, "codex")
         self.assertEqual(code, 0)
         self._assert_private_recovery(out, err, source, generation)
-        self.assertEqual(cursor[antiphon.page_cursor_key("codex")]["v"],
-                         antiphon.PAGE_CURSOR_VERSION)
+        self.assertEqual(
+            cursor[antiphon.anchored_page_cursor_key("codex")]["v"],
+            antiphon.ANCHORED_PAGE_CURSOR_VERSION)
 
     def test_non_object_array_mcp_restarts_from_zero_and_establishes_v3(self):
         with tempfile.TemporaryDirectory() as project:
@@ -6748,8 +6921,9 @@ class InvalidCursorFilePagingTest(unittest.TestCase):
             cursor = antiphon.read_cursor(project, "codex")
         text = response["result"]["content"][0]["text"]
         self._assert_private_recovery(text, err, source, generation)
-        self.assertEqual(cursor[antiphon.page_cursor_key("codex")]["v"],
-                         antiphon.PAGE_CURSOR_VERSION)
+        self.assertEqual(
+            cursor[antiphon.anchored_page_cursor_key("codex")]["v"],
+            antiphon.ANCHORED_PAGE_CURSOR_VERSION)
 
     def test_non_object_null_hook_restarts_from_zero_and_establishes_v3(self):
         with tempfile.TemporaryDirectory() as project:
@@ -6760,8 +6934,9 @@ class InvalidCursorFilePagingTest(unittest.TestCase):
             cursor = antiphon.read_cursor(project, "codex")
         self.assertEqual(code, 0)
         self._assert_private_recovery(out, err, source, generation)
-        self.assertEqual(cursor[antiphon.page_cursor_key("codex")]["v"],
-                         antiphon.PAGE_CURSOR_VERSION)
+        self.assertEqual(
+            cursor[antiphon.anchored_page_cursor_key("codex")]["v"],
+            antiphon.ANCHORED_PAGE_CURSOR_VERSION)
 
     def test_failed_output_preserves_invalid_bytes_and_the_same_recovery_page(self):
         original = b'{"codex_seen":'
@@ -6952,9 +7127,11 @@ class PagedDeliveryTest(_PagingIntegrationCase):
         self.assertIn("B second", second)
         self.assertLess(first.index("A first"), first.index("A second"))
         self.assertLess(second.index("B first"), second.index("B second"))
-        first_sources = first_cursor["codex_pages"]["sources"]
+        first_sources = first_cursor[
+            antiphon.anchored_page_cursor_key("codex")]["sources"]
         self.assertEqual(first_sources[self.SID_B]["offset"], 0)
-        sources = cursor["codex_pages"]["sources"]
+        sources = cursor[
+            antiphon.anchored_page_cursor_key("codex")]["sources"]
         self.assertEqual(len(sources), 2)
         self.assertGreater(sources[self.SID_A]["offset"], 0)
         self.assertGreater(sources[self.SID_B]["offset"], 0)
@@ -6978,23 +7155,24 @@ class PagedDeliveryTest(_PagingIntegrationCase):
                                             codex=codex),
                          self._write_source(project, self.SID_B, records_b,
                                             codex=codex)]
-                real_read = antiphon.read_records
+                real_read = antiphon._PathSource.read_anchored_records
                 counts = {path: 0 for path in paths}
 
-                def tracked(path, offset=0):
-                    for record in real_read(path, offset):
-                        counts[path] += 1
+                def tracked(source, offset=0):
+                    for record in real_read(source, offset):
+                        counts[source.path] += 1
                         yield record
 
                 with patch.object(antiphon, discover, return_value=paths), \
-                     patch.object(antiphon, "read_records", side_effect=tracked):
+                     patch.object(antiphon._PathSource, "read_anchored_records",
+                                  new=tracked):
                     antiphon.build_summary(project, side)
             self.assertEqual(
                 counts,
                 {path: antiphon.EVENT_LIMIT + 1 for path in paths},
                 side)
 
-    def test_filtered_only_hook_persists_v3_and_preserves_legacy_bytes(self):
+    def test_filtered_only_hook_persists_v4_and_preserves_legacy_bytes(self):
         seeded = {"v": 2, "sources": {"legacy": {"gen": "old", "offset": 17}}}
         records = [self._claude_record("filtered", i, filtered=True) for i in range(3)]
         with tempfile.TemporaryDirectory() as project:
@@ -7007,11 +7185,11 @@ class PagedDeliveryTest(_PagingIntegrationCase):
         self.assertIn(antiphon.REPLAY_NOTICES["legacy_upgrade"], text)
         self.assertIn("has_more: false", text)
         self.assertEqual(cursor["codex_seen"], seeded)
-        self.assertEqual(cursor["codex_pages"]["v"], 3)
-        self.assertEqual(cursor["codex_pages"]["sources"][self.SID_A]["offset"],
-                         size)
+        v4 = cursor[antiphon.anchored_page_cursor_key("codex")]
+        self.assertEqual(v4["v"], antiphon.ANCHORED_PAGE_CURSOR_VERSION)
+        self.assertEqual(v4["sources"][self.SID_A]["offset"], size)
 
-    def test_filtered_only_mcp_persists_v3_and_preserves_legacy_bytes(self):
+    def test_filtered_only_mcp_persists_v4_and_preserves_legacy_bytes(self):
         seeded = {"v": 2, "sources": {"legacy": {"gen": "old", "offset": 19}}}
         records = [self._claude_record("filtered", i, filtered=True) for i in range(3)]
         with tempfile.TemporaryDirectory() as project:
@@ -7024,8 +7202,12 @@ class PagedDeliveryTest(_PagingIntegrationCase):
         self.assertIn(antiphon.REPLAY_NOTICES["legacy_upgrade"],
                       result["content"][0]["text"])
         self.assertEqual(cursor["codex_seen"], seeded)
-        self.assertEqual(cursor["codex_pages"], {"v": 3, "sources": {
-            self.SID_A: {"gen": generation, "offset": size}}})
+        v4 = cursor[antiphon.anchored_page_cursor_key("codex")]
+        self.assertEqual(v4["v"], antiphon.ANCHORED_PAGE_CURSOR_VERSION)
+        self.assertEqual(v4["adopting_v3"], {})
+        self.assertEqual(v4["sources"][self.SID_A]["gen"], generation)
+        self.assertEqual(v4["sources"][self.SID_A]["offset"], size)
+        self.assertIsNotNone(v4["sources"][self.SID_A]["anchor"])
 
     def test_failed_hook_write_leaves_first_page_and_cursor_untouched(self):
         records = [self._claude_record("retry me", 0)]
@@ -7074,8 +7256,9 @@ class PagedDeliveryTest(_PagingIntegrationCase):
         delivered_text = json.loads(delivered[0])["hookSpecificOutput"]["additionalContext"]
         self.assertIn(oversized, delivered_text)
         self.assertEqual(created, [])
-        self.assertEqual(cursor["codex_pages"]["sources"][self.SID_A]["offset"],
-                         size)
+        self.assertEqual(
+            cursor[antiphon.anchored_page_cursor_key("codex")]
+            ["sources"][self.SID_A]["offset"], size)
 
     def test_oversized_mcp_refuses_without_advancing_or_spilling(self):
         oversized = "界" * (antiphon.PAGE_BUDGET // 3 + 100)
@@ -7189,8 +7372,9 @@ class PagedDeliveryTest(_PagingIntegrationCase):
         self.assertIn(oversized, first)
         self.assertIn("has_more: true", first)
         self.assertNotIn("normal page two", first)
-        self.assertEqual(cursor["codex_pages"]["sources"][self.SID_A]["offset"],
-                         starts[1][0])
+        self.assertEqual(
+            cursor[antiphon.anchored_page_cursor_key("codex")]
+            ["sources"][self.SID_A]["offset"], starts[1][0])
         self.assertIn("normal page two", second)
 
     def test_page_hook_and_mcp_preserve_exact_non_tool_whitespace(self):
@@ -7218,6 +7402,123 @@ class RollingUpgradePagingTest(_PagingIntegrationCase):
             return cursor
 
         return antiphon.update_cursor(project, side, mutate)
+
+    def test_v3_positive_boundary_repeats_only_its_preceding_record(self):
+        records = [self._claude_record("already delivered", 0, old=True),
+                   self._claude_record("boundary repeat", 1, old=True)]
+        with tempfile.TemporaryDirectory() as project:
+            path = self._write_source(project, self.SID_A, records)
+            generation = antiphon.source_generation(path)
+            end = os.path.getsize(path)
+            v3 = {"v": 3, "sources": {self.SID_A: {
+                "gen": generation, "offset": end}}}
+            antiphon.write_cursor(project, {"codex_pages": v3}, "codex")
+            code, page, err, _raw = self._hook(project, [path])
+            cursor = antiphon.read_cursor(project, "codex")
+        self.assertEqual(code, 0, err)
+        self.assertNotIn("already delivered", page)
+        self.assertIn("boundary repeat", page)
+        self.assertIn(antiphon.REPLAY_NOTICES["anchor_upgrade"], page)
+        self.assertEqual(cursor["codex_pages"], v3,
+                         "the v3 sibling remains untouched")
+        v4 = cursor[antiphon.anchored_page_cursor_key("codex")]
+        self.assertEqual(v4["adopting_v3"], {})
+        self.assertEqual(v4["sources"][self.SID_A]["offset"], end)
+        self.assertIsNotNone(v4["sources"][self.SID_A]["anchor"])
+
+    def test_v3_invalid_boundary_recovers_from_byte_zero(self):
+        records = [self._claude_record("first again", 0, old=True),
+                   self._claude_record("second again", 1, old=True)]
+        with tempfile.TemporaryDirectory() as project:
+            path = self._write_source(project, self.SID_A, records)
+            generation = antiphon.source_generation(path)
+            first_end = list(antiphon.read_records(path))[0][1]
+            v3 = {"v": 3, "sources": {self.SID_A: {
+                "gen": generation, "offset": first_end + 1}}}
+            antiphon.write_cursor(project, {"codex_pages": v3}, "codex")
+            code, page, err, _raw = self._hook(project, [path])
+        self.assertEqual(code, 0, err)
+        self.assertIn("first again", page)
+        self.assertIn("second again", page)
+        self.assertIn(antiphon.REPLAY_NOTICES["anchor_upgrade"], page)
+
+    def test_first_v4_write_freezes_an_unresolved_v3_position(self):
+        source_b = [self._claude_record("B already delivered", 0, old=True),
+                    self._claude_record("B frozen boundary", 1, old=True)]
+        with tempfile.TemporaryDirectory() as project:
+            path_b = self._write_source(project, self.SID_B, source_b)
+            generation_b = antiphon.source_generation(path_b)
+            frozen_end = os.path.getsize(path_b)
+            path_a = self._write_source(project, self.SID_A, [
+                self._claude_record("A opens adoption", 2, old=True)])
+            generation_a = antiphon.source_generation(path_a)
+            v3 = {"v": 3, "sources": {
+                self.SID_A: {"gen": generation_a, "offset": 0},
+                self.SID_B: {"gen": generation_b, "offset": frozen_end},
+            }}
+            antiphon.write_cursor(project, {"codex_pages": v3}, "codex")
+            first = self._hook(project, [path_a])[1]
+            frozen = antiphon.read_cursor(project, "codex")
+            self.assertEqual(
+                frozen[antiphon.anchored_page_cursor_key("codex")]
+                ["adopting_v3"][self.SID_B]["offset"], frozen_end)
+
+            def move_old_v3(cursor):
+                cursor["codex_pages"]["sources"][self.SID_B]["offset"] = 0
+                return cursor
+
+            self.assertTrue(antiphon.update_cursor(
+                project, "codex", move_old_v3))
+            second = self._hook(project, [path_b])[1]
+            final = antiphon.read_cursor(project, "codex")
+        self.assertIn("A opens adoption", first)
+        self.assertIn(antiphon.REPLAY_NOTICES["anchor_upgrade"], first)
+        self.assertNotIn("B already delivered", second)
+        self.assertIn("B frozen boundary", second)
+        self.assertIn(antiphon.REPLAY_NOTICES["anchor_upgrade"], second)
+        self.assertEqual(
+            final[antiphon.anchored_page_cursor_key("codex")]["adopting_v3"], {})
+
+    def test_gone_v3_entry_does_not_leave_a_permanent_upgrade_notice(self):
+        with tempfile.TemporaryDirectory() as project:
+            path = self._write_source(project, self.SID_A, [
+                self._claude_record("readable adopter", 0, old=True)])
+            v3 = {"v": 3, "sources": {
+                self.SID_A: {"gen": antiphon.source_generation(path), "offset": 0},
+                self.SID_B: {"gen": "gone-generation", "offset": 42},
+            }}
+            antiphon.write_cursor(project, {"codex_pages": v3}, "codex")
+            first = self._hook(project, [path])[1]
+            second = self._hook(project, [])[1]
+            cursor = antiphon.read_cursor(project, "codex")
+        self.assertIn(antiphon.REPLAY_NOTICES["anchor_upgrade"], first)
+        self.assertEqual(second, "")
+        v4 = cursor[antiphon.anchored_page_cursor_key("codex")]
+        self.assertNotIn("replay", v4)
+        self.assertEqual(v4["adopting_v3"][self.SID_B],
+                         {"gen": "gone-generation", "offset": 42})
+
+    def test_failed_first_v3_adoption_delivery_leaves_cursor_bytes_unchanged(self):
+        attempted = []
+        with tempfile.TemporaryDirectory() as project:
+            path = self._write_source(project, self.SID_A, [
+                self._claude_record("same adoption page", 0, old=True)])
+            v3 = {"v": 3, "sources": {self.SID_A: {
+                "gen": antiphon.source_generation(path), "offset": 0}}}
+            antiphon.write_cursor(project, {"codex_pages": v3}, "codex")
+            cursor_path = os.path.join(project, ".antiphon", "cursor.json")
+            with open(cursor_path, "rb") as stream:
+                before = stream.read()
+            code = self._hook(
+                project, [path],
+                deliver=lambda line: attempted.append(line) or False)[0]
+            with open(cursor_path, "rb") as stream:
+                after = stream.read()
+            repeated = self._hook(project, [path])[1]
+        self.assertEqual(code, 1)
+        self.assertEqual(after, before)
+        self.assertIn("same adoption page", attempted[0])
+        self.assertIn("same adoption page", repeated)
 
     def test_a_numeric_v1_cursor_replays_from_its_timestamp_not_from_byte_zero(self):
         """0.1.0 wrote `<side>_seen` as one epoch float — the time of the last
@@ -7254,7 +7555,9 @@ class RollingUpgradePagingTest(_PagingIntegrationCase):
         self.assertIn("after the cursor", page)
         self.assertIn(antiphon.REPLAY_NOTICES["legacy_upgrade"], page)
         self.assertEqual(cursor["codex_seen"], seen, "the v1 value is left in place")
-        self.assertEqual(cursor["codex_pages"]["v"], 3)
+        self.assertEqual(
+            cursor[antiphon.anchored_page_cursor_key("codex")]["v"],
+            antiphon.ANCHORED_PAGE_CURSOR_VERSION)
 
     def test_positions_for_a_numeric_legacy_value_hands_back_its_time(self):
         """`{}` positions and the v1 time as `since`: the existing
@@ -7294,9 +7597,10 @@ class RollingUpgradePagingTest(_PagingIntegrationCase):
         self.assertEqual(pages[3], "")
         for page in pages[:3]:
             self.assertIn(antiphon.REPLAY_NOTICES["legacy_upgrade"], page)
-        self.assertEqual(cursors[0]["codex_pages"]["replay"], "legacy_upgrade")
-        self.assertEqual(cursors[1]["codex_pages"]["replay"], "legacy_upgrade")
-        self.assertNotIn("replay", cursors[2]["codex_pages"])
+        v4_key = antiphon.anchored_page_cursor_key("codex")
+        self.assertEqual(cursors[0][v4_key]["replay"], "legacy_upgrade")
+        self.assertEqual(cursors[1][v4_key]["replay"], "legacy_upgrade")
+        self.assertNotIn("replay", cursors[2][v4_key])
         self.assertTrue(all(cursor["codex_seen"] == seeded for cursor in cursors))
 
     def test_old_writer_advancing_v2_after_page_one_cannot_skip_page_two(self):
@@ -7318,7 +7622,9 @@ class RollingUpgradePagingTest(_PagingIntegrationCase):
         self.assertIn("overlap 0", first)
         self.assertIn("overlap 1", second)
         self.assertIn(antiphon.REPLAY_NOTICES["legacy_upgrade"], second)
-        self.assertEqual(first_cursor["codex_pages"]["replay"], "legacy_upgrade")
+        self.assertEqual(
+            first_cursor[antiphon.anchored_page_cursor_key("codex")]["replay"],
+            "legacy_upgrade")
         self.assertEqual(second_cursor["codex_seen"], old_value)
 
     def test_malformed_v3_ignores_farther_v2_and_keeps_recovery_until_final_page(self):
@@ -7346,8 +7652,9 @@ class RollingUpgradePagingTest(_PagingIntegrationCase):
         self.assertIn("recovery 2", pages[1])
         for page in pages:
             self.assertIn(antiphon.REPLAY_NOTICES["cursor_recovery"], page)
-        self.assertEqual(cursors[0]["codex_pages"]["replay"], "cursor_recovery")
-        self.assertNotIn("replay", cursors[1]["codex_pages"])
+        v4_key = antiphon.anchored_page_cursor_key("codex")
+        self.assertEqual(cursors[0][v4_key]["replay"], "cursor_recovery")
+        self.assertNotIn("replay", cursors[1][v4_key])
         self.assertIn("cursor", "".join(errors).lower())
         self.assertNotIn("secret-source", "".join(errors))
 
@@ -7404,10 +7711,14 @@ class RollingUpgradePagingTest(_PagingIntegrationCase):
             result = self._hook(project, [path])
             page, err = result[1], result[2]
             cursor = antiphon.read_cursor(project, "codex")
-        self.assertNotIn("already delivered", page)
+        self.assertIn("already delivered", page,
+                      "v3 adoption repeats its preceding boundary record")
         self.assertIn("next trusted record", page)
-        self.assertNotIn("replay:", page)
-        self.assertNotIn("replay", cursor["codex_pages"])
+        self.assertIn(antiphon.REPLAY_NOTICES["anchor_upgrade"], page)
+        self.assertNotIn(
+            "replay", cursor[antiphon.anchored_page_cursor_key("codex")])
+        self.assertIn("replay", cursor["codex_pages"],
+                      "the preserved v3 sibling remains byte-for-byte")
         self.assertIn("replay", err.lower())
         self.assertNotIn("must-not-render", err)
 
@@ -7426,7 +7737,8 @@ class RollingUpgradePagingTest(_PagingIntegrationCase):
         self.assertIn(antiphon.REPLAY_NOTICES["legacy_upgrade"], notice)
         self.assertIn("has_more: false", notice)
         self.assertEqual(after["codex_seen"], legacy)
-        self.assertNotIn("replay", after["codex_pages"])
+        self.assertNotIn(
+            "replay", after[antiphon.anchored_page_cursor_key("codex")])
 
 
 class MalformedStateTest(unittest.TestCase):
@@ -7604,8 +7916,16 @@ class MalformedStateTest(unittest.TestCase):
             cursor_path = os.path.join(project, ".antiphon", "cursor.json")
             os.makedirs(os.path.dirname(cursor_path))
             with open(cursor_path, "w", encoding="utf-8") as f:
-                json.dump({"codex_pages": {"v": 3, "sources":
-                           {sid: {"gen": gen, "offset": seen_through}}}}, f)
+                json.dump({"codex_pages_v4": {
+                    "v": 4,
+                    "sources": {sid: {
+                        "gen": gen,
+                        "offset": seen_through,
+                        "anchor": antiphon._path_anchor_at(path, seen_through),
+                    }},
+                    "adopting_v3": {},
+                    "next_lane": "active",
+                }}, f)
             out = io.StringIO()
             with patch.dict(os.environ, {}):
                 os.environ.pop("ANTIPHON_NAME", None)

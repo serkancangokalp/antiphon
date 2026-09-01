@@ -77,6 +77,7 @@ RECENT_FILES = 3          # bounded fallback/current-window discovery per side
 LOOKBACK = 6 * 3600       # anything older than this doesn't count as part of "this session"
 CATALOG_VERSION = 1
 CATALOG_BATCH = 8
+ANCHOR_HASH_CHUNK = 64 * 1024
 
 # EVENT_LIMIT and PAGE_BUDGET bound a complete page. The catalog is the
 # correctness inventory; RECENT_FILES bounds only degraded fallback and cheap
@@ -825,11 +826,25 @@ def cursor_time(cursor, key, default=None):
 
 
 CURSOR_VERSION = 2
-PAGE_CURSOR_VERSION = 3
+V3_PAGE_CURSOR_VERSION = 3
+PAGE_CURSOR_VERSION = V3_PAGE_CURSOR_VERSION
+ANCHORED_PAGE_CURSOR_VERSION = 4
+
+
+class RuntimePositions(dict):
+    """Dict-compatible cursor view with non-persisted adoption provenance."""
+
+    def __init__(self, values=None, adopting=()):
+        super().__init__(values or {})
+        self.adopting = frozenset(adopting)
 
 
 def page_cursor_key(side):
     return "%s_pages" % side
+
+
+def anchored_page_cursor_key(side):
+    return "%s_pages_v4" % side
 
 
 def _valid_position(entry):
@@ -847,6 +862,47 @@ def _valid_position(entry):
             and entry["offset"] >= 0)
 
 
+def _valid_anchor(anchor, offset):
+    if offset == 0:
+        return anchor is None
+    return (isinstance(anchor, dict)
+            and set(anchor) == {"start", "sha256"}
+            and isinstance(anchor.get("start"), int)
+            and not isinstance(anchor.get("start"), bool)
+            and 0 <= anchor["start"] < offset
+            and isinstance(anchor.get("sha256"), str)
+            and len(anchor["sha256"]) == 64
+            and all(char in "0123456789abcdef"
+                    for char in anchor["sha256"]))
+
+
+def _valid_anchored_position(entry):
+    return (_valid_position(entry)
+            and set(entry) == {"gen", "offset", "anchor"}
+            and _valid_anchor(entry.get("anchor"), entry["offset"]))
+
+
+def _valid_v4_page_cursor(value):
+    if (not isinstance(value, dict)
+            or value.get("v") != ANCHORED_PAGE_CURSOR_VERSION
+            or not isinstance(value.get("sources"), dict)
+            or not isinstance(value.get("adopting_v3"), dict)
+            or value.get("next_lane") not in ("active", "dead")
+            or any(not isinstance(sid, str) or not sid
+                   for sid in set(value["sources"]).union(value["adopting_v3"]))
+            or set(value["sources"]).intersection(value["adopting_v3"])
+            or not all(_valid_anchored_position(entry)
+                       for entry in value["sources"].values())
+            or not all(_valid_position(entry)
+                       for entry in value["adopting_v3"].values())):
+        return False
+    allowed = {"v", "sources", "adopting_v3", "next_lane", "replay"}
+    if set(value) - allowed:
+        return False
+    replay = value.get("replay")
+    return replay is None or replay in REPLAY_NOTICES
+
+
 def positions_for(cursor, side, loader_state="valid"):
     """Return ``(positions, since, replay_reason)`` for one paging reader.
 
@@ -856,15 +912,26 @@ def positions_for(cursor, side, loader_state="valid"):
     new reader past content it did not deliver.
     """
     if loader_state == "invalid":
-        return {}, None, "cursor_recovery"
+        return RuntimePositions(), None, "cursor_recovery"
     cursor = cursor if isinstance(cursor, dict) else {}
     key = page_cursor_key(side)
+    v4_key = anchored_page_cursor_key(side)
     legacy_key = "%s_seen" % side
     since = time.time() - LOOKBACK
+    if v4_key in cursor:
+        value = cursor.get(v4_key)
+        if _valid_v4_page_cursor(value):
+            sources = json.loads(json.dumps(value["sources"]))
+            sources.update(json.loads(json.dumps(value["adopting_v3"])))
+            return RuntimePositions(
+                sources, adopting=value["adopting_v3"]), since, value.get("replay")
+        print("antiphon: anchored paging cursor state was invalid; restarting "
+              "discovered transcript history", file=sys.stderr)
+        return RuntimePositions(), None, "cursor_recovery"
     if key in cursor:
         value = cursor.get(key)
         if (isinstance(value, dict)
-                and value.get("v") == PAGE_CURSOR_VERSION
+                and value.get("v") == V3_PAGE_CURSOR_VERSION
                 and isinstance(value.get("sources"), dict)):
             sources = {sid: entry for sid, entry in value["sources"].items()
                        if _valid_position(entry)}
@@ -876,10 +943,11 @@ def positions_for(cursor, side, loader_state="valid"):
                     print("antiphon: cursor replay metadata was invalid and was "
                           "ignored", file=sys.stderr)
                     replay = None
-                return sources, since, replay
+                return RuntimePositions(
+                    sources, adopting=sources), since, replay
         print("antiphon: paging cursor state was invalid; restarting discovered "
               "transcript history", file=sys.stderr)
-        return {}, None, "cursor_recovery"
+        return RuntimePositions(), None, "cursor_recovery"
     if legacy_key in cursor:
         legacy = cursor.get(legacy_key)
         if isinstance(legacy, dict):
@@ -887,7 +955,7 @@ def positions_for(cursor, side, loader_state="valid"):
             # records how far the old scanner *read*, not what it delivered —
             # it scanned the whole suffix and rendered the newest EVENT_LIMIT
             # — so no offset in it is a safe start. Byte zero, marked.
-            return {}, None, "legacy_upgrade"
+            return RuntimePositions(), None, "legacy_upgrade"
         # 0.1.0 — the published upgrade path — kept one epoch float: the time
         # of the last event it rendered. That time is taken as authoritative
         # and the page starts at the first record at or after it (`>=`, so
@@ -897,20 +965,42 @@ def positions_for(cursor, side, loader_state="valid"):
         # that is not a time trusts nothing and replays from byte zero.
         unset = object()
         moment = cursor_time(cursor, legacy_key, default=unset)
-        return {}, (None if moment is unset else moment), "legacy_upgrade"
-    return {}, since, None
+        return (RuntimePositions(),
+                (None if moment is unset else moment), "legacy_upgrade")
+    return RuntimePositions(), since, None
 
 
 def _advance_page_cursor(cwd, kind, cursor, side, positions, advance):
     """Persist the delivered source prefix and replay lifecycle as one value."""
     if advance is None:
         return True
-    merged = dict(positions)
-    merged.update(advance.sources)
-    value = {"v": PAGE_CURSOR_VERSION, "sources": merged}
+    key = anchored_page_cursor_key(side)
+    held = cursor.get(key)
+    if _valid_v4_page_cursor(held):
+        sources = json.loads(json.dumps(held["sources"]))
+        adopting = json.loads(json.dumps(held["adopting_v3"]))
+        next_lane = held["next_lane"]
+    else:
+        sources, adopting, next_lane = {}, {}, "active"
+
+    def merge(entries):
+        for sid, raw in entries.items():
+            entry = dict(raw)
+            if _valid_anchored_position(entry):
+                sources[sid] = entry
+                adopting.pop(sid, None)
+            elif _valid_position(entry):
+                adopting[sid] = {
+                    "gen": entry["gen"], "offset": entry["offset"]}
+                sources.pop(sid, None)
+
+    merge(positions)
+    merge(advance.sources)
+    value = {"v": ANCHORED_PAGE_CURSOR_VERSION, "sources": sources,
+             "adopting_v3": adopting, "next_lane": next_lane}
     if advance.has_more and advance.replay_reason in REPLAY_NOTICES:
         value["replay"] = advance.replay_reason
-    cursor[page_cursor_key(side)] = value
+    cursor[key] = value
     return write_cursor(cwd, cursor, kind)
 
 
@@ -1060,6 +1150,45 @@ def read_records(path, offset=0):
         return
 
 
+def _anchor_from_stream(stream, offset):
+    """Anchor the one complete raw record ending at ``offset``.
+
+    Reads backward and hashes forward in fixed chunks. ``None`` means the
+    requested byte is not a proved record boundary in this stream.
+    """
+    if not isinstance(offset, int) or isinstance(offset, bool) or offset < 0:
+        return None
+    if offset == 0:
+        return None
+    size = stream.seek(0, os.SEEK_END)
+    if offset > size:
+        return None
+    stream.seek(offset - 1)
+    if stream.read(1) != b"\n":
+        return None
+    position = offset - 1
+    start = 0
+    while position > 0:
+        chunk_start = max(0, position - ANCHOR_HASH_CHUNK)
+        stream.seek(chunk_start)
+        block = stream.read(position - chunk_start)
+        newline = block.rfind(b"\n")
+        if newline >= 0:
+            start = chunk_start + newline + 1
+            break
+        position = chunk_start
+    digest = hashlib.sha256()
+    remaining = offset - start
+    stream.seek(start)
+    while remaining:
+        block = stream.read(min(ANCHOR_HASH_CHUNK, remaining))
+        if not block:
+            return None
+        digest.update(block)
+        remaining -= len(block)
+    return {"start": start, "sha256": digest.hexdigest()}
+
+
 def head_lines(path, limit=12, num_bytes=64 * 1024):
     """Returns the lines at the start of the file, used for session metadata."""
     try:
@@ -1150,6 +1279,28 @@ class SafeSource:
                     yield start, position, raw[:-1].decode("utf-8", "replace")
         except OSError:
             return
+
+    def read_anchored_records(self, offset=0):
+        try:
+            with self._reader(offset) as stream:
+                position = offset
+                for raw in stream:
+                    if not raw.endswith(b"\n"):
+                        return
+                    start, position = position, position + len(raw)
+                    anchor = {"start": start,
+                              "sha256": hashlib.sha256(raw).hexdigest()}
+                    yield (start, position,
+                           raw[:-1].decode("utf-8", "replace"), anchor)
+        except OSError:
+            return
+
+    def anchor_at(self, offset):
+        try:
+            with self._reader() as stream:
+                return _anchor_from_stream(stream, offset)
+        except OSError:
+            return None
 
     def size(self):
         try:
@@ -1280,6 +1431,25 @@ class _PathSource:
 
     def read_records(self, offset=0):
         return read_records(self.path, offset)
+
+    def read_anchored_records(self, offset=0):
+        # This path-only view exists for compatibility callers and isolated
+        # tests. Production discovery uses ``SafeSource`` and hashes the raw
+        # descriptor bytes directly. Keeping this adapter on the public
+        # ``read_records`` seam preserves callers that inject virtual records
+        # without weakening the descriptor-backed production path.
+        for start, end, line in read_records(self.path, offset):
+            raw = (line + "\n").encode("utf-8")
+            anchor = {"start": start,
+                      "sha256": hashlib.sha256(raw).hexdigest()}
+            yield start, end, line, anchor
+
+    def anchor_at(self, offset):
+        try:
+            with open(self.path, "rb") as stream:
+                return _anchor_from_stream(stream, offset)
+        except OSError:
+            return None
 
     def size(self):
         return _source_size(self.path)
@@ -2168,9 +2338,12 @@ def iso_epoch(s):
         return 0.0
 
 
-Event = collections.namedtuple("Event", "time kind text source generation offset end")
+Event = collections.namedtuple(
+    "Event", "time kind text source generation offset end before_anchor anchor",
+    defaults=(None, None))
 Record = collections.namedtuple(
-    "Record", "time source generation offset end events")
+    "Record", "time source generation offset end events before_anchor anchor",
+    defaults=(None, None))
 PageAdvance = collections.namedtuple(
     "PageAdvance", "sources has_more replay_reason")
 REPLAY_NOTICES = {
@@ -2182,6 +2355,10 @@ REPLAY_NOTICES = {
         "replay: replaying discovered history because the previous cursor "
         "could not be trusted; duplicates are expected until this backlog "
         "drains — `antiphon catch-up` skips what is left"),
+    "anchor_upgrade": (
+        "replay: adopting a delivered frontier from the previous cursor "
+        "format; at most its boundary record repeats while the content "
+        "anchor is established"),
 }
 
 
@@ -2237,6 +2414,14 @@ def _source_size(path):
         return None
 
 
+def _path_anchor_at(path, offset):
+    try:
+        with open(path, "rb") as stream:
+            return _anchor_from_stream(stream, offset)
+    except OSError:
+        return None
+
+
 def _start_offset(path, sid, generation, positions, since):
     """Where to start reading one source: its recorded offset, when the file
     is still the one that offset was measured against and has not shrunk
@@ -2275,6 +2460,12 @@ def _start_source_offset(source, positions, since):
         print("antiphon: a transcript is shorter than the %d bytes already "
               "read from it; reading it again" %
               positions[source.source]["offset"], file=sys.stderr)
+    elif reason == "rewritten":
+        print("antiphon: the record anchoring a delivered transcript frontier "
+              "was rewritten; reading that record again", file=sys.stderr)
+    elif reason == "invalid-anchor":
+        print("antiphon: a transcript frontier anchor could not be proved; "
+              "reading it again", file=sys.stderr)
     return start
 
 
@@ -2288,6 +2479,27 @@ def _resolve_source_start(source, positions, since):
             return 0, "unmeasurable"
         if recorded["offset"] > size:
             return 0, "shrunk"
+        if source.source in getattr(positions, "adopting", ()):
+            if recorded["offset"] == 0:
+                return 0, "adopting"
+            actual = source.anchor_at(recorded["offset"])
+            if actual is None:
+                return 0, "invalid-anchor"
+            return actual["start"], "adopting"
+        if "anchor" in recorded:
+            if recorded["offset"] == 0:
+                return (0, "positioned") if recorded.get("anchor") is None \
+                    else (0, "invalid-anchor")
+            actual = source.anchor_at(recorded["offset"])
+            expected = recorded.get("anchor")
+            if actual is None or not _valid_anchor(
+                    expected, recorded["offset"]):
+                return 0, "invalid-anchor"
+            if actual == expected:
+                return recorded["offset"], "positioned"
+            if actual["start"] == expected["start"]:
+                return expected["start"], "rewritten"
+            return 0, "invalid-anchor"
         return recorded["offset"], "positioned"
     if since is not None:
         return _source_offset_at_or_after(source, since), "since"
@@ -2319,6 +2531,27 @@ def _resolve_start(path, sid, generation, positions, since):
             return 0, "unmeasurable"
         if recorded["offset"] > size:
             return 0, "shrunk"
+        if sid in getattr(positions, "adopting", ()):
+            if recorded["offset"] == 0:
+                return 0, "adopting"
+            actual = _path_anchor_at(path, recorded["offset"])
+            if actual is None:
+                return 0, "invalid-anchor"
+            return actual["start"], "adopting"
+        if "anchor" in recorded:
+            if recorded["offset"] == 0:
+                return (0, "positioned") if recorded.get("anchor") is None \
+                    else (0, "invalid-anchor")
+            actual = _path_anchor_at(path, recorded["offset"])
+            expected = recorded.get("anchor")
+            if actual is None or not _valid_anchor(
+                    expected, recorded["offset"]):
+                return 0, "invalid-anchor"
+            if actual == expected:
+                return recorded["offset"], "positioned"
+            if actual["start"] == expected["start"]:
+                return expected["start"], "rewritten"
+            return 0, "invalid-anchor"
         return recorded["offset"], "positioned"
     if since is not None:
         return offset_at_or_after(path, since), "since"
@@ -2442,11 +2675,15 @@ def claude_events(cwd, positions=None, since=None, visible_record_limit=None,
             visible_records = 0
             sid, gen = source.source, source.generation
             offset = _start_source_offset(source, positions, since)
+            previous_anchor = source.anchor_at(offset) if offset else None
             if gen is not None:
-                reached[sid] = {"gen": gen, "offset": offset}
-            for start, end, line in source.read_records(offset):
+                reached[sid] = {
+                    "gen": gen, "offset": offset,
+                    "anchor": previous_anchor}
+            for start, end, line, anchor in source.read_anchored_records(offset):
                 if gen is not None:
-                    reached[sid] = {"gen": gen, "offset": end}
+                    reached[sid] = {
+                        "gen": gen, "offset": end, "anchor": anchor}
                 before = len(events)
                 try:
                     d = json.loads(line)
@@ -2470,7 +2707,9 @@ def claude_events(cwd, positions=None, since=None, visible_record_limit=None,
                                                         d.get("promptSource"))
                                 and not _is_self_injected(text)):
                             events.append((ts, path, next(position),
-                                          Event(ts, "you", text, sid, gen, start, end)))
+                                          Event(ts, "you", text, sid, gen,
+                                                start, end, previous_anchor,
+                                                anchor)))
                     elif kind == "assistant":
                         for c in content if isinstance(content, list) else []:
                             if not isinstance(c, dict):
@@ -2480,7 +2719,8 @@ def claude_events(cwd, positions=None, since=None, visible_record_limit=None,
                                 if isinstance(text, str) and text != "":
                                     events.append((ts, path, next(position),
                                                   Event(ts, "claude", text,
-                                                        sid, gen, start, end)))
+                                                        sid, gen, start, end,
+                                                        previous_anchor, anchor)))
                             elif c.get("type") == "tool_use":
                                 arguments = c.get("input") or {}
                                 arguments = (arguments if isinstance(arguments, dict)
@@ -2491,7 +2731,9 @@ def claude_events(cwd, positions=None, since=None, visible_record_limit=None,
                                 events.append((ts, path, next(position),
                                               Event(ts, "tool",
                                                     f"{c.get('name', '?')} {detail}".strip(),
-                                                    sid, gen, start, end)))
+                                                    sid, gen, start, end,
+                                                    previous_anchor, anchor)))
+                previous_anchor = anchor
                 if len(events) > before:
                     visible_records += 1
                     if (visible_record_limit is not None
@@ -2570,11 +2812,15 @@ def codex_events(cwd, positions=None, since=None, visible_record_limit=None,
             visible_records = 0
             sid, gen = source.source, source.generation
             offset = _start_source_offset(source, positions, since)
+            previous_anchor = source.anchor_at(offset) if offset else None
             if gen is not None:
-                reached[sid] = {"gen": gen, "offset": offset}
-            for start, end, line in source.read_records(offset):
+                reached[sid] = {
+                    "gen": gen, "offset": offset,
+                    "anchor": previous_anchor}
+            for start, end, line, anchor in source.read_anchored_records(offset):
                 if gen is not None:
-                    reached[sid] = {"gen": gen, "offset": end}
+                    reached[sid] = {
+                        "gen": gen, "offset": end, "anchor": anchor}
                 before = len(events)
                 try:
                     d = json.loads(line)
@@ -2596,11 +2842,13 @@ def codex_events(cwd, positions=None, since=None, visible_record_limit=None,
                                         and not _is_self_injected(text)):
                                     events.append((ts, path, next(position),
                                                   Event(ts, "you", text, sid, gen,
-                                                        start, end)))
+                                                        start, end, previous_anchor,
+                                                        anchor)))
                             elif role == "assistant":
                                 events.append((ts, path, next(position),
                                               Event(ts, "codex", text, sid, gen,
-                                                    start, end)))
+                                                    start, end, previous_anchor,
+                                                    anchor)))
                     elif (kind == "event_msg"
                           and payload.get("type") == "exec_command_begin"):
                         command = payload.get("command")
@@ -2609,7 +2857,9 @@ def codex_events(cwd, positions=None, since=None, visible_record_limit=None,
                         if command:
                             events.append((ts, path, next(position),
                                           Event(ts, "tool", f"shell {command}",
-                                                sid, gen, start, end)))
+                                                sid, gen, start, end,
+                                                previous_anchor, anchor)))
+                previous_anchor = anchor
                 if len(events) > before:
                     visible_records += 1
                     if (visible_record_limit is not None
@@ -2696,7 +2946,8 @@ def _ordered_records(events):
     streams = {}
     for (source, generation, offset, end), record_events in grouped.items():
         record = Record(record_events[0].time, source, generation, offset, end,
-                        tuple(record_events))
+                        tuple(record_events), record_events[0].before_anchor,
+                        record_events[0].anchor)
         streams.setdefault((source, generation), []).append(record)
 
     ordered_streams = []
@@ -2886,18 +3137,23 @@ def _page_frontier(records, selected, scanned):
     """Return offsets that stop at each source's first undelivered record."""
     first_remaining = {}
     for record in records[selected:]:
-        first_remaining.setdefault(record.source, record.offset)
+        first_remaining.setdefault(record.source, record)
     frontier = {}
     for source, position in scanned.items():
-        offset = first_remaining.get(source, position["offset"])
-        frontier[source] = dict(position, offset=offset)
+        remaining = first_remaining.get(source)
+        if remaining is None:
+            frontier[source] = dict(position)
+        else:
+            frontier[source] = dict(
+                position, offset=remaining.offset,
+                anchor=remaining.before_anchor)
     return frontier
 
 
 def _build_page(events, scanned, side, replay_reason=None, join=None,
                 discovery=None):
     """Build one bounded, whole-record page and its safe source frontier."""
-    if replay_reason not in (None, "legacy_upgrade", "cursor_recovery"):
+    if replay_reason not in REPLAY_NOTICES and replay_reason is not None:
         raise ValueError("unknown replay reason")
     records = _ordered_records(events)
     if not records:
@@ -2972,6 +3228,10 @@ def build_summary(cwd, side, positions=None, since=None, replay_reason=None,
             state="degraded",
             refusals=discovery.refusals + len(missing),
             reason="some project sources could not be proved")
+    adopting_readable = bool(
+        set(reached).intersection(getattr(positions, "adopting", ())))
+    if replay_reason is None and adopting_readable:
+        replay_reason = "anchor_upgrade"
     # Once per build, and threaded down. `_render_page` runs once per prefix
     # length inside the budget loop — up to `EVENT_LIMIT` times — and the join
     # walks the registry, `ps` and all: measured, 343 ms per turn if it were
@@ -7123,7 +7383,7 @@ def catch_up(side=None):
         sides = (side,)
     status = 0
     for one in sides:
-        key = page_cursor_key(one)
+        key = anchored_page_cursor_key(one)
         held_cursor, held_state = _read_cursor_state(cwd, one)
         positions, since, _replay = positions_for(
             held_cursor, one, held_state)
@@ -7139,23 +7399,49 @@ def catch_up(side=None):
                 if source.generation is None:
                     unpinned += 1
                     continue
-                frontier[source.source] = {
-                    "gen": source.generation,
-                    "offset": source.complete_prefix_end()}
+                end = source.complete_prefix_end()
+                anchor = source.anchor_at(end) if end else None
+                entry = {"gen": source.generation, "offset": end,
+                         "anchor": anchor}
+                if not _valid_anchored_position(entry):
+                    unpinned += 1
+                    continue
+                frontier[source.source] = entry
         skipped = {"bytes": 0}
 
         def mutate(cursor, key=key, frontier=frontier, skipped=skipped):
             held = cursor.get(key)
-            old = (held.get("sources") if isinstance(held, dict)
-                   and isinstance(held.get("sources"), dict) else {})
+            if _valid_v4_page_cursor(held):
+                sources = json.loads(json.dumps(held["sources"]))
+                adopting = json.loads(json.dumps(held["adopting_v3"]))
+                next_lane = held["next_lane"]
+            else:
+                sources, adopting, next_lane = {}, {}, "active"
             for sid, entry in frontier.items():
-                was = old.get(sid)
+                was = (positions or {}).get(sid)
                 was = (was.get("offset") if isinstance(was, dict)
                        and isinstance(was.get("offset"), int) else 0)
                 skipped["bytes"] += max(0, entry["offset"] - was)
-            merged = json.loads(json.dumps(old))
-            merged.update(frontier)
-            cursor[key] = {"v": PAGE_CURSOR_VERSION, "sources": merged}
+
+            def merge(entries):
+                for sid, raw in entries.items():
+                    entry = dict(raw)
+                    if _valid_anchored_position(entry):
+                        sources[sid] = entry
+                        adopting.pop(sid, None)
+                    elif _valid_position(entry):
+                        adopting[sid] = {
+                            "gen": entry["gen"], "offset": entry["offset"]}
+                        sources.pop(sid, None)
+
+            merge(positions or {})
+            merge(frontier)
+            cursor[key] = {
+                "v": ANCHORED_PAGE_CURSOR_VERSION,
+                "sources": sources,
+                "adopting_v3": adopting,
+                "next_lane": next_lane,
+            }
             return cursor
 
         if not update_cursor(cwd, one, mutate):
