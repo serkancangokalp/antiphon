@@ -555,4 +555,3 @@ If review finds anything, receive it through
 `superpowers:receiving-code-review`, reproduce it, add a red test, fix it and
 repeat Steps 1–5 on the new SHA. When review closes, report Wave 0 complete and
 begin brainstorming Wave 1. Do not merge/push/version/publish.
-
