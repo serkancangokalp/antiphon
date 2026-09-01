@@ -5249,7 +5249,15 @@ def _doctor_peers(report, cwd):
             report.note(f"peer {who}: stale record; a live session cleans this "
                         "up on its next pass")
             continue
-        if peers._owner_of(record) is None:
+        owner = peers._owner_of(record)
+        session = peers.read_session(cwd, record.get("kind"), record.get("name"))
+        session_owner = peers._owner_of(session) if session else None
+        mixed_owner_generation = peers.owner_generations_mixed(
+            owner, session_owner)
+        if mixed_owner_generation:
+            report.note(f"peer {who}: endpoint and session owner key generations "
+                        "differ; restart the older writer to refresh its record")
+        elif owner is None:
             # Two origins and no way to tell them apart from here: a record
             # written before the field existed, or an `owner_key()` that
             # returned nothing at registration. The note states what is
@@ -5258,7 +5266,8 @@ def _doctor_peers(report, cwd):
                         "sessions cannot be joined to it; restarting that "
                         "session usually records one")
         if peers._address_of(record) is None:
-            report.note(f"peer {who}: live, waiting for its first turn")
+            if not mixed_owner_generation:
+                report.note(f"peer {who}: live, waiting for its first turn")
         else:
             live.append(record)
             report.ok(f"peer {who}: live and addressed")

@@ -3257,6 +3257,31 @@ class DoctorTest(unittest.TestCase):
         _, printed = self.run_doctor(project)
         self.assertNotIn("no owner key", printed)
 
+    def test_doctor_names_a_mixed_owner_generation_without_writing(self):
+        """A current endpoint and legacy session are live but cannot be joined.
+
+        Doctor explains the rolling-upgrade state without weakening the join
+        to a pid guess and without refreshing either writer's record itself.
+        """
+        project = self.project()
+        self.set_up(project)
+        current = "300:v1:Sat Aug 30 01:00:00 2026"
+        legacy = "300:Sat Aug 30 01:00:00 2026"
+        antiphon.peers.register(project, "codex", "build", None,
+                                pid=os.getpid(), owner_key=current)
+        directory = antiphon.peers.peer_dir(project, "codex", "build")
+        session = os.path.join(directory, "session.json")
+        with open(session, "w", encoding="utf-8") as f:
+            json.dump({"kind": "codex", "name": "build", "owner": legacy,
+                       "session_id": "1d5a03e0-0548-4339-87c3-45c5dbf7e9d7"}, f)
+        before = self.snapshot(project)
+        _, printed = self.run_doctor(project)
+        self.assertEqual(before, self.snapshot(project))
+        line = self.line_for(printed, "peer codex/build:")
+        self.assertTrue(line.startswith("·"), line)
+        self.assertIn("owner key generations differ", line)
+        self.assertIn("older writer", line)
+
     def test_doctor_notes_messages_queued_to_a_codex_thread_that_is_not_running(self):
         """Measured: two bridge messages sat in Codex's queue for threads that
         had closed (one since 12:17, one since 15:04), invisible to everyone.

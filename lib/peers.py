@@ -38,6 +38,8 @@ KIND_PATTERN = re.compile(r"claude|codex")
 # below produces it. A bare pid is refused deliberately: it is the recycled
 # number the start time exists to rule out.
 OWNER_PATTERN = re.compile(r"[1-9][0-9]*:\S(?:.*\S)?")
+VERSIONED_OWNER_PATTERN = re.compile(
+    r"([1-9][0-9]*):v([1-9][0-9]*):\S(?:.*\S)?")
 PROCESS_FINGERPRINT_VERSION = 1
 OWNER_KEY_VERSION = f"v{PROCESS_FINGERPRINT_VERSION}"
 # The canonical UUID a Codex session is named by, lowercase as the CLI writes it
@@ -109,6 +111,29 @@ def valid_owner_key(key):
     simply never came back.
     """
     return isinstance(key, str) and bool(OWNER_PATTERN.fullmatch(key))
+
+
+def owner_key_version(key):
+    """The explicit owner-key generation, or None for legacy/invalid keys."""
+    if not valid_owner_key(key):
+        return None
+    matched = VERSIONED_OWNER_PATTERN.fullmatch(key)
+    return int(matched.group(2)) if matched else None
+
+
+def owner_generations_mixed(left, right):
+    """Whether two valid keys for one pid use different schema generations.
+
+    A legacy key has no generation. It is deliberately not normalised from its
+    rendered clock: the timezone and locale that produced it were never stored.
+    """
+    if not (valid_owner_key(left) and valid_owner_key(right)):
+        return False
+    left_pid, _, _ = left.partition(":")
+    right_pid, _, _ = right.partition(":")
+    if left_pid != right_pid:
+        return False
+    return owner_key_version(left) != owner_key_version(right)
 
 
 def valid_session_id(value):

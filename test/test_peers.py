@@ -485,6 +485,13 @@ class OwnerKeyTest(unittest.TestCase):
              patch.object(peers, "_process_info", return_value=None):
             self.assertIsNone(peers.owner_key(100))
 
+    def test_owner_key_schema_distinguishes_current_from_legacy(self):
+        self.assertEqual(
+            peers.owner_key_version("300:v1:Sat Aug 30 01:00:00 2026"), 1)
+        self.assertIsNone(
+            peers.owner_key_version("300:Sat Aug 30 01:00:00 2026"))
+        self.assertIsNone(peers.owner_key_version("not-an-owner"))
+
     def test_the_walk_finds_this_session_for_real(self):
         """Not a stub: this test process is running under a real CLI, so the
         walk has something to find. Skipped where it is not."""
@@ -973,6 +980,7 @@ class SessionRecordTest(unittest.TestCase):
     OTHER = "2e6b14f1-1659-544a-98d4-56d6eca8fa48"
     KEY = "300:first"
     OTHER_KEY = "301:second"
+    CURRENT_KEY = "300:v1:Sat Aug 30 01:00:00 2026"
 
     def _endpoint(self, project, owner=None):
         owner = owner or self.KEY
@@ -993,6 +1001,7 @@ class SessionRecordTest(unittest.TestCase):
     # ---- the join ----
 
     def test_an_addressless_endpoint_takes_its_own_sessions_id_as_its_address(self):
+        """Equal legacy keys remain joinable during rolling upgrade."""
         with tempfile.TemporaryDirectory() as project:
             self._endpoint(project)
             ok, detail = peers.write_session(project, "codex", "build", self.UUID,
@@ -1001,6 +1010,34 @@ class SessionRecordTest(unittest.TestCase):
             peer = peers.read_peers(project, "codex")[0]
         self.assertEqual(peer["address"], self.UUID)
         self.assertEqual(peer["pid"], os.getpid())
+
+    def test_two_current_owner_keys_join(self):
+        with tempfile.TemporaryDirectory() as project:
+            self._endpoint(project, self.CURRENT_KEY)
+            ok, detail = peers.write_session(
+                project, "codex", "build", self.UUID, "/t/r.jsonl",
+                self.CURRENT_KEY)
+            self.assertTrue(ok, detail)
+            peer = peers.read_peers(project, "codex")[0]
+        self.assertEqual(peer["address"], self.UUID)
+
+    def test_mixed_owner_key_generations_never_join_by_pid_alone(self):
+        """The legacy half may be stale from a process whose pid was reused.
+
+        Matching the numeric prefix would silently attach that old session to
+        a new endpoint. A rolling upgrade remains visible but unroutable until
+        the older writer refreshes its half.
+        """
+        with tempfile.TemporaryDirectory() as project:
+            self._endpoint(project, self.CURRENT_KEY)
+            self._write_raw(project, json.dumps({
+                "owner": "300:Sat Aug 30 01:00:00 2026",
+                "session_id": self.UUID,
+            }))
+            peer = peers.read_peers(project, "codex")[0]
+        self.assertIsNone(peer["address"])
+        self.assertTrue(peers.owner_generations_mixed(
+            self.CURRENT_KEY, "300:Sat Aug 30 01:00:00 2026"))
 
     def test_an_endpoint_with_no_session_record_stays_unroutable(self):
         with tempfile.TemporaryDirectory() as project:
