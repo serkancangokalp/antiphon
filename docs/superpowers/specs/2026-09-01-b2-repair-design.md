@@ -17,12 +17,22 @@ Measured at `d89d983` with a correct fixture — `peers.register` plus
 3. `@claude:auto-A` still resolves to an address: the socket now served by the
    process running session B.
 
-Two of the three mechanisms were already correct. `sender_alias` derives the
-name from the *current* session id and requires name, owner, digest and session
-address to agree, so a B session can never sign as A. The join guard already
-refuses B. Exactly one fact is missing: nothing supersedes A's session half when
-the same owner's current session becomes B. `_session_address` joins the halves
-on owner and nothing else, so a stale session record stays authoritative.
+Exactly one fact is missing, and it surfaces in two places rather than one.
+The missing fact: nothing supersedes A's session half when the same owner's
+current session becomes B. `_session_address` joins the halves on owner and
+nothing else, so a stale session record stays authoritative forever.
+
+Already correct: the join guard refuses B, and Python's Stop-signing identity
+`claimed_alias` derives its name from the *current* session id and requires
+name, owner, digest and session address to agree, so a B session cannot sign as
+A on that path.
+
+Stale, both reading state that nothing superseded: **routing**, which the
+reproduction above measured, and **Node's reply signing**, where
+`automaticIdentityJoined()` consults the endpoint and the stale session half
+without reading the proof at all. The first was measured here and led me to
+claim two of three mechanisms were already correct; review found the second and
+that claim was wrong. One missing fact, two consequences.
 
 The owner-current proof is therefore the missing fact, not a compensating
 cleanup pass.
@@ -211,7 +221,8 @@ the others are already inert because routing consults the proof.
   this bridge: positive proof or nothing.
 - It is removed only when its owner is **positively proved dead**, and only on
   a mutation path that is already writing the registry. That path is named, not
-  implied: each `write_identity_proof` sweeps under the lock it already holds
+  implied: `rotate_identity_proof` — the call production actually makes —
+  sweeps under the lock it already holds
   and reclaims only those whose owner death is proved. A reclamation function
   with no real caller would let a unit test pass while production never
   reclaimed anything.
@@ -262,8 +273,9 @@ the others are already inert because routing consults the proof.
   its own and whose identity digest is no longer current. Never an endpoint,
   never an explicit peer, never another owner's record.
 - The retire control is content-free, single-shot, bounded and non-patient. Any
-  error, timeout or refusal is swallowed: it cannot fail the hook and cannot
-  cost it. The Stop hook is the hottest path on the bridge, and the proof has
+  error, timeout or refusal is swallowed: it cannot fail the hook, and can
+  delay it by at most the stated control patience of 250 ms — a bounded and
+  known cost, but a cost. Saying it "cannot cost" the hook would be false. The Stop hook is the hottest path on the bridge, and the proof has
   already made routing safe without the control.
 - The listener alone unregisters its own pid-owned endpoint and closes only its
   channel socket.
