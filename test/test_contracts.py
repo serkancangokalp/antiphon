@@ -1020,6 +1020,36 @@ class IdentityPrivacyContractTest(unittest.TestCase):
                           + antiphon._VERDICT_NOTE["STRUCTURAL_INVALID"],
                           verdict)
 
+    def test_the_socket_path_is_never_unlinked_after_a_close(self):
+        """`close()` removes the socket file the server bound. An explicit
+        unlink after it is a second removal with an await in front of it, and
+        a successor can bind the path inside that gap — which is how one
+        session came to delete another's live socket, the failure
+        `owningSocket` was added to prevent, reached through the guard itself.
+
+        Pinned on the source rather than on behaviour, and deliberately so:
+        the property *is* about the source — this call must not appear in these
+        places. Two behavioural attempts are recorded here because they looked
+        right and measured nothing. Binding a successor after the process has
+        exited never opens the window; and a second channel started against a
+        held path refuses at the liveness check and never reaches the branch
+        under test at all. Reproducing either needs a production hook that
+        holds a process between a close and an unlink, which is a seam this
+        contract does not otherwise want.
+        """
+        node = read("lib", "channel.mjs")
+        self.assertEqual(node.count("unlink(socketPath)"), 1,
+                         "exactly one removal, and it is the pre-bind clear")
+        clear = node.index("await unlink(socketPath);")
+        serve = node.index("async function serveSocket()")
+        self.assertLess(serve, clear,
+                        "the one removal is inside `serveSocket`, before the "
+                        "bind — nothing removes the path after a close")
+        for after in ("close(resolve));\n    await unlink",
+                      "close(resolve));\n  await unlink",
+                      "socketServer.close();\n    await unlink"):
+            self.assertNotIn(after, node)
+
     def test_a_retiring_listener_refuses_to_republish_itself(self):
         """Retirement must be the last registry mutation a process makes.
 

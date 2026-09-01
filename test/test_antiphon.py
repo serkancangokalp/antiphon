@@ -17181,6 +17181,12 @@ class ReadinessParityTest(unittest.TestCase):
             f'"session_id": "{session_id or self.A}"{extra}}}')
 
     @staticmethod
+    def _own_birth():
+        """The birth the registry records for this test process, as a listener
+        would remember it from its own claim."""
+        return antiphon.peers._process_birth(os.getpid()) or ""
+
+    @staticmethod
     def _bom(path, _ignored=None):
         with open(path, "rb") as stream:
             raw = stream.read()
@@ -17305,13 +17311,14 @@ class ReadinessParityTest(unittest.TestCase):
     def _node(self, project, alias, digest):
         script = (
             'import { automaticProofVerdict } from "./lib/identity.mjs";'
-            'const [d, a, g, pid] = process.argv.slice(-4);'
-            'process.stdout.write(String('
-            'automaticProofVerdict(d, a, g, Number(pid))));'
+            'const [d, a, g, pid, birth] = process.argv.slice(-5);'
+            'process.stdout.write(String(automaticProofVerdict('
+            'd, a, g, Number(pid), birth || undefined)));'
         )
         done = subprocess.run(
             ["node", "--input-type=module", "-e", script, "--",
-             project, alias, digest, str(os.getpid())],
+             project, alias, digest, str(os.getpid()),
+             self._own_birth()],
             capture_output=True, text=True, cwd=self.ROOT)
         if done.returncode != 0:
             self.fail("node verdict failed: "
@@ -17666,6 +17673,20 @@ class ReadinessParityTest(unittest.TestCase):
             # or unrelated process read as this listener's own — and with a
             # rotation tombstone beside it, Node retired over a record Python
             # prunes before it can be enumerated at all.
+            # The pid is half of a process identity; the birth is the other
+            # half, and it is what tells a live process from a recycled number.
+            # Node compared the pid alone, so an endpoint left by an earlier
+            # process that happens to share this pid read as this listener's
+            # own — while Python prunes it before it can be enumerated.
+            "endpoint records another process's birth": lambda p, a: (
+                self._proof(p, self.A),
+                self._patch_endpoint(p, a, birth="Thu Jan  1 00:00:00 1970",
+                                     birth_version=1)),
+            "rotated, endpoint records another birth": lambda p, a: (
+                self._proof(p, self.B),
+                self._withdrawn(p, a),
+                self._patch_endpoint(p, a, birth="Thu Jan  1 00:00:00 1970",
+                                     birth_version=1)),
             "endpoint names a dead process": lambda p, a: (
                 self._proof(p, self.A),
                 self._patch_endpoint(p, a, pid=self._reaped_pid())),
@@ -17679,6 +17700,19 @@ class ReadinessParityTest(unittest.TestCase):
             "endpoint pid is a bool": lambda p, a: (
                 self._proof(p, self.A),
                 self._patch_endpoint(p, a, pid=True)),
+            # `strip()` and `trim()` are not the same set, in both
+            # directions: an address of a single U+0085 was empty to one
+            # reader and a real address to the other, U+FEFF the reverse.
+            "endpoint address is one Unicode space": lambda p, a: (
+                self._proof(p, self.A),
+                self._patch_endpoint(p, a, address="\u0085")),
+            "endpoint address is a byte-order mark": lambda p, a: (
+                self._proof(p, self.A),
+                self._patch_endpoint(p, a, address="\ufeff")),
+            "rotated, address is one Unicode space": lambda p, a: (
+                self._proof(p, self.B),
+                self._withdrawn(p, a),
+                self._patch_endpoint(p, a, address="\u0085")),
             "endpoint address dropped": lambda p, a: (
                 self._proof(p, self.A),
                 self._patch_endpoint(p, a, drop="address")),

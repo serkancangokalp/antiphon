@@ -2541,3 +2541,24 @@ peers.rotate_identity_proof(${JSON.stringify(dir)}, owner,
 }
 
 await aSilentClientDoesNotHoldRetirementOpen();
+
+// --- an ordinary exit takes its own socket and nothing else ---------------
+async function anOrdinaryShutdownRemovesItsOwnSocket() {
+  const dir = await mkdtemp(join(tmpdir(), "antiphon-shutdown-own-"));
+  const session = spawnChannel(dir, "ui");
+  const socket = socketFor(dir, "ui");
+  try {
+    assert.ok(await waitFor(() => existsSync(socket)),
+      `channel never bound; stderr=${session.stderr()}`);
+    session.child.stdin.end();
+    assert.ok(await waitForExit(session.child, 5_000), "the session exits");
+    assert.ok(!existsSync(socket), "and takes its own socket with it");
+  } finally {
+    session.child.kill("SIGKILL");
+    await waitForExit(session.child, 2_000);
+    await rm(socket, { force: true }).catch(() => {});
+    await rm(dir, { recursive: true, force: true }).catch(() => {});
+  }
+}
+
+await anOrdinaryShutdownRemovesItsOwnSocket();

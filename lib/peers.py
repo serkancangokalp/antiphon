@@ -55,6 +55,16 @@ VERSIONED_OWNER_PATTERN = re.compile(
 # bounds meet here: `os.kill` refuses a value above the platform's signed int,
 # and JavaScript's numbers stop being exact integers past 2**53 - 1. The
 # smaller of the two is what both sides can agree on.
+# What counts as blank, in the one set both readers share. `str.strip()` uses
+# Python's whitespace and `String.trim()` uses JavaScript's, and they differ in
+# both directions — so an address of a single U+0085 was empty here and a real
+# address there, and U+FEFF was the reverse. Whichever way it fell, one reader
+# had a peer the other did not, and with a rotation tombstone beside it that
+# reader was the one that retires.
+BLANK = (" \t\n\r\f\v\x1c\x1d\x1e\x1f\x85\u00a0\u1680"
+         "\u2000\u2001\u2002\u2003\u2004\u2005\u2006\u2007\u2008\u2009"
+         "\u200a\u2028\u2029\u202f\u205f\u3000\ufeff")
+
 PID_CEILING = 2 ** 31 - 1
 PROCESS_FINGERPRINT_VERSION = 1
 OWNER_KEY_VERSION = f"v{PROCESS_FINGERPRINT_VERSION}"
@@ -1031,7 +1041,7 @@ def _address_of(record):
     """A usable address, or None. An empty address is not a peer: stored, it made
     the single-peer resolver fall back to the legacy socket without saying so."""
     address = record.get("address") if hasattr(record, "get") else None
-    if not isinstance(address, str) or not address.strip():
+    if not isinstance(address, str) or not address.strip(BLANK):
         return None
     return address
 
