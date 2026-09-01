@@ -29,9 +29,9 @@ for attempt in 1 2 3; do
       printf 'attempt=%s\ntranscript=%s\n' "$attempt" "$transcript"
       exit 0
       ;;
-    1) ;;
+    3) ;;
     *)
-      echo "the exact-assistant marker probe failed" >&2
+      echo "the exact-assistant marker probe failed; not retrying Claude" >&2
       exit 2
       ;;
   esac

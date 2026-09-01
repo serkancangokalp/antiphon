@@ -11,6 +11,7 @@ import unittest
 ROOT = Path(__file__).resolve().parents[1]
 PROBE = ROOT / "test" / "e2e" / "marker_probe.py"
 TURN = ROOT / "test" / "e2e" / "marker_turn.sh"
+CONTRACT = ROOT / "test" / "e2e" / "marker_contract.sh"
 
 
 class ExactAssistantMarkerProbeTest(unittest.TestCase):
@@ -54,8 +55,18 @@ class ExactAssistantMarkerProbeTest(unittest.TestCase):
             marker = "@codex exact-prompt-only"
             self.write_records(root, "prompt.jsonl", [self.user(marker)])
             done = self.run_probe(root, marker)
-        self.assertEqual(done.returncode, 1, done.stderr)
+        self.assertEqual(done.returncode, 3, done.stderr)
         self.assertEqual(done.stdout, "")
+
+    def test_a_non_directory_root_is_a_probe_error_not_no_match(self):
+        with tempfile.TemporaryDirectory() as root:
+            marker = "@codex bad-root"
+            not_a_directory = Path(root, "transcript-root")
+            not_a_directory.write_text("not a directory", encoding="utf-8")
+            done = self.run_probe(not_a_directory, marker)
+        self.assertEqual(done.returncode, 2, done.stderr)
+        self.assertIn("transcript root", done.stderr)
+        self.assertNotIn(marker, done.stderr)
 
     def test_only_an_exact_trimmed_assistant_text_block_matches(self):
         with tempfile.TemporaryDirectory() as root:
@@ -81,7 +92,7 @@ class ExactAssistantMarkerProbeTest(unittest.TestCase):
             self.write_records(
                 root, "partial.jsonl", [self.assistant(marker)], complete=False)
             done = self.run_probe(root, marker)
-        self.assertEqual(done.returncode, 1, done.stderr)
+        self.assertEqual(done.returncode, 3, done.stderr)
         self.assertEqual(done.stdout, "")
 
     def test_the_newest_exact_matching_transcript_is_selected(self):
@@ -122,6 +133,8 @@ class BoundedMarkerTurnTest(unittest.TestCase):
             mode = os.environ.get("FAKE_CLAUDE_MODE", "exact")
             if mode == "nonzero":
                 raise SystemExit(7)
+            if mode == "probe-error":
+                raise SystemExit(0)
             prompt = sys.argv[-1]
             match = re.search(r"(@codex [^\\s]+)$", prompt)
             if not match:
@@ -179,8 +192,59 @@ class BoundedMarkerTurnTest(unittest.TestCase):
         self.assertEqual(self.count.read_text(), "3")
         self.assertNotIn(marker, done.stdout + done.stderr)
 
+    def test_a_transcript_root_failure_is_not_retried_as_an_omission(self):
+        self.transcripts.rmdir()
+        self.transcripts.write_text("not a directory", encoding="utf-8")
+        done, _ = self.run_turn("probe-error")
+        self.assertEqual(done.returncode, 2, done.stderr)
+        self.assertEqual(self.count.read_text(), "1")
+        self.assertIn("probe failed", done.stderr)
+        self.assertNotIn("absent after 3", done.stderr)
+
+    def test_an_unexpected_probe_exit_one_is_fail_closed_and_not_retried(self):
+        real_python = Path(sys.executable).resolve()
+        wrapper = self.bin / "python3"
+        wrapper.write_text(textwrap.dedent(f"""\
+            #!/usr/bin/env bash
+            case "$1" in
+              */marker_probe.py) exit 1 ;;
+              *) exec "{real_python}" "$@" ;;
+            esac
+            """), encoding="utf-8")
+        wrapper.chmod(0o755)
+        done, _ = self.run_turn("probe-error")
+        self.assertEqual(done.returncode, 2, done.stderr)
+        self.assertEqual(self.count.read_text(), "1")
+        self.assertIn("probe failed", done.stderr)
+
 
 class FreshUserMarkerContractTest(unittest.TestCase):
+
+    def test_the_production_shell_guards_execute_each_stage_once_and_preserve(self):
+        fixture = r'''
+source "$1" || exit 90
+KEEP=0
+pushes=0
+pages=0
+continued=0
+e2e_once push && pushes=$((pushes + 1))
+e2e_once push && pushes=$((pushes + 1))
+e2e_once page && pages=$((pages + 1))
+e2e_once page && pages=$((pages + 1))
+if preserve_marker_evidence "marker turn" "/tmp/evidence-a" "/tmp/evidence-b"; then
+  continued=1
+fi
+printf 'pushes=%s pages=%s keep=%s continued=%s\n' \
+  "$pushes" "$pages" "$KEEP" "$continued"
+'''
+        done = subprocess.run(
+            ["bash", "-c", fixture, "fixture", str(CONTRACT)],
+            capture_output=True, text=True, timeout=10,
+            stdin=subprocess.DEVNULL)
+        self.assertEqual(done.returncode, 0, done.stderr)
+        self.assertEqual(
+            done.stdout, "pushes=1 pages=1 keep=1 continued=0\n")
+        self.assertIn("preserving evidence", done.stderr)
 
     def test_the_retry_helper_cannot_repeat_push_or_page_delivery(self):
         helper = TURN.read_text(encoding="utf-8")
@@ -194,6 +258,8 @@ class FreshUserMarkerContractTest(unittest.TestCase):
         ]
         self.assertEqual(t2_t3.count("antiphon push codex"), 1)
         self.assertEqual(t2_t3.count('PAGE="$(page_now)"'), 1)
+        self.assertEqual(t2_t3.count("e2e_once push"), 1)
+        self.assertEqual(t2_t3.count("e2e_once page"), 1)
 
     def test_the_exact_second_transcript_is_carried_to_the_single_push(self):
         script = (ROOT / "test" / "e2e" / "fresh-user.sh").read_text(
@@ -208,8 +274,7 @@ class FreshUserMarkerContractTest(unittest.TestCase):
         start = script.index("land_exact_marker()")
         end = script.index("\n}\n", start) + 3
         helper = script[start:end]
-        self.assertIn("KEEP=1", helper)
-        self.assertIn("preserving evidence", helper)
+        self.assertIn("preserve_marker_evidence", helper)
         self.assertRegex(helper, r"1\)\n(?:.|\n)*?exit 1")
 
 

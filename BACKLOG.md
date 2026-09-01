@@ -1558,6 +1558,12 @@ What the first run measured, in order of what it changed:
   remain single-shot. Final marker exhaustion fails before those assertions
   can cascade and preserves both temporary evidence roots automatically;
   nonzero CLI exit remains a distinct, non-retried failure.
+  A deterministic shell fixture executes the same once/preserve guards the
+  harness sources, while wiring checks bind the real push and page sites to
+  them; it does not stub the entire host-heavy script. The clean exact-SHA run
+  therefore remains the separate proof that those guarded sites execute in the
+  real flow. This split is an explicit harness boundary, not a claim that the
+  focused fixture drove Claude, Codex, setup and delivery together.
 
 Named limitations, checked by hand instead: `-p` mode never loads the channel,
 so the host's notification schema — the fault that cost the most today — is

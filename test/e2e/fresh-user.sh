@@ -48,6 +48,7 @@
 set -uo pipefail
 
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd -P)"
+source "$REPO/test/e2e/marker_contract.sh" || exit 2
 VERSION=""
 KEEP=0
 while [ $# -gt 0 ]; do
@@ -119,9 +120,7 @@ land_exact_marker() {
       MARKER_TRANSCRIPT="$transcript"
       ;;
     1)
-      KEEP=1
-      echo "$label: exact assistant marker absent after three exit-zero turns" >&2
-      echo "preserving evidence: $TMP and $CLAUDE_DIR" >&2
+      preserve_marker_evidence "$label" "$TMP" "$CLAUDE_DIR"
       exit 1
       ;;
     *)
@@ -349,9 +348,10 @@ case "$BEFORE_QUEUE" in
   absent) echo "  ---- Codex has no queue database yet; the stranding check compares against none" ;;
   ''|*[!0-9]*) fail "Codex's queue could not be read; the stranding check would prove nothing" ;;
 esac
-# Two turns, so T5 has two distinct moments to place a cursor between. One
-# turn renders both of its lines in the same second, and the `>=` boundary
-# rule repeats the whole cohort sharing it — nothing to bound.
+# Two accepted marker moments give T5 two distinct cursor boundaries. Omitted
+# attempts may add records, but they cannot remove either accepted boundary and
+# only increase T5's lower-bound event count. One accepted turn renders both of
+# its lines in the same second, and the `>=` rule repeats that whole cohort.
 land_exact_marker "@codex $NONCE-one" "the first claude -p turn"
 pass "the first claude -p turn exits 0"
 pass "the first exact assistant marker landed on attempt $MARKER_ATTEMPT"
@@ -363,6 +363,7 @@ pass "the second exact assistant marker landed on attempt $MARKER_ATTEMPT"
 # passed the second-marker predicate, and it is the only transcript T2 pushes.
 TRANSCRIPT="$MARKER_TRANSCRIPT"
 [ -d "$PROJECT/.antiphon" ] && pass "the hooks ran (.antiphon exists)" || fail "the hooks never ran"
+e2e_once push || { fail "the T2 push stage attempted to run twice"; exit 1; }
 PUSH="$(printf '{"cwd":"%s","hook_event_name":"Stop","transcript_path":"%s","session_id":"%s"}' \
         "$PROJECT" "$TRANSCRIPT" "$(basename "$TRANSCRIPT" .jsonl)" | (cd "$PROJECT" && antiphon push codex 2>&1))"
 contains "the push refuses instead of guessing" "$PUSH" "no Codex session found"
@@ -409,6 +410,7 @@ ROLLOUT="$FOUND"
 # the surprise and the script would run it anyway.
 HOOK_CMD="$(python3 -c "import json; print(json.load(open('$PROJECT/.codex/hooks.json'))['hooks']['UserPromptSubmit'][0]['hooks'][0]['command'])")"
 check "hooks.json declares the hook command" "$HOOK_CMD" "antiphon hook codex"
+e2e_once page || { fail "the T3 page stage attempted to run twice"; exit 1; }
 PAGE="$(page_now)" && pass "the first page was produced" || fail "the first page — hook failed"
 # The relayed prompt carries the same words, so the label decides: this must
 # be Claude's own line, which is what the refused push could not carry.
