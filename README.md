@@ -43,7 +43,9 @@ A Stop marker can carry a block. Make its one-line message
 Markdown-fence-aware, so choose a token absent from the body. Marker-looking
 lines inside the body are content. A malformed or unclosed block sends nothing
 from that turn. To send literal text beginning with `<<`, put it inside a block
-body. Direct tools remain the better road for long content.
+body. Use the direct tools — `antiphon_send` or `reply_to_codex` — for long
+content: an oversized direct-tool message can be parked as an attachment,
+while an oversized Stop-marker block is refused and not parked.
 
 Every push is addressed to exactly one peer and is never broadcast. When the
 recipient cannot be shown to be the only candidate, the send is refused rather

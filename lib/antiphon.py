@@ -6342,6 +6342,11 @@ MULTILINE_MARKER_RULE = (
     "or unclosed block sends nothing from that turn. To send literal text "
     "beginning with `<<`, put it inside a block body.")
 
+LONG_MARKER_RULE = (
+    "Use `{tool}` for long content: an oversized direct-tool message can be "
+    "parked as an attachment, while an oversized Stop-marker block is refused "
+    "and not parked.")
+
 AGENTS_RULE = ("\n## The Antiphon bridge\n\n"
                "You are working alongside Claude Code on this project. What happens on the "
                "other side is injected into your context automatically at the start of each "
@@ -6398,7 +6403,8 @@ AGENTS_RULE = ("\n## The Antiphon bridge\n\n"
                "Channel event. To reach Claude without ending your turn, call the "
                "`antiphon_send` tool instead: it delivers immediately, so Claude can start "
                "working while you carry on, and `antiphon_read` picks up the answer later in "
-               "the same turn. " + MULTILINE_MARKER_RULE + "\n\n"
+               "the same turn. " + MULTILINE_MARKER_RULE + " "
+               + LONG_MARKER_RULE.format(tool="antiphon_send") + "\n\n"
                "A direct send reaches one peer and is never broadcast. Write `@claude:name`, "
                "or `antiphon_send(to=name)`, whenever more than one Claude peer is live: an "
                "unaddressed send is refused rather than delivered to a guess. For the same "
@@ -6472,7 +6478,8 @@ CLAUDE_RULE = ("\n## The Antiphon bridge\n\n"
                "has to be started with `ANTIPHON_NAME` set — Codex terminals above all, "
                "because an unnamed Codex session leaves no record at all, and one that exists "
                "unseen is why a bare message to Codex is refused. "
-               + MULTILINE_MARKER_RULE + "\n\n"
+               + MULTILINE_MARKER_RULE + " "
+               + LONG_MARKER_RULE.format(tool="reply_to_codex") + "\n\n"
                "A message too large for the transport arrives as an envelope instead of the "
                "words: a line starting with `[Antiphon attachment]` naming an absolute path "
                "under `.antiphon/messages/`, the content's size and its SHA-256. Read that "

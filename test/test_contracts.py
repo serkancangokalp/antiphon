@@ -583,6 +583,18 @@ class ShippedContractTest(unittest.TestCase):
             self.assertRegex(
                 text, r"(?i)literal text beginning with `?<<`?[^.]*block\s+body",
                 where)
+            self.assertRegex(
+                text,
+                r"(?i)oversized[^.]*Stop-marker block[^.]*refused[^.]*not parked",
+                where,
+            )
+        self.assertRegex(surfaces["README"],
+                         r"(?i)direct tools[^.]*long\s+content")
+        self.assertRegex(surfaces["AGENTS rule"],
+                         r"(?i)antiphon_send[^.]*long\s+content")
+        for where in ("CLAUDE rule", "channel instructions"):
+            self.assertRegex(surfaces[where],
+                             r"(?i)reply_to_codex[^.]*long\s+content", where)
         self.assertIn("@claude[:name]", surfaces["README"])
         self.assertIn("@codex[:name]", surfaces["README"])
 
