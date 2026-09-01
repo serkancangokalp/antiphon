@@ -89,6 +89,13 @@ runs. The operation is: read state and reserve a bounded work batch under the
 catalog lock, release; inspect source descriptors; reacquire and merge only
 observations whose bootstrap generation is still current.
 
+Completeness is re-proved on every read rather than inferred from the word
+`complete` in `state.json`: the nested state shape, safe manifest basename,
+project/kind/generation/phase metadata, committed indices and terminal record
+coverage must agree. A manifest candidate whose record is missing is still
+opened through the descriptor-safe path so its content is not hidden, but the
+page is degraded until a later bounded scan restores the missing proof.
+
 The lock-order invariant is explicit: any operation that needs catalog and
 cursor work acquires and releases the catalog lock before it acquires the cursor
 lock; the locks are never nested. A deterministic two-hook test must fail on
@@ -104,7 +111,8 @@ otherwise deliverable hook nonzero. The explicit scanner returns nonzero so a
 person invoking it learns that no progress was reserved.
 
 Malformed, unreadable or newer-version catalog state is never overwritten.
-Readers fall back to the existing current-window discovery and return a
+Its detached candidate-record inventory is not an authority: readers ignore it,
+fall back to the existing current-window discovery and return a
 degraded reason; hooks still deliver the page they can build. The explicit
 scanner refuses that state too and tells the person to repair or move it;
 setup and `doctor --fix` remain configuration-only and do not take ownership
@@ -124,6 +132,9 @@ file is not invented into the catalog. Failure is visible on stderr and makes
 discovery degraded, but it cannot make the hook nonzero or suppress an
 otherwise deliverable page. The current source is attempted before bootstrap
 work, so a new live reply never waits for historical enumeration to finish.
+For Claude, the expected parent is derived independently from the one host
+project directory selected for `cwd`; an offered or stored relative path never
+supplies its own project prefix.
 
 `record_claude_session` and `record_codex_session` keep their existing named
 peer records and owner-key rules. The catalog is not read through

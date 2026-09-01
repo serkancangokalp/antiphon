@@ -278,6 +278,8 @@ async function aLiveListenerReassertsItsOwnMissingEndpoint() {
   try {
     assert.ok(await waitFor(() => registeredPeers(dir).length === 1),
       `listener never registered: ${session.stderr()}`);
+    assert.ok(await waitFor(() => existsSync(session.socketPath)),
+      `listener registered before its socket was ready: ${session.stderr()}`);
     const endpoint = endpointFor(dir, "ui");
     await rm(endpoint, { force: true });
     assert.deepEqual(registeredPeers(dir), [], "fixture must reproduce no endpoint");

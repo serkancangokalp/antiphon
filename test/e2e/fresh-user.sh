@@ -253,37 +253,54 @@ for number in range(4):
         stream.write(json.dumps(record) + "\n")
     os.utime(path, (100 + number, 100 + number))
 PY
-HOME="$CATALOG_HOME" ANTIPHON_CWD="$CATALOG_PROJECT" \
+HOME="$CATALOG_HOME" ANTIPHON_CWD="$CATALOG_PROJECT" ANTIPHON_NAME= \
   antiphon setup >/dev/null 2>&1 \
   && pass "catalog fixture setup exits 0" || fail "catalog fixture setup failed"
-BUILDING="$(HOME="$CATALOG_HOME" ANTIPHON_CWD="$CATALOG_PROJECT" antiphon summary codex 2>&1)"
+BUILDING="$(HOME="$CATALOG_HOME" ANTIPHON_CWD="$CATALOG_PROJECT" ANTIPHON_NAME= antiphon summary codex 2>&1)"
 contains "an incomplete bootstrap says building" "$BUILDING" "discovery: building"
 contains "the incomplete page still names its scope" "$BUILDING" "has_more_scope: catalogued project sources"
 lacks "the newest-three fallback cannot claim the fourth source" "$BUILDING" "$NONCE-catalog-oldest"
 CURSOR_BEFORE="$(cursor_digest "$CATALOG_PROJECT")"
-CATALOG_SCAN="$(HOME="$CATALOG_HOME" ANTIPHON_CWD="$CATALOG_PROJECT" antiphon sources scan 2>&1)"; CATALOG_SCAN_CODE=$?
+CATALOG_SCAN="$(HOME="$CATALOG_HOME" ANTIPHON_CWD="$CATALOG_PROJECT" ANTIPHON_NAME= antiphon sources scan 2>&1)"; CATALOG_SCAN_CODE=$?
 check "sources scan completes" "$CATALOG_SCAN_CODE" "0"
 contains "sources scan reports completion" "$CATALOG_SCAN" "source catalog: complete"
 check "sources scan does not move a cursor" "$(cursor_digest "$CATALOG_PROJECT")" "$CURSOR_BEFORE"
-COMPLETE="$(HOME="$CATALOG_HOME" ANTIPHON_CWD="$CATALOG_PROJECT" antiphon summary codex 2>&1)"
+COMPLETE="$(HOME="$CATALOG_HOME" ANTIPHON_CWD="$CATALOG_PROJECT" ANTIPHON_NAME= antiphon summary codex 2>&1)"
 contains "complete discovery sees the fourth older source" "$COMPLETE" "$NONCE-catalog-oldest"
 lacks "a complete page has no building marker" "$COMPLETE" "discovery: building"
 lacks "a complete page has no degraded marker" "$COMPLETE" "discovery: degraded"
 CATALOG_STATE="$CATALOG_PROJECT/.antiphon/sources/state.json"
 cp "$CATALOG_STATE" "$TMP/catalog-state.saved"
 printf '{malformed\n' > "$CATALOG_STATE"
-DEGRADED="$(HOME="$CATALOG_HOME" ANTIPHON_CWD="$CATALOG_PROJECT" antiphon summary codex 2>&1)"
+DEGRADED="$(HOME="$CATALOG_HOME" ANTIPHON_CWD="$CATALOG_PROJECT" ANTIPHON_NAME= antiphon summary codex 2>&1)"
 contains "an untrusted catalog says degraded" "$DEGRADED" "discovery: degraded"
+lacks "an untrusted catalog uses only the bounded recent fallback" "$DEGRADED" "$NONCE-catalog-oldest"
 cp "$TMP/catalog-state.saved" "$CATALOG_STATE"
-CATALOG_STATUS="$(HOME="$CATALOG_HOME" ANTIPHON_CWD="$CATALOG_PROJECT" antiphon status 2>&1)"
+OLDEST_REL="$CATALOG_SLUG/00000000-4444-4444-8444-000000000000.jsonl"
+OLDEST_RECORD="$(python3 - "$CATALOG_PROJECT" "$OLDEST_REL" <<'PY'
+import hashlib, os, sys
+project, relative = sys.argv[1:]
+digest = hashlib.sha256(("claude\0" + relative).encode()).hexdigest()
+print(os.path.join(project, ".antiphon", "sources", "records", "claude",
+                   digest[:2], digest + ".json"))
+PY
+)"
+rm "$OLDEST_RECORD"
+MISSING_RECORD="$(HOME="$CATALOG_HOME" ANTIPHON_CWD="$CATALOG_PROJECT" ANTIPHON_NAME= antiphon summary codex 2>&1)"
+contains "a missing index record cannot hide its manifest source" "$MISSING_RECORD" "$NONCE-catalog-oldest"
+contains "a missing index record degrades completeness" "$MISSING_RECORD" "discovery: degraded"
+CATALOG_REPAIR="$(HOME="$CATALOG_HOME" ANTIPHON_CWD="$CATALOG_PROJECT" ANTIPHON_NAME= antiphon sources scan 2>&1)"; CATALOG_REPAIR_CODE=$?
+check "sources scan repairs missing record coverage" "$CATALOG_REPAIR_CODE" "0"
+contains "repaired catalog is complete" "$CATALOG_REPAIR" "source catalog: complete"
+CATALOG_STATUS="$(HOME="$CATALOG_HOME" ANTIPHON_CWD="$CATALOG_PROJECT" ANTIPHON_NAME= antiphon status 2>&1)"
 contains "status reports the catalog complete" "$CATALOG_STATUS" "source catalog codex_pages: complete"
 check "status does not move a cursor" "$(cursor_digest "$CATALOG_PROJECT")" "$CURSOR_BEFORE"
-CATALOG_DOCTOR="$(HOME="$CATALOG_HOME" ANTIPHON_CWD="$CATALOG_PROJECT" antiphon doctor 2>&1)"; CATALOG_DOCTOR_CODE=$?
+CATALOG_DOCTOR="$(HOME="$CATALOG_HOME" ANTIPHON_CWD="$CATALOG_PROJECT" ANTIPHON_NAME= antiphon doctor 2>&1)"; CATALOG_DOCTOR_CODE=$?
 check "doctor accepts the complete catalog fixture" "$CATALOG_DOCTOR_CODE" "0"
 contains "doctor reports the catalog complete" "$CATALOG_DOCTOR" "source catalog codex_pages: complete"
 check "doctor does not move a cursor" "$(cursor_digest "$CATALOG_PROJECT")" "$CURSOR_BEFORE"
 CATALOG_PAGE="$(printf '{"cwd":"%s","hook_event_name":"UserPromptSubmit"}' "$CATALOG_PROJECT" \
-  | HOME="$CATALOG_HOME" ANTIPHON_CWD="$CATALOG_PROJECT" antiphon hook codex 2>/dev/null \
+  | HOME="$CATALOG_HOME" ANTIPHON_CWD="$CATALOG_PROJECT" ANTIPHON_NAME= antiphon hook codex 2>/dev/null \
   | python3 -c "import json,sys; print(json.load(sys.stdin)['hookSpecificOutput']['additionalContext'])")"
 contains "the passive hook delivers the fourth older source" "$CATALOG_PAGE" "$NONCE-catalog-oldest"
 

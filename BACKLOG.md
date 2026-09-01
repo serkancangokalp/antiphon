@@ -75,6 +75,16 @@ the write-and-flush-before-advance transaction.
   means every recorded path is `ENOENT`, and its relevance is read-only and
   reader-specific. Ordinary advancement and catch-up merge safe fronts onto
   the prior v3 map, preserving every unresolved subtree.
+- The exact-SHA review caught two false authorities before Wave 1A closed:
+  `state.json` could say `complete` without proving its immutable manifests and
+  terminal record coverage, and a Claude catalog path could supply the same
+  project prefix later used to validate itself. Readers now validate the whole
+  state/manifest join, keep a manifest source readable-but-degraded when its
+  index record is missing, ignore detached records when state is untrusted,
+  and bind every Claude candidate to the independently selected host project
+  directory. The same review made reservation/write contention visible in the
+  hook page and scanner result, and made a partial first record retryable rather
+  than durable `ready` state.
 
 ### Still open, by name
 

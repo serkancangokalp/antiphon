@@ -721,8 +721,7 @@ def _hook_catalog_update(cwd, side, payload):
         if not current.ok:
             print(f"antiphon: current {side} transcript was not catalogued "
                   f"({current.reason}); discovery is incomplete", file=sys.stderr)
-            if current.reason == "lock-contention":
-                return False
+            return False
     for kind in (side, OTHER_SIDE[side][0]):
         progress = _catalog_scan_step(cwd, kind)
         if progress.state == "degraded":
@@ -1324,6 +1323,8 @@ CatalogProgress = collections.namedtuple(
     "CatalogProgress", "state pending processed refusals gone")
 CatalogObservation = collections.namedtuple(
     "CatalogObservation", "ok reason record")
+CatalogView = collections.namedtuple(
+    "CatalogView", "state pending candidates reason")
 Discovery = collections.namedtuple(
     "Discovery", "sources state pending refusals gone reason")
 
@@ -1370,11 +1371,71 @@ def _read_source_catalog(cwd):
     version = state.get("v")
     if isinstance(version, int) and version > CATALOG_VERSION:
         return CatalogLoad(None, "newer", "newer-version")
+    kinds = state.get("kinds")
     if (version != CATALOG_VERSION
             or state.get("project") != os.path.abspath(cwd)
-            or not isinstance(state.get("kinds"), dict)):
+            or not isinstance(kinds, dict)
+            or any(kind not in ("claude", "codex")
+                   or not _valid_catalog_entry_shape(kind, entry)
+                   for kind, entry in kinds.items())):
         return CatalogLoad(None, "invalid", "wrong-project-or-schema")
     return CatalogLoad(state, "valid", None)
+
+
+def _catalog_generation(value):
+    return (isinstance(value, str) and len(value) == 32
+            and all(char in "0123456789abcdef" for char in value))
+
+
+def _catalog_manifest_name(kind, generation, phase):
+    return f"{generation}-{kind}-{phase}.json"
+
+
+def _valid_catalog_entry_shape(kind, entry):
+    """Validate nested state without opening anything it points at."""
+    if not isinstance(entry, dict):
+        return False
+    generation = entry.get("generation")
+    phase = entry.get("phase")
+    base = entry.get("base_manifest")
+    delta = entry.get("delta_manifest")
+    base_next = entry.get("base_next")
+    delta_next = entry.get("delta_next")
+    if (not _catalog_generation(generation)
+            or phase not in ("base", "reconcile", "delta", "complete")
+            or base != _catalog_manifest_name(kind, generation, "base")
+            or isinstance(base_next, bool) or not isinstance(base_next, int)
+            or base_next < 0
+            or isinstance(delta_next, bool) or not isinstance(delta_next, int)
+            or delta_next < 0):
+        return False
+    if phase in ("base", "reconcile"):
+        if delta is not None or delta_next != 0:
+            return False
+    elif delta != _catalog_manifest_name(kind, generation, "delta"):
+        return False
+    stamp = entry.get("root_stamp")
+    if (stamp is not None
+            and (not isinstance(stamp, list) or len(stamp) != 3
+                 or any(isinstance(item, bool) or not isinstance(item, int)
+                        for item in stamp))):
+        return False
+    inflight = entry.get("inflight")
+    if inflight is None:
+        return True
+    if phase not in ("base", "delta") or not isinstance(inflight, dict):
+        return False
+    start, end = inflight.get("start"), inflight.get("end")
+    paths = inflight.get("paths")
+    return (inflight.get("phase") == phase
+            and isinstance(inflight.get("token"), str)
+            and bool(inflight["token"])
+            and not isinstance(start, bool) and isinstance(start, int)
+            and not isinstance(end, bool) and isinstance(end, int)
+            and 0 <= start < end
+            and isinstance(paths, list)
+            and len(paths) == end - start
+            and all(isinstance(path, str) for path in paths))
 
 
 def _new_catalog_state(cwd):
@@ -1396,7 +1457,11 @@ def _write_catalog_manifest(cwd, filename, data):
     return _atomic_json(path, data)
 
 
-def _read_catalog_manifest(cwd, filename):
+def _read_catalog_manifest(cwd, filename, kind=None, generation=None,
+                           phase=None):
+    if (not isinstance(filename, str) or not filename
+            or os.path.basename(filename) != filename):
+        return None
     try:
         with open(_catalog_manifest_path(cwd, filename), encoding="utf-8") as stream:
             data = json.load(stream)
@@ -1405,10 +1470,69 @@ def _read_catalog_manifest(cwd, filename):
     if (not isinstance(data, dict)
             or data.get("v") != CATALOG_VERSION
             or data.get("project") != os.path.abspath(cwd)
+            or data.get("kind") not in ("claude", "codex")
+            or not _catalog_generation(data.get("generation"))
+            or data.get("phase") not in ("base", "delta")
             or not isinstance(data.get("paths"), list)
-            or any(not isinstance(path, str) for path in data["paths"])):
+            or any(not isinstance(path, str) or not path
+                   for path in data["paths"])
+            or len(set(data["paths"])) != len(data["paths"])
+            or (kind is not None and data.get("kind") != kind)
+            or (generation is not None
+                and data.get("generation") != generation)
+            or (phase is not None and data.get("phase") != phase)
+            or (kind is not None and generation is not None and phase is not None
+                and filename != _catalog_manifest_name(
+                    kind, generation, phase))):
         return None
     return data
+
+
+def _catalog_view(cwd, kind, loaded=None):
+    """Prove one kind's state/manifest join and expose committed candidates."""
+    loaded = loaded or _read_source_catalog(cwd)
+    if loaded.status in ("invalid", "newer", "unreadable"):
+        return CatalogView("degraded", 0, (), loaded.reason)
+    entry = (((loaded.state or {}).get("kinds") or {}).get(kind))
+    if entry is None:
+        return CatalogView("building", 0, (), None)
+    if not _valid_catalog_entry_shape(kind, entry):
+        return CatalogView("degraded", 0, (), "malformed-entry")
+    generation = entry["generation"]
+    base = _read_catalog_manifest(
+        cwd, entry["base_manifest"], kind, generation, "base")
+    if base is None or entry["base_next"] > len(base["paths"]):
+        return CatalogView("degraded", 0, (), "untrusted-base-manifest")
+    phase = entry["phase"]
+    if phase in ("reconcile", "delta", "complete") \
+            and entry["base_next"] != len(base["paths"]):
+        return CatalogView("degraded", 0, (), "incomplete-base-manifest")
+    candidates = list(base["paths"][:entry["base_next"]])
+    pending = max(0, len(base["paths"]) - entry["base_next"])
+    active_manifest = base
+    active_next = entry["base_next"]
+    if phase in ("delta", "complete"):
+        delta = _read_catalog_manifest(
+            cwd, entry["delta_manifest"], kind, generation, "delta")
+        if delta is None or entry["delta_next"] > len(delta["paths"]):
+            return CatalogView("degraded", 0, (), "untrusted-delta-manifest")
+        if phase == "complete" and entry["delta_next"] != len(delta["paths"]):
+            return CatalogView("degraded", 0, (), "incomplete-delta-manifest")
+        candidates.extend(delta["paths"][:entry["delta_next"]])
+        if len(set(candidates)) != len(candidates):
+            return CatalogView("degraded", 0, (), "duplicate-manifest-candidate")
+        pending = max(0, len(delta["paths"]) - entry["delta_next"])
+        active_manifest = delta
+        active_next = entry["delta_next"]
+    inflight = entry.get("inflight")
+    if inflight is not None:
+        if (inflight["start"] != active_next
+                or inflight["end"] > len(active_manifest["paths"])
+                or inflight["paths"] != active_manifest["paths"][
+                    inflight["start"]:inflight["end"]]):
+            return CatalogView("degraded", 0, (), "malformed-reservation")
+    state = "complete" if phase == "complete" else "building"
+    return CatalogView(state, pending, tuple(candidates), None)
 
 
 def _catalog_record_path(cwd, kind, relative):
@@ -1424,12 +1548,39 @@ def _read_catalog_record(cwd, kind, relative):
             value = json.load(stream)
     except (OSError, json.JSONDecodeError, ValueError):
         return None
+    status = value.get("status") if isinstance(value, dict) else None
+    generation = value.get("generation") if isinstance(value, dict) else None
+    complete_size = value.get("complete_size") if isinstance(value, dict) else None
     if (not isinstance(value, dict)
             or value.get("v") != CATALOG_VERSION
             or value.get("project") != os.path.abspath(cwd)
             or value.get("kind") != kind
-            or value.get("relative") != relative):
+            or value.get("relative") != relative
+            or value.get("source") != source_id(relative)
+            or status not in ("ready", "unrelated", "refused")
+            or (status == "unrelated" and kind != "codex")
+            or not isinstance(value.get("observed"), (int, float))
+            or (status == "ready"
+                and (not isinstance(generation, str) or not generation
+                     or isinstance(complete_size, bool)
+                     or not isinstance(complete_size, int)
+                     or complete_size < 0))
+            or (status != "ready"
+                and (generation is not None or complete_size is not None
+                     or not isinstance(value.get("reason"), str)))):
         return None
+    historical = (
+        value.get("last_complete_generation"),
+        value.get("last_complete_size"),
+        value.get("last_complete_observed"),
+    )
+    if any(item is not None for item in historical):
+        old_generation, old_size, old_observed = historical
+        if (not isinstance(old_generation, str) or not old_generation
+                or isinstance(old_size, bool) or not isinstance(old_size, int)
+                or old_size < 0
+                or not isinstance(old_observed, (int, float))):
+            return None
     return value
 
 
@@ -1487,6 +1638,18 @@ def _enumerate_catalog_candidates(cwd, kind):
     return None
 
 
+def _claude_catalog_prefix(cwd):
+    """The one host-selected Claude project directory this cwd may read."""
+    directory = claude_project_dir(cwd)
+    if not directory:
+        return None
+    relative = os.path.relpath(directory, CLAUDE_PROJECTS)
+    if (relative in ("", ".", "..") or relative.startswith(".." + os.sep)
+            or os.path.isabs(relative) or os.sep in relative):
+        return None
+    return relative
+
+
 def _start_catalog_generation(cwd, kind, enumeration):
     loaded = _read_source_catalog(cwd)
     if loaded.status in ("invalid", "newer", "unreadable"):
@@ -1529,6 +1692,9 @@ def _reserve_catalog_batch(cwd, kind, limit=None):
     entry = state["kinds"].get(kind)
     if not isinstance(entry, dict):
         return None
+    view = _catalog_view(cwd, kind, loaded)
+    if view.state == "degraded":
+        return False
     inflight = entry.get("inflight")
     if isinstance(inflight, dict):
         return CatalogReservation(
@@ -1537,14 +1703,14 @@ def _reserve_catalog_batch(cwd, kind, limit=None):
     filename, start = _phase_manifest(entry)
     if not filename:
         return None
-    manifest = _read_catalog_manifest(cwd, filename)
+    manifest = _read_catalog_manifest(
+        cwd, filename, kind, entry["generation"], entry["phase"])
     if manifest is None:
-        return None
+        return False
     paths = manifest["paths"]
     if start >= len(paths):
         entry["phase"] = "reconcile" if entry["phase"] == "base" else "complete"
-        _write_catalog_state(cwd, state)
-        return None
+        return None if _write_catalog_state(cwd, state) else False
     end = min(len(paths), start + max(1, int(limit)))
     token = uuid.uuid4().hex
     entry["inflight"] = {
@@ -1552,7 +1718,7 @@ def _reserve_catalog_batch(cwd, kind, limit=None):
         "paths": paths[start:end], "start": start, "end": end,
     }
     if not _write_catalog_state(cwd, state):
-        return None
+        return False
     return CatalogReservation(
         kind, entry["generation"], entry["phase"], token,
         tuple(paths[start:end]), start, end)
@@ -1560,7 +1726,16 @@ def _reserve_catalog_batch(cwd, kind, limit=None):
 
 def _observe_catalog_candidate(cwd, kind, relative):
     root = CLAUDE_PROJECTS if kind == "claude" else CODEX_SESSIONS
-    prefix = os.path.dirname(relative) if kind == "claude" else None
+    prefix = _claude_catalog_prefix(cwd) if kind == "claude" else None
+    if kind == "claude" and prefix is None:
+        return {
+            "v": CATALOG_VERSION, "project": os.path.abspath(cwd),
+            "kind": kind, "relative": relative,
+            "source": source_id(os.path.basename(relative)),
+            "status": "refused", "reason": "project-mismatch",
+            "observed": time.time(), "generation": None,
+            "complete_size": None,
+        }
     candidate = SourceCandidate(
         kind, relative, source_id(os.path.basename(relative)), prefix)
     opened = _open_safe_source(root, candidate, cwd)
@@ -1576,6 +1751,14 @@ def _observe_catalog_candidate(cwd, kind, relative):
             "generation": None, "complete_size": None,
         }
     with opened as source:
+        if source.generation is None:
+            return {
+                "v": CATALOG_VERSION, "project": os.path.abspath(cwd),
+                "kind": kind, "relative": relative, "source": source.source,
+                "status": "refused", "reason": "partial-record",
+                "observed": observed, "generation": None,
+                "complete_size": None,
+            }
         return {
             "v": CATALOG_VERSION, "project": os.path.abspath(cwd),
             "kind": kind, "relative": relative, "source": source.source,
@@ -1604,7 +1787,9 @@ def _merge_catalog_batch(cwd, reservation, observations):
     entry["inflight"] = None
     filename = (entry["base_manifest"] if reservation.phase == "base"
                 else entry["delta_manifest"])
-    manifest = _read_catalog_manifest(cwd, filename)
+    manifest = _read_catalog_manifest(
+        cwd, filename, reservation.kind, reservation.generation,
+        reservation.phase)
     if manifest is None:
         return False
     if reservation.end >= len(manifest["paths"]):
@@ -1620,7 +1805,8 @@ def _install_reconciliation(cwd, kind, enumeration):
     entry = state["kinds"].get(kind)
     if not isinstance(entry, dict) or entry.get("phase") != "reconcile":
         return False
-    base = _read_catalog_manifest(cwd, entry["base_manifest"])
+    base = _read_catalog_manifest(
+        cwd, entry["base_manifest"], kind, entry["generation"], "base")
     if base is None:
         return False
     unseen = sorted(set(enumeration.relative_paths) - set(base["paths"]))
@@ -1640,18 +1826,19 @@ def _install_reconciliation(cwd, kind, enumeration):
 
 
 def _catalog_pending(cwd, kind):
-    loaded = _read_source_catalog(cwd)
-    if loaded.status != "valid":
-        return 0
-    entry = loaded.state["kinds"].get(kind) or {}
-    filename, index = _phase_manifest(entry)
-    manifest = _read_catalog_manifest(cwd, filename) if filename else None
-    return max(0, len(manifest["paths"]) - index) if manifest else 0
+    view = _catalog_view(cwd, kind)
+    return view.pending if view.state != "degraded" else 0
 
 
 def _catalog_refresh_needed(cwd, kind, entry):
     if not isinstance(entry, dict) or entry.get("phase") != "complete":
         return False
+    view = _catalog_view(cwd, kind)
+    if view.state == "degraded":
+        return False
+    _records, issues = _catalog_record_inventory(cwd, kind, view)
+    if issues:
+        return True
     if kind == "claude":
         directory = claude_project_dir(cwd)
         return bool(directory and _directory_stamp(directory) != entry.get("root_stamp"))
@@ -1669,6 +1856,9 @@ def _catalog_scan_step(cwd, kind, force=False):
     if loaded.status in ("invalid", "newer", "unreadable"):
         return CatalogProgress("degraded", 0, 0, 1, 0)
     entry = ((loaded.state or {}).get("kinds") or {}).get(kind)
+    view = _catalog_view(cwd, kind, loaded)
+    if view.state == "degraded":
+        return CatalogProgress("degraded", 0, 0, 1, 0)
     if (entry is None
             or ((force or _catalog_refresh_needed(cwd, kind, entry))
                 and entry.get("phase") == "complete")):
@@ -1680,6 +1870,9 @@ def _catalog_scan_step(cwd, kind, force=False):
         if not result.ok or not result.value:
             return CatalogProgress("degraded", 0, 0, 1, 0)
     loaded = _read_source_catalog(cwd)
+    view = _catalog_view(cwd, kind, loaded)
+    if loaded.status != "valid" or view.state == "degraded":
+        return CatalogProgress("degraded", 0, 0, 1, 0)
     entry = loaded.state["kinds"].get(kind)
     if entry.get("phase") == "reconcile":
         enumeration = _enumerate_catalog_candidates(cwd, kind)
@@ -1691,16 +1884,17 @@ def _catalog_scan_step(cwd, kind, force=False):
             return CatalogProgress("degraded", 0, 0, 1, 0)
     reservation_result = _catalog_phase(
         cwd, lambda: _reserve_catalog_batch(cwd, kind))
-    reservation = reservation_result.value if reservation_result.ok else None
+    if not reservation_result.ok or reservation_result.value is False:
+        return CatalogProgress("degraded", _catalog_pending(cwd, kind), 0, 1, 0)
+    reservation = reservation_result.value
     if reservation is None:
-        entry = ((_read_source_catalog(cwd).state or {}).get("kinds") or {}).get(
-            kind, {})
-        phase = entry.get("phase")
-        filename, _index = _phase_manifest(entry)
-        if filename and _read_catalog_manifest(cwd, filename) is None:
+        loaded = _read_source_catalog(cwd)
+        view = _catalog_view(cwd, kind, loaded)
+        if view.state == "degraded":
             return CatalogProgress("degraded", 0, 0, 1, 0)
-        state = "complete" if phase == "complete" else "building"
-        return CatalogProgress(state, _catalog_pending(cwd, kind), 0, 0, 0)
+        _records, unproved = _catalog_record_inventory(cwd, kind, view)
+        state = "degraded" if unproved else view.state
+        return CatalogProgress(state, view.pending, 0, unproved, 0)
     observations = [
         _observe_catalog_candidate(cwd, kind, relative)
         for relative in reservation.relative_paths]
@@ -1709,9 +1903,14 @@ def _catalog_scan_step(cwd, kind, force=False):
     if not merged.ok or not merged.value:
         return CatalogProgress("degraded", _catalog_pending(cwd, kind), 0, 1, 0)
     refusals = sum(record.get("status") == "refused" for record in observations)
-    phase = _read_source_catalog(cwd).state["kinds"][kind]["phase"]
+    loaded = _read_source_catalog(cwd)
+    view = _catalog_view(cwd, kind, loaded)
+    _records, unproved = _catalog_record_inventory(cwd, kind, view)
+    refusals = max(refusals, unproved)
+    state = ("degraded" if view.state == "degraded" or refusals else
+             view.state)
     return CatalogProgress(
-        "complete" if phase == "complete" else "building",
+        state,
         _catalog_pending(cwd, kind), len(observations), refusals, 0)
 
 
@@ -1757,9 +1956,23 @@ def _catalog_records(cwd, kind):
     return records, malformed
 
 
-def _catalog_marker(kind, relative):
+def _catalog_record_inventory(cwd, kind, view):
+    """Return valid records and count every missing or unproved terminal row."""
+    records, malformed = _catalog_records(cwd, kind)
+    by_relative = {record["relative"]: record for record in records}
+    missing = set(view.candidates) - set(by_relative)
+    unproved = {
+        record["relative"] for record in records
+        if record.get("status") not in ("ready", "unrelated")
+    }
+    return records, malformed + len(missing) + len(unproved)
+
+
+def _catalog_marker(cwd, kind, relative):
     root = CLAUDE_PROJECTS if kind == "claude" else CODEX_SESSIONS
-    prefix = os.path.dirname(relative) if kind == "claude" else None
+    prefix = _claude_catalog_prefix(cwd) if kind == "claude" else None
+    if kind == "claude" and prefix is None:
+        return None
     path = os.path.join(root, relative)
     return DiscoveredSourcePath(
         path, root, SourceCandidate(
@@ -1787,26 +2000,21 @@ def _discover_sources(cwd, kind, reader_side, positions, since):
     """Safely union catalog and recent candidates for one reader, read-only."""
     del reader_side, since                 # the v3 position map is the authority here
     loaded = _read_source_catalog(cwd)
-    pending = 0
-    structural = 0
-    if loaded.status in ("invalid", "newer", "unreadable"):
-        base_state, structural = "degraded", 1
-        entry = None
-    else:
-        entry = (((loaded.state or {}).get("kinds") or {}).get(kind))
-        if not isinstance(entry, dict):
-            base_state = "building"
-        elif entry.get("phase") == "complete":
-            base_state = "complete"
-        else:
-            base_state = "building"
-            pending = _catalog_pending(cwd, kind)
-
-    records, malformed = _catalog_records(cwd, kind)
-    structural += malformed
+    view = _catalog_view(cwd, kind, loaded)
+    base_state, pending = view.state, view.pending
+    structural = 1 if view.state == "degraded" else 0
+    trust_inventory = view.state != "degraded"
+    records, record_issues = (_catalog_record_inventory(cwd, kind, view)
+                              if trust_inventory else ([], 0))
+    structural += record_issues
     by_relative = {record["relative"]: record for record in records}
-    markers = {relative: _catalog_marker(kind, relative)
-               for relative in by_relative}
+    markers = {}
+    for relative in set(by_relative).union(view.candidates):
+        marker = _catalog_marker(cwd, kind, relative)
+        if marker is None:
+            structural += 1
+            continue
+        markers[relative] = marker
     recent = (claude_transcripts(cwd) if kind == "claude"
               else codex_rollout_files(cwd))[:RECENT_FILES]
     uncatalogued = 0
@@ -2666,7 +2874,8 @@ def _build_page(events, scanned, side, replay_reason=None, join=None,
     return text, PageAdvance(frontier, has_more, replay_reason), count
 
 
-def build_summary(cwd, side, positions=None, since=None, replay_reason=None):
+def build_summary(cwd, side, positions=None, since=None, replay_reason=None,
+                  catalog_degraded=False):
     """`side` is the side that will READ the summary ('claude' | 'codex').
     Turns what happened on the other side, and what the user said, into
     compact text.
@@ -2676,6 +2885,10 @@ def build_summary(cwd, side, positions=None, since=None, replay_reason=None):
     undelivered visible record; it is not the parser's scanned EOF."""
     kind = "codex" if side == "claude" else "claude"
     discovery = _discover_sources(cwd, kind, side, positions, since)
+    if catalog_degraded:
+        discovery = discovery._replace(
+            state="degraded", refusals=max(1, discovery.refusals),
+            reason="some project sources could not be proved")
     if side == "claude":
         events, reached = codex_events(
             cwd, positions, since, visible_record_limit=EVENT_LIMIT + 1,
@@ -2754,7 +2967,7 @@ def hook(side="claude"):
     # Every reserve and merge inside this bounded update releases the catalog
     # lock before transcript inspection. The whole update returns before any
     # cursor lock is attempted, keeping the two lock families unnested.
-    _hook_catalog_update(cwd, side, input_data)
+    catalog_ok = _hook_catalog_update(cwd, side, input_data)
 
     if side == "codex":
         # On every event, not only `SessionStart`. A missed one then costs a
@@ -2790,7 +3003,8 @@ def hook(side="claude"):
         positions, since, replay_reason = positions_for(
             cursor, side, cursor_state)
         text, advance, _ = build_summary(
-            cwd, side, positions, since, replay_reason)
+            cwd, side, positions, since, replay_reason,
+            catalog_degraded=not catalog_ok)
         if not text:
             # Nothing to deliver this turn, so the write-then-advance order
             # below does not protect anything -- there is no page to lose.

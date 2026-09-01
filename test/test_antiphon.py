@@ -5122,6 +5122,67 @@ class SourceCatalogStateTest(unittest.TestCase):
             self.assertEqual(f.read(), raw)
         self.assertEqual(progress.state, "degraded")
 
+    def test_nested_state_and_manifest_identity_must_be_trusted(self):
+        self._source(1)
+        while antiphon._catalog_scan_step(
+                self.project, "claude").state != "complete":
+            pass
+        state_path = antiphon._catalog_state_path(self.project)
+        with open(state_path, encoding="utf-8") as f:
+            original_state = json.load(f)
+
+        malformed = json.loads(json.dumps(original_state))
+        malformed["kinds"]["claude"] = "not an entry"
+        with open(state_path, "w", encoding="utf-8") as f:
+            json.dump(malformed, f)
+        with open(state_path, "rb") as f:
+            before = f.read()
+        progress = antiphon._catalog_scan_step(self.project, "claude")
+        self.assertEqual(progress.state, "degraded")
+        with open(state_path, "rb") as f:
+            self.assertEqual(f.read(), before)
+
+        with open(state_path, "w", encoding="utf-8") as f:
+            json.dump(original_state, f)
+        entry = original_state["kinds"]["claude"]
+        manifest_path = os.path.join(
+            self.project, ".antiphon", "sources", "manifests",
+            entry["base_manifest"])
+        with open(manifest_path, encoding="utf-8") as f:
+            original_manifest = json.load(f)
+        for field, value in (
+                ("kind", "codex"),
+                ("generation", "0" * 32),
+                ("phase", "delta"),
+                ("paths", [["not", "a", "path"]])):
+            manifest = json.loads(json.dumps(original_manifest))
+            manifest[field] = value
+            with open(manifest_path, "w", encoding="utf-8") as f:
+                json.dump(manifest, f)
+            with open(manifest_path, "rb") as f:
+                before = f.read()
+            progress = antiphon._catalog_scan_step(self.project, "claude")
+            self.assertEqual(progress.state, "degraded")
+            with open(manifest_path, "rb") as f:
+                self.assertEqual(f.read(), before)
+
+        with open(manifest_path, "w", encoding="utf-8") as f:
+            json.dump(original_manifest, f)
+        unsafe = json.loads(json.dumps(original_state))
+        unsafe["kinds"]["claude"]["base_manifest"] = "../../outside.json"
+        with open(state_path, "w", encoding="utf-8") as f:
+            json.dump(unsafe, f)
+        self.assertEqual(
+            antiphon._catalog_scan_step(self.project, "claude").state,
+            "degraded")
+
+        with open(state_path, "w", encoding="utf-8") as f:
+            json.dump(original_state, f)
+        os.unlink(manifest_path)
+        self.assertEqual(
+            antiphon._catalog_scan_step(self.project, "claude").state,
+            "degraded")
+
     def test_a_malformed_candidate_record_is_not_overwritten(self):
         _sid, path = self._source(2)
         relative = os.path.relpath(path, self.host)
@@ -5222,6 +5283,55 @@ class CatalogDiscoveryTest(unittest.TestCase):
         self.assertIn("has_more_scope: catalogued project sources", text)
         self.assertNotIn("\ndiscovery:", text)
 
+    def test_missing_manifest_record_degrades_but_keeps_source_readable(self):
+        paths = [self._claude(number, text)[1] for number, text in enumerate(
+            ("oldest", "two", "three", "newest"))]
+        self._scan()
+        oldest = os.path.relpath(paths[0], self.claude_root)
+        os.unlink(antiphon._catalog_record_path(
+            self.project, "claude", oldest))
+
+        text, _advance, _count = antiphon.build_summary(
+            self.project, "codex", {}, since=0)
+
+        self.assertIn("oldest", text)
+        self.assertIn("discovery: degraded", text)
+
+    def test_claude_catalog_candidates_are_bound_to_the_selected_slug(self):
+        sibling = os.path.join(self.claude_root, "another-project")
+        os.makedirs(sibling)
+        sid = "aaaaaaaa-4444-4444-8444-aaaaaaaaaaaa"
+        path = os.path.join(sibling, sid + ".jsonl")
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(json.dumps({
+                "type": "assistant", "timestamp": "2026-09-01T00:00:00Z",
+                "message": {"content": [{"type": "text",
+                                            "text": "foreign secret"}]},
+            }) + "\n")
+
+        offered = antiphon._record_current_source(
+            self.project, "claude", path)
+        self.assertFalse(offered.ok)
+        self.assertEqual(offered.reason, "project-mismatch")
+
+        self._scan()
+        relative = os.path.relpath(path, self.claude_root)
+        forged = {
+            "v": antiphon.CATALOG_VERSION,
+            "project": os.path.abspath(self.project),
+            "kind": "claude", "relative": relative, "source": sid,
+            "status": "ready", "reason": None, "observed": time.time(),
+            "generation": antiphon.source_generation(path),
+            "complete_size": os.path.getsize(path),
+        }
+        self.assertTrue(antiphon._atomic_json(
+            antiphon._catalog_record_path(
+                self.project, "claude", relative), forged))
+        text, _advance, _count = antiphon.build_summary(
+            self.project, "codex", {}, since=0)
+        self.assertNotIn("foreign secret", text)
+        self.assertIn("discovery: degraded", text)
+
     def test_building_and_malformed_catalogs_cannot_look_complete(self):
         for number in range(4):
             self._claude(number, str(number))
@@ -5240,6 +5350,40 @@ class CatalogDiscoveryTest(unittest.TestCase):
         self.assertIn(
             "discovery: degraded — some project sources could not be proved",
             degraded)
+        self.assertNotIn("Claude: 0", degraded)
+
+    def test_partial_first_record_is_not_persisted_as_ready(self):
+        sid = "bbbbbbbb-4444-4444-8444-bbbbbbbbbbbb"
+        path = os.path.join(self.claude_dir, sid + ".jsonl")
+        with open(path, "w", encoding="utf-8") as f:
+            f.write('{"type":"assistant"')
+        observed = antiphon._record_current_source(
+            self.project, "claude", path)
+        self.assertFalse(observed.ok)
+        self.assertEqual(observed.reason, "partial-record")
+        self.assertIsNone(antiphon._read_catalog_record(
+            self.project, "claude",
+            os.path.relpath(path, self.claude_root)))
+
+        self.assertEqual(
+            antiphon._catalog_scan_step(self.project, "claude").state,
+            "degraded")
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(json.dumps({
+                "type": "assistant", "timestamp": "2026-09-01T00:00:00Z",
+                "message": {"content": [{"type": "text",
+                                            "text": "now complete"}]},
+            }) + "\n")
+        for _attempt in range(6):
+            progress = antiphon._catalog_scan_step(self.project, "claude")
+            if progress.state == "complete":
+                break
+        self.assertEqual(progress.state, "complete")
+        record = antiphon._read_catalog_record(
+            self.project, "claude",
+            os.path.relpath(path, self.claude_root))
+        self.assertEqual(record["status"], "ready")
+        self.assertIsNotNone(record["generation"])
 
     def test_two_distinct_codex_files_claiming_one_source_are_both_refused(self):
         sid = "eeeeeeee-4444-4444-8444-eeeeeeeeeeee"
@@ -5539,6 +5683,72 @@ class SourceCatalogLockTest(unittest.TestCase):
                 os.close(holder)
         self.assertEqual(code, 0)
         self.assertIn("catalog", err.getvalue().lower())
+
+    def test_reservation_contention_is_degraded_even_after_completion(self):
+        with tempfile.TemporaryDirectory() as project, \
+             tempfile.TemporaryDirectory() as claude_root, \
+             tempfile.TemporaryDirectory() as codex_root, \
+             patch.object(antiphon, "CLAUDE_PROJECTS", claude_root), \
+             patch.object(antiphon, "CODEX_SESSIONS", codex_root):
+            for kind in ("claude", "codex"):
+                while antiphon._catalog_scan_step(
+                        project, kind).state != "complete":
+                    pass
+                with patch.object(
+                        antiphon, "_catalog_phase",
+                        return_value=antiphon.CatalogPhaseResult(
+                            False, "lock-contention", None)):
+                    progress = antiphon._catalog_scan_step(project, kind)
+                self.assertEqual(progress.state, "degraded")
+
+    def test_sources_scan_stops_after_one_contended_step_per_kind(self):
+        with tempfile.TemporaryDirectory() as project:
+            calls = []
+
+            def contended(_cwd, kind, force=False):
+                calls.append((kind, force))
+                return antiphon.CatalogProgress("degraded", 2, 0, 1, 0)
+
+            with patch.object(antiphon, "project_dir", return_value=project), \
+                 patch.object(antiphon, "_catalog_scan_step",
+                              side_effect=contended), \
+                 contextlib.redirect_stdout(io.StringIO()):
+                self.assertEqual(antiphon.sources("scan"), 1)
+        self.assertEqual([kind for kind, _force in calls],
+                         ["claude", "codex"])
+
+    def test_hook_catalog_failure_is_rendered_in_the_page(self):
+        payload = {"cwd": None, "hook_event_name": "UserPromptSubmit"}
+        with tempfile.TemporaryDirectory() as project, \
+             tempfile.TemporaryDirectory() as claude_root, \
+             tempfile.TemporaryDirectory() as codex_root:
+            payload["cwd"] = project
+            with patch.object(antiphon, "CLAUDE_PROJECTS", claude_root), \
+                 patch.object(antiphon, "CODEX_SESSIONS", codex_root), \
+                 patch.object(antiphon, "_hook_catalog_update",
+                              return_value=False), \
+                 patch.object(antiphon, "record_claude_session"), \
+                 patch.object(antiphon, "sweep_attachments"), \
+                 patch.object(antiphon.sys, "stdin",
+                              io.StringIO(json.dumps(payload))), \
+                 contextlib.redirect_stdout(io.StringIO()) as out, \
+                 contextlib.redirect_stderr(io.StringIO()):
+                self.assertEqual(antiphon.hook("claude"), 0)
+        delivered = json.loads(out.getvalue())
+        text = delivered["hookSpecificOutput"]["additionalContext"]
+        self.assertIn("discovery: degraded", text)
+
+    def test_every_failed_current_source_offer_degrades_the_hook(self):
+        failed = antiphon.CatalogObservation(
+            False, "partial-record", None)
+        with patch.object(antiphon, "_record_current_source",
+                          return_value=failed), \
+             patch.object(antiphon, "_catalog_scan_step") as scan, \
+             contextlib.redirect_stderr(io.StringIO()):
+            ok = antiphon._hook_catalog_update(
+                "/tmp/project", "claude", {"transcript_path": "/tmp/x"})
+        self.assertFalse(ok)
+        scan.assert_not_called()
 
     def test_one_degraded_catalog_phase_skips_the_rest_of_that_hook(self):
         progress = antiphon.CatalogProgress("degraded", 0, 0, 1, 0)
