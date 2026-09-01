@@ -1507,29 +1507,56 @@ addressability; those remain the next entry's work.
 
 ## P2 — Automatic peer identity
 
-Aliases are intentionally explicit in the first multi-peer release. A later
-release may make unnamed peers visible, but only after both writers derive the
-same identity on every supported host. There must be no user-settable owner-key
-override, no short-id collision, and no “newest session” fallback once more than
-one candidate is known.
+The design is approved after measuring both hosts on 2026-09-01. Claude Code
+2.1.251 returned exactly one interactive record from `claude agents --json
+--cwd <project>`: its pid was the same canonical CLI root independently found
+by `owner_key`, its cwd matched exactly, and its `sessionId` was canonical.
+Twelve local runs took 141–183 ms. Codex 0.151.0 exposed no session or thread id
+in the Antiphon MCP process environment, and the Codex App can multiplex work
+through a shared app-server, so neither an MCP ancestor nor an owner key may be
+promoted into Codex public identity.
 
-There is a concrete Claude-side lead, not yet a contract. On Claude Code
-2.1.251, `claude agents --json --cwd <project>` locally returned the active
-interactive session with `pid`, exact `cwd`, `sessionId` and a generated `name`,
-and the channel server's ancestor chain reached that pid. Before using it:
+**The approved contract.** A canonical host session UUID maps to `auto-` plus
+the lower-case unpadded base32 of the first 128 SHA-256 bits: 31 characters,
+inside the existing alias grammar. Records also carry and compare the complete
+256-bit digest. The short alias is therefore useful, never authoritative: a
+different full digest or an explicit alias at the same name is a collision and
+delivery refuses. `owner_key` remains only process ownership and endpoint/hook
+join evidence. It is never a public identity, never user-settable and never a
+fallback seed. An explicit valid `ANTIPHON_NAME` deliberately overrides the
+automatic road; an invalid configured value does not fall through to automatic
+identity.
 
-- feature-detect the command and schema; help text calls this background-agent
-  management even though JSON currently includes interactive sessions;
-- measure the MCP startup race and use a bounded wait, never “newest” as a
-  fallback while the session has not appeared yet;
-- fail anonymous when the server is orphaned or its ancestry cannot be joined
-  to exactly one entry;
-- treat `sessionId` as the identity candidate and the generated `name` only as
-  untrusted display metadata until uniqueness and lifetime are documented;
-- prove the equivalent Codex MCP/hook join before changing the product rule —
-  a Claude-only automatic name would restore the asymmetry this release removed;
-- keep an explicit `ANTIPHON_NAME` as the deliberate override and test upgrade,
-  collision and mixed-version behaviour.
+Codex gains an automatic peer only after its existing B1 observation has a
+positively held exact writer lock. The observation is projected read-only into
+an addressable peer whose route is the canonical host session UUID; no endpoint
+record is invented, and the shared MCP server makes no identity guess. Unknown
+observations remain retained counts and create neither an alias nor ambiguity.
+One automatic candidate preserves the legacy bare single-pair route; two or
+more positive candidates refuse. One explicit named Codex peer retains the
+conservative refusal because a pre-hook unnamed session still cannot be ruled
+out.
+
+An unnamed Claude channel performs one bounded fixed-argv Python probe of
+`claude agents --json --cwd <exact project>`. It accepts only one schema-valid
+interactive record whose pid equals the canonical Claude CLI root and whose cwd
+matches exactly; otherwise it remains unnamed. The record's generated `name`
+is ignored deliberately — it is host display metadata, not Antiphon identity.
+The Claude hook derives the expected alias and full digest independently from
+its supplied session UUID, and writes its session half only beside a live
+automatic endpoint with that alias, digest and owner key. A mismatch stays
+unjoined and visible; it never repoints a peer. Automatic outgoing identity is
+published only after that authenticated join. Explicit Claude identity keeps
+the existing identity-versus-reachability rule.
+
+Status, doctor, refusals, labels and errors may show the public `auto-…` alias
+but never the underlying session UUID, route or digest. This re-verifies B1's
+privacy rule for the new internal address shape. README, both generated agent
+rules and the live channel instructions say that automatic names appear after
+the first trustworthy observation/probe, the Claude host's generated display
+name is ignored, and `ANTIPHON_NAME` is the explicit override. Older peers that
+cannot supply the new proof remain on the existing unnamed/explicit paths; no
+mixed-version guess or automatic migration rewrites their records.
 
 ## P2 — Cross-vendor managed workers
 
