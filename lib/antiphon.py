@@ -2943,6 +2943,35 @@ def codex_rollout_files(cwd, days=3):
     return matched
 
 
+CODEX_TOOL_COMPONENT = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]*")
+
+
+def _codex_tool_name(payload):
+    """Return the only safe public detail from one measured Codex tool call.
+
+    Codex writes calls as `response_item` records. `custom_tool_call.input`
+    and `function_call.arguments` contain the caller's private payload, while
+    their output records contain the result; none belongs on a passive page.
+    The name is useful without either. A namespace qualifies it only when both
+    components can be rendered as one inert line. The retired
+    `event_msg/exec_command_begin` shape is deliberately not accepted: no
+    current rollout in the measured corpus writes it, and it exposed commands.
+    """
+    kind = payload.get("type")
+    argument_key = {"custom_tool_call": "input",
+                    "function_call": "arguments"}.get(kind)
+    if argument_key is None or not isinstance(payload.get(argument_key), str):
+        return None
+    name = payload.get("name")
+    if not isinstance(name, str) or CODEX_TOOL_COMPONENT.fullmatch(name) is None:
+        return None
+    namespace = payload.get("namespace")
+    if (isinstance(namespace, str)
+            and CODEX_TOOL_COMPONENT.fullmatch(namespace) is not None):
+        return f"{namespace}.{name}"
+    return name
+
+
 def codex_events(cwd, positions=None, since=None, visible_record_limit=None,
                  source_paths=None):
     """Return visible events and the safe scanned position for each rollout."""
@@ -2996,14 +3025,11 @@ def codex_events(cwd, positions=None, since=None, visible_record_limit=None,
                                               Event(ts, "codex", text, sid, gen,
                                                     start, end, previous_anchor,
                                                     anchor)))
-                    elif (kind == "event_msg"
-                          and payload.get("type") == "exec_command_begin"):
-                        command = payload.get("command")
-                        if isinstance(command, list):
-                            command = " ".join(command)
-                        if command:
+                    elif kind == "response_item":
+                        tool_name = _codex_tool_name(payload)
+                        if tool_name is not None:
                             events.append((ts, path, next(position),
-                                          Event(ts, "tool", f"shell {command}",
+                                          Event(ts, "tool", tool_name,
                                                 sid, gen, start, end,
                                                 previous_anchor, anchor)))
                 previous_anchor = anchor
@@ -4120,12 +4146,10 @@ class _ClassifiedRefusal(str):
         return refusal
 
 
-# Measured, per direction, and both halves are surprises: a refused
-# `reply_to_codex` reaches the Codex-side page as a bare tool-name line (123
-# real records; the `text` argument is unreachable by the parser), and a refused
-# `antiphon_send` reaches Claude's page as nothing at all (0 tool events across
-# 21 rollouts — the parser emits one only for `exec_command_begin`). What does
-# carry the words either way is the visible reply, through the passive pages.
+# Measured, per direction: both `reply_to_codex` and `antiphon_send` reach the
+# peer's page as a bare tool-name line. Their text arguments are deliberately
+# unreachable by both parsers, as are tool results and call ids. What carries
+# the words either way is the visible reply, through the passive pages.
 # No timing is promised: a page is bounded, so under a backlog the words land
 # some turns later, and saying "next turn" would be the same false promise this
 # sentence exists to replace.
@@ -5383,10 +5407,10 @@ def _send_tool(cwd, text, to=None, sender=None):
     if not ok:
         if parked is not None:
             drop_attachment(cwd, parked.path)
-        # `nothing`, not a tool-name line: Claude's parser emits a tool event
-        # only for `exec_command_begin`, and an MCP call is never one — measured
-        # at 0 tool events across 21 rollouts.
-        return _tool_error(f"Not delivered to Claude: {_guided(detail, 'nothing')}")
+        # The real Codex call record contributes its safe name only; its input,
+        # result and ids are deliberately unreachable by Claude's pull page.
+        return _tool_error(f"Not delivered to Claude: "
+                           f"{_guided(detail, 'only a tool-name line')}")
     _record_delivery(cwd, "claude", outgoing, to)
     # Naming the peer back is what lets the sender notice it addressed the wrong
     # one. With a single peer there is nothing to distinguish, so the old
@@ -5833,7 +5857,8 @@ AGENTS_RULE = ("\n## The Antiphon bridge\n\n"
                "active and dead after successful delivery. Candidate retirement is never "
                "a hook side effect: `antiphon sources compact` explicitly retires only "
                "aged, gone sources every relevant v4 reader proves consumed. Hooks never "
-               "retire candidates.\n\n"
+               "retire candidates. Codex tool calls appear on Claude's passive page as "
+               "compact name-only events; arguments and results stay unavailable.\n\n"
                "When Claude wants to tell you something directly, you'll see it as a user "
                "message starting with `[Antiphon bridge] Claude:` (pushed from Claude's Stop "
                "hook) or `[Antiphon channel] Claude:` (a direct reply through the channel) — "
@@ -5904,7 +5929,8 @@ CLAUDE_RULE = ("\n## The Antiphon bridge\n\n"
                "and dead after successful delivery. Candidate retirement is never a hook "
                "side effect: `antiphon sources compact` explicitly retires only aged, gone "
                "sources every relevant v4 reader proves consumed. Hooks never retire "
-               "candidates.\n\n"
+               "candidates. Codex tool calls appear on this passive page as compact "
+               "name-only events; arguments and results stay unavailable.\n\n"
                "Events that come directly from that agent are marked "
                "`<channel source=\"antiphon\" sender=\"codex\" sender_kind=\"agent\" "
                "sender_alias=\"...\">`; ordinary events "

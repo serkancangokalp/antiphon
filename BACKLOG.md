@@ -138,6 +138,29 @@ the write-and-flush-before-advance transaction.
   narrowing classification and can never exceed `snapshot-raced`.
   Hooks never retire candidates.
 
+### Completed by Wave 1C real Codex tool visibility
+
+- Codex tool calls now use the host's real completed record shapes:
+  `response_item/custom_tool_call` and `response_item/function_call`. Each is
+  one atomic, compact name-only event; a safe namespace may qualify the name.
+  Inputs, arguments, results, call ids, source ids and paths remain unavailable.
+  Separate output records stay filtered but advance the safe scanned frontier.
+  The obsolete `event_msg/exec_command_begin` reader is explicitly retired: it
+  occurred zero times in the measured supported corpus and exposed commands.
+- The pre-change corpus measurement found roughly 5,970 custom calls and 468
+  function calls across 22 project rollouts, while the parser rendered zero of
+  them. Making those calls visible increased a fully drained replay from 800 to
+  899 pages (+12.4%) and displaced 6,234 human records by median/p95/max
+  53/59/98 pages. That is historical replay cost, not ordinary latency: in 987
+  steady-state tool runs the next human record stayed on the same page 983
+  times, and the worst delay was two pages. This does not justify another
+  persisted fairness lane; the existing active/dead scheduler remains the
+  measured starvation boundary.
+- Tool-only records consume the same 40-record and UTF-8 byte budgets without
+  incrementing the human-message count. Failed delivery persists neither their
+  frontier nor scheduler lane, and no output can move the frontier past a first
+  undelivered visible call.
+
 ### Still open, by name
 
 - Stable event ids and full tool-call retrieval: tool calls remain compressed
@@ -901,13 +924,14 @@ page is neither everything nor the same thing in both directions.
   `text` argument is unreachable by any parser path. That sample covers refused
   calls by mechanism: a `tool_use` block is part of the assistant message and
   is written when the call is *emitted*, before any result exists.
-- **Codex → Claude: nothing at all.** `codex_events`
-  (`lib/antiphon.py:1205`) emits a tool event from exactly one record shape,
-  `payload.type == "exec_command_begin"`. Across 21 discovered rollouts there
-  were 0 tool events, and a census of all 129 rollout files on the maintainer's
-  machine found no `exec_command_begin` record of any kind — this Codex writes
-  tool calls as `custom_tool_call` (3,879) and `function_call` (282). A refused
-  `antiphon_send` leaves no trace on Claude's page whatsoever.
+- **Codex → Claude: a tool-name line, and nothing of the message.** Before
+  Wave 1C, `codex_events` recognised only `exec_command_begin`, a shape absent
+  from every measured supported rollout, so thousands of real
+  `custom_tool_call` and `function_call` records were invisible. The parser now
+  emits the safe compact name from those real call records and deliberately
+  excludes their inputs, arguments, outputs and ids. A refused
+  `antiphon_send` therefore leaves the call name on Claude's page, never its
+  message text.
 - **What does survive is the visible reply.** `build_summary` carries assistant
   text verbatim, marker line included, and `_build_page`
   (`lib/antiphon.py:1415`) never splits a record. So the guidance points there
@@ -932,9 +956,9 @@ page is neither everything nor the same thing in both directions.
 
 ### What the surfaces say now
 
-`TOOL_GUIDANCE` (`lib/antiphon.py:2033`) with a `{seen}` slot the reading
-surface fills from its own measurement: `only a tool-name line` from `reply()`,
-`nothing` from `_send_tool`. It is appended only when the detail was born
+`TOOL_GUIDANCE` with a `{seen}` slot the reading surface fills from its own
+measurement: `only a tool-name line` from both `reply()` and `_send_tool`. It
+is appended only when the detail was born
 carrying a class — a `str` subclass with `refusal_class`
 (`_ClassifiedRefusal`, `lib/antiphon.py:2000`), wrapped at the birth sites
 below. Widening the `(ok, detail)` pair to carry the class instead was measured

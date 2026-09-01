@@ -2334,6 +2334,81 @@ class AntiphonTest(unittest.TestCase):
                             ]},
             }), [value])
 
+    def test_codex_custom_tool_call_exposes_only_its_safe_name(self):
+        secret = "printf 'never expose this argument'"
+        texts = self._events_from_real_jsonl("codex", {
+            "type": "response_item",
+            "timestamp": "2026-08-30T10:00:00.000Z",
+            "payload": {"type": "custom_tool_call", "name": "exec",
+                        "call_id": "call-private", "input": secret},
+        })
+        self.assertEqual(texts, ["exec"])
+        self.assertNotIn(secret, "".join(texts))
+        self.assertNotIn("call-private", "".join(texts))
+
+    def test_codex_function_call_qualifies_a_safe_namespace_without_arguments(self):
+        secret = json.dumps({"message": "never expose this argument"})
+        texts = self._events_from_real_jsonl("codex", {
+            "type": "response_item",
+            "timestamp": "2026-08-30T10:00:00.000Z",
+            "payload": {"type": "function_call", "namespace": "collaboration",
+                        "name": "send_message", "call_id": "call-private",
+                        "arguments": secret},
+        })
+        self.assertEqual(texts, ["collaboration.send_message"])
+        self.assertNotIn(secret, "".join(texts))
+        self.assertNotIn("call-private", "".join(texts))
+
+    def test_codex_tool_call_requires_the_measured_safe_shape(self):
+        records = [
+            {"type": "custom_tool_call", "name": name, "input": "opaque"}
+            for name in (None, "", " bad", "line\nbreak", ["exec"])
+        ] + [
+            {"type": "custom_tool_call", "name": "exec", "input": {}},
+            {"type": "function_call", "name": "send_message", "arguments": {}},
+        ]
+        for payload in records:
+            with self.subTest(payload=payload):
+                self.assertEqual(self._events_from_real_jsonl("codex", {
+                    "type": "response_item",
+                    "timestamp": "2026-08-30T10:00:00.000Z",
+                    "payload": payload,
+                }), [])
+
+    def test_codex_tool_call_ignores_an_unsafe_namespace_but_keeps_the_name(self):
+        self.assertEqual(self._events_from_real_jsonl("codex", {
+            "type": "response_item",
+            "timestamp": "2026-08-30T10:00:00.000Z",
+            "payload": {"type": "function_call", "namespace": "bad namespace",
+                        "name": "send_message", "arguments": "{}"},
+        }), ["send_message"])
+
+    def test_codex_tool_outputs_and_the_obsolete_exec_event_are_filtered(self):
+        records = [
+            {"type": "response_item", "payload": {
+                "type": "custom_tool_call_output", "call_id": "private",
+                "output": [{"type": "text", "text": "private result"}]}},
+            {"type": "response_item", "payload": {
+                "type": "function_call_output", "call_id": "private",
+                "output": "private result"}},
+            {"type": "event_msg", "payload": {
+                "type": "exec_command_begin", "command": ["private", "argument"]}},
+        ]
+        with tempfile.TemporaryDirectory() as directory:
+            path = os.path.join(
+                directory,
+                "rollout-2026-08-30T00-00-00-"
+                "4eecac24-1c21-47ad-ab11-a650708f3098.jsonl")
+            with open(path, "w", encoding="utf-8") as stream:
+                for record in records:
+                    stream.write(json.dumps(record) + "\n")
+            size = os.path.getsize(path)
+            with patch.object(antiphon, "codex_rollout_files", return_value=[path]):
+                events, reached = antiphon.codex_events(directory)
+        self.assertEqual(events, [])
+        self.assertEqual(reached["4eecac24-1c21-47ad-ab11-a650708f3098"]["offset"],
+                         size)
+
     def test_standalone_whitespace_user_block_is_content_on_both_sides(self):
         records = {
             "claude": {
@@ -8571,6 +8646,28 @@ class _PagingIntegrationCase(unittest.TestCase):
                             {"type": "output_text", "text": text}]},
         })
 
+    @classmethod
+    def _codex_tool_record(cls, name, index=0, namespace=None,
+                           kind="custom_tool_call"):
+        payload = {"type": kind, "name": name, "call_id": "private-%d" % index}
+        if kind == "custom_tool_call":
+            payload["input"] = "private argument %d" % index
+        else:
+            payload["arguments"] = json.dumps({"private": index})
+        if namespace is not None:
+            payload["namespace"] = namespace
+        return json.dumps({"type": "response_item",
+                           "timestamp": cls._timestamp(index),
+                           "payload": payload})
+
+    @classmethod
+    def _codex_tool_output_record(cls, index=0, kind="custom_tool_call_output"):
+        return json.dumps({"type": "response_item",
+                           "timestamp": cls._timestamp(index),
+                           "payload": {"type": kind,
+                                       "call_id": "private-%d" % index,
+                                       "output": "private result %d" % index}})
+
     @staticmethod
     def _write_source(project, sid, records, codex=False):
         name = ("rollout-2026-08-30T00-00-00-%s.jsonl" % sid
@@ -8651,6 +8748,109 @@ class PagedDeliveryTest(_PagingIntegrationCase):
         self.assertIn("mcp record 0", texts[0])
         self.assertIn("mcp record 40", texts[1])
         self.assertIn("Nothing new", texts[2])
+
+    def test_codex_tool_only_records_count_toward_the_page_limit_not_messages(self):
+        records = [self._codex_tool_record("tool_%d" % index, index)
+                   for index in range(antiphon.EVENT_LIMIT + 1)]
+        with tempfile.TemporaryDirectory() as project:
+            path = self._write_source(project, self.SID_A, records, codex=True)
+            with patch.object(antiphon, "codex_rollout_files", return_value=[path]):
+                events, scanned = antiphon.codex_events(project)
+            first, advance, count = antiphon._build_page(events, scanned, "claude")
+            hook_first = self._hook(
+                project, codex_paths=[path], side="claude")[1]
+            hook_second = self._hook(
+                project, codex_paths=[path], side="claude")[1]
+        self.assertEqual(count, 0)
+        self.assertTrue(advance.has_more)
+        self.assertIn("tool_0", first)
+        self.assertIn("tool_39", first)
+        self.assertNotIn("tool_40", first)
+        self.assertIn("tool_39", hook_first)
+        self.assertNotIn("tool_40", hook_first)
+        self.assertIn("has_more: true", hook_first)
+        self.assertIn("tool_40", hook_second)
+        self.assertIn("has_more: false", hook_second)
+
+    def test_mixed_codex_calls_and_messages_keep_record_order_and_human_count(self):
+        records = [
+            self._codex_tool_record("exec", 0),
+            self._codex_record("human-visible answer", 1),
+            self._codex_tool_record(
+                "send_message", 2, namespace="collaboration",
+                kind="function_call"),
+        ]
+        with tempfile.TemporaryDirectory() as project:
+            path = self._write_source(project, self.SID_A, records, codex=True)
+            with patch.object(antiphon, "codex_rollout_files", return_value=[path]):
+                events, scanned = antiphon.codex_events(project)
+            with patch.object(antiphon, "EVENT_LIMIT", 2):
+                text, advance, count = antiphon._build_page(
+                    events, scanned, "claude")
+        self.assertLess(text.index("exec"), text.index("human-visible answer"))
+        self.assertNotIn("collaboration.send_message", text)
+        self.assertEqual(count, 1)
+        self.assertTrue(advance.has_more)
+
+    def test_filtered_codex_output_advances_the_frontier_before_the_next_message(self):
+        records = [
+            self._codex_tool_record("exec", 0),
+            self._codex_tool_output_record(1),
+            self._codex_record("after output", 2),
+        ]
+        first_two_bytes = len((records[0] + "\n" + records[1] + "\n").encode())
+        with tempfile.TemporaryDirectory() as project:
+            path = self._write_source(project, self.SID_A, records, codex=True)
+            with patch.object(antiphon, "EVENT_LIMIT", 1):
+                first = self._hook(
+                    project, codex_paths=[path], side="claude")[1]
+                cursor = antiphon.read_cursor(project, "claude")
+                second = self._hook(
+                    project, codex_paths=[path], side="claude")[1]
+        self.assertIn("exec", first)
+        self.assertNotIn("private result", first)
+        self.assertNotIn("after output", first)
+        self.assertEqual(
+            cursor[antiphon.anchored_page_cursor_key("claude")]
+            ["sources"][self.SID_A]["offset"], first_two_bytes)
+        self.assertIn("after output", second)
+
+    def test_failed_codex_tool_page_leaves_cursor_bytes_and_retry_unchanged(self):
+        attempted = []
+        original = {"keep": "byte-for-byte"}
+        with tempfile.TemporaryDirectory() as project:
+            path = self._write_source(
+                project, self.SID_A, [self._codex_tool_record("exec")], codex=True)
+            antiphon.write_cursor(project, original, "claude")
+            cursor_path = os.path.join(project, ".antiphon", "cursor.json")
+            with open(cursor_path, "rb") as stream:
+                before = stream.read()
+            code = self._hook(
+                project, codex_paths=[path], side="claude",
+                deliver=lambda line: attempted.append(line) or False)[0]
+            with open(cursor_path, "rb") as stream:
+                after = stream.read()
+            repeated = self._hook(
+                project, codex_paths=[path], side="claude")[1]
+        attempted_text = json.loads(attempted[0])["hookSpecificOutput"]["additionalContext"]
+        self.assertEqual(code, 1)
+        self.assertEqual(after, before)
+        self.assertEqual(repeated, attempted_text)
+        self.assertIn("exec", repeated)
+
+    def test_codex_tool_before_an_oversized_message_keeps_both_records_whole(self):
+        oversized = "oversized-start\n" + "X" * (antiphon.PAGE_BUDGET + 100)
+        records = [self._codex_tool_record("exec", 0),
+                   self._codex_record(oversized, 1)]
+        with tempfile.TemporaryDirectory() as project:
+            path = self._write_source(project, self.SID_A, records, codex=True)
+            first = self._hook(project, codex_paths=[path], side="claude")[1]
+            second = self._hook(project, codex_paths=[path], side="claude")[1]
+        self.assertIn("exec", first)
+        self.assertNotIn("oversized-start", first)
+        self.assertIn("has_more: true", first)
+        self.assertIn(oversized, second)
+        self.assertIn("has_more: false", second)
 
     def test_hook_persists_a_mixed_lane_turn_only_after_delivery(self):
         join = antiphon.SessionJoin(
@@ -12238,6 +12438,25 @@ class SenderIdentityTest(unittest.TestCase):
     UUID = "1d5a03e0-0548-4339-87c3-45c5dbf7e9d7"
     OWNER = "300:mine"
 
+    def test_every_agent_facing_surface_bounds_codex_tool_visibility(self):
+        """A tool-name line is awareness, never disclosure of its invocation."""
+        node = read_source("lib", "channel.mjs")
+        start = node.index("    instructions:")
+        end = node.index("\n  },\n);", start)
+        channel = re.sub(r'"\s*\+\s*\n\s*"', "", node[start:end])
+        surfaces = {
+            "AGENTS.md rule": antiphon.AGENTS_RULE,
+            "CLAUDE.md rule": antiphon.CLAUDE_RULE,
+            "channel instructions": channel,
+            "README": read_source("README.md"),
+        }
+        for name, surface in surfaces.items():
+            with self.subTest(surface=name):
+                words = " ".join(surface.lower().split())
+                self.assertIn("codex tool calls", words)
+                self.assertIn("compact name-only events", words)
+                self.assertIn("arguments and results stay unavailable", words)
+
     def test_every_agent_facing_surface_states_the_v4_retention_contract(self):
         node = read_source("lib", "channel.mjs")
         start = node.index("    instructions:")
@@ -13160,13 +13379,11 @@ class RefusedSendHonestyTest(unittest.TestCase):
     """What a refused send tells its sender about what the peer will still see.
 
     A refusal born in the transport leaves the words nowhere the peer can read
-    them, and the two directions are not even wrong in the same way: measured
-    on this project's own records, a refused `reply_to_codex` reaches the
-    Codex-side page as a bare tool-name line (123 real records; the `text`
-    argument is unreachable by the parser), while a refused `antiphon_send`
-    reaches Claude's page as nothing at all (0 tool events across 21 rollouts).
-    So those refusals name the road that does carry words — the visible reply,
-    which travels with the passive pages, in order and in full.
+    them. Measured on this project's own records, both `reply_to_codex` and
+    `antiphon_send` reach the peer's page as a bare tool-name line; their text
+    arguments remain unreachable by either parser. So those refusals name the
+    road that does carry words — the visible reply, which travels with the
+    passive pages, in order and in full.
 
     An addressing refusal already names its own fix and says nothing more. That
     is structural rather than a matter of discipline: only the guidance-carrying
@@ -13326,9 +13543,7 @@ class RefusedSendHonestyTest(unittest.TestCase):
             antiphon.TOOL_GUIDANCE.format(seen="only a tool-name line")))
 
     def test_a_refused_send_tool_names_the_passive_page(self):
-        """The other direction says `nothing`, because that is what Claude's page
-        holds of a refused `antiphon_send`: the parser emits a tool event only
-        for `exec_command_begin`, which an MCP call never is."""
+        """Claude's page gets the real call name, but never its message input."""
         with tempfile.TemporaryDirectory() as project:
             antiphon.peers.register(project, "claude", "ui", "/tmp/ui.sock")
             with patch.object(antiphon.socket, "socket", self._DeadSocket()):
@@ -13337,7 +13552,8 @@ class RefusedSendHonestyTest(unittest.TestCase):
         self.assertEqual(result["content"][0]["text"],
                          "Not delivered to Claude: Claude MCP Channel is down: "
                          "Permission denied — "
-                         + antiphon.TOOL_GUIDANCE.format(seen="nothing"))
+                         + antiphon.TOOL_GUIDANCE.format(
+                             seen="only a tool-name line"))
 
     def test_a_missing_codex_session_still_gets_the_guidance(self):
         """Discovery finding no rollout to address says nothing about a peer's
@@ -13366,7 +13582,8 @@ class RefusedSendHonestyTest(unittest.TestCase):
         self.assertIn("the channel accepts at most {}".format(
             antiphon.MAX_CHANNEL_BYTES), text)
         self.assertTrue(
-            text.endswith(" — " + antiphon.TOOL_GUIDANCE.format(seen="nothing")),
+            text.endswith(" — " + antiphon.TOOL_GUIDANCE.format(
+                seen="only a tool-name line")),
             text)
 
     def test_every_wrap_site_reaches_its_reader_with_the_guidance(self):
@@ -13379,7 +13596,7 @@ class RefusedSendHonestyTest(unittest.TestCase):
         case here, which the count assertion below insists on.
         """
         replied = antiphon.TOOL_GUIDANCE.format(seen="only a tool-name line")
-        sent = antiphon.TOOL_GUIDANCE.format(seen="nothing")
+        sent = antiphon.TOOL_GUIDANCE.format(seen="only a tool-name line")
 
         def named_reply(*contexts):
             """`reply()` to a peer that resolves, so the transport is reached."""
@@ -13974,7 +14191,8 @@ class AttachmentSpillTest(unittest.TestCase):
             self.assertIn("the channel accepts at most {}".format(
                 antiphon.MAX_CHANNEL_BYTES), said)
             self.assertTrue(said.endswith(
-                " — " + antiphon.TOOL_GUIDANCE.format(seen="nothing")), said)
+                " — " + antiphon.TOOL_GUIDANCE.format(
+                    seen="only a tool-name line")), said)
             self.assertFalse(os.path.exists(self._store(project)),
                              "nothing is parked for a message no store takes")
 
@@ -14235,8 +14453,8 @@ class AttachmentLifecycleTest(unittest.TestCase):
             said = result["content"][0]["text"]
             self.assertIs(result.get("isError"), True)
             self.assertIn("attachment store", said)
-            self.assertNotIn(antiphon.TOOL_GUIDANCE.format(seen="nothing"),
-                             said)
+            self.assertNotIn(antiphon.TOOL_GUIDANCE.format(
+                seen="only a tool-name line"), said)
             self.assertEqual(self._files(project), before,
                              "nothing was evicted and nothing was added")
             self.assertTrue(os.path.exists(held))

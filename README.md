@@ -252,6 +252,9 @@ most 40 completed source records — the byte number is measured against the
 installed hosts' injection limits, not a permanent host guarantee. Non-tool
 records are no longer cut or flattened: line structure, indentation, code and
 SQL formatting travel intact, and a record is never split across pages.
+Codex tool calls appear as compact name-only events; arguments and results stay
+unavailable. Tool outputs remain filtered while still advancing the safe
+scanned frontier.
 
 A page that leaves work behind says so with a visible `has_more: true` line;
 calling `antiphon_read` again (or simply letting later turns run) drains the
