@@ -7,6 +7,7 @@ import errno
 import hashlib
 import io
 import json
+import pathlib
 import multiprocessing
 import subprocess
 import tempfile
@@ -2869,7 +2870,7 @@ class WithdrawalRequiresAValidAutomaticHalfTest(unittest.TestCase):
             with self.subTest(half=name):
                 with tempfile.TemporaryDirectory() as project:
                     path = self._half(project, alias, record)
-                    before = open(path, "rb").read()
+                    before = pathlib.Path(path).read_bytes()
                     outcome = peers.rotate_identity_proof(
                         project, owner, self.B,
                         peers.auto_identity(self.B)[1])
@@ -2878,7 +2879,7 @@ class WithdrawalRequiresAValidAutomaticHalfTest(unittest.TestCase):
                         os.path.exists(path),
                         f"{name}: a record this cannot read is not one to "
                         "delete")
-                    self.assertEqual(before, open(path, "rb").read(),
+                    self.assertEqual(before, pathlib.Path(path).read_bytes(),
                                      f"{name}: byte-identical")
                     self.assertEqual(list(outcome.withdrawn), [], name)
 

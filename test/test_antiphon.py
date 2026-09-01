@@ -9,6 +9,7 @@ import glob
 import hashlib
 import io
 import json
+import pathlib
 import shutil
 import signal
 import socket
@@ -14920,8 +14921,16 @@ class ClaimedAliasTest(unittest.TestCase):
              patch.object(antiphon.sys, "stdin", io.StringIO(json.dumps({
                  "kind": "claude", "name": "ui", "address": "/tmp/ui.sock",
                  "pid": os.getpid()}))):
-            self.assertEqual(antiphon.register_peer(), 0)
+            answer = io.StringIO()
+            with contextlib.redirect_stdout(answer):
+                self.assertEqual(antiphon.register_peer(), 0)
             peer = antiphon.peers.read_peers(project, "claude")[0]
+        # The operation answers with the fingerprint of the process it just
+        # recorded. That answer is the caller's only authority: a listener that
+        # re-read the record to learn what it published would be asking the
+        # same bytes both questions.
+        self.assertEqual(json.loads(answer.getvalue()),
+                         {"birth": antiphon.peers._process_birth(os.getpid())})
         self.assertEqual(peer["owner"], self.MINE)
         self.assertEqual(peer["pid"], os.getpid())
 
@@ -14936,7 +14945,11 @@ class ClaimedAliasTest(unittest.TestCase):
              patch.object(antiphon.sys, "stdin", io.StringIO(json.dumps({
                  "kind": "claude", "name": "ui", "address": "/tmp/ui.sock",
                  "pid": os.getpid(), "birth": "Thu Jan  1 00:00:00 1970"}))):
-            self.assertEqual(antiphon.register_peer(), 0)
+            answer = io.StringIO()
+            with contextlib.redirect_stdout(answer):
+                self.assertEqual(antiphon.register_peer(), 0)
+            self.assertNotIn("1970", answer.getvalue(),
+                             "the answer is measured, not echoed back")
             path = os.path.join(antiphon.peers.peer_dir(project, "claude", "ui"),
                                 "endpoint.json")
             with open(path, encoding="utf-8") as f:
@@ -18289,7 +18302,7 @@ class ReconnectNoticeTest(unittest.TestCase):
             alias, digest = antiphon.peers.auto_identity(self.B)
             antiphon.peers.write_identity_proof(project, legacy, self.B, digest)
             path = antiphon.peers.identity_proof_path(project, legacy)
-            before = open(path, "rb").read()
+            before = pathlib.Path(path).read_bytes()
             with patch.object(antiphon, "project_dir", return_value=project):
                 out = io.StringIO()
                 with contextlib.redirect_stdout(out):
@@ -18299,7 +18312,7 @@ class ReconnectNoticeTest(unittest.TestCase):
                 with contextlib.redirect_stdout(out):
                     antiphon.doctor()
                 doctor = out.getvalue()
-            after = open(path, "rb").read()
+            after = pathlib.Path(path).read_bytes()
         self.assertEqual(before, after,
                          "a read-only surface never rewrites a proof")
         for where, words in (("status", status), ("doctor", doctor)):
@@ -18346,7 +18359,7 @@ class ProofLifecycleSurfaceTest(unittest.TestCase):
             _alias, digest = antiphon.peers.auto_identity(self.A)
             antiphon.peers.write_identity_proof(project, dead, self.A, digest)
             path = antiphon.peers.identity_proof_path(project, dead)
-            before = open(path, "rb").read()
+            before = pathlib.Path(path).read_bytes()
             with patch.object(antiphon, "project_dir", return_value=project):
                 with contextlib.redirect_stdout(io.StringIO()):
                     antiphon.status()
@@ -18357,7 +18370,7 @@ class ProofLifecycleSurfaceTest(unittest.TestCase):
             self.assertTrue(os.path.exists(path),
                             "a read-only surface never collects a proof, not "
                             "even one whose owner is proved dead")
-            self.assertEqual(before, open(path, "rb").read(),
+            self.assertEqual(before, pathlib.Path(path).read_bytes(),
                              "nor rewrites one")
 
     def test_proof_lifecycle_the_real_hook_collects(self):
