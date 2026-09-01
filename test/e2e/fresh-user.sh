@@ -10,7 +10,7 @@
 # a throwaway prefix, sets up a throwaway project, and drives both CLIs.
 #
 # It is NOT part of `npm test`: it needs a logged-in `claude` and `codex`, the
-# network, and it spends two small model calls per run. Run it before a release,
+# network, and it spends 2 to 6 small model calls per run. Run it before a release,
 # after the wrapper census and before `npm version`.
 #
 # What it does not cover, and how to check those by hand:
@@ -34,6 +34,10 @@
 #   * The Codex rollout this run creates is left in place and named, never
 #     deleted: choosing a file to delete from a person's session store on the
 #     word of the code under test is a risk no test script may take.
+#   * A successful live model call can omit the exact marker it was asked for.
+#     Only that marker-producing turn is retried up to the shared attempt limit,
+#     after exit zero. Push, queue, page delivery and the rest of T2/T3 stay
+#     single-shot. Final marker exhaustion preserves both evidence roots.
 #
 # Usage:  test/e2e/fresh-user.sh [--version <npm-version>] [--keep]
 #   default:  packs an immutable copy of HEAD (refuses a dirty tree) and prints
@@ -44,6 +48,7 @@
 set -uo pipefail
 
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd -P)"
+source "$REPO/test/e2e/marker_contract.sh" || exit 2
 VERSION=""
 KEEP=0
 while [ $# -gt 0 ]; do
@@ -92,6 +97,45 @@ except Exception as error:
 }
 events_in() { printf '%s' "$1" | grep -cE '^\[[0-9][0-9]:[0-9][0-9]\]'; }
 
+# This is the only retry boundary in the E2E. The helper prints a path and an
+# attempt number, never transcript content. A final exact-marker omission keeps
+# the evidence automatically; a CLI or probe failure remains a distinct error.
+land_exact_marker() {
+  local marker="$1" label="$2" result code attempt transcript
+  result="$(bash "$REPO/test/e2e/marker_turn.sh" \
+    "$PROJECT" "$CLAUDE_DIR" "$marker")"
+  code=$?
+  case "$code" in
+    0)
+      attempt="$(printf '%s\n' "$result" | sed -n 's/^attempt=//p')"
+      transcript="$(printf '%s\n' "$result" | sed -n 's/^transcript=//p')"
+      case "$attempt" in
+        ''|*[!0-9]*) fail "$label returned an invalid attempt"; exit 1 ;;
+      esac
+      if [ "$attempt" -lt 1 ] || [ "$attempt" -gt "$MAX_MARKER_ATTEMPTS" ]; then
+        fail "$label returned an out-of-range attempt"
+        exit 1
+      fi
+      case "$transcript" in
+        "$CLAUDE_DIR"/*.jsonl) ;;
+        *) fail "$label returned a transcript outside this run"; exit 1 ;;
+      esac
+      [ -f "$transcript" ] && [ ! -L "$transcript" ] \
+        || { fail "$label returned no regular transcript"; exit 1; }
+      MARKER_ATTEMPT="$attempt"
+      MARKER_TRANSCRIPT="$transcript"
+      ;;
+    1)
+      preserve_marker_evidence "$label" "$TMP" "$CLAUDE_DIR"
+      exit 1
+      ;;
+    *)
+      fail "$label failed before an exact assistant marker landed"
+      exit 1
+      ;;
+  esac
+}
+
 for tool in claude codex node npm python3 sqlite3; do
   command -v "$tool" >/dev/null || { echo "gerekli araç yok: $tool" >&2; exit 2; }
 done
@@ -115,6 +159,11 @@ CODEX_CONFIG_BEFORE="$(shasum -a 256 "$HOME/.codex/config.toml" 2>/dev/null | cu
 queued() {
   [ -f "$QUEUE" ] || { echo absent; return; }
   sqlite3 -readonly "$QUEUE" 'SELECT count(*) FROM queued_items;' 2>/dev/null || echo unreadable
+}
+cursor_digest() {
+  local path="$1/.antiphon/cursor.json"
+  [ -f "$path" ] || { echo absent; return; }
+  shasum -a 256 "$path" | cut -d' ' -f1
 }
 
 cleanup() {
@@ -193,24 +242,134 @@ DOCTOR="$(cd "$PROJECT" && antiphon doctor 2>&1)"; DOCTOR_CODE=$?
 check "doctor exit on a fresh project" "$DOCTOR_CODE" "0"
 lacks "doctor finds nothing broken" "$DOCTOR" "✗"
 
+# Break one project-local entry with a fixed Python program. No command read
+# from the configuration is executed, and no runtime state is involved.
+python3 - "$PROJECT/.mcp.json" <<'PY'
+import json, sys
+path = sys.argv[1]
+with open(path, encoding="utf-8") as source:
+    data = json.load(source)
+servers = data.get("mcpServers")
+if not isinstance(servers, dict) or "antiphon" not in servers:
+    raise SystemExit(1)
+del servers["antiphon"]
+with open(path, "w", encoding="utf-8") as target:
+    json.dump(data, target, indent=2)
+    target.write("\n")
+PY
+[ "$?" -eq 0 ] && pass "the fixture removed only the project MCP entry" \
+                 || fail "the fixture could not remove the project MCP entry"
+BROKEN_DOCTOR="$(cd "$PROJECT" && antiphon doctor 2>&1)"; BROKEN_DOCTOR_CODE=$?
+check "ordinary doctor rejects the broken project" "$BROKEN_DOCTOR_CODE" "1"
+contains "ordinary doctor names the missing MCP server" "$BROKEN_DOCTOR" ".mcp.json: missing"
+REPAIR="$(cd "$PROJECT" && antiphon doctor --fix 2>&1)"; REPAIR_CODE=$?
+check "doctor --fix repairs project configuration" "$REPAIR_CODE" "0"
+contains "the repair says what setup changed" "$REPAIR" "Claude MCP Channel registered"
+contains "the repair marks its read-only re-check" "$REPAIR" "doctor re-check (read-only)"
+AFTER_REPAIR="$(cd "$PROJECT" && antiphon doctor 2>&1)"; AFTER_REPAIR_CODE=$?
+check "ordinary doctor is clean after repair" "$AFTER_REPAIR_CODE" "0"
+lacks "the repaired project has no broken finding" "$AFTER_REPAIR" "✗"
+check "doctor --fix left global Codex config untouched" \
+  "$(shasum -a 256 "$HOME/.codex/config.toml" 2>/dev/null | cut -d' ' -f1)" \
+  "$CODEX_CONFIG_BEFORE"
+
+step "T1C — a durable catalog proves the whole project or names its boundary"
+CATALOG_HOME="$TMP/catalog-home"; CATALOG_PROJECT="$TMP/catalog-project"
+mkdir -p "$CATALOG_HOME" "$CATALOG_PROJECT"
+(cd "$CATALOG_PROJECT" && git init -q)
+CATALOG_SLUG="$(printf '%s' "$CATALOG_PROJECT" | sed 's|[^A-Za-z0-9]|-|g')"
+CATALOG_CLAUDE="$CATALOG_HOME/.claude/projects/$CATALOG_SLUG"
+mkdir -p "$CATALOG_CLAUDE"
+python3 - "$CATALOG_CLAUDE" "$NONCE" <<'PY'
+import datetime, json, os, sys
+root, nonce = sys.argv[1:]
+now = datetime.datetime.now(datetime.timezone.utc)
+for number in range(4):
+    sid = f"{number:08x}-4444-4444-8444-{number:012x}"
+    text = f"{nonce}-catalog-{'oldest' if number == 0 else number}"
+    record = {
+        "type": "assistant",
+        "timestamp": (now + datetime.timedelta(seconds=number)).isoformat(),
+        "message": {"content": [{"type": "text", "text": text}]},
+    }
+    path = os.path.join(root, sid + ".jsonl")
+    with open(path, "w", encoding="utf-8") as stream:
+        stream.write(json.dumps(record) + "\n")
+    os.utime(path, (100 + number, 100 + number))
+PY
+HOME="$CATALOG_HOME" ANTIPHON_CWD="$CATALOG_PROJECT" ANTIPHON_NAME= \
+  antiphon setup >/dev/null 2>&1 \
+  && pass "catalog fixture setup exits 0" || fail "catalog fixture setup failed"
+BUILDING="$(HOME="$CATALOG_HOME" ANTIPHON_CWD="$CATALOG_PROJECT" ANTIPHON_NAME= antiphon summary codex 2>&1)"
+contains "an incomplete bootstrap says building" "$BUILDING" "discovery: building"
+contains "the incomplete page still names its scope" "$BUILDING" "has_more_scope: catalogued project sources"
+lacks "the newest-three fallback cannot claim the fourth source" "$BUILDING" "$NONCE-catalog-oldest"
+CURSOR_BEFORE="$(cursor_digest "$CATALOG_PROJECT")"
+CATALOG_SCAN="$(HOME="$CATALOG_HOME" ANTIPHON_CWD="$CATALOG_PROJECT" ANTIPHON_NAME= antiphon sources scan 2>&1)"; CATALOG_SCAN_CODE=$?
+check "sources scan completes" "$CATALOG_SCAN_CODE" "0"
+contains "sources scan reports completion" "$CATALOG_SCAN" "source catalog: complete"
+check "sources scan does not move a cursor" "$(cursor_digest "$CATALOG_PROJECT")" "$CURSOR_BEFORE"
+COMPLETE="$(HOME="$CATALOG_HOME" ANTIPHON_CWD="$CATALOG_PROJECT" ANTIPHON_NAME= antiphon summary codex 2>&1)"
+contains "complete discovery sees the fourth older source" "$COMPLETE" "$NONCE-catalog-oldest"
+lacks "a complete page has no building marker" "$COMPLETE" "discovery: building"
+lacks "a complete page has no degraded marker" "$COMPLETE" "discovery: degraded"
+CATALOG_STATE="$CATALOG_PROJECT/.antiphon/sources/state.json"
+cp "$CATALOG_STATE" "$TMP/catalog-state.saved"
+printf '{malformed\n' > "$CATALOG_STATE"
+DEGRADED="$(HOME="$CATALOG_HOME" ANTIPHON_CWD="$CATALOG_PROJECT" ANTIPHON_NAME= antiphon summary codex 2>&1)"
+contains "an untrusted catalog says degraded" "$DEGRADED" "discovery: degraded"
+lacks "an untrusted catalog uses only the bounded recent fallback" "$DEGRADED" "$NONCE-catalog-oldest"
+cp "$TMP/catalog-state.saved" "$CATALOG_STATE"
+OLDEST_REL="$CATALOG_SLUG/00000000-4444-4444-8444-000000000000.jsonl"
+OLDEST_RECORD="$(python3 - "$CATALOG_PROJECT" "$OLDEST_REL" <<'PY'
+import hashlib, os, sys
+project, relative = sys.argv[1:]
+digest = hashlib.sha256(("claude\0" + relative).encode()).hexdigest()
+print(os.path.join(project, ".antiphon", "sources", "records", "claude",
+                   digest[:2], digest + ".json"))
+PY
+)"
+rm "$OLDEST_RECORD"
+MISSING_RECORD="$(HOME="$CATALOG_HOME" ANTIPHON_CWD="$CATALOG_PROJECT" ANTIPHON_NAME= antiphon summary codex 2>&1)"
+contains "a missing index record cannot hide its manifest source" "$MISSING_RECORD" "$NONCE-catalog-oldest"
+contains "a missing index record degrades completeness" "$MISSING_RECORD" "discovery: degraded"
+CATALOG_REPAIR="$(HOME="$CATALOG_HOME" ANTIPHON_CWD="$CATALOG_PROJECT" ANTIPHON_NAME= antiphon sources scan 2>&1)"; CATALOG_REPAIR_CODE=$?
+check "sources scan repairs missing record coverage" "$CATALOG_REPAIR_CODE" "0"
+contains "repaired catalog is complete" "$CATALOG_REPAIR" "source catalog: complete"
+CATALOG_STATUS="$(HOME="$CATALOG_HOME" ANTIPHON_CWD="$CATALOG_PROJECT" ANTIPHON_NAME= antiphon status 2>&1)"
+contains "status reports the catalog complete" "$CATALOG_STATUS" "source catalog codex_pages: complete"
+check "status does not move a cursor" "$(cursor_digest "$CATALOG_PROJECT")" "$CURSOR_BEFORE"
+CATALOG_DOCTOR="$(HOME="$CATALOG_HOME" ANTIPHON_CWD="$CATALOG_PROJECT" ANTIPHON_NAME= antiphon doctor 2>&1)"; CATALOG_DOCTOR_CODE=$?
+check "doctor accepts the complete catalog fixture" "$CATALOG_DOCTOR_CODE" "0"
+contains "doctor reports the catalog complete" "$CATALOG_DOCTOR" "source catalog codex_pages: complete"
+check "doctor does not move a cursor" "$(cursor_digest "$CATALOG_PROJECT")" "$CURSOR_BEFORE"
+CATALOG_PAGE="$(printf '{"cwd":"%s","hook_event_name":"UserPromptSubmit"}' "$CATALOG_PROJECT" \
+  | HOME="$CATALOG_HOME" ANTIPHON_CWD="$CATALOG_PROJECT" ANTIPHON_NAME= antiphon hook codex 2>/dev/null \
+  | python3 -c "import json,sys; print(json.load(sys.stdin)['hookSpecificOutput']['additionalContext'])")"
+contains "the passive hook delivers the fourth older source" "$CATALOG_PAGE" "$NONCE-catalog-oldest"
+
 step "T2 — Claude writes to a Codex that does not exist yet"
 BEFORE_QUEUE="$(queued)"
 case "$BEFORE_QUEUE" in
   absent) echo "  ---- Codex has no queue database yet; the stranding check compares against none" ;;
   ''|*[!0-9]*) fail "Codex's queue could not be read; the stranding check would prove nothing" ;;
 esac
-# Two turns, so T5 has two distinct moments to place a cursor between. One
-# turn renders both of its lines in the same second, and the `>=` boundary
-# rule repeats the whole cohort sharing it — nothing to bound.
-(cd "$PROJECT" && claude -p "Respond with exactly one line and nothing else, no preamble: @codex $NONCE-one" >/dev/null 2>&1) \
-  && pass "the first claude -p turn exits 0" || fail "the first claude -p turn failed"
+# Two accepted marker moments give T5 two distinct cursor boundaries. Omitted
+# attempts may add records, but they cannot remove either accepted boundary and
+# only increase T5's lower-bound event count. One accepted turn renders both of
+# its lines in the same second, and the `>=` rule repeats that whole cohort.
+land_exact_marker "@codex $NONCE-one" "the first claude -p turn"
+pass "the first claude -p turn exits 0"
+pass "the first exact assistant marker landed on attempt $MARKER_ATTEMPT"
 sleep 2
-(cd "$PROJECT" && claude -p "Respond with exactly one line and nothing else, no preamble: @codex $NONCE-two" >/dev/null 2>&1) \
-  && pass "the second claude -p turn exits 0" || fail "the second claude -p turn failed"
-TRANSCRIPT="$(ls -t "$CLAUDE_DIR"/*.jsonl 2>/dev/null | head -1)"
-[ -n "$TRANSCRIPT" ] && pass "claude -p wrote a transcript" || fail "claude -p wrote no transcript"
-grep -qr "@codex $NONCE-two" "$CLAUDE_DIR" 2>/dev/null && pass "the marker is in the transcript" || fail "the marker never reached the transcript"
+land_exact_marker "@codex $NONCE-two" "the second claude -p turn"
+pass "the second claude -p turn exits 0"
+pass "the second exact assistant marker landed on attempt $MARKER_ATTEMPT"
+# Stronger than "newest": this is the exact transcript whose assistant block
+# passed the second-marker predicate, and it is the only transcript T2 pushes.
+TRANSCRIPT="$MARKER_TRANSCRIPT"
 [ -d "$PROJECT/.antiphon" ] && pass "the hooks ran (.antiphon exists)" || fail "the hooks never ran"
+e2e_once push || { fail "the T2 push stage attempted to run twice"; exit 1; }
 PUSH="$(printf '{"cwd":"%s","hook_event_name":"Stop","transcript_path":"%s","session_id":"%s"}' \
         "$PROJECT" "$TRANSCRIPT" "$(basename "$TRANSCRIPT" .jsonl)" | (cd "$PROJECT" && antiphon push codex 2>&1))"
 contains "the push refuses instead of guessing" "$PUSH" "no Codex session found"
@@ -257,6 +416,7 @@ ROLLOUT="$FOUND"
 # the surprise and the script would run it anyway.
 HOOK_CMD="$(python3 -c "import json; print(json.load(open('$PROJECT/.codex/hooks.json'))['hooks']['UserPromptSubmit'][0]['hooks'][0]['command'])")"
 check "hooks.json declares the hook command" "$HOOK_CMD" "antiphon hook codex"
+e2e_once page || { fail "the T3 page stage attempted to run twice"; exit 1; }
 PAGE="$(page_now)" && pass "the first page was produced" || fail "the first page — hook failed"
 # The relayed prompt carries the same words, so the label decides: this must
 # be Claude's own line, which is what the refused push could not carry.
@@ -317,6 +477,112 @@ CATCHUP="$(cd "$PROJECT" && antiphon catch-up 2>&1)"
 contains "catch-up says what it abandons" "$CATCHUP" "will not be delivered"
 AFTER_PAGE="$(page_now)" && pass "the post-catch-up page was produced" || fail "the post-catch-up page was produced — hook failed"
 check "nothing is left to deliver after catch-up" "$(printf '%s' "$AFTER_PAGE" | tr -d '[:space:]')" ""
+
+step "T6 — v3 adoption anchors the boundary and catches an in-place rewrite"
+ANCHOR_HOME="$TMP/anchor-home"; ANCHOR_PROJECT="$TMP/anchor-project"
+mkdir -p "$ANCHOR_HOME" "$ANCHOR_PROJECT"
+(cd "$ANCHOR_PROJECT" && git init -q)
+ANCHOR_SLUG="$(printf '%s' "$ANCHOR_PROJECT" | sed 's|[^A-Za-z0-9]|-|g')"
+ANCHOR_CLAUDE="$ANCHOR_HOME/.claude/projects/$ANCHOR_SLUG"
+mkdir -p "$ANCHOR_CLAUDE"
+ANCHOR_SID="aaaaaaaa-5555-4555-8555-aaaaaaaaaaaa"
+ANCHOR_SOURCE="$ANCHOR_CLAUDE/$ANCHOR_SID.jsonl"
+python3 - "$ANCHOR_SOURCE" "$NONCE" <<'PY'
+import datetime, json, sys
+path, nonce = sys.argv[1:]
+now = datetime.datetime.now(datetime.timezone.utc)
+records = []
+for offset, text in enumerate((f"{nonce}-anchor-first", f"{nonce}-anchor-old")):
+    records.append({
+        "type": "assistant",
+        "timestamp": (now + datetime.timedelta(seconds=offset)).isoformat(),
+        "message": {"content": [{"type": "text", "text": text}]},
+    })
+with open(path, "w", encoding="utf-8") as stream:
+    for record in records:
+        stream.write(json.dumps(record, separators=(",", ":")) + "\n")
+PY
+HOME="$ANCHOR_HOME" ANTIPHON_CWD="$ANCHOR_PROJECT" ANTIPHON_NAME= \
+  antiphon sources scan >/dev/null 2>&1 \
+  && pass "the anchor fixture catalog completes" || fail "the anchor fixture catalog failed"
+PYTHONPATH="$PREFIX/lib/node_modules/antiphon/lib" python3 - \
+  "$ANCHOR_PROJECT" "$ANCHOR_SOURCE" "$ANCHOR_SID" <<'PY'
+import json, os, sys
+import antiphon
+project, source, sid = sys.argv[1:]
+cursor = {"codex_pages": {"v": 3, "sources": {sid: {
+    "gen": antiphon.source_generation(source),
+    "offset": os.path.getsize(source),
+}}, "future": {"integer": 1, "float": 1.0,
+                 "flag": True, "nested": [None, "kept"]}}}
+path = os.path.join(project, ".antiphon", "cursor.json")
+os.makedirs(os.path.dirname(path), exist_ok=True)
+with open(path, "w", encoding="utf-8") as stream:
+    json.dump(cursor, stream, sort_keys=True)
+PY
+ANCHOR_CURSOR="$ANCHOR_PROJECT/.antiphon/cursor.json"
+V3_BEFORE="$(python3 - "$ANCHOR_CURSOR" <<'PY'
+import hashlib, json, sys
+value = json.load(open(sys.argv[1], encoding="utf-8"))["codex_pages"]
+print(hashlib.sha256(json.dumps(value, sort_keys=True).encode()).hexdigest())
+PY
+)"
+anchor_page() {
+  local raw decoded
+  raw="$(printf '{"cwd":"%s","hook_event_name":"UserPromptSubmit"}' "$ANCHOR_PROJECT" \
+    | HOME="$ANCHOR_HOME" ANTIPHON_CWD="$ANCHOR_PROJECT" ANTIPHON_NAME= \
+      antiphon hook codex 2>/dev/null)" || { echo "HOOK-FAILED"; return 1; }
+  [ -z "$raw" ] && return 0
+  decoded="$(printf '%s' "$raw" | python3 -c "
+import sys, json
+try: print(json.loads(sys.stdin.read())['hookSpecificOutput']['additionalContext'])
+except Exception as error:
+    print('HOOK-UNDECODABLE: %s' % error); raise SystemExit(1)")" \
+    || { echo "$decoded"; return 1; }
+  printf '%s' "$decoded"
+}
+ADOPTION_PAGE="$(anchor_page)" && pass "the v3 adoption page was produced" \
+  || fail "the v3 adoption page failed"
+contains "v3 adoption repeats its last record" "$ADOPTION_PAGE" "$NONCE-anchor-old"
+lacks "v3 adoption does not replay the earlier record" "$ADOPTION_PAGE" "$NONCE-anchor-first"
+contains "v3 adoption names the bounded repeat" "$ADOPTION_PAGE" "adopting a delivered frontier"
+V3_AFTER="$(python3 - "$ANCHOR_CURSOR" <<'PY'
+import hashlib, json, sys
+value = json.load(open(sys.argv[1], encoding="utf-8"))["codex_pages"]
+print(hashlib.sha256(json.dumps(value, sort_keys=True).encode()).hexdigest())
+PY
+)"
+check "the preserved v3 sibling remains deeply value-equivalent" "$V3_AFTER" "$V3_BEFORE"
+V4_STATE="$(python3 - "$ANCHOR_CURSOR" "$ANCHOR_SID" <<'PY'
+import json, sys
+cursor = json.load(open(sys.argv[1], encoding="utf-8"))
+value = cursor.get("codex_pages_v4") or {}
+position = (value.get("sources") or {}).get(sys.argv[2]) or {}
+print("%s|%s|%s" % (value.get("v"), bool(position.get("anchor")),
+                     len(value.get("adopting_v3") or {})))
+PY
+)"
+check "the adopted cursor is anchored v4 with no pending v3 source" "$V4_STATE" "4|True|0"
+ANCHOR_STAT_BEFORE="$(stat -f '%i:%z' "$ANCHOR_SOURCE")"
+python3 - "$ANCHOR_SOURCE" "$NONCE" <<'PY'
+import sys
+path, nonce = sys.argv[1:]
+old = (nonce + "-anchor-old").encode()
+new = (nonce + "-anchor-new").encode()
+assert len(old) == len(new)
+with open(path, "r+b") as stream:
+    raw = stream.read()
+    assert raw.count(old) == 1
+    stream.seek(0)
+    stream.write(raw.replace(old, new))
+    stream.truncate()
+PY
+check "the rewrite preserves inode and length" "$(stat -f '%i:%z' "$ANCHOR_SOURCE")" "$ANCHOR_STAT_BEFORE"
+REWRITE_PAGE="$(anchor_page)" && pass "the rewritten-anchor page was produced" \
+  || fail "the rewritten-anchor page failed"
+contains "an in-place rewrite repeats the changed anchored record" "$REWRITE_PAGE" "$NONCE-anchor-new"
+lacks "the rewrite does not replay the earlier record" "$REWRITE_PAGE" "$NONCE-anchor-first"
+lacks "the superseded anchored bytes are not delivered" "$REWRITE_PAGE" "$NONCE-anchor-old"
 
 step "what the run changed outside its own temp tree"
 # Not "the machine is as it was": this run leaves a Codex rollout behind on

@@ -13,6 +13,7 @@ import antiphon
 import peers
 
 import contextlib
+import inspect
 import io
 import json
 import re
@@ -131,7 +132,11 @@ class CrossBoundaryContractTest(unittest.TestCase):
         # `serveSocket` is defined above the branch that calls it. What matters is
         # evaluation order in the chain, plus binding living in exactly one place
         # so there is no second path to it.
-        self.assertLess(source.index("await claimPeer()"),
+        # The claim now declares which kind of claim it is, so match the call
+        # rather than one spelling of its argument: what this guards is the
+        # order, and a literal that pins the argument too would fail the next
+        # time the payload gains a field without the race ever returning.
+        self.assertLess(source.index("await claimPeer("),
                         source.index("await serveSocket()"),
                         "the address must be claimed before anything binds")
         self.assertEqual(source.count("socketServer.listen("), 1,
@@ -237,6 +242,69 @@ class CrossBoundaryContractTest(unittest.TestCase):
                       "channel.mjs must carry the same sentence verbatim")
         self.assertIn('required: ["text"]', node,
                       "and must not make it required on its side alone")
+
+    def test_both_mcp_servers_publish_one_retrieval_contract(self):
+        node = re.sub(r'"\s*\+\s*\n\s*"', "", read("lib", "channel.mjs"))
+        self.assertIn(antiphon.RETRIEVE_DESCRIPTION, node)
+        description = antiphon.RETRIEVE_DESCRIPTION.lower()
+        for phrase in ("invocation only", "never the tool result", "read-only",
+                       "write-free", "8000", "antiphon retrieve"):
+            self.assertIn(phrase, description, phrase)
+
+    def test_every_agent_surface_teaches_the_retrieval_limits(self):
+        channel = re.sub(r'"\s*\+\s*\n\s*"', "", read("lib", "channel.mjs"))
+        surfaces = {
+            "AGENTS rule": antiphon.AGENTS_RULE,
+            "CLAUDE rule": antiphon.CLAUDE_RULE,
+            "channel instructions": channel,
+            "README": read("README.md"),
+        }
+        for where, text in surfaces.items():
+            self.assertIn("antiphon_retrieve", text, where)
+            self.assertRegex(text, r"(?i)content-bound", where)
+            self.assertRegex(text, r"(?i)invocation only", where)
+            self.assertRegex(text, r"(?i)never (the |a )?(tool )?result", where)
+            self.assertRegex(text, r"(?i)read-only|cursor-neutral", where)
+            self.assertRegex(text, r"8,?000", where)
+            self.assertIn("antiphon retrieve", text, where)
+            self.assertRegex(text, r"(?i)retention|compact", where)
+            self.assertRegex(text, r"(?i)unavailable", where)
+            self.assertRegex(text, r"(?i)duplicate|two copies", where)
+            self.assertRegex(text, r"(?i)untrusted", where)
+
+    def test_docs_name_the_indexless_diagnostic_trade_and_closed_p0(self):
+        readme = read("README.md")
+        backlog = read("BACKLOG.md")
+        for where, text in (("README", readme), ("BACKLOG", backlog)):
+            self.assertRegex(text, r"(?i)no persistent (invocation )?index", where)
+            self.assertRegex(text, r"(?i)tombstone", where)
+            self.assertRegex(text, r"(?is)changed.{0,80}expired.{0,80}never[- ]existed|"
+                                   r"never[- ]existed.{0,80}changed", where)
+            self.assertRegex(text, r"(?i)earlier-prefix", where)
+            self.assertRegex(text, r"(?i)old id.{0,100}(not|never).{0,40}new|"
+                                   r"changed.{0,100}old id", where)
+        p0 = section(backlog, "P0 — Lossless, paged context transfer")
+        open_phase = capture(
+            r"(?ms)^### Still open, by name\s*$(.*?)(?=^### |\Z)", p0)
+        self.assertNotRegex(open_phase, r"(?i)stable event ids|tool-call retrieval")
+        self.assertRegex(p0, r"(?i)Completed by Wave 1D")
+
+    def test_readme_distinguishes_claude_details_from_codex_name_only_pages(self):
+        limits = section(read("README.md"), "Limits")
+        self.assertIsNotNone(limits)
+        renderer = inspect.getsource(antiphon.claude_events)
+        detail_expression = capture(
+            r'(?s)detail = \((.*?)\)\n\s*events\.append', renderer)
+        self.assertIsNotNone(detail_expression)
+        detail_keys = re.findall(
+            r'arguments\.get\("([^"]+)"\)', detail_expression)
+        self.assertTrue(detail_keys)
+        for key in detail_keys:
+            self.assertIn("`%s`" % key, limits)
+        self.assertRegex(
+            limits,
+            r"(?is)Claude.{0,160}(file_path|command|pattern).{0,240}Codex.{0,80}name-only")
+        self.assertNotRegex(limits, r"(?i)Their arguments are absent")
 
     def test_both_sides_agree_on_the_channel_message_limit(self):
         """The sender refuses before transport and the server refuses on arrival.
@@ -386,7 +454,8 @@ class ShippedContractTest(unittest.TestCase):
         for side in ("claude", "codex"):
             self.assertEqual(antiphon.page_cursor_key(side), side + "_pages")
         self.assertEqual(set(antiphon.REPLAY_NOTICES), {"legacy_upgrade",
-                                                        "cursor_recovery"})
+                                                        "cursor_recovery",
+                                                        "anchor_upgrade"})
         self.assertFalse(hasattr(antiphon, "SUMMARY_BUDGET"),
                          "the summary budget must not survive as an unused "
                          "constant a later reader mistakes for a live setting")
@@ -400,8 +469,8 @@ class ShippedContractTest(unittest.TestCase):
         for what, words in (
                 ("the page target", ("8,000", "UTF-8", "bytes")),
                 ("the page record limit", ("40", "completed", "source", "records")),
-                ("the transcript window",
-                 (str(antiphon.RECENT_FILES), "transcript", "files")),
+                ("the catalog hook batch",
+                 (str(antiphon.CATALOG_BATCH), "candidate", "records", "per", "hook")),
                 ("the direct-channel cap",
                  (str(antiphon.MAX_CHANNEL_BYTES // 1024), "KiB"))):
             self.assertRegex(limits, r"\s+".join(map(re.escape, words)), what)
@@ -498,23 +567,62 @@ class ShippedContractTest(unittest.TestCase):
         self.assertIn("reply_to_codex", antiphon.CLAUDE_RULE)
         self.assertIn("@codex` line is not parked", antiphon.CLAUDE_RULE)
 
+    def test_every_agent_surface_teaches_the_same_multiline_marker_contract(self):
+        channel = re.sub(r'"\s*\+\s*\n\s*"', "", read("lib", "channel.mjs"))
+        surfaces = {
+            "README": read("README.md"),
+            "AGENTS rule": antiphon.AGENTS_RULE,
+            "CLAUDE rule": antiphon.CLAUDE_RULE,
+            "channel instructions": channel,
+        }
+        for where, text in surfaces.items():
+            self.assertIn("<<TOKEN", text, where)
+            self.assertIn("[A-Z][A-Z0-9_]{0,31}", text, where)
+            self.assertRegex(text, r"(?i)exact[^.]*TOKEN[^.]*line[^.]*close", where)
+            self.assertRegex(text, r"(?i)do not nest|not nestable", where)
+            self.assertRegex(text, r"(?i)not[^.]*fence-aware", where)
+            self.assertRegex(text, r"(?i)token absent from the body", where)
+            self.assertRegex(
+                text, r"(?i)malformed or unclosed[^.]*nothing[^.]*turn", where)
+            self.assertRegex(
+                text, r"(?i)literal text beginning with `?<<`?[^.]*block\s+body",
+                where)
+            self.assertRegex(
+                text,
+                r"(?i)oversized[^.]*Stop-marker block[^.]*refused[^.]*not parked",
+                where,
+            )
+        self.assertRegex(surfaces["README"],
+                         r"(?i)direct tools[^.]*long\s+content")
+        self.assertRegex(surfaces["AGENTS rule"],
+                         r"(?i)antiphon_send[^.]*long\s+content")
+        for where in ("CLAUDE rule", "channel instructions"):
+            self.assertRegex(surfaces[where],
+                             r"(?i)reply_to_codex[^.]*long\s+content", where)
+        self.assertIn("@claude[:name]", surfaces["README"])
+        self.assertIn("@codex[:name]", surfaces["README"])
+
     def test_paged_context_surfaces_teach_has_more(self):
         """An agent that has not been told a page is one of several will treat
         the first page as the whole answer. Both the tool description and the
-        agent instructions teach the loop, and both scope `has_more: false` to
-        the sources discovery can currently see — it is not an inventory of
-        project history."""
+        agent instructions teach the loop. A false value proves the durable
+        catalog only when discovery is complete; building or degraded is an
+        explicitly incomplete boundary."""
         tool = next(t for t in antiphon.TOOLS if t["name"] == "antiphon_read")
-        for name, text in (("the antiphon_read description", tool["description"]),
-                           ("AGENTS_RULE", antiphon.AGENTS_RULE)):
+        surfaces = (("the antiphon_read description", tool["description"]),
+                    ("AGENTS_RULE", antiphon.AGENTS_RULE),
+                    ("CLAUDE_RULE", antiphon.CLAUDE_RULE))
+        for name, text in surfaces:
             self.assertIn("has_more", text, name)
             self.assertRegex(text, r"(?i)one page|a single page", name)
-            self.assertRegex(text, r"(?i)discover", name)
-            # Operational, not decorative: the surface must tell the agent what
-            # to DO while has_more is true — call again, or let later turns
-            # drain it. Naming the field without the loop teaches nothing.
-            self.assertRegex(text, r"(?i)again", name)
+            self.assertIn("has_more_scope", text, name)
+            self.assertRegex(text, r"(?i)catalogued project sources", name)
+            self.assertRegex(text, r"(?i)building", name)
+            self.assertRegex(text, r"(?i)degraded", name)
+            self.assertRegex(text, r"(?i)incomplete", name)
             self.assertRegex(text, r"(?i)drain", name)
+        for name, text in surfaces[:2]:
+            self.assertRegex(text, r"(?i)again", name)
         # The replay lifecycle lives on the agent surface too: an agent that
         # sees dozens of duplicate-history pages with no framing will treat
         # recovery as malfunction. Deleting this guidance left every test
@@ -554,9 +662,9 @@ class ShippedContractTest(unittest.TestCase):
         limits = section(read("README.md"), "Limits")
         self.assertIsNotNone(limits, "the README has no Limits section")
         for gap, pattern in (
-                ("compressed tool detail", r"(?i)tool (call|detail)s? (are|remain|stay)[a-z ]*compressed"),
+                ("unavailable tool results", r"(?i)tool results? remain unavailable"),
                 ("backward paging", r"(?i)backward"),
-                ("catalog completeness", r"(?i)newest 3|newest three"),
+                ("catalog failure visibility", r"(?i)building|degraded"),
                 ("host spill contents", r"(?i)verbatim"),
                 ("the replay size", r"69"),
                 ("the replay size, codex side", r"53")):
@@ -571,19 +679,21 @@ class ShippedContractTest(unittest.TestCase):
                          "record atomicity is stated")
         self.assertIn("_pages", limits, "the semantic key is named")
         self.assertIn("_seen", limits, "the preserved legacy key is named")
-        self.assertRegex(limits, r"(?i)exactly\s+two\s+fixed\s+explanation",
+        self.assertRegex(limits, r"(?i)exactly\s+three\s+fixed\s+explanation",
                          "the replay reasons are a closed set, and the README "
                          "says so rather than leaving the set open")
         self.assertRegex(limits, r"(?i)legacy\s+upgrade", "reason one, named")
         self.assertRegex(limits, r"(?i)cursor\s+recovery", "reason two, named")
+        self.assertRegex(limits, r"(?i)anchor\s+(upgrade|adoption)",
+                         "reason three, named")
         self.assertRegex(limits, r"(?i)(malformed|unreadable)[^.]*byte\s+zero",
                          "a malformed existing cursor replays; it is not a "
                          "fresh install")
         self.assertRegex(limits, r"(?i)missing\s+cursor[^.]*new\s+side",
                          "only a genuinely missing cursor means a new side")
-        self.assertRegex(limits, r"(?i)timestamp\s+cursor[^.]*boundary[^.]*gone",
-                         "the retired boundary-migration promise is named as "
-                         "retired")
+        self.assertRegex(limits, r"(?i)(adopt[^.]*valid\s+v3\s+frontier|"
+                                 r"valid\s+v3\s+frontier[^.]*adopt)",
+                         "the v4 migration contract names bounded adoption")
         self.assertNotRegex(antiphon.offset_at_or_after.__doc__,
                             r"(?i)migrat",
                             "the helper's docstring described the rejected "
@@ -593,7 +703,7 @@ class ShippedContractTest(unittest.TestCase):
                          "README says whose files they are")
         backlog = read("BACKLOG.md")
         for gap, pattern in (
-                ("stable event id", r"(?i)stable\s+event\s+id"),
+                ("stable invocation id", r"(?i)stable\s+(event\s+id|tool\s+invocation)"),
                 ("source catalog", r"(?i)source\s+catalog"),
                 ("degraded-discovery marker", r"(?i)degraded-discovery"),
                 ("backward paging", r"(?i)backward\s+paging"),
@@ -610,6 +720,13 @@ class ShippedContractTest(unittest.TestCase):
         self.assertIsNotNone(still_open, "the P0 ledger is gone")
         self.assertNotRegex(still_open, r"(?i)direct-channel\s+spill",
                             "the spill is no longer an open P0 loss")
+        open_phase = capture(
+            r"(?ms)^### Still open, by name\s*$(.*?)(?=^### |\Z)",
+            still_open)
+        self.assertIsNotNone(open_phase, "the open P0 sub-ledger is gone")
+        self.assertNotRegex(open_phase, r"(?i)durable\s+source\s+catalog|"
+                             r"degraded-discovery|descriptor-safe",
+                            "Wave 1A work is recorded as completed, not open")
         self.assertRegex(
             backlog,
             r"## P1 — Large direct-message attachments[^\n]*"
@@ -636,6 +753,66 @@ class ShippedContractTest(unittest.TestCase):
         tarball is a dead end for exactly the readers who installed the way the
         README told them to."""
         self.assertIn("BACKLOG.md", json.loads(read("package.json"))["files"])
+
+    def test_the_operational_ledger_matches_the_candidate_not_a_past_release(self):
+        """Operational prose is itself a diagnostic contract.
+
+        The old ledger simultaneously called delivered work future, gave
+        status a weaker definition than doctor, and narrated a candidate fix
+        as though it were present in published 0.3.3. Pin the distinctions a
+        release reader needs rather than allowing another chronology rewrite.
+        """
+        backlog = read("BACKLOG.md")
+        doctor = section(backlog, "Shipped — `antiphon doctor`")
+        self.assertIsNotNone(doctor)
+        self.assertRegex(doctor, r"(?i)default `antiphon doctor`[^.]*read-only")
+        self.assertRegex(
+            doctor,
+            r"(?i)`antiphon doctor --fix`[^.]*project\s+configuration only")
+        self.assertRegex(
+            doctor,
+            r"(?i)`status`[^.]*same[^.]*content-free[^.]*probe")
+        self.assertNotIn("Doctor is authoritative over `status`", doctor)
+        self.assertRegex(
+            doctor,
+            r"(?is)thread-writer lock.*queue.*read-only.*supported")
+        self.assertRegex(
+            doctor,
+            r"(?is)active Codex reachability.*declined.*bounded.*non-spawning")
+        self.assertNotIn("Whether Codex actually *forwards*", doctor)
+
+        identity = section(
+            backlog,
+            "P0 — A named Claude session can identify itself as `<unnamed>` (fixed)")
+        self.assertIsNotNone(identity)
+        self.assertRegex(identity, r"Published 0\.3\.3 still")
+        self.assertRegex(
+            identity, r"candidate\s+branch[^.]*a4533d1[^.]*6902546")
+        self.assertRegex(identity, r"(?i)doctor[^.]*dead-pid endpoint")
+        self.assertRegex(
+            identity,
+            r"(?is)stdin close.*wrapper-forwarded signals.*fixed.*"
+            r"abrupt.*SIGKILL.*remain")
+
+        source_labels = section(
+            backlog, "P1 — Source-aware multi-peer pull context (fixed)")
+        self.assertIsNotNone(source_labels)
+        self.assertIn("record_claude_session", source_labels)
+        self.assertIn("Labels are per record block", source_labels)
+        self.assertNotIn("there is no Claude-side writer", backlog)
+        self.assertNotIn("read_session` has no production caller", backlog)
+        self.assertNotRegex(
+            backlog,
+            r"(?i)relayed label should carry[^.]*alias[^.]*deferred")
+
+        wrapper = section(backlog, "P1 — Re-run the host wrapper census before release")
+        self.assertIsNotNone(wrapper)
+        self.assertIn("test/host_wrapper_census.py", wrapper)
+        self.assertRegex(wrapper, r"(?i)aggregate counts only")
+        self.assertRegex(wrapper, r"Codex user messages")
+        self.assertNotRegex(wrapper, r"Codex user blocks")
+        self.assertRegex(
+            doctor, r"(?is)default read-only command.*configuration repair")
 
     def test_the_readme_shows_how_to_start_each_kind_of_named_peer(self):
         """Naming is not a flag on a command, it is an environment variable read
@@ -675,6 +852,33 @@ class ShippedContractTest(unittest.TestCase):
                             ("CLAUDE.md rule", antiphon.CLAUDE_RULE)):
             self.assertIn("ANTIPHON_NAME", text, where)
 
+    def test_every_agent_surface_teaches_automatic_identity_limits(self):
+        """Automatic identity is public only after host-specific positive proof;
+        every surface keeps the pre-hook window and privacy boundary honest."""
+        channel = re.sub(r'"\s*\+\s*\n\s*"', "",
+                         read("lib", "channel.mjs"))
+        surfaces = {
+            "README": read("README.md"),
+            "AGENTS rule": antiphon.AGENTS_RULE,
+            "CLAUDE rule": antiphon.CLAUDE_RULE,
+            "channel instructions": channel,
+        }
+        for where, text in surfaces.items():
+            self.assertRegex(text, r"(?i)automatic `auto-` peer alias", where)
+            self.assertRegex(text, r"(?i)at least[^.]*first hook", where)
+            self.assertRegex(text, r"(?i)fixed Claude probe", where)
+            self.assertRegex(text, r"(?i)host display name is ignored", where)
+            # Widened with the privacy sentence: the owner key and socket
+            # route are now named private too, and the surfaces bound by that
+            # promise are named beside it.
+            self.assertRegex(
+                text,
+                r"(?i)identity digest, owner key and socket route stay private",
+                where)
+            self.assertRegex(text, r"(?i)expose only the public alias", where)
+            self.assertIn("ANTIPHON_NAME", text, where)
+            self.assertRegex(text, r"(?i)(two or more|multiple)[^.]*refus", where)
+
     def test_both_generated_rules_keep_the_ambient_pull_apart_from_a_direct_send(self):
         """One is addressed and reaches one peer; the other is project-wide
         awareness that today may merge several transcripts under a generic label. An
@@ -700,3 +904,132 @@ class ShippedContractTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class IdentityPrivacyContractTest(unittest.TestCase):
+    """Every surface that teaches the automatic identity says what stays
+    private, in the same words, so a reader cannot learn a weaker rule from
+    whichever one they happen to open."""
+
+    def test_identity_privacy_every_written_surface_agrees(self):
+        node = read("lib", "channel.mjs")
+        start = node.index("    instructions:")
+        end = node.index("\n  },\n);", start)
+        channel = re.sub(r'"\s*\+\s*\n\s*"', "", node[start:end])
+        surfaces = {
+            "README": read("README.md"),
+            "AGENTS rule": antiphon.AGENTS_RULE,
+            "CLAUDE rule": antiphon.CLAUDE_RULE,
+            "channel instructions": channel,
+        }
+        for where, text in surfaces.items():
+            with self.subTest(surface=where):
+                words = " ".join(text.split())
+                for required in ("identity digest", "owner key",
+                                 "socket route", "public alias"):
+                    self.assertIn(required, words, f"{where}: {required}")
+                self.assertRegex(
+                    words, r"(?i)refusals[^.]*errors|errors[^.]*refusals",
+                    f"{where}: error paths are covered, not only refusals")
+
+    def test_reconnect_notice_every_written_surface_states_the_cost(self):
+        """There is no dynamic rename of a live listener, so a rotation costs a
+        person a reconnect. An agent that reads only "the alias moved" will keep
+        addressing a name nothing answers; the remedy has to travel with it, in
+        the same words `status` and `doctor` use."""
+        node = read("lib", "channel.mjs")
+        start = node.index("    instructions:")
+        end = node.index("\n  },\n);", start)
+        channel = re.sub(r'"\s*\+\s*\n\s*"', "", node[start:end])
+        surfaces = {
+            "README": read("README.md"),
+            "AGENTS rule": antiphon.AGENTS_RULE,
+            "CLAUDE rule": antiphon.CLAUDE_RULE,
+            "channel instructions": channel,
+        }
+        for where, text in surfaces.items():
+            with self.subTest(surface=where):
+                words = " ".join(text.split())
+                self.assertRegex(words, r"(?i)until a fresh endpoint exists",
+                                 f"{where}: the window has a stated end")
+                self.assertRegex(words, r"(?i)reconnect",
+                                 f"{where}: the remedy is named")
+                self.assertRegex(words, r"(?i)counted, never addressed",
+                                 f"{where}: an unprovable owner fails closed")
+
+    def test_proof_lifecycle_backlog_bounds_the_sweep_s_degradation(self):
+        """The sweep swallows a cursor-write failure, which is right — the
+        rotation has already committed and must not fail over housekeeping.
+        But a *persistent* failure silently reduces the guarantee from "the
+        whole inventory in a finite number of writes" to "the first eight
+        records, forever". An unwritten limitation reads as a bug later."""
+        words = " ".join(read("BACKLOG.md").split())
+        self.assertIn("If that cursor can never be written", words)
+        self.assertRegex(words, r"(?i)first eight")
+
+    def test_identity_privacy_backlog_names_what_is_deliberately_not_redacted(self):
+        """A blanket promise would be the wrong one, and an unwritten exception
+        reads as an oversight later. Two shapes stay visible on purpose: an
+        explicitly named peer's socket path, which is what makes `remove it`
+        actionable for the operator who chose that name, and the channel's own
+        readiness line, which is neither a refusal nor an error."""
+        words = " ".join(read("BACKLOG.md").split())
+        self.assertIn("Redaction is scoped, and its two exceptions are "
+                      "deliberate", words)
+        self.assertRegex(words, r"(?i)explicitly named peer keeps its socket "
+                                r"path")
+        self.assertRegex(words, r"(?i)`antiphon channel ready:` line")
+
+    def test_every_node_error_surface_redacts_before_it_truncates(self):
+        """Node prints and returns its own refusals and never crosses back into
+        Python to have them cleaned. Three surfaces carried arbitrary detail —
+        the retrieval bridge's stderr, the reply bridge's stderr, and whatever
+        went wrong on the way to an emission — and two of them cut to 500
+        characters first, which can leave half a session id behind where a
+        whole-shape check finds nothing to remove."""
+        node = read("lib", "channel.mjs")
+        surfaces = [m.start() for m in
+                    re.finditer(r"String\(error\?\.(?:stderr|message)", node)]
+        self.assertGreaterEqual(len(surfaces), 3,
+                                "the error surfaces are still here")
+        for at in surfaces:
+            # `redactPrivate(` wraps the expression, so it precedes it.
+            self.assertIn("redactPrivate", node[max(0, at - 160):at],
+                          "unredacted error surface at "
+                          f"{node[at:at + 70]!r}")
+        # And no surface cuts before it redacts.
+        self.assertNotIn(".trim().slice(0, 500)", node)
+        self.assertNotIn("detail.slice(0, 500)", node)
+
+    def test_identity_proof_has_one_validator_on_each_side(self):
+        """The verdict reads the proof twice — once before it observes the
+        halves, once after, to close the window a rotation can land in. Two
+        readers of one file was already the hazard this whole module exists to
+        manage; two *validators* inside one reader is the same hazard at a
+        smaller scale, and it happened: the second read was parse-plus-session-id
+        while the first was total, so a malformed proof carrying the same
+        session id could authorise a retirement on one side alone.
+        """
+        node = read("lib", "identity.mjs")
+        self.assertEqual(node.count("function readIdentityProof("), 1,
+                         "one validator")
+        # Its definition plus the two call sites.
+        self.assertEqual(node.count("readIdentityProof(projectDir"), 3,
+                         "and both reads go through it")
+        # Nothing may reach the proof file except that validator.
+        self.assertEqual(
+            node.count('".antiphon", "identity", "claude"'), 1,
+            "no second path to the proof file")
+        python = read("lib", "peers.py")
+        self.assertEqual(python.count("def _read_identity_proof_file("), 1)
+        self.assertEqual(python.count("def read_identity_proof("), 1)
+
+    def test_reconnect_notice_backlog_records_the_accepted_cost(self):
+        """A live listener is never renamed, so a rotation costs a person a
+        reconnect. That is a decision with a price, not an oversight, and the
+        ledger has to carry the price beside the decision or the next reader
+        will file it as a bug to fix."""
+        words = " ".join(read("BACKLOG.md").split())
+        self.assertIn("There is no dynamic rename of a live listener", words)
+        self.assertRegex(words, r"(?i)until a fresh endpoint exists")
+        self.assertRegex(words, r"(?i)counted, never addressed")

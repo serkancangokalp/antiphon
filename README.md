@@ -4,7 +4,7 @@
 
 Antiphon doesn't dispatch work. It only carries messages between the sides while preserving whether they came from the human user, from Claude, or from Codex.
 
-With one terminal per side there is nothing to configure beyond `antiphon setup`: peers go unnamed, messages have only one place to go, and the rest of this page is background. Naming becomes necessary the moment a second session opens on either side — see [Many peers](#many-peers).
+With one terminal per side there is nothing to configure beyond `antiphon setup`: Antiphon assigns an automatic alias when it can positively prove the host session, otherwise the peer stays honestly unnamed and the legacy single-peer road remains. With several sessions, address the automatic aliases shown by `status` or set explicit names — see [Many peers](#many-peers).
 
 ## How it works
 
@@ -21,11 +21,10 @@ The other side's recent messages enter your turn's context when you type
 something. Nobody is woken up.
 
 This path is project-wide awareness, not delivery. It is not addressed to
-anyone, and today it can merge activity from several project transcripts under
-one generic `Claude` or `Codex` label — so with several terminals open, one
-agent's words can arrive looking like another's. Source-aware labelling is a
-tracked P1 item in [BACKLOG.md](BACKLOG.md). Until it lands, do not read pull
-context as a private line between two particular peers.
+anyone. When a page interleaves multiple sessions, blocks that can be joined to
+a current named peer carry that peer's label; older, unnamed or unjoinable
+blocks remain honestly unlabelled. Do not read pull context as a private line
+between two particular peers.
 
 ### Push — addressed, live wake
 
@@ -36,6 +35,17 @@ context as a private line between two particular peers.
 
 A line starting with `@codex` or `@claude` in a reply reaches the other
 agent immediately, even if nobody is typing.
+
+A Stop marker can carry a block. Make its one-line message
+`@claude[:name] <<TOKEN` or `@codex[:name] <<TOKEN`, where `TOKEN` matches
+`[A-Z][A-Z0-9_]{0,31}`; put the body on following lines and use an exact
+`TOKEN` line to close it. Blocks do not nest and the closer is not
+Markdown-fence-aware, so choose a token absent from the body. Marker-looking
+lines inside the body are content. A malformed or unclosed block sends nothing
+from that turn. To send literal text beginning with `<<`, put it inside a block
+body. Use the direct tools — `antiphon_send` or `reply_to_codex` — for long
+content: an oversized direct-tool message can be parked as an attachment,
+while an oversized Stop-marker block is refused and not parked.
 
 Every push is addressed to exactly one peer and is never broadcast. When the
 recipient cannot be shown to be the only candidate, the send is refused rather
@@ -52,7 +62,15 @@ line does not send it twice.
 
 A Claude → Codex message reaches Codex tagged either `[Antiphon bridge] Claude:` (pushed from Claude's Stop hook) or `[Antiphon channel] Claude:` (a direct reply sent through the channel, via the `reply_to_codex` tool) — either way, Codex sees these as Claude's words, not the human user's.
 
-The tag is followed by `[from=<alias> id=<uuid>]`, naming which Claude peer spoke so a reply can be addressed back to it. A session started without `ANTIPHON_NAME` shows `from=<unnamed>`: it has no name to be addressed by, and the angle brackets keep that apart from a peer actually called `unnamed`. The id names one delivery attempt — it is not a correlation id, and nothing routes replies by it.
+The tag is followed by `[from=<alias> id=<uuid>]`, naming which Claude peer spoke. A session whose configured identity does not own its return channel instead carries `[from=<alias> reply_to=<unavailable> id=<uuid>]`; that exception is explained below. A session that cannot establish either an explicit or automatic identity shows `from=<unnamed>`: it has no name to be addressed by, and the angle brackets keep that apart from a peer actually called `unnamed`. The id names one delivery attempt — it is not a correlation id, and nothing routes replies by it.
+
+A valid Claude `ANTIPHON_NAME` is the session's configured identity, not proof that its named return channel is reachable. If startup says the channel was not acquired, the name still identifies that session's outgoing words, but the label alone does not establish that a reply will reach the same process. The startup warning exposes a duplicate-name loss; `antiphon doctor` exposes a named listener whose endpoint registration is missing. Restart the Claude session after correcting either fault.
+
+Without `ANTIPHON_NAME`, Antiphon may derive an automatic `auto-` peer alias from a canonical host session UUID. Codex publishes one only after its first hook records that UUID and a writer lock positively proves the session live. Every census remains `at least N` because sessions before their first hook may be invisible. Claude accepts one only from a fixed Claude probe that finds exactly one interactive record with this session's CLI-root pid and exact project cwd; the host display name is ignored, and the Claude hook must join the same endpoint, owner and identity. Probe or hook failure stays `<unnamed>`. `ANTIPHON_NAME` overrides automatic identity. One positively live automatic peer can be addressed by alias and is the only automatic case a bare send may choose; two or more positively live candidates make a bare send refused. Older or mixed-version peers are never guessed into automatic identity. The full host session id, identity digest, owner key and socket route stay private; status, doctor, labels, refusals and errors expose only the public alias and the remedy beside it. After a session rotates to a new host session, its old automatic alias stops resolving at once and its new one is unreachable until a fresh endpoint exists — in practice an MCP reconnect. `status` and `doctor` name the current alias beside that remedy; an identity whose owner cannot be proved live is counted, never addressed.
+
+If a label carries `reply_to=<unavailable>`, do not reply to its `from` alias: that channel belongs to a different session. The sender remains identified, but there is deliberately no routable return alias until its Claude channel is restarted under a unique name.
+
+An `Antiphon delivery notice:` event is a bridge-authored diagnostic: it carries no original message content and does not turn the sender's refusal into delivery. Before that refusal, Antiphon makes one content-free recovery request to the explicitly requested alias's deterministic socket. A current listener can restore its own endpoint; the original words are sent exactly once, and only if the registry resolves again. An old or unverified listener stays refused and may need a restart. Doctor only reports this state; it never performs the recovery. When recovery fails but the socket still answers, the notice names the alias and attempt time while the original send remains refused.
 
 A Codex → Claude message never pastes text into the terminal and never impersonates user input. The local MCP server sends Claude Code a `notifications/claude/channel` event. Its metadata looks like:
 
@@ -60,9 +78,9 @@ A Codex → Claude message never pastes text into the terminal and never imperso
 <channel source="antiphon" sender="codex" sender_kind="agent" sender_alias="build" message_id="...">
 ```
 
-Claude Code's interface shows this as an incoming channel event, and Claude treats the message as the words of the Codex agent, not of the human user. It sends its reply back with the `reply_to_codex` MCP tool, passing `sender_alias` as `to` whenever it is a name rather than the literal `<unnamed>`. A bare reply is refused as soon as any named Codex peer is registered: an unnamed Codex session leaves no registry record, so one visible peer cannot be shown to be the only one running. A `sender_alias` of `<unnamed>` is a peer with no name — it cannot be addressed by name, and a bare reply reaches it only in a project where nothing is registered; passing `<unnamed>` as `to` is the same as leaving it out.
+Claude Code's interface shows this as an incoming channel event, and Claude treats the message as the words of the Codex agent, not of the human user. It sends its reply back with the `reply_to_codex` MCP tool, passing `sender_alias` as `to` whenever it is a name rather than the literal `<unnamed>`. A bare reply works where no Codex peer is registered, or where one positively live automatic peer is the only candidate. It is refused when an explicit named peer or multiple positive candidates are live, because an unnamed Codex session before its first hook cannot be ruled out. A `sender_alias` of `<unnamed>` is a peer with no name — it cannot be addressed by name, and a bare reply reaches it only in the no-registered-peer case; passing `<unnamed>` as `to` is the same as leaving it out.
 
-Nothing pairs peers up. There is no automatic Claude↔Codex partnership, and no reply correlation: a message is routed only by the name written on it.
+Automatic aliases identify individual peers; they do not pair a Claude peer with a Codex peer. There is no automatic Claude↔Codex partnership and no reply correlation: a message is routed only by the alias written on it, except for the explicitly bounded bare-send cases above.
 
 ## Many peers
 
@@ -74,7 +92,11 @@ command:
     ANTIPHON_NAME=build codex
     ANTIPHON_NAME=review codex
 
-Once named, a peer is addressed explicitly — by marker at the start of a line,
+Names must be unique per side within a project. Two Claude sessions configured
+with the same name both identify their own outgoing words by that name, but
+only the one that owns the named channel can receive a reply there.
+
+Once an alias is visible, a peer is addressed explicitly — by marker at the start of a line,
 or by the `to` argument of the tool that sends without ending the turn:
 
 | From | Marker | Tool |
@@ -92,16 +114,16 @@ traces:
 
 - **To Claude.** A bare `@claude` works while exactly one Claude peer is live.
   From the second one on, it is refused and you must name one.
-- **To Codex.** A bare `@codex` is refused as soon as *any* named Codex peer is
-  registered — even if it is the only one you can see. A Codex session started
-  without a name leaves no registry record at all, so a second, unnamed one
-  cannot be ruled out, and the bridge will not guess between a peer it can see
-  and one it cannot.
+- **To Codex.** A bare `@codex` works when no peer is registered (the legacy
+  single-peer road), or when exactly one positively live automatic peer is the
+  only candidate. It is refused when any explicit named Codex peer is live or
+  when two or more positive candidates exist. A session before its first hook
+  may still be invisible, so an explicit peer is never guessed to be alone.
 
-That asymmetry is why **every terminal in a multi-peer project must be named,
-Codex terminals above all**. Mixing named and unnamed sessions is the one
-configuration that can leave a message impossible to answer: the unnamed peer
-is live, it can send, and there is no name to send a reply back to.
+Automatic aliases make multi-peer addressing work without configuration after
+the host proofs arrive. Distinct `ANTIPHON_NAME` values remain the explicit
+override and avoid the first-hook/probe window; a peer whose proof fails stays
+unnamed and cannot be addressed while other candidates are live.
 
 ### Seeing who is live
 
@@ -113,19 +135,30 @@ address to receive on, or `waiting for first turn` before that. Under the list
 it prints the addressing rule that currently applies:
 
 ```
+Codex session census: at least 2 live observed; additional sessions before their first hook may be invisible
+
 Peers:
   Claude ui — ready
   Claude api — ready
   Codex build — ready
-  Codex review — waiting for first turn
+  Codex auto-cwymp7bdr2do3ymgr5kxwv74tq — ready
   → a bare @claude line is refused; address one: @claude:ui, @claude:api
-  → a bare @codex line is refused, because unnamed Codex sessions leave no record; address one: @codex:build, @codex:review
+  → a bare @codex line is refused; address a named peer: @codex:auto-cwymp7bdr2do3ymgr5kxwv74tq, @codex:build
 ```
 
 A peer that is `waiting for first turn` is still a candidate: readiness never
 decides who a message goes to, so it cannot silently hand routing to whichever
-session happened to start first. With nothing registered — the unnamed single
-pair — the block is empty, because there is nobody to choose between.
+session happened to start first. A positively live Codex observation is
+projected read-only as its stable automatic alias; the host UUID and full digest
+remain internal. Every census says `at least N` because additional sessions
+before their first hook may be invisible. One automatic peer is both explicitly
+addressable and reachable by a bare send while it is the only positive
+candidate. Two or more positive candidates make a bare send refused. With no
+peer or live observation, the `Peers:` block is empty while the census still
+says `at least 0`; zero observations never proves that zero sessions exist.
+Stored observations whose writer lock no longer gives positive liveness are
+retained and shown only as a count: a missing or unlocked lock is insufficient
+evidence that the host session is dead.
 
 ## Install
 
@@ -176,6 +209,9 @@ antiphon doctor            # read-only checkup: why is the bridge quiet?
 antiphon summary [side]    # show the context that would be injected
 antiphon setup             # (re)install the project setup
 antiphon catch-up [side]   # skip undelivered history: page cursors jump to the live edge
+antiphon sources scan      # finish or refresh the durable source catalog
+antiphon sources compact   # retire aged gone sources proved consumed by every relevant reader
+antiphon retrieve <id>     # print one complete tool invocation (never its result)
 antiphon --version         # the installed version
 npm test                   # Python unit tests + real MCP protocol test
 test/e2e/fresh-user.sh     # what a new user gets, with the real CLIs (not in npm test)
@@ -185,8 +221,10 @@ test/e2e/fresh-user.sh     # what a new user gets, with the real CLIs (not in np
 After an upgrade the bridge may re-deliver history from the start of every
 transcript it can see, one page per turn, and a new message waits behind all
 of it. `catch-up` pins each side's page cursor at the live edge — the end of
-the last complete record in every discovered transcript — under the same lock
-the readers take, and says how many bytes it abandoned. What it skips is not
+the last complete record in every safely proved catalog source — under the
+same lock the readers take, and says how many bytes it abandoned. Sources that
+cannot be proved are counted and left alone, as are their existing cursor
+entries. What it skips is not
 delivered later; run it when both terminals have already been read by the
 person sitting at them. Unnamed, it moves both sides; a named terminal has its
 own cursor and is told which side to move. `status` shows how far behind each
@@ -203,23 +241,29 @@ them started before its own code last changed (a server loads its code once;
 the hooks reload every turn), the Node and
 Python the bridge actually gets, every file `setup` writes read back
 through the shapes `setup` wrote, the current alias, the registered peers,
-and whether the Claude channel *answers* — a connect and a one-line reply,
+whether the durable source catalog is complete for each reader, and whether
+the Claude channel *answers* — a connect and a one-line reply,
 not a file that exists. `✓` fine, `·` nothing to do here, `✗` broken; only
 a `✗` makes it exit non-zero, so a set-up project with no session running
 exits 0. It never takes a lock, never writes, and never removes the stale
 record it is explaining.
 
-`setup` registers Codex's MCP tools — `antiphon_read` and `antiphon_send`
+`setup` registers Codex's MCP tools — `antiphon_read`, `antiphon_send` and
+`antiphon_retrieve`
 — in this project's `.codex/config.toml`, so there is nothing to add by
 hand. Note the entry
 names `args = ["mcp"]`: the `channel` server is Claude's side and hands out
-`reply_to_codex`. Aiming Codex at it would let Codex publish messages
+`reply_to_codex` plus its own `antiphon_retrieve`. Aiming Codex at it would let
+Codex publish messages
 labelled as Claude's — exactly what this bridge exists to prevent — so
 `setup` rewrites that table whenever it is wrong, leaving the rest of the
 file alone. The same table forwards `ANTIPHON_NAME` into the tool process,
 because Codex does not pass the parent environment through on its own.
 
-Without this entry the pull hook still delivers Claude's context at the start of each Codex turn, but Codex loses both tools: it can no longer check the bridge by hand, nor reach Claude before its turn ends.
+Without this entry the pull hook still delivers Claude's context at the start
+of each Codex turn, but Codex loses all three tools: it can no longer check the
+bridge by hand, retrieve a complete invocation, nor reach Claude before its
+turn ends.
 
 ## Limits
 
@@ -238,12 +282,71 @@ most 40 completed source records — the byte number is measured against the
 installed hosts' injection limits, not a permanent host guarantee. Non-tool
 records are no longer cut or flattened: line structure, indentation, code and
 SQL formatting travel intact, and a record is never split across pages.
+Tool calls appear as compact events with ids. Claude tool entries retain the
+pre-existing selected `file_path`, `command` or `pattern` value as a compact
+detail; the rest of the argument object is absent. Codex tool entries remain
+name-only. Complete invocations require retrieval, and tool results remain
+unavailable. Tool outputs remain filtered while still advancing the safe
+scanned frontier.
+
+#### Tool invocation ids and retrieval
+
+Every compact tool-call entry carries a 22-character opaque, content-bound
+`tc1.<kind>.<digest>` id. Both agents can call
+`antiphon_retrieve(id="<id>")`; the CLI equivalent is `antiphon retrieve <id>`.
+Retrieval returns the complete invocation only, never the tool result: side,
+call type, safe tool name, optional namespace/caller and the complete argument
+value. Claude argument objects keep their JSON types; Codex free-form and
+function arguments remain exact strings rather than being guessed into JSON.
+Source ids, native ids, paths, offsets and generations are not returned.
+
+Retrieval is read-only, write-free and cursor-neutral. It scans every safely
+discovered candidate to avoid accepting the first of two matches, and returns
+one of five honest outcomes: `found`, `invalid-id`, `unavailable`, `ambiguous`
+or `untrusted`. A content-bound id protects an earlier-prefix rewrite: changed
+invocation bytes receive a new id, and the old id never returns the new bytes.
+There is no persistent invocation index or tombstone. Consequently changed,
+expired and never-existed ids cannot be distinguished and all honestly collapse
+to `unavailable`; doctor cannot recover that distinction without the rejected
+persistent prefix/index state.
+
+An MCP retrieval above 8,000 UTF-8 bytes is refused without truncation and
+names `antiphon retrieve <id>`, which prints the full invocation. Host retention
+or `antiphon sources compact` can make an old id unavailable. Two copies of one
+transcript identity inside a host discovery root make retrieval `untrusted`;
+a backup outside those roots does not affect discovery.
 
 A page that leaves work behind says so with a visible `has_more: true` line;
 calling `antiphon_read` again (or simply letting later turns run) drains the
-rest. Either `has_more` value describes only the transcripts discovery can
-currently see — discovery still reads only the newest 3 transcript files per
-side, so `has_more: false` is not an inventory of all project history.
+rest. `has_more_scope: catalogued project sources` names the boundary. A
+`has_more: false` page proves the current durable project catalog is drained
+only when it has no `discovery: building` or `discovery: degraded` line. Either
+marker makes the incomplete discovery boundary explicit instead of allowing a
+newest-file fallback to masquerade as project completeness.
+
+The catalog lives under `.antiphon/sources/` as small state, immutable
+generation manifests and partitioned per-candidate records; it stores paths and
+fingerprints, never transcript content. Each hook records its own current
+source first and inspects at most 8 candidate records per hook. A generation is
+finite (`base`, one reconciliation pass, one delta, then `complete`); later
+changes start a new refresh. `antiphon sources scan` runs the same bounded
+steps explicitly until the catalog is complete, returns nonzero for pending or
+refused work, and never moves a page cursor. State and immutable manifests are
+loaded under a short shared lock; successful state switches reclaim only
+grammar-valid, unreferenced regular manifests. Failed cleanup is retried by the
+next catalog mutation and appears as an aggregate count in `status`, `doctor`
+and the scanner, never as paths or source ids.
+
+Every admitted transcript is opened beneath its host root without following
+symlinks, checked as a regular file, and read for identity, metadata, generation
+and records through that one descriptor. Claude membership comes from the
+selected host project slug; Codex membership requires an exact project path in
+session metadata. The newest 3 files remain only a bounded current-window and
+degraded fallback, not the correctness inventory. A missing path becomes
+`gone` only when every recorded path for that source is missing; whether that
+gap still matters is calculated separately from each reader's own cursor and
+the six-hour lookback. Permissions, unsafe paths, type changes, identity
+collisions and transient I/O stay refused and keep discovery degraded.
 
 One record larger than an ordinary page is handled asymmetrically, from
 measurement rather than preference. Both hosts' automatic prompt hooks save an
@@ -254,30 +357,53 @@ lifecycle. Codex's MCP tool-result surface showed no such verified path, so
 `antiphon_read` refuses that one record instead: nothing is read or marked
 seen, and the next automatic prompt hook delivers it.
 
-Page positions live under an isolated v3 cursor key, `<side>_pages`
-(`claude_pages`, `codex_pages`). The old `<side>_seen` value is
-preserved untouched beside it for still-running pre-upgrade processes and
-rollback — it is never trusted or overwritten by paging code, and it is
-scheduled for
-retirement once pre-v3 processes no longer need it, not a template for
-accumulating keys. Any present legacy value, and equally a malformed or
-unreadable existing cursor file, starts a conservative replay of the currently
-discovered sources from byte zero; only a genuinely missing cursor means a new
-side and keeps the normal six-hour lookback. The old promise that a timestamp
-cursor migrates at its exact boundary is gone: that boundary cannot be trusted
-while an old process may still move it. The replay is bounded but it is not
-small — on the reviewed snapshots it took 69 Claude-source pages and 53
-Codex-source pages, up to that many automatic prompt turns — and every replay
-page carries one of exactly two fixed explanation lines, one for the legacy
-upgrade and one for cursor recovery, until the final successfully persisted
-page clears it, so duplicated history is visible as recovery rather than
-mistaken for a malfunction. A failed delivery leaves the cursor bytes exactly
-as they were.
+Page positions now live under `<side>_pages_v4`, beside the preserved v3 sibling
+`<side>_pages` and legacy `<side>_seen` key. Every sibling's parsed value,
+including unknown fields and JSON types, remains deeply equal for rolling old
+processes and rollback; canonical reserialization may change whitespace or key
+order. V4 never lets a later sibling write move its frozen adoption frontier.
+Each v4 position anchors
+the last complete source record by content. During adoption from a valid v3
+frontier, that last record repeats at most once while the anchor is established;
+an in-place rewrite that keeps inode, length and the first line no longer skips
+silently. A malformed or unreadable existing cursor restarts every discovered
+source from byte zero; only a genuinely missing cursor means a new side and
+keeps the normal six-hour lookback. The measured full recovery was 69
+Claude-source pages and 53 Codex-source pages on the reviewed snapshots. Every
+replay page carries one of exactly three fixed explanation lines — legacy
+upgrade, cursor recovery or anchor adoption — until its corresponding recovery
+finishes. A failed delivery changes neither frontier nor scheduler lane.
 
-What still loses, by name: tool calls remain compressed one-line summaries
-with no stable-id retrieval yet, discovery has no catalog (the newest-3 window
-above), and there is no backward paging into history an older version already
-marked seen. Those are tracked in [BACKLOG.md](BACKLOG.md).
+Live and unknown sources share the active lane. Only a current process
+fingerprint can prove a source dead; missing, legacy or unreadable identity
+evidence stays unknown. When both active and dead backlog exist, delivery
+alternates whole pages after each successful delivery, so live replies are not
+stranded behind dead history and dead history still drains. `status` and
+`doctor` report aggregate live/unknown/dead counts, adoption and the next lane,
+without identities or anchors.
+
+Candidate retirement is separate and explicit. `antiphon sources compact`
+first completes discovery, then retires only a whole aged, gone source that
+every relevant v4 reader proves consumed (or has no entry for after lookback).
+The shared cursor is always relevant; a named cursor is dormant only when its
+current process fingerprint proves its recorded owner dead. Unknown ownership
+stays relevant. The command revalidates every value its decision read —
+including the deeply typed values of the candidate records it would retire —
+under the catalog lock around its atomic state switch. Unrelated record updates
+do not block it. Output reports only aggregate blocker classes and reclaimed
+files/bytes, tells the operator to retry only when a revalidated input snapshot
+changed, and preserves all cursor files. A proof failure that cannot be
+interpreted as a transient change reports that no automatic remedy was
+attempted. A durable prepared/committed journal keeps the old catalog visible
+until post-switch proof succeeds; a crash or failed rollback therefore retries
+or rolls back instead of turning an unproved detached record into deletion proof.
+Hooks never retire candidates; they may only recover a prepared safe view.
+Committed record cleanup remains an explicit `sources compact` operation.
+
+What still loses, by name: tool results remain unavailable, and there is no
+backward paging into history an older version already marked seen. Those are
+tracked in
+[BACKLOG.md](BACKLOG.md).
 
 ### An oversized direct message is parked, never truncated
 

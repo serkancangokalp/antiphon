@@ -11,6 +11,7 @@
     "bin/",
     "lib/antiphon.py",
     "lib/channel.mjs",
+    "lib/identity.mjs",
     "lib/peers.py",
     "README.md",
     "BACKLOG.md",

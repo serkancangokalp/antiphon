@@ -3,7 +3,7 @@ import { createHash } from "node:crypto";
 import { execFileSync, spawn } from "node:child_process";
 import { existsSync, mkdirSync, readdirSync, readFileSync, statSync, symlinkSync, writeFileSync } from "node:fs";
 import { mkdtemp, rm } from "node:fs/promises";
-import { Socket, connect } from "node:net";
+import { Socket, connect, createServer } from "node:net";
 import { once } from "node:events";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -25,6 +25,10 @@ const socketPath = join(process.env.TMPDIR || "/tmp", `antiphon-channel-${projec
 // `ANTIPHON_NAME=ui npm test` is a perfectly reasonable thing to do now.
 const mainEnv = { ...process.env, ANTIPHON_CWD: projectDir };
 delete mainEnv.ANTIPHON_NAME;
+// Every transcript and catalog this integration run discovers stays inside its
+// throwaway project. The real channel process receives this HOME too, so its
+// Python retrieval child and this test name the same isolated source roots.
+mainEnv.HOME = projectDir;
 
 // A `codex` that records instead of queueing. Without it the reply tool can
 // only ever be tested on its failure paths, and the sentence it hands back on
@@ -44,6 +48,11 @@ const queueLog = stub.log;
 mainEnv.PATH = `${stubDir}:${process.env.PATH}`;
 
 const CODEX_SESSION = "1d5a03e0-0548-4339-87c3-45c5dbf7e9d7";
+const AUTO_ALIAS = "auto-yzmcrss6whnnsjxthq2pclz3l4";
+const AUTO_DIGEST = "c65828ca5eb1dad926f33c34f12f3b5fb031dca2f2e33d83dd70aa072a959928";
+const UUID_V7 = "01890f3e-7b5a-7cc2-8f5d-123456789abc";
+const AUTO_V7_ALIAS = "auto-h7n54mu5tb4wpf3g72gggmq5om";
+const AUTO_V7_DIGEST = "3fdbde329d9879679766fe8c63321d733f8abaee51cf9dd450a4b5fc85471986";
 
 function liveCodexPeer(dir, alias, owner, session) {
   const peer = join(dir, ".antiphon", "peers", `codex-${alias}`);
@@ -113,15 +122,125 @@ function socketFor(dir, name) {
   return join(process.env.TMPDIR || "/tmp", `antiphon-channel-${key}.sock`);
 }
 
-function spawnChannel(dir, name) {
-  const env = { ...process.env, ANTIPHON_CWD: dir };
+function spawnChannel(dir, name, extraEnv = {}) {
+  const env = { ...process.env, ...extraEnv, ANTIPHON_CWD: dir };
   if (name) env.ANTIPHON_NAME = name;
   else delete env.ANTIPHON_NAME;
   const child = spawn("node", ["lib/channel.mjs"], { env, stdio: ["pipe", "pipe", "pipe"] });
   let stderr = "";
+  let stdout = "";
   child.stderr.setEncoding("utf8");
   child.stderr.on("data", (chunk) => { stderr += chunk; });
-  return { child, socketPath: socketFor(dir, name), stderr: () => stderr };
+  child.stdout.setEncoding("utf8");
+  child.stdout.on("data", (chunk) => { stdout += chunk; });
+  return {
+    child,
+    socketPath: socketFor(dir, name),
+    stderr: () => stderr,
+    stdout: () => stdout,
+  };
+}
+
+async function makeDelayedRegistryPython() {
+  const dir = await mkdtemp(join(tmpdir(), "antiphon-python-"));
+  const armed = join(dir, "armed");
+  const registerStarted = join(dir, "register-started");
+  const registerFinished = join(dir, "register-finished");
+  const releaseRegister = join(dir, "release-register");
+  const unregisterArmed = join(dir, "unregister-armed");
+  const unregisterStarted = join(dir, "unregister-started");
+  const releaseUnregister = join(dir, "release-unregister");
+  const realPython = execFileSync("python3", [
+    "-c", "import sys; print(sys.executable)",
+  ], { encoding: "utf8" }).trim();
+  writeFileSync(join(dir, "python3"), `#!${realPython}
+import os
+import subprocess
+import sys
+import time
+
+command = sys.argv[2] if len(sys.argv) > 2 else ""
+armed = os.environ["ANTIPHON_TEST_REGISTER_ARMED"]
+register_started = os.environ["ANTIPHON_TEST_REGISTER_STARTED"]
+register_finished = os.environ["ANTIPHON_TEST_REGISTER_FINISHED"]
+release_register = os.environ["ANTIPHON_TEST_REGISTER_RELEASE"]
+unregister_started = os.environ["ANTIPHON_TEST_UNREGISTER_STARTED"]
+unregister_armed = os.environ["ANTIPHON_TEST_UNREGISTER_ARMED"]
+release_unregister = os.environ["ANTIPHON_TEST_UNREGISTER_RELEASE"]
+real_python = os.environ["ANTIPHON_TEST_REAL_PYTHON"]
+
+if command == "register_peer" and os.path.exists(armed):
+    open(register_started, "w").close()
+    while not os.path.exists(release_register):
+        time.sleep(0.01)
+
+if command == "unregister_peer":
+    open(unregister_started, "w").close()
+    while os.path.exists(unregister_armed) and not os.path.exists(release_unregister):
+        time.sleep(0.01)
+    result = subprocess.run([real_python, *sys.argv[1:]])
+    raise SystemExit(result.returncode)
+
+if command == "register_peer":
+    result = subprocess.run([real_python, *sys.argv[1:]])
+    open(register_finished, "w").close()
+    raise SystemExit(result.returncode)
+
+os.execv(real_python, [real_python, *sys.argv[1:]])
+`, { mode: 0o755 });
+  return {
+    dir,
+    armed,
+    registerStarted,
+    registerFinished,
+    releaseRegister,
+    unregisterArmed,
+    unregisterStarted,
+    releaseUnregister,
+    env: {
+      PATH: `${dir}:${process.env.PATH}`,
+      ANTIPHON_TEST_REGISTER_ARMED: armed,
+      ANTIPHON_TEST_REGISTER_STARTED: registerStarted,
+      ANTIPHON_TEST_REGISTER_FINISHED: registerFinished,
+      ANTIPHON_TEST_REGISTER_RELEASE: releaseRegister,
+      ANTIPHON_TEST_UNREGISTER_ARMED: unregisterArmed,
+      ANTIPHON_TEST_UNREGISTER_STARTED: unregisterStarted,
+      ANTIPHON_TEST_UNREGISTER_RELEASE: releaseUnregister,
+      ANTIPHON_TEST_REAL_PYTHON: realPython,
+    },
+  };
+}
+
+async function makeAutomaticIdentityPython(identity) {
+  const dir = await mkdtemp(join(tmpdir(), "antiphon-identity-python-"));
+  const calls = join(dir, "calls.txt");
+  const realPython = execFileSync("python3", [
+    "-c", "import sys; print(sys.executable)",
+  ], { encoding: "utf8" }).trim();
+  writeFileSync(join(dir, "python3"), `#!${realPython}
+import os
+import sys
+
+command = sys.argv[2] if len(sys.argv) > 2 else ""
+if command == "claude_identity":
+    with open(os.environ["ANTIPHON_TEST_IDENTITY_CALLS"], "a") as stream:
+        stream.write(command + "\\n")
+    print(os.environ["ANTIPHON_TEST_IDENTITY_RESULT"])
+    raise SystemExit(0)
+
+real_python = os.environ["ANTIPHON_TEST_REAL_PYTHON"]
+os.execv(real_python, [real_python, *sys.argv[1:]])
+`, { mode: 0o755 });
+  return {
+    dir,
+    calls,
+    env: {
+      PATH: `${dir}:${process.env.PATH}`,
+      ANTIPHON_TEST_IDENTITY_CALLS: calls,
+      ANTIPHON_TEST_IDENTITY_RESULT: JSON.stringify(identity),
+      ANTIPHON_TEST_REAL_PYTHON: realPython,
+    },
+  };
 }
 
 // Every test removes exactly the socket it created and nothing else. Killing
@@ -148,6 +267,31 @@ async function cleanUp(session, dir) {
   }
   await rm(session.socketPath, { force: true });
   await rm(dir, { recursive: true, force: true });
+}
+
+async function invalidConfiguredNamesAreNotEchoed() {
+  const variants = [
+    CODEX_SESSION.toUpperCase(),
+    `{${CODEX_SESSION}}`,
+    `urn:uuid:${CODEX_SESSION}`,
+    `uuid:${CODEX_SESSION}`,
+    `<${CODEX_SESSION}>`,
+    `${CODEX_SESSION}.`,
+  ];
+  for (const supplied of variants) {
+    const dir = await mkdtemp(join(tmpdir(), "antiphon-uuid-name-"));
+    const session = spawnChannel(dir, supplied);
+    try {
+      assert.ok(await waitFor(() => /not a usable peer name/.test(session.stderr())),
+        session.stderr());
+      assert.match(session.stderr(), /ANTIPHON_NAME/,
+        "the refusal names the invalid setting without reproducing its value");
+      assert.ok(!session.stderr().toLowerCase().includes(CODEX_SESSION),
+        `the configured host id must stay private: ${session.stderr()}`);
+    } finally {
+      await cleanUp(session, dir);
+    }
+  }
 }
 
 async function waitFor(predicate, timeoutMs = 5_000) {
@@ -185,6 +329,467 @@ function registeredPeers(dir) {
     .map((entry) => join(root, entry, "endpoint.json"))
     .filter((path) => existsSync(path))
     .map((path) => JSON.parse(readFileSync(path, "utf8")));
+}
+
+function endpointFor(dir, name) {
+  return join(dir, ".antiphon", "peers", `claude-${name}`, "endpoint.json");
+}
+
+async function anAutomaticClaudeIdentityRequiresTheHookJoinBeforeSigning() {
+  const dir = await mkdtemp(join(tmpdir(), "antiphon-auto-claude-"));
+  const probe = await makeAutomaticIdentityPython({
+    alias: AUTO_ALIAS,
+    identity_digest: AUTO_DIGEST,
+  });
+  const stub = await makeCodexStub();
+  const socket = socketFor(dir, AUTO_ALIAS);
+  const env = { ...process.env, ...probe.env, ANTIPHON_CWD: dir };
+  env.PATH = `${probe.dir}:${stub.dir}:${process.env.PATH}`;
+  delete env.ANTIPHON_NAME;
+  const transport = new StdioClientTransport({
+    command: "node", args: ["lib/channel.mjs"], env, stderr: "pipe",
+  });
+  const client = new Client({ name: "antiphon-auto-identity", version: "1.0.0" });
+  try {
+    liveCodexPeer(dir, "build", "300:build", CODEX_SESSION);
+    await client.connect(transport);
+    assert.ok(await waitFor(() => existsSync(endpointFor(dir, AUTO_ALIAS))),
+      "the verified probe did not create the automatic Claude endpoint");
+    const endpoint = JSON.parse(readFileSync(endpointFor(dir, AUTO_ALIAS), "utf8"));
+    assert.ok(await waitFor(() => existsSync(socket)),
+      `the automatic alias must select its named socket; endpoint=${JSON.stringify(endpoint)}`);
+
+    assert.equal(endpoint.name, AUTO_ALIAS);
+    assert.equal(endpoint.automatic, true);
+    assert.equal(endpoint.identity_digest, AUTO_DIGEST);
+    assert.ok(!JSON.stringify(endpoint).includes(CODEX_SESSION),
+      "the public registry record must not contain the host session id");
+    assert.equal(readFileSync(probe.calls, "utf8").trim(), "claude_identity",
+      "an unnamed channel asks the fixed Python identity probe exactly once");
+
+    await client.callTool({
+      name: "reply_to_codex", arguments: { text: "before hook", to: "build" },
+    });
+    let queued = readFileSync(stub.log, "utf8");
+    assert.match(queued, /\[from=<unnamed> id=/,
+      "a probe alone cannot authenticate an outgoing automatic identity");
+    assert.ok(!queued.includes(AUTO_ALIAS),
+      "the automatic alias stays private until the hook joins the same endpoint");
+
+    // The real hook writes both halves: the session record and the
+    // owner-current proof, in that one turn. A fixture that wrote only the
+    // session half would be simulating a hook that no longer exists.
+    writeFileSync(join(dir, ".antiphon", "peers", `claude-${AUTO_ALIAS}`, "session.json"),
+      JSON.stringify({
+        kind: "claude",
+        name: AUTO_ALIAS,
+        owner: endpoint.owner,
+        session_id: CODEX_SESSION,
+        automatic: true,
+        identity_digest: AUTO_DIGEST,
+      }));
+    const currentOwnerDigest = createHash("sha256")
+      .update(endpoint.owner).digest("hex");
+    mkdirSync(join(dir, ".antiphon", "identity", "claude"), { recursive: true });
+    writeFileSync(
+      join(dir, ".antiphon", "identity", "claude", `${currentOwnerDigest}.json`),
+      JSON.stringify({
+        version: 1, kind: "claude", owner_key: endpoint.owner,
+        owner_digest: currentOwnerDigest, session_id: CODEX_SESSION,
+        identity_digest: AUTO_DIGEST,
+      }));
+    await client.callTool({
+      name: "reply_to_codex", arguments: { text: "after hook", to: "build" },
+    });
+    queued = readFileSync(stub.log, "utf8");
+    assert.match(queued, new RegExp(`\\[from=${AUTO_ALIAS} id=`),
+      "the matching hook record authenticates the automatic sender alias");
+    const labels = queued.match(/\[from=[^\]]+ id=[^\]]+\]/g)?.join("\n") || "";
+    assert.ok(!labels.includes(CODEX_SESSION),
+      "the host session id never crosses in the message label");
+
+    // --- Task 6b: signing_identity ---------------------------------------
+    // Routing already refuses a rotated alias. Signing must refuse it too, or
+    // the old listener keeps announcing an identity that is no longer its own.
+    const ownerDigest = currentOwnerDigest;
+    const otherSession = "0199a1b2-2222-7000-8000-00000000000b";
+    const otherDigest = createHash("sha256")
+      .update(otherSession).digest("hex");
+    mkdirSync(join(dir, ".antiphon", "identity", "claude"), { recursive: true });
+    writeFileSync(
+      join(dir, ".antiphon", "identity", "claude", `${ownerDigest}.json`),
+      JSON.stringify({
+        version: 1, kind: "claude", owner_key: endpoint.owner,
+        owner_digest: ownerDigest, session_id: otherSession,
+        identity_digest: otherDigest,
+      }));
+    const before = readFileSync(stub.log, "utf8").length;
+    await client.callTool({
+      name: "reply_to_codex",
+      arguments: { text: "signing_identity after rotation", to: "build" },
+    });
+    const after = readFileSync(stub.log, "utf8").slice(before);
+    assert.ok(!after.includes(AUTO_ALIAS),
+      "signing_identity: a rotated proof must stop this listener signing as "
+      + "the alias it no longer owns");
+    assert.match(after, /\[from=<unnamed> id=/,
+      "signing_identity: unreachable and unnamed, not silently still itself");
+    assert.ok(!labels.includes(AUTO_DIGEST),
+      "the private digest never crosses in the message label");
+    console.log("automatic Claude identity waits for the hook join: ok");
+  } finally {
+    await client.close().catch(() => {});
+    await rm(socket, { force: true }).catch(() => {});
+    for (const path of [dir, probe.dir, stub.dir]) {
+      await rm(path, { recursive: true, force: true }).catch(() => {});
+    }
+  }
+}
+
+async function explicitAndUnverifiedClaudeIdentitiesStayConservative() {
+  const explicitDir = await mkdtemp(join(tmpdir(), "antiphon-explicit-claude-"));
+  const explicitProbe = await makeAutomaticIdentityPython({
+    alias: AUTO_ALIAS,
+    identity_digest: AUTO_DIGEST,
+  });
+  const explicit = spawnChannel(explicitDir, "ui", explicitProbe.env);
+  try {
+    assert.ok(await waitFor(() => existsSync(endpointFor(explicitDir, "ui"))),
+      `the explicit peer never registered: ${explicit.stderr()}`);
+    assert.ok(!existsSync(explicitProbe.calls),
+      "ANTIPHON_NAME is an override, so an explicit peer never runs the auto probe");
+  } finally {
+    await cleanUp(explicit, explicitDir);
+    await rm(explicitProbe.dir, { recursive: true, force: true });
+  }
+
+  const rejectedDir = await mkdtemp(join(tmpdir(), "antiphon-rejected-auto-"));
+  const rejectedProbe = await makeAutomaticIdentityPython({
+    alias: "auto-aaaaaaaaaaaaaaaaaaaaaaaaaa",
+    identity_digest: AUTO_DIGEST,
+  });
+  const rejected = spawnChannel(rejectedDir, "", rejectedProbe.env);
+  try {
+    assert.ok(await waitFor(() => registeredPeers(rejectedDir).length === 1),
+      `the conservative unnamed peer never registered: ${rejected.stderr()}`);
+    assert.deepEqual(registeredPeers(rejectedDir).map((peer) => peer.name), ["<unnamed>"],
+      "an alias that does not derive from its digest is never published");
+    assert.ok(await waitFor(() => existsSync(socketFor(rejectedDir, ""))),
+      "a rejected probe keeps the legacy unnamed socket");
+    assert.ok(!rejected.stderr().includes(AUTO_DIGEST),
+      "a rejected private digest is not echoed in diagnostics");
+  } finally {
+    await cleanUp(rejected, rejectedDir);
+    await rm(rejectedProbe.dir, { recursive: true, force: true });
+  }
+  console.log("explicit and unverified Claude identities stay conservative: ok");
+}
+
+async function automaticClaudeIdentityAcceptsTheCanonicalUuidGrammar() {
+  const dir = await mkdtemp(join(tmpdir(), "antiphon-auto-v7-"));
+  const probe = await makeAutomaticIdentityPython({
+    alias: AUTO_V7_ALIAS,
+    identity_digest: AUTO_V7_DIGEST,
+  });
+  const stub = await makeCodexStub();
+  const socket = socketFor(dir, AUTO_V7_ALIAS);
+  const env = { ...process.env, ...probe.env, ANTIPHON_CWD: dir };
+  env.PATH = `${probe.dir}:${stub.dir}:${process.env.PATH}`;
+  delete env.ANTIPHON_NAME;
+  const transport = new StdioClientTransport({
+    command: "node", args: ["lib/channel.mjs"], env, stderr: "pipe",
+  });
+  const client = new Client({ name: "antiphon-auto-v7", version: "1.0.0" });
+  try {
+    liveCodexPeer(dir, "build", "300:build", CODEX_SESSION);
+    await client.connect(transport);
+    assert.ok(await waitFor(() => existsSync(endpointFor(dir, AUTO_V7_ALIAS))),
+      "the canonical v7 identity did not create an endpoint");
+    const endpoint = JSON.parse(readFileSync(endpointFor(dir, AUTO_V7_ALIAS), "utf8"));
+    writeFileSync(join(dir, ".antiphon", "peers", `claude-${AUTO_V7_ALIAS}`, "session.json"),
+      JSON.stringify({
+        kind: "claude", name: AUTO_V7_ALIAS, owner: endpoint.owner,
+        session_id: UUID_V7, automatic: true, identity_digest: AUTO_V7_DIGEST,
+      }));
+    // Both halves, as the real hook writes them in one turn.
+    const v7OwnerDigest = createHash("sha256")
+      .update(endpoint.owner).digest("hex");
+    mkdirSync(join(dir, ".antiphon", "identity", "claude"), { recursive: true });
+    writeFileSync(
+      join(dir, ".antiphon", "identity", "claude", `${v7OwnerDigest}.json`),
+      JSON.stringify({
+        version: 1, kind: "claude", owner_key: endpoint.owner,
+        owner_digest: v7OwnerDigest, session_id: UUID_V7,
+        identity_digest: AUTO_V7_DIGEST,
+      }));
+    await client.callTool({
+      name: "reply_to_codex", arguments: { text: "from v7", to: "build" },
+    });
+    assert.match(readFileSync(stub.log, "utf8"),
+      new RegExp(`\\[from=${AUTO_V7_ALIAS} id=`),
+      "Node must accept every canonical UUID shape accepted by the registry");
+    console.log("automatic Claude identity accepts the canonical UUID grammar: ok");
+  } finally {
+    await client.close().catch(() => {});
+    await rm(socket, { force: true }).catch(() => {});
+    for (const path of [dir, probe.dir, stub.dir]) {
+      await rm(path, { recursive: true, force: true }).catch(() => {});
+    }
+  }
+}
+
+async function aLiveListenerReassertsItsOwnMissingEndpoint() {
+  // The durable outage: the process and named socket are both alive, but a
+  // reader rendered its process birth in another timezone and pruned the
+  // endpoint. Only the process actually serving the socket may restore it.
+  const dir = await mkdtemp(join(tmpdir(), "antiphon-reassert-"));
+  const session = spawnChannel(dir, "ui");
+  try {
+    assert.ok(await waitFor(() => registeredPeers(dir).length === 1),
+      `listener never registered: ${session.stderr()}`);
+    assert.ok(await waitFor(() => existsSync(session.socketPath)),
+      `listener registered before its socket was ready: ${session.stderr()}`);
+    const endpoint = endpointFor(dir, "ui");
+    await rm(endpoint, { force: true });
+    assert.deepEqual(registeredPeers(dir), [], "fixture must reproduce no endpoint");
+
+    const wrong = JSON.parse(await sendTo(session.socketPath, JSON.stringify({
+      control: "antiphon.channel",
+      version: 1,
+      action: "reassert",
+      alias: "api",
+      nonce: "wrong-alias",
+    })));
+    assert.equal(wrong.ok, false);
+    assert.deepEqual(registeredPeers(dir), [],
+      "a request for another alias must write nothing");
+
+    const nonce = "reassert-own-endpoint";
+    const reply = JSON.parse(await sendTo(session.socketPath, JSON.stringify({
+      control: "antiphon.channel",
+      version: 1,
+      action: "reassert",
+      alias: "ui",
+      nonce,
+    })));
+    assert.deepEqual(reply, {
+      ok: true,
+      control: "antiphon.channel",
+      version: 1,
+      action: "reasserted",
+      alias: "ui",
+      nonce,
+      pid: session.child.pid,
+    });
+    assert.ok(await waitFor(() => registeredPeers(dir).length === 1),
+      `listener did not restore its endpoint: ${session.stderr()}`);
+    const [restored] = registeredPeers(dir);
+    assert.equal(restored.pid, session.child.pid,
+      "the caller must never register another process on its behalf");
+    assert.equal(restored.address, session.socketPath);
+    assert.ok(!session.stdout().includes("notifications/claude/channel"),
+      "a control request must never become a Claude channel notification");
+    console.log("a live listener reasserts its own endpoint: ok");
+  } finally {
+    await cleanUp(session, dir);
+  }
+}
+
+async function aStartupClaimCannotOutliveSignalShutdown() {
+  const dir = await mkdtemp(join(tmpdir(), "antiphon-claim-signal-"));
+  const delayed = await makeDelayedRegistryPython();
+  writeFileSync(delayed.armed, "");
+  const session = spawnChannel(dir, "ui", delayed.env);
+  let stale = false;
+  try {
+    assert.ok(await waitFor(() => existsSync(delayed.registerStarted)),
+      `startup never entered register_peer: ${session.stderr()}`);
+
+    session.child.kill("SIGTERM");
+    // The broken implementation starts unregister_peer beside the blocked
+    // registration. The corrected implementation deliberately does not, so
+    // this bounded wait is only a deterministic observation window before the
+    // test lets the registration finish.
+    await waitFor(() => existsSync(delayed.unregisterStarted), 2_000);
+    writeFileSync(delayed.releaseRegister, "");
+
+    assert.ok(await waitFor(() => existsSync(delayed.registerFinished)),
+      "the delayed startup registration never finished");
+    assert.ok(await waitForExit(session.child, 5_000),
+      "shutdown did not finish after startup registration was released");
+    stale = registeredPeers(dir).length !== 0;
+    return stale;
+  } finally {
+    writeFileSync(delayed.releaseRegister, "");
+    await cleanUp(session, dir);
+    await rm(delayed.dir, { recursive: true, force: true });
+  }
+}
+
+async function aCompletedClaimCannotBindAfterSignalShutdown() {
+  const dir = await mkdtemp(join(tmpdir(), "antiphon-bind-signal-"));
+  const delayed = await makeDelayedRegistryPython();
+  const gateEntered = join(delayed.dir, "socket-gate-entered");
+  const releaseGate = join(delayed.dir, "release-socket-gate");
+  writeFileSync(delayed.unregisterArmed, "");
+  const session = spawnChannel(dir, "ui", {
+    ...delayed.env,
+    NODE_ENV: "test",
+    ANTIPHON_TEST_SOCKET_GATE: "after-claim",
+    ANTIPHON_TEST_SOCKET_GATE_ENTERED: gateEntered,
+    ANTIPHON_TEST_SOCKET_GATE_RELEASE: releaseGate,
+  });
+  let stale = false;
+  try {
+    assert.ok(await waitFor(() => existsSync(gateEntered)
+      && registeredPeers(dir).length === 1),
+    `claim did not finish before the socket gate: ${session.stderr()}`);
+    assert.ok(!existsSync(session.socketPath),
+      "the fixture must stop after claim and before bind");
+
+    session.child.kill("SIGTERM");
+    // In the broken order shutdown reaches unregister while startup is still
+    // held before bind. In the corrected order it waits for startup first.
+    const unregisterStartedBeforeGate = await waitFor(
+      () => existsSync(delayed.unregisterStarted), 2_000);
+    writeFileSync(releaseGate, "");
+    if (unregisterStartedBeforeGate) {
+      assert.ok(await waitFor(() => existsSync(session.socketPath)),
+        "the regression fixture did not expose the post-cleanup bind");
+    } else {
+      assert.ok(await waitFor(() => existsSync(delayed.unregisterStarted)),
+        "shutdown did not reach its final unregister after startup settled");
+      assert.ok(!existsSync(session.socketPath),
+        "startup must not bind after shutdown begins");
+    }
+    writeFileSync(delayed.releaseUnregister, "");
+
+    assert.ok(await waitForExit(session.child, 5_000),
+      "shutdown did not finish after unregister was released");
+    stale = existsSync(session.socketPath) || registeredPeers(dir).length !== 0;
+    return stale;
+  } finally {
+    writeFileSync(releaseGate, "");
+    writeFileSync(delayed.releaseUnregister, "");
+    await cleanUp(session, dir);
+    await rm(delayed.dir, { recursive: true, force: true });
+  }
+}
+
+async function aControlClaimCannotOutliveEofShutdown() {
+  const dir = await mkdtemp(join(tmpdir(), "antiphon-claim-eof-"));
+  const delayed = await makeDelayedRegistryPython();
+  const session = spawnChannel(dir, "ui", delayed.env);
+  let stale = false;
+  try {
+    assert.ok(await waitFor(() => registeredPeers(dir).length === 1
+      && existsSync(delayed.registerFinished)
+      && existsSync(session.socketPath)),
+    `listener never completed startup: ${session.stderr()}`);
+    await rm(endpointFor(dir, "ui"), { force: true });
+    await rm(delayed.registerStarted, { force: true });
+    await rm(delayed.registerFinished, { force: true });
+    writeFileSync(delayed.armed, "");
+
+    const reply = sendTo(session.socketPath, JSON.stringify({
+      control: "antiphon.channel",
+      version: 1,
+      action: "reassert",
+      alias: "ui",
+      nonce: "shutdown-during-reassert",
+    }));
+    assert.ok(await waitFor(() => existsSync(delayed.registerStarted)),
+      `control request never entered register_peer; stderr=${session.stderr()} ` +
+      `exit=${session.child.exitCode}/${session.child.signalCode} ` +
+      `socket=${existsSync(session.socketPath)}`);
+
+    session.child.stdin.end();
+    await waitFor(() => existsSync(delayed.unregisterStarted), 2_000);
+    writeFileSync(delayed.releaseRegister, "");
+
+    assert.ok(await waitFor(() => existsSync(delayed.registerFinished)),
+      "the delayed control registration never finished");
+    assert.ok(await waitForExit(session.child, 5_000),
+      "EOF shutdown did not finish after control registration was released");
+    await reply;
+    stale = registeredPeers(dir).length !== 0;
+    return stale;
+  } finally {
+    writeFileSync(delayed.releaseRegister, "");
+    await cleanUp(session, dir);
+    await rm(delayed.dir, { recursive: true, force: true });
+  }
+}
+
+async function anArbitrarySocketBinderIsNotAdopted() {
+  const dir = await mkdtemp(join(tmpdir(), "antiphon-binder-"));
+  const path = socketFor(dir, "ui");
+  let received = "";
+  const binder = createServer({ allowHalfOpen: true }, (socket) => {
+    socket.on("error", () => {});
+    socket.setEncoding("utf8");
+    socket.on("data", (chunk) => { received += chunk; });
+    socket.on("end", () => socket.end(JSON.stringify({ ok: true })));
+  });
+  await new Promise((resolve, reject) => {
+    binder.once("error", reject);
+    binder.listen(path, resolve);
+  });
+  const session = spawnChannel(dir, "ui");
+  try {
+    assert.ok(await waitFor(() => /did not prove/.test(session.stderr())),
+      `the occupied path was not diagnosed: ${session.stderr()}`);
+    assert.deepEqual(registeredPeers(dir), [],
+      "generic JSON from a socket holder is not an endpoint claim");
+    const request = JSON.parse(received);
+    assert.equal(request.control, "antiphon.channel");
+    assert.equal(request.action, "reassert");
+    assert.equal(request.alias, "ui");
+    assert.ok(!Object.hasOwn(request, "content"),
+      "even an unverified listener learns no attempted message content");
+    console.log("an arbitrary socket binder is not adopted: ok");
+  } finally {
+    await new Promise((resolve) => binder.close(resolve));
+    await cleanUp(session, dir);
+  }
+}
+
+async function aReconnectRepairsTheLiveListenersMissingRecord() {
+  // This is the persistent production chain, not only the control primitive:
+  // a second MCP server starts while the first still owns the named socket but
+  // its endpoint has been pruned. The second must ask the first to advertise
+  // itself, never leave the project in the same invisible state again.
+  const dir = await mkdtemp(join(tmpdir(), "antiphon-reconnect-"));
+  const first = spawnChannel(dir, "ui");
+  let second;
+  try {
+    assert.ok(await waitFor(() => registeredPeers(dir).length === 1
+      && existsSync(first.socketPath)),
+      `first listener never registered: ${first.stderr()}`);
+    await rm(endpointFor(dir, "ui"), { force: true });
+    assert.deepEqual(registeredPeers(dir), []);
+
+    second = spawnChannel(dir, "ui");
+    assert.ok(await waitFor(() => registeredPeers(dir).length === 1
+      && /reasserted its endpoint/.test(second.stderr())),
+      `reconnect did not repair the first listener:\n${first.stderr()}\n${second.stderr()}`);
+    const [restored] = registeredPeers(dir);
+    assert.equal(restored.pid, first.child.pid,
+      "the process holding the socket must remain the registered peer");
+    assert.notEqual(restored.pid, second.child.pid,
+      "the reconnect must not advertise itself over somebody else's socket");
+    assert.ok(existsSync(first.socketPath));
+
+    second.child.kill("SIGTERM");
+    await once(second.child, "exit");
+    assert.equal(registeredPeers(dir)[0].pid, first.child.pid,
+      "the reconnect's shutdown must not release the listener's restored claim");
+    assert.ok(existsSync(first.socketPath));
+    console.log("a reconnect repairs the live listener's missing record: ok");
+  } finally {
+    await cleanUp(first, dir);
+    if (second) await cleanUp(second, dir);
+  }
 }
 
 // Four sessions, four real process trees, nothing planted. Every earlier test
@@ -378,11 +983,12 @@ async function fourLiveSessionsRouteByName() {
   }
 }
 
-async function onlyTheSessionThatWonTheNameSignsItsMessages() {
-  // Two sessions started as `ui`; exactly one wins the registry. The winner
-  // must sign its messages `ui` and the loser must not, because a reply
-  // addressed to `ui` reaches the winner — and a message the loser signed `ui`
-  // would send that reply to a session that never spoke.
+async function everySessionSignsTheValidNameItWasGiven() {
+  // Two sessions started as `ui`; exactly one wins the registry and owns the
+  // channel. That decides reachability, not identity: both sessions were
+  // explicitly named `ui`, so both must sign their own words `ui`. The losing
+  // session is warned that it cannot receive there; silently renaming its words
+  // `<unnamed>` would describe a configuration it does not have.
   //
   // Both branches, in one real race, through two live MCP clients. With only
   // the loser exercised, deleting the success assignment outright changed no
@@ -432,20 +1038,23 @@ async function onlyTheSessionThatWonTheNameSignsItsMessages() {
       arguments: { text: "from the loser", to: "build" },
     });
 
-    assert.match(readFileSync(stubs[0].log, "utf8"), /\[from=ui id=/,
-      "the session that holds `ui` must sign itself `ui`");
+    const winnerQueue = readFileSync(stubs[0].log, "utf8");
+    assert.match(winnerQueue, /\[from=ui id=/,
+      "the session that holds `ui` signs itself `ui`");
+    assert.ok(!winnerQueue.includes("reply_to=<unavailable>"),
+      `the channel owner must remain addressable: ${winnerQueue}`);
     const loserQueue = readFileSync(stubs[1].log, "utf8");
-    assert.match(loserQueue, /\[from=<unnamed> id=/,
-      "and the session that does not hold it must not");
-    assert.ok(!loserQueue.includes("[from=ui "),
-      `the loser signed itself with a name it does not hold: ${loserQueue}`);
+    assert.match(loserQueue, /\[from=ui reply_to=<unavailable> id=/,
+      "the loser keeps its identity but exposes no route to the winner's channel");
+    assert.ok(!loserQueue.includes("[from=<unnamed> "),
+      `a named session silently denied its own identity: ${loserQueue}`);
 
     await clients.pop().close();      // the loser leaves
     const held = registeredPeers(dir).filter((peer) => peer.name === "ui");
     assert.equal(held.length, 1, "the winner's record survives the loser's exit");
     assert.equal(held[0].address, sockets[0]);
     assert.ok(existsSync(sockets[0]), "and its socket still serves");
-    console.log("only the winner signs its name: ok");
+    console.log("identity is independent of channel ownership: ok");
   } finally {
     for (const client of clients) await client.close().catch(() => {});
     for (const path of sockets) await rm(path, { force: true }).catch(() => {});
@@ -799,7 +1408,30 @@ await anOversizedMessageIsRefusedWithoutKillingTheSession();
 await aRefusedClientCannotKeepStreaming();
 await aStalledClientDoesNotBlockShutdown();
 await aSocketPathItCannotClearDoesNotKillTheSession();
-await onlyTheSessionThatWonTheNameSignsItsMessages();
+const startupClaimOutlivedShutdown = await aStartupClaimCannotOutliveSignalShutdown();
+const postClaimBindOutlivedShutdown = await aCompletedClaimCannotBindAfterSignalShutdown();
+const controlClaimOutlivedShutdown = await aControlClaimCannotOutliveEofShutdown();
+assert.deepEqual(
+  {
+    startupClaimOutlivedShutdown,
+    postClaimBindOutlivedShutdown,
+    controlClaimOutlivedShutdown,
+  },
+  {
+    startupClaimOutlivedShutdown: false,
+    postClaimBindOutlivedShutdown: false,
+    controlClaimOutlivedShutdown: false,
+  },
+  "shutdown must outlive both registry claims and socket acquisition",
+);
+await aLiveListenerReassertsItsOwnMissingEndpoint();
+await anArbitrarySocketBinderIsNotAdopted();
+await aReconnectRepairsTheLiveListenersMissingRecord();
+await everySessionSignsTheValidNameItWasGiven();
+await invalidConfiguredNamesAreNotEchoed();
+await anAutomaticClaudeIdentityRequiresTheHookJoinBeforeSigning();
+await explicitAndUnverifiedClaudeIdentitiesStayConservative();
+await automaticClaudeIdentityAcceptsTheCanonicalUuidGrammar();
 await fourLiveSessionsRouteByName();
 await onlyOneUnnamedSessionGetsTheChannel(false);   // a second terminal, later
 await onlyOneUnnamedSessionGetsTheChannel(true);    // both started together
@@ -819,14 +1451,70 @@ try {
   };
 
   const tools = await client.listTools();
-  assert.equal(tools.tools[0].name, "reply_to_codex");
-  assert.doesNotMatch(tools.tools[0].description, /you can leave it out/,
+  assert.deepEqual(tools.tools.map((tool) => tool.name),
+    ["reply_to_codex", "antiphon_retrieve"]);
+  const replyTool = tools.tools.find((tool) => tool.name === "reply_to_codex");
+  const retrieveTool = tools.tools.find((tool) => tool.name === "antiphon_retrieve");
+  assert.doesNotMatch(replyTool.description, /you can leave it out/,
     "there is no single-peer shortcut on the Codex side to promise");
-  const schema = tools.tools[0].inputSchema;
+  const schema = replyTool.inputSchema;
   assert.equal(schema.properties.to.type, "string");
   assert.deepEqual(schema.required, ["text"],
     "`to` is optional here only to preserve the project with no registered " +
     "Codex peer at all; requiring it would break every unnamed single pair");
+  assert.deepEqual(retrieveTool.inputSchema.required, ["id"]);
+  assert.match(retrieveTool.description, /invocation only/);
+  assert.match(retrieveTool.description, /read-only/i);
+  assert.match(retrieveTool.description, /antiphon retrieve/);
+
+  // The Claude-facing retrieval tool crosses the real Node -> Python boundary.
+  // Build its source catalog in an isolated HOME, then prove both a small exact
+  // invocation and the bounded refusal for a value that cannot fit in MCP.
+  const retrievalSource = "4eecac24-1c21-47ad-ab11-a650708f3098";
+  const retrievalDir = join(
+    projectDir, ".claude", "projects", projectDir.replace(/[^A-Za-z0-9]/g, "-"));
+  mkdirSync(retrievalDir, { recursive: true });
+  const smallBlock = {
+    type: "tool_use", id: "toolu_node_small", name: "Read",
+    input: { argument: "line\nsmall" }, caller: { type: "direct" },
+  };
+  const largeBlock = {
+    type: "tool_use", id: "toolu_node_large", name: "Read",
+    input: { argument: "z".repeat(9_000) }, caller: { type: "direct" },
+  };
+  writeFileSync(join(retrievalDir, `${retrievalSource}.jsonl`), `${JSON.stringify({
+    type: "assistant", cwd: projectDir, timestamp: "2026-09-01T00:00:00Z",
+    message: { content: [smallBlock, largeBlock] },
+  })}\n`);
+  execFileSync("python3", [join(process.cwd(), "lib", "antiphon.py"),
+                           "sources", "scan"],
+    { cwd: projectDir, env: mainEnv, encoding: "utf8" });
+  const invocationId = (block) => execFileSync("python3", [
+    "-c",
+    "import json, sys\n" +
+    "sys.path.insert(0, sys.argv[1])\n" +
+    "import antiphon\n" +
+    "b = json.load(sys.stdin)\n" +
+    "print(antiphon._claude_invocation(b, sys.argv[2], 0, int(sys.argv[3])).public_id)\n",
+    join(process.cwd(), "lib"), retrievalSource, String(block === largeBlock ? 1 : 0),
+  ], { input: JSON.stringify(block), env: mainEnv, encoding: "utf8" }).trim();
+
+  const smallId = invocationId(smallBlock);
+  const smallRetrieved = await client.callTool({
+    name: "antiphon_retrieve", arguments: { id: smallId },
+  });
+  assert.equal(smallRetrieved.isError, undefined);
+  assert.deepEqual(JSON.parse(smallRetrieved.content[0].text).arguments,
+    { argument: "line\nsmall" });
+  const largeId = invocationId(largeBlock);
+  const largeRetrieved = await client.callTool({
+    name: "antiphon_retrieve", arguments: { id: largeId },
+  });
+  assert.equal(largeRetrieved.isError, true);
+  assert.match(largeRetrieved.content[0].text,
+    new RegExp(`antiphon retrieve ${largeId}`));
+  assert.doesNotMatch(largeRetrieved.content[0].text, /zzzzzzzzzz/,
+    "an oversized refusal carries no invocation content");
 
   // `to` has to survive the hop into the Python process. Only the resolver
   // there can produce this sentence, so seeing the alias in the error proves
@@ -857,11 +1545,11 @@ try {
     "and the message must be queued against that peer's session");
 
   // A bare reply is refused as soon as a named Codex peer is registered: an
-  // unnamed session leaves no record, so `review` cannot be shown to be the
-  // only one there. Nothing is queued for it.
+  // unnamed session leaves no routable peer record, so `review` cannot be shown
+  // to be the only one there. Nothing is queued for it.
   await assert.rejects(
     () => client.callTool({ name: "reply_to_codex", arguments: { text: "bare" } }),
-    /not discoverable/,
+    /not all observable/,
     "one registered peer is not proof of one session",
   );
   assert.ok(!readFileSync(queueLog, "utf8").includes("bare"),
@@ -1062,3 +1750,548 @@ try {
   await rm(projectDir, { recursive: true, force: true }).catch(() => {});
   await rm(stubDir, { recursive: true, force: true }).catch(() => {});
 }
+
+// --- Task 4: the bridge payload must say which claim this is -------------
+// Initial and reassert carry different rules and today send an identical
+// payload, so once an endpoint is pruned Python has nothing left to tell them
+// apart. The mode travels in the payload, and an unknown one fails closed.
+async function makeModeRecordingPython(identity) {
+  const dir = await mkdtemp(join(tmpdir(), "antiphon-mode-python-"));
+  const payloads = join(dir, "payloads.txt");
+  const realPython = execFileSync("python3", [
+    "-c", "import sys; print(sys.executable)",
+  ], { encoding: "utf8" }).trim();
+  writeFileSync(join(dir, "python3"), `#!${realPython}
+import os
+import sys
+
+command = sys.argv[2] if len(sys.argv) > 2 else ""
+if command == "claude_identity":
+    print(os.environ["ANTIPHON_TEST_IDENTITY_RESULT"])
+    raise SystemExit(0)
+if command == "register_peer":
+    body = sys.stdin.read()
+    with open(os.environ["ANTIPHON_TEST_MODE_PAYLOADS"], "a") as stream:
+        stream.write(body + "\\n")
+    raise SystemExit(0)
+
+real_python = os.environ["ANTIPHON_TEST_REAL_PYTHON"]
+os.execv(real_python, [real_python, *sys.argv[1:]])
+`, { mode: 0o755 });
+  return {
+    dir,
+    payloads,
+    env: {
+      PATH: `${dir}:${process.env.PATH}`,
+      ANTIPHON_TEST_MODE_PAYLOADS: payloads,
+      ANTIPHON_TEST_IDENTITY_RESULT: JSON.stringify(identity),
+      ANTIPHON_TEST_REAL_PYTHON: realPython,
+    },
+  };
+}
+
+async function automaticRegistrationDeclaresItsMode() {
+  // The real values, taken from peers.auto_identity rather than recomputed:
+  // the alias is lowercase base32 of the first 128 bits, and an alias that
+  // does not validate would silently leave the channel on the explicit path
+  // where no mode is sent at all.
+  const session_id = "8261c119-2c20-4bf4-87ab-f152ac87dbda";
+  const digest =
+    "9aa9141f2a5c704b91ef1d2122ad75e67a1ca8be84b7fe119a6edeca9f0b6937";
+  const alias = "auto-tkurihzklryexeppduqsfllv4y";
+  const stub = await makeModeRecordingPython({
+    alias, identity_digest: digest, session_id,
+  });
+  const dir = await mkdtemp(join(tmpdir(), "antiphon-mode-"));
+  const session = spawnChannel(dir, undefined, stub.env);
+  try {
+    assert.ok(await waitFor(() => existsSync(stub.payloads)),
+      `the channel never reached register_peer; stderr=${session.stderr()}`);
+    const first = JSON.parse(readFileSync(stub.payloads, "utf8")
+      .trim().split("\n")[0]);
+    assert.equal(first.mode, "initial",
+      "a startup claim is an initial claim, and must say so");
+  } finally {
+    session.child.kill("SIGKILL");
+    await waitForExit(session.child, 2_000);
+    await rm(dir, { recursive: true, force: true }).catch(() => {});
+    await rm(stub.dir, { recursive: true, force: true }).catch(() => {});
+  }
+}
+
+await automaticRegistrationDeclaresItsMode();
+
+// --- Task 5: delivery linearizes at the listener --------------------------
+// The retire control is best effort, so a sender can resolve A while A is
+// current, the hook can then move the proof, and the sender can connect
+// afterwards. The only point that closes that window is the listener's own
+// check, taken on every inbound delivery before anything is emitted.
+const STALE_A = "8261c119-2c20-4bf4-87ab-f152ac87dbda";
+const STALE_A_ALIAS = "auto-tkurihzklryexeppduqsfllv4y";
+const STALE_A_DIGEST =
+  "9aa9141f2a5c704b91ef1d2122ad75e67a1ca8be84b7fe119a6edeca9f0b6937";
+const STALE_B = "0199a1b2-2222-7000-8000-00000000000b";
+
+function pythonBridge() {
+  return execFileSync("python3", ["-c", "import sys; print(sys.executable)"],
+    { encoding: "utf8" }).trim();
+}
+
+function runPeers(dir, code) {
+  execFileSync(pythonBridge(), ["-c",
+    `import sys; sys.path.insert(0, "lib"); import peers\n${code}`],
+    { cwd: process.cwd(), env: { ...process.env, ANTIPHON_CWD: dir } });
+}
+
+async function boundSocketOf(session) {
+  // The channel derives its own name, so the path is whatever it announces.
+  await waitFor(() => /channel ready: (\S+)/.test(session.stderr()));
+  const found = /channel ready: (\S+)/.exec(session.stderr());
+  return found ? found[1] : null;
+}
+
+async function staleInboundSession(dir) {
+  const stub = await makeAutomaticIdentityPython({
+    alias: STALE_A_ALIAS, identity_digest: STALE_A_DIGEST,
+    session_id: STALE_A,
+  });
+  const session = spawnChannel(dir, undefined, stub.env);
+  return { session, stub };
+}
+
+async function aStaleInboundIsRefusedAsNoPeerAndEmitsNothing() {
+  const dir = await mkdtemp(join(tmpdir(), "antiphon-stale-"));
+  const { session, stub } = await staleInboundSession(dir);
+  try {
+    const bound = await boundSocketOf(session);
+    assert.ok(bound && existsSync(bound),
+      `channel never bound; stderr=${session.stderr()}`);
+    // No hook has written this listener's session half, so this is UNREADY
+    // rather than PROVED_STALE — the comment here used to claim the latter and
+    // the fixture never built it. Both refuse with the same class, which is
+    // what this test is about; the wording below is what tells them apart, and
+    // `aRetiringListenerNamesItsAliasAndTheRemedy` builds the stale one.
+    runPeers(dir, `
+owner = peers.owner_key() or "1:v1:x"
+peers.write_identity_proof(${JSON.stringify(dir)}, owner,
+                           ${JSON.stringify(STALE_B)},
+                           peers.auto_identity(${JSON.stringify(STALE_B)})[1])
+`);
+    const before = session.stdout();
+    const reply = await new Promise((resolve, reject) => {
+      const socket = connect(bound);
+      let out = "";
+      socket.setEncoding("utf8");
+      socket.on("connect", () => socket.end(JSON.stringify({
+        content: "hello", sender_alias: "build",
+      })));
+      socket.on("data", (chunk) => { out += chunk; });
+      socket.on("end", () => resolve(out ? JSON.parse(out) : null));
+      socket.on("error", reject);
+    });
+    assert.equal(reply?.ok, false, "a stale listener must refuse");
+    assert.equal(reply?.refusal_class, "no-peer",
+      "classified, not a transport error: the peer that alias named is gone");
+    assert.match(String(reply?.error), /not established yet/,
+      `an unready listener says so in its own words: ${reply?.error}`);
+    assert.ok(!session.stdout().slice(before.length)
+      .includes("notifications/claude/channel"),
+      "a stale inbound emits zero channel notifications");
+  } finally {
+    session.child.kill("SIGKILL");
+    await waitForExit(session.child, 2_000);
+    await rm(dir, { recursive: true, force: true }).catch(() => {});
+    await rm(stub.dir, { recursive: true, force: true }).catch(() => {});
+  }
+}
+
+async function anUnreadyInboundRefusesWithoutRetiringAnything() {
+  const dir = await mkdtemp(join(tmpdir(), "antiphon-unready-"));
+  const { session, stub } = await staleInboundSession(dir);
+  let socket = null;
+  try {
+    socket = await boundSocketOf(session);
+    assert.ok(socket && existsSync(socket),
+      `channel never bound; stderr=${session.stderr()}`);
+    // No hook has run, so there is no proof at all: UNREADY, never destructive.
+    const reply = await sendToSocketAt(socket, { content: "hi" });
+    assert.equal(reply?.ok, false, "unready refuses");
+    assert.ok(existsSync(socket), "an unready listener keeps its socket");
+    assert.ok(existsSync(join(dir, ".antiphon", "peers",
+      `claude-${STALE_A_ALIAS}`, "endpoint.json")),
+      "an unready listener keeps its endpoint: the next hook makes it ready");
+  } finally {
+    session.child.kill("SIGKILL");
+    await waitForExit(session.child, 2_000);
+    if (socket) await rm(socket, { force: true }).catch(() => {});
+    await rm(dir, { recursive: true, force: true }).catch(() => {});
+    await rm(stub.dir, { recursive: true, force: true }).catch(() => {});
+  }
+}
+
+function sendToSocketAt(path, payload) {
+  return new Promise((resolve, reject) => {
+    const socket = connect(path);
+    let out = "";
+    socket.setEncoding("utf8");
+    socket.on("connect", () => socket.end(JSON.stringify(payload)));
+    socket.on("data", (chunk) => { out += chunk; });
+    socket.on("end", () => resolve(out ? JSON.parse(out) : null));
+    socket.on("error", reject);
+  });
+}
+
+await aStaleInboundIsRefusedAsNoPeerAndEmitsNothing();
+await anUnreadyInboundRefusesWithoutRetiringAnything();
+
+// --- Task 9: an automatic route is private on this side too ----------------
+// The channel prints its own refusals. Nothing here crosses back into Python to
+// have them cleaned, so a shape only the Python redactor removes still reaches
+// the terminal from here.
+async function anAutomaticSessionNeverPrintsItsOwnRoute() {
+  const dir = await mkdtemp(join(tmpdir(), "antiphon-private-"));
+  const stub = await makeAutomaticIdentityPython({
+    alias: STALE_A_ALIAS, identity_digest: STALE_A_DIGEST,
+    session_id: STALE_A,
+  });
+  // A directory on the socket path: `unlink` fails with EPERM and the refusal
+  // that follows is the one that used to name the route.
+  const blocked = socketFor(dir, STALE_A_ALIAS);
+  mkdirSync(blocked, { recursive: true });
+  const session = spawnChannel(dir, undefined, stub.env);
+  try {
+    assert.ok(await waitFor(() => /could not clear|could not serve/.test(session.stderr())),
+      `expected a refusal, got: ${session.stderr()}`);
+    const words = session.stderr();
+    assert.doesNotMatch(words, /antiphon-channel-[0-9a-f]+\.sock/,
+      `an automatic peer's route is not a remedy: ${words}`);
+    assert.match(words, /can still reply to Codex/,
+      "the remedy beside it survives the redaction");
+  } finally {
+    session.child.kill("SIGKILL");
+    await waitForExit(session.child, 2_000);
+    await rm(blocked, { recursive: true, force: true }).catch(() => {});
+    await rm(dir, { recursive: true, force: true }).catch(() => {});
+    await rm(stub.dir, { recursive: true, force: true }).catch(() => {});
+  }
+}
+
+async function anExplicitSessionKeepsTheRouteItCanActOn() {
+  // The mirror case, and the reason redaction is not blanket: an operator who
+  // typed the name can act on the path, and `remove it` needs to name what.
+  const dir = await mkdtemp(join(tmpdir(), "antiphon-explicit-private-"));
+  const blocked = socketFor(dir, "ui");
+  mkdirSync(blocked, { recursive: true });
+  const session = spawnChannel(dir, "ui");
+  try {
+    assert.ok(await waitFor(() => /could not clear|could not serve/.test(session.stderr())),
+      `expected a refusal, got: ${session.stderr()}`);
+    assert.match(session.stderr(), /antiphon-channel-[0-9a-f]+\.sock/,
+      "an explicit peer's path is actionable for it");
+  } finally {
+    session.child.kill("SIGKILL");
+    await waitForExit(session.child, 2_000);
+    await rm(blocked, { recursive: true, force: true }).catch(() => {});
+    await rm(dir, { recursive: true, force: true }).catch(() => {});
+  }
+}
+
+await anAutomaticSessionNeverPrintsItsOwnRoute();
+await anExplicitSessionKeepsTheRouteItCanActOn();
+
+// --- Task 10: the retiring listener says which alias stopped answering ------
+// "The identity moved" is true and unusable. Whoever reads this terminal, and
+// whoever addressed the peer, both need the name that stopped resolving and the
+// one remedy that fixes it — and the alias is the public half, so naming it
+// costs nothing the privacy contract protects.
+async function aRetiringListenerNamesItsAliasAndTheRemedy() {
+  const dir = await mkdtemp(join(tmpdir(), "antiphon-retire-notice-"));
+  const { session, stub } = await staleInboundSession(dir);
+  let socket = null;
+  try {
+    socket = await boundSocketOf(session);
+    assert.ok(socket && existsSync(socket),
+      `channel never bound; stderr=${session.stderr()}`);
+    // PROVED_STALE, not UNREADY: the hook half has to exist and agree with the
+    // endpoint before a proof naming another session can outgrow it. The owner
+    // comes from the endpoint the channel itself wrote, because this test
+    // process and the channel need not walk to the same CLI root.
+    runPeers(dir, `
+import json, os
+root = os.path.join(${JSON.stringify(dir)}, ".antiphon", "peers",
+                    "claude-${STALE_A_ALIAS}")
+owner = json.load(open(os.path.join(root, "endpoint.json")))["owner"]
+peers.write_session(${JSON.stringify(dir)}, "claude", "${STALE_A_ALIAS}",
+                    ${JSON.stringify(STALE_A)}, "/t/a.jsonl", owner,
+                    ${JSON.stringify(STALE_A_DIGEST)}, True)
+peers.write_identity_proof(${JSON.stringify(dir)}, owner,
+                           ${JSON.stringify(STALE_A)},
+                           ${JSON.stringify(STALE_A_DIGEST)})
+# The production rotation, not a hand-built state: it withdraws this peer's
+# half and leaves the tombstone behind. Writing the proof directly would have
+# skipped the withdrawal and measured a state no hook can produce.
+peers.rotate_identity_proof(${JSON.stringify(dir)}, owner,
+                            ${JSON.stringify(STALE_B)},
+                            peers.auto_identity(${JSON.stringify(STALE_B)})[1])
+`);
+    const reply = await sendToSocketAt(socket, { content: "hi" });
+    assert.equal(reply?.ok, false, "a proved-stale identity refuses");
+    assert.match(String(reply?.error), new RegExp(STALE_A_ALIAS),
+      `the sender is told which alias stopped answering: ${reply?.error}`);
+    assert.match(String(reply?.error), /reconnect/i,
+      "and the remedy travels with it");
+    assert.ok(await waitFor(() => new RegExp(STALE_A_ALIAS).test(session.stderr())),
+      `the terminal is told too: ${session.stderr()}`);
+    assert.match(session.stderr(), /reconnect/i,
+      "the terminal gets the same remedy");
+    // The alias is public; nothing else about the identity is.
+    assert.doesNotMatch(session.stderr(), new RegExp(STALE_A_DIGEST),
+      "the digest is not public");
+    assert.doesNotMatch(String(reply?.error), new RegExp(STALE_A),
+      "nor is the host session id");
+    // The spec's guarantee, end to end: the delivery attempt is its own
+    // wakeup, so cleanup does not depend on a control that may never arrive.
+    // The response is flushed first — a listener that withdrew before
+    // answering would leave the sender with a closed socket and no reason.
+    const endpoint = join(dir, ".antiphon", "peers",
+      `claude-${STALE_A_ALIAS}`, "endpoint.json");
+    assert.ok(await waitFor(() => !existsSync(endpoint)),
+      "a proved-stale listener withdraws its own endpoint");
+    assert.ok(await waitFor(() => !existsSync(socket)),
+      "and unlinks the socket nothing should reach any more");
+  } finally {
+    session.child.kill("SIGKILL");
+    await waitForExit(session.child, 2_000);
+    if (socket) await rm(socket, { force: true }).catch(() => {});
+    await rm(dir, { recursive: true, force: true }).catch(() => {});
+    await rm(stub.dir, { recursive: true, force: true }).catch(() => {});
+  }
+}
+
+await aRetiringListenerNamesItsAliasAndTheRemedy();
+
+// --- the retire control, over real bytes ------------------------------------
+// Every existing test of this path patches `_retire_control` away, so the wire
+// shape was never exercised: Python sent an envelope the listener does not
+// branch on, and the wakeup was answered as a malformed message instead. Its
+// safety is not authentication — anyone who can reach a Unix socket can send
+// this — it is that the listener decides by re-reading the proof itself.
+async function theRetireControlIsRecognisedAndNonDestructive() {
+  const dir = await mkdtemp(join(tmpdir(), "antiphon-retire-control-"));
+  const { session, stub } = await staleInboundSession(dir);
+  let socket = null;
+  try {
+    socket = await boundSocketOf(session);
+    assert.ok(socket && existsSync(socket),
+      `channel never bound; stderr=${session.stderr()}`);
+    const endpoint = join(dir, ".antiphon", "peers",
+      `claude-${STALE_A_ALIAS}`, "endpoint.json");
+    assert.ok(existsSync(endpoint), "the listener registered before the test");
+
+    // No proof at all: UNREADY. A control must not retire this — the next hook
+    // is about to make it ready, and that is the bootstrap case the verdict
+    // exists to keep apart from a stale one.
+    const ack = await sendToSocketAt(socket, {
+      control: "antiphon.channel",
+      version: 1,
+      action: "identity-retire",
+      alias: STALE_A_ALIAS,
+      nonce: "n0nce_test-1",
+    });
+    // Recognised as a control — the ack shape and the echoed nonce say so —
+    // but `ok` reports whether this listener acted, and it did not. Asserting
+    // `ok:true` here pinned a contradiction: a success that changed nothing,
+    // which a sender cannot tell from a wakeup that was honoured.
+    assert.equal(ack?.action, "identity-retire-ack",
+      `recognised as a control: ${JSON.stringify(ack)}`);
+    assert.equal(ack?.nonce, "n0nce_test-1", "the nonce is echoed");
+    assert.equal(ack?.verdict, "UNREADY", "and says why it did nothing");
+    assert.equal(ack?.ok, false, "an UNREADY listener retires nothing");
+    assert.notEqual(ack?.error, "content must be a non-empty string");
+    assert.ok(existsSync(endpoint),
+      "an UNREADY listener keeps its endpoint through a retire control");
+
+    // A malformed control is refused as a control, not treated as content.
+    const bad = await sendToSocketAt(socket, {
+      control: "antiphon.channel",
+      version: 1,
+      action: "identity-retire",
+      alias: STALE_A_ALIAS,
+    });
+    assert.equal(bad?.ok, false, "a missing nonce fails the shape check");
+    assert.match(String(bad?.error), /control request/,
+      `refused as a control: ${JSON.stringify(bad)}`);
+    assert.ok(existsSync(endpoint), "and nothing was withdrawn");
+
+    // Another peer's alias is not this listener's business.
+    const other = await sendToSocketAt(socket, {
+      control: "antiphon.channel",
+      version: 1,
+      action: "identity-retire",
+      alias: "auto-yzmcrss6whnnsjxthq2pclz3l4",
+      nonce: "n0nce_test-2",
+    });
+    assert.equal(other?.ok, false, "an alias this listener does not hold is refused");
+    assert.ok(existsSync(endpoint), "and nothing was withdrawn");
+
+    // Now the state a real rotation leaves. The control is an optimisation —
+    // the first stale delivery would do this too — but it is the one that
+    // stops an outgrown socket lingering until its process exits.
+    runPeers(dir, `
+import json, os
+root = os.path.join(${JSON.stringify(dir)}, ".antiphon", "peers",
+                    "claude-${STALE_A_ALIAS}")
+owner = json.load(open(os.path.join(root, "endpoint.json")))["owner"]
+peers.write_session(${JSON.stringify(dir)}, "claude", "${STALE_A_ALIAS}",
+                    ${JSON.stringify(STALE_A)}, "/t/a.jsonl", owner,
+                    ${JSON.stringify(STALE_A_DIGEST)}, True)
+peers.write_identity_proof(${JSON.stringify(dir)}, owner,
+                           ${JSON.stringify(STALE_A)},
+                           ${JSON.stringify(STALE_A_DIGEST)})
+peers.rotate_identity_proof(${JSON.stringify(dir)}, owner,
+                            ${JSON.stringify(STALE_B)},
+                            peers.auto_identity(${JSON.stringify(STALE_B)})[1])
+`);
+    const stale = await sendToSocketAt(socket, {
+      control: "antiphon.channel",
+      version: 1,
+      action: "identity-retire",
+      alias: STALE_A_ALIAS,
+      nonce: "n0nce_test-3",
+    });
+    assert.equal(stale?.ok, true, `answered: ${JSON.stringify(stale)}`);
+    assert.equal(stale?.verdict, "PROVED_STALE",
+      "the listener reached the verdict by reading the proof itself");
+    assert.ok(await waitFor(() => !existsSync(endpoint)),
+      "and only then withdrew, after its answer was flushed");
+    // Withdrawal must be the last registry mutation this process makes. The
+    // release happens before the socket is fully torn down, so a reassert that
+    // lands in that window would re-create the record naming a listener on its
+    // way out. Nothing may bring the endpoint back.
+    for (let attempt = 0; attempt < 10; attempt += 1) {
+      await sendToSocketAt(socket, {
+        control: "antiphon.channel",
+        version: 1,
+        action: "reassert",
+        alias: STALE_A_ALIAS,
+        nonce: `n0nce_revive-${attempt}`,
+      }).catch(() => {});
+      assert.ok(!existsSync(endpoint),
+        `attempt ${attempt}: a retired listener must not republish itself`);
+    }
+  } finally {
+    session.child.kill("SIGKILL");
+    await waitForExit(session.child, 2_000);
+    if (socket) await rm(socket, { force: true }).catch(() => {});
+    await rm(dir, { recursive: true, force: true }).catch(() => {});
+    await rm(stub.dir, { recursive: true, force: true }).catch(() => {});
+  }
+}
+
+await theRetireControlIsRecognisedAndNonDestructive();
+
+// --- an automatic listener must not read `null` as permission ---------------
+// `null` from the shared verdict means "this contract does not govern that
+// record". For a listener that has no automatic identity at all — an explicit
+// peer — that is right, and delivery proceeds. For a listener that *does* hold
+// an automatic digest it means something else entirely: the endpoint on disk
+// no longer describes this process. The delivery gate treated both the same
+// and emitted, which is the wrong-recipient delivery this whole repair exists
+// to end. The prior test measured only that the string "null" is not "READY".
+async function anAutomaticListenerRefusesWhenItsEndpointStopsDescribingIt() {
+  for (const [name, mutation] of [
+    ["endpoint is explicit-shaped", "record.pop('automatic', None)"],
+    ["endpoint digest moved", "record['identity_digest'] = '0' * 64"],
+  ]) {
+    const dir = await mkdtemp(join(tmpdir(), "antiphon-null-verdict-"));
+    const { session, stub } = await staleInboundSession(dir);
+    let socket = null;
+    try {
+      socket = await boundSocketOf(session);
+      assert.ok(socket && existsSync(socket),
+        `${name}: channel never bound; stderr=${session.stderr()}`);
+      const endpoint = join(dir, ".antiphon", "peers",
+        `claude-${STALE_A_ALIAS}`, "endpoint.json");
+      runPeers(dir, `
+import json
+path = ${JSON.stringify(endpoint)}
+record = json.load(open(path))
+${mutation}
+json.dump(record, open(path, "w"))
+`);
+      const before = session.stdout();
+      const reply = await sendToSocketAt(socket, { content: "hello" });
+      assert.equal(reply?.ok, false,
+        `${name}: an endpoint that does not describe this listener must refuse`);
+      assert.equal(reply?.refusal_class, "no-peer", name);
+      assert.ok(!session.stdout().slice(before.length)
+        .includes("notifications/claude/channel"),
+        `${name}: zero notifications are emitted`);
+      // `null` is not PROVED_STALE and authorises nothing destructive.
+      assert.ok(existsSync(endpoint), `${name}: nothing is withdrawn`);
+      assert.ok(existsSync(socket), `${name}: the socket stays`);
+    } finally {
+      session.child.kill("SIGKILL");
+      await waitForExit(session.child, 2_000);
+      if (socket) await rm(socket, { force: true }).catch(() => {});
+      await rm(dir, { recursive: true, force: true }).catch(() => {});
+      await rm(stub.dir, { recursive: true, force: true }).catch(() => {});
+    }
+  }
+}
+
+await anAutomaticListenerRefusesWhenItsEndpointStopsDescribingIt();
+
+// --- two guarantees the plan names and nothing measured --------------------
+// Both hold by construction — a configured name leaves `automaticIdentityDigest`
+// null, and doctor's probe half-closes with an empty payload, which fails the
+// content check long before any verdict. Construction changes; these do not.
+async function neitherTheControlNorADoctorProbeTouchesAnExplicitPeer() {
+  const dir = await mkdtemp(join(tmpdir(), "antiphon-explicit-auto-"));
+  // The exact string a prior automatic identity would have used, configured by
+  // hand. §4 devotes a paragraph to this: the alias grammar allows it, so the
+  // control must not act on the address alone.
+  const session = spawnChannel(dir, STALE_A_ALIAS);
+  try {
+    assert.ok(await waitFor(() => /channel ready/.test(session.stderr())),
+      `channel never bound; stderr=${session.stderr()}`);
+    const socket = socketFor(dir, STALE_A_ALIAS);
+    const endpoint = join(dir, ".antiphon", "peers",
+      `claude-${STALE_A_ALIAS}`, "endpoint.json");
+    assert.ok(existsSync(endpoint), "the explicit peer registered");
+
+    const ack = await sendToSocketAt(socket, {
+      control: "antiphon.channel",
+      version: 1,
+      action: "identity-retire",
+      alias: STALE_A_ALIAS,
+      nonce: "n0nce_explicit",
+    });
+    assert.equal(ack?.ok, false, "an explicit peer retires nothing");
+    assert.notEqual(ack?.verdict, "PROVED_STALE",
+      `an explicit peer has no automatic verdict: ${JSON.stringify(ack)}`);
+    assert.ok(existsSync(endpoint), "and keeps its endpoint");
+
+    // Doctor's probe: connect, half-close, expect an object with `ok`.
+    const probe = await new Promise((resolve, reject) => {
+      const client = connect(socket);
+      let out = "";
+      client.setEncoding("utf8");
+      client.on("connect", () => client.end());
+      client.on("data", (chunk) => { out += chunk; });
+      client.on("end", () => resolve(out ? JSON.parse(out) : null));
+      client.on("error", reject);
+    });
+    assert.equal(probe?.ok, false, "the probe is answered, not acted on");
+    assert.ok(existsSync(endpoint),
+      "a read-only diagnostic never retires a listener");
+    assert.ok(existsSync(socket), "nor removes its socket");
+  } finally {
+    session.child.kill("SIGKILL");
+    await waitForExit(session.child, 2_000);
+    await rm(socketFor(dir, STALE_A_ALIAS), { force: true }).catch(() => {});
+    await rm(dir, { recursive: true, force: true }).catch(() => {});
+  }
+}
+
+await neitherTheControlNorADoctorProbeTouchesAnExplicitPeer();

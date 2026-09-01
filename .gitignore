@@ -12,5 +12,8 @@ CLAUDE.md
 AGENTS.md
 .DS_Store
 
-# planning notes; kept local, not part of the package
-docs/
+# planning notes; kept out of the package, but reviewed Superpowers plans are
+# versioned so an approved content hash has durable provenance
+docs/*
+!docs/superpowers/
+!docs/superpowers/**
