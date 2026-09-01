@@ -3261,11 +3261,43 @@ class ToolInvocationRetrievalTest(unittest.TestCase):
             self.assertEqual(result.status, "untrusted")
             self.assertIsNone(result.invocation)
 
+        other_source = "896738a1-a616-4c4f-a82e-ded21c5b8bb1"
+
+        @contextlib.contextmanager
+        def second_source_faults(source, offset=0):
+            with real_reader(source, offset) as stream:
+                if source.source == other_source:
+                    yield FaultAfterOneRecord(stream)
+                else:
+                    yield stream
+
+        with tempfile.TemporaryDirectory() as project:
+            root = os.path.join(project, "host")
+            prefix = "project"
+            paths = []
+            for source_id, blocks in (
+                    (self.SOURCE, [block]),
+                    (other_source, [self._block("other-one", "toolu_other_1"),
+                                    self._block("other-two", "toolu_other_2")])):
+                path = os.path.join(root, prefix, source_id + ".jsonl")
+                self._write(path, [self._record(item) for item in blocks])
+                paths.append(antiphon._discovered_source_path(
+                    path, root, "claude", prefix))
+            with patch.object(antiphon.SafeSource, "_reader",
+                              new=second_source_faults):
+                result = antiphon._retrieve_invocation(
+                    project, public_id, source_paths=paths)
+        self.assertEqual(result.status, "untrusted")
+        self.assertIsNone(result.invocation)
+
     def test_invalid_utf8_records_do_not_invent_replacement_invocations(self):
         replacement = "bad \ufffd byte"
         public_id = antiphon._claude_invocation(
             self._block(replacement, "toolu_invalid"),
             self.SOURCE, 0, 0).public_id
+        valid_block = self._block("valid after malformed", "toolu_valid")
+        valid_id = antiphon._claude_invocation(
+            valid_block, self.SOURCE, 0, 0).public_id
         for invalid in (b"\x80", b"\x81"):
             with self.subTest(invalid=invalid), \
                  tempfile.TemporaryDirectory() as project:
@@ -3276,10 +3308,17 @@ class ToolInvocationRetrievalTest(unittest.TestCase):
                     b"INVALID_BYTE", b"bad " + invalid + b" byte")
                 with open(path, "wb") as stream:
                     stream.write(raw + b"\n")
+                    stream.write(json.dumps(self._record(valid_block)).encode(
+                        "utf-8") + b"\n")
                 result = antiphon._retrieve_invocation(
                     project, public_id, source_paths=[path])
+                later = antiphon._retrieve_invocation(
+                    project, valid_id, source_paths=[path])
             self.assertEqual(result.status, "unavailable")
             self.assertIsNone(result.invocation)
+            self.assertEqual(later.status, "found")
+            self.assertEqual(later.invocation.arguments,
+                             {"argument": "valid after malformed"})
 
     def test_degraded_or_unsafe_discovery_is_untrusted(self):
         public_id = antiphon._claude_invocation(

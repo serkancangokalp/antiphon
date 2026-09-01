@@ -3254,8 +3254,11 @@ def _scan_invocations(cwd, kind, paths, public_id):
                 for start, _end, raw in source.read_retrieval_records():
                     try:
                         line = raw.decode("utf-8", "strict")
+                    except UnicodeDecodeError:
+                        continue
+                    try:
                         record = json.loads(line)
-                    except (UnicodeDecodeError, json.JSONDecodeError, ValueError):
+                    except (json.JSONDecodeError, ValueError):
                         continue
                     matches.extend(
                         invocation for invocation in _record_invocations(

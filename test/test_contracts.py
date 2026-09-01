@@ -13,6 +13,7 @@ import antiphon
 import peers
 
 import contextlib
+import inspect
 import io
 import json
 import re
@@ -287,6 +288,15 @@ class CrossBoundaryContractTest(unittest.TestCase):
     def test_readme_distinguishes_claude_details_from_codex_name_only_pages(self):
         limits = section(read("README.md"), "Limits")
         self.assertIsNotNone(limits)
+        renderer = inspect.getsource(antiphon.claude_events)
+        detail_expression = capture(
+            r'(?s)detail = \((.*?)\)\n\s*events\.append', renderer)
+        self.assertIsNotNone(detail_expression)
+        detail_keys = re.findall(
+            r'arguments\.get\("([^"]+)"\)', detail_expression)
+        self.assertTrue(detail_keys)
+        for key in detail_keys:
+            self.assertIn("`%s`" % key, limits)
         self.assertRegex(
             limits,
             r"(?is)Claude.{0,160}(file_path|command|pattern).{0,240}Codex.{0,80}name-only")
