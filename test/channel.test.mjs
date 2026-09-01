@@ -232,19 +232,28 @@ async function cleanUp(session, dir) {
   await rm(dir, { recursive: true, force: true });
 }
 
-async function aUuidShapedConfiguredNameIsNotEchoed() {
-  const dir = await mkdtemp(join(tmpdir(), "antiphon-uuid-name-"));
-  const supplied = CODEX_SESSION.toUpperCase();
-  const session = spawnChannel(dir, supplied);
-  try {
-    assert.ok(await waitFor(() => /not a usable peer name/.test(session.stderr())),
-      session.stderr());
-    assert.match(session.stderr(), /UUID-shaped/,
-      "the refusal names the private shape without reproducing it");
-    assert.ok(!session.stderr().toLowerCase().includes(CODEX_SESSION),
-      `the configured host id must stay private: ${session.stderr()}`);
-  } finally {
-    await cleanUp(session, dir);
+async function invalidConfiguredNamesAreNotEchoed() {
+  const variants = [
+    CODEX_SESSION.toUpperCase(),
+    `{${CODEX_SESSION}}`,
+    `urn:uuid:${CODEX_SESSION}`,
+    `uuid:${CODEX_SESSION}`,
+    `<${CODEX_SESSION}>`,
+    `${CODEX_SESSION}.`,
+  ];
+  for (const supplied of variants) {
+    const dir = await mkdtemp(join(tmpdir(), "antiphon-uuid-name-"));
+    const session = spawnChannel(dir, supplied);
+    try {
+      assert.ok(await waitFor(() => /not a usable peer name/.test(session.stderr())),
+        session.stderr());
+      assert.match(session.stderr(), /ANTIPHON_NAME/,
+        "the refusal names the invalid setting without reproducing its value");
+      assert.ok(!session.stderr().toLowerCase().includes(CODEX_SESSION),
+        `the configured host id must stay private: ${session.stderr()}`);
+    } finally {
+      await cleanUp(session, dir);
+    }
   }
 }
 
@@ -1179,7 +1188,7 @@ await aLiveListenerReassertsItsOwnMissingEndpoint();
 await anArbitrarySocketBinderIsNotAdopted();
 await aReconnectRepairsTheLiveListenersMissingRecord();
 await everySessionSignsTheValidNameItWasGiven();
-await aUuidShapedConfiguredNameIsNotEchoed();
+await invalidConfiguredNamesAreNotEchoed();
 await fourLiveSessionsRouteByName();
 await onlyOneUnnamedSessionGetsTheChannel(false);   // a second terminal, later
 await onlyOneUnnamedSessionGetsTheChannel(true);    // both started together

@@ -1480,9 +1480,9 @@ observations appear only on a labelled local diagnostic row carrying the full
 UUID. Refusals, errors and every other line expose neither that id nor paths.
 The UUID is explicitly not an alias and cannot be addressed. Invalid routing
 and malformed hook-session values are never echoed, so wrapping or decorating a
-UUID cannot bypass the rule; UUID-shaped configured-name values are described
-without their value. A failed observation write reports only its exception
-class and numeric errno.
+UUID cannot bypass the rule; invalid configured-name values are described
+without ever repeating their value. A failed observation write reports only
+its exception class and numeric errno.
 
 Observation reads are fail-closed: the schema version is an exact JSON integer,
 the time is finite and representable, and malformed or overflow-sized records

@@ -4445,7 +4445,12 @@ def push(target="codex"):
         # and one real message is not empty, so a per-batch check would let the
         # empty line disappear without a word.
         for blank in (m for m in messages if not m.strip()):
-            named = f":{recipient}" if recipient is not None else ""
+            # A refusal is still an output surface. Only a recipient that
+            # could actually be registered is safe and useful to repeat;
+            # invalid values can carry a host session id in decorated form.
+            named = (f":{recipient}"
+                     if recipient is not None and peers.valid_name(recipient)
+                     else "")
             print(f"antiphon: a @{target}{named} line carried no message, "
                   "nothing sent for it", file=sys.stderr)
         said = [m for m in messages if m.strip()]
@@ -5986,10 +5991,7 @@ def register_codex_peer(cwd):
     if not alias:
         return None
     if not peers.valid_name(alias):
-        shown = ("ANTIPHON_NAME is a UUID-shaped configured value"
-                 if peers.looks_like_session_id(alias)
-                 else f"ANTIPHON_NAME={alias!r}")
-        print(f"antiphon: {shown} is not a usable name "
+        print("antiphon: ANTIPHON_NAME is not a usable name "
               "([a-z0-9][a-z0-9_-]{0,31}); named routing is off for this session "
               "and the single unnamed peer still works.", file=sys.stderr)
         return None
@@ -8006,10 +8008,7 @@ def _doctor_alias(report):
     elif peers.valid_name(name):
         report.ok(f'alias: named "{name}"')
     else:
-        subject = ("ANTIPHON_NAME is a UUID-shaped configured value"
-                   if peers.looks_like_session_id(name)
-                   else f'ANTIPHON_NAME resolves to "{name}"')
-        report.bad(f'alias: {subject}, which cannot '
+        report.bad('alias: ANTIPHON_NAME is not usable and cannot '
                    "be addressed — use lower-case letters, digits, `_` and "
                    "`-`, starting with a letter or digit, at most 32 characters")
 

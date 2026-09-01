@@ -1287,6 +1287,35 @@ class AntiphonTest(unittest.TestCase):
                 self.assertEqual(antiphon.push("claude"), 0)
         self.assertIn("@claude:api line carried no message", err.getvalue())
 
+    def test_an_empty_marker_never_echoes_an_invalid_uuid_bearing_recipient(self):
+        """Even an empty message is a refusal surface, in both directions."""
+        uuid = "1d5a03e0-0548-4339-87c3-45c5dbf7e9d7"
+        variants = (uuid.upper(), f"{{{uuid}}}", f"urn:uuid:{uuid}",
+                    f"uuid:{uuid}", f"<{uuid}>", f"{uuid}.")
+        for target, turn_name in (("claude", "_codex_turn"),
+                                  ("codex", "_claude_turn")):
+            for recipient in variants:
+                with self.subTest(target=target, recipient=recipient), \
+                     tempfile.TemporaryDirectory() as project:
+                    err = io.StringIO()
+                    payload = {"cwd": project,
+                               "transcript_path": "/tmp/transcript"}
+                    with patch.object(antiphon.os.path, "exists",
+                                      return_value=True), \
+                         patch.object(antiphon, turn_name,
+                                      return_value=(
+                                          f"@{target}:{recipient}", "")), \
+                         patch.object(antiphon, "read_cursor",
+                                      return_value={}), \
+                         patch.object(antiphon, "write_cursor"), \
+                         patch.object(antiphon.sys, "stdin",
+                                      io.StringIO(json.dumps(payload))), \
+                         contextlib.redirect_stderr(err):
+                        self.assertEqual(antiphon.push(target), 0)
+                refusal = err.getvalue()
+                self.assertIn("carried no message", refusal)
+                self.assertNotIn(uuid, refusal.lower())
+
     def test_a_named_marker_that_reaches_nobody_is_reported_not_redirected(self):
         """A name that does not resolve is refused out loud. Delivering it to
         whoever is around instead would be the silent misroute wearing a
@@ -4863,15 +4892,22 @@ class DoctorTest(unittest.TestCase):
         line = self.line_for(printed, "alias:")
         self.assertTrue(line.startswith("✗"), line)
         self.assertIn("lower-case", line, "the accepted shape is named")
+        self.assertNotIn("bad name", line,
+                         "an invalid configured value is never repeated")
 
-        uuid_name = self.OBSERVED.upper()
-        with patch.dict(os.environ, {"ANTIPHON_NAME": uuid_name}):
-            code, printed = self.run_doctor(project)
-        self.assertEqual(code, 1)
-        line = self.line_for(printed, "alias:")
-        self.assertIn("UUID-shaped", line)
-        self.assertNotIn(self.OBSERVED, line.lower(),
-                         "doctor describes the invalid shape without the id")
+        variants = (self.OBSERVED.upper(), f"{{{self.OBSERVED}}}",
+                    f"urn:uuid:{self.OBSERVED}",
+                    f"uuid:{self.OBSERVED}", f"<{self.OBSERVED}>",
+                    f"{self.OBSERVED}.")
+        for supplied in variants:
+            with self.subTest(supplied=supplied), \
+                 patch.dict(os.environ, {"ANTIPHON_NAME": supplied}):
+                code, printed = self.run_doctor(project)
+            self.assertEqual(code, 1)
+            line = self.line_for(printed, "alias:")
+            self.assertIn("ANTIPHON_NAME", line)
+            self.assertNotIn(self.OBSERVED, line.lower(),
+                             "doctor never repeats an invalid configured value")
 
         with patch.dict(os.environ, {"ANTIPHON_NAME": "ui"}):
             code, printed = self.run_doctor(project)
@@ -11589,16 +11625,20 @@ class CodexPeerWiringTest(unittest.TestCase):
             walk.assert_not_called()
         self.assertIn("a-z0-9", err.getvalue())
 
-    def test_a_uuid_shaped_configured_alias_is_not_echoed(self):
-        supplied = self.UUID.upper()
-        with tempfile.TemporaryDirectory() as project:
-            with self._named(supplied), \
-                 patch.object(antiphon.peers, "owner_key") as walk, \
-                 contextlib.redirect_stderr(io.StringIO()) as err:
-                self.assertIsNone(antiphon.register_codex_peer(project))
-            walk.assert_not_called()
-        self.assertIn("UUID-shaped", err.getvalue())
-        self.assertNotIn(self.UUID, err.getvalue().lower())
+    def test_invalid_configured_aliases_are_never_echoed(self):
+        variants = (self.UUID.upper(), f"{{{self.UUID}}}",
+                    f"urn:uuid:{self.UUID}", f"uuid:{self.UUID}",
+                    f"<{self.UUID}>", f"{self.UUID}.")
+        for supplied in variants:
+            with self.subTest(supplied=supplied), \
+                 tempfile.TemporaryDirectory() as project:
+                with self._named(supplied), \
+                     patch.object(antiphon.peers, "owner_key") as walk, \
+                     contextlib.redirect_stderr(io.StringIO()) as err:
+                    self.assertIsNone(antiphon.register_codex_peer(project))
+                walk.assert_not_called()
+            self.assertIn("ANTIPHON_NAME", err.getvalue())
+            self.assertNotIn(self.UUID, err.getvalue().lower())
 
     def test_an_alias_that_cannot_be_identified_says_so(self):
         with tempfile.TemporaryDirectory() as project:
