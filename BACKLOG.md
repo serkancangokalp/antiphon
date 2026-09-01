@@ -1544,6 +1544,20 @@ What the first run measured, in order of what it changed:
 - **macOS `$TMPDIR` is a symlink** and both hosts record the resolved path, so
   a harness that does not `pwd -P` watches a transcript directory that never
   fills. Two of the first run's failures were this, not the product.
+- **An exit-zero model turn is not proof of the exact marker it was asked to
+  write.** On exact candidate commit `802fc8a`, one fresh temporary run passed
+  91 of 93 assertions because the second Claude answer omitted its exact
+  marker; the two failures were that one missing fact and its downstream page
+  assertion. Two later fresh runs on the same product bytes passed 93 of 93.
+  The varying component was the live `claude -p` answer, while the compaction-
+  only diff could not reach T2/T3. The candidate harness now accepts only an
+  exact trimmed assistant text block — the prompt itself cannot satisfy it —
+  and retries only that marker-producing turn after exit zero, at most three
+  times. It prints the landing attempt and carries the exact second transcript
+  into the one push. Push, queue, page delivery and all later T2/T3 behavior
+  remain single-shot. Final marker exhaustion fails before those assertions
+  can cascade and preserves both temporary evidence roots automatically;
+  nonzero CLI exit remains a distinct, non-retried failure.
 
 Named limitations, checked by hand instead: `-p` mode never loads the channel,
 so the host's notification schema — the fault that cost the most today — is

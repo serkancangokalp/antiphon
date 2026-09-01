@@ -34,6 +34,10 @@
 #   * The Codex rollout this run creates is left in place and named, never
 #     deleted: choosing a file to delete from a person's session store on the
 #     word of the code under test is a risk no test script may take.
+#   * A successful live model call can omit the exact marker it was asked for.
+#     Only that marker-producing turn is retried, at most three times, and only
+#     after exit zero. Push, queue, page delivery and the rest of T2/T3 stay
+#     single-shot. Final marker exhaustion preserves both evidence roots.
 #
 # Usage:  test/e2e/fresh-user.sh [--version <npm-version>] [--keep]
 #   default:  packs an immutable copy of HEAD (refuses a dirty tree) and prints
@@ -91,6 +95,41 @@ except Exception as error:
   printf '%s' "$decoded"
 }
 events_in() { printf '%s' "$1" | grep -cE '^\[[0-9][0-9]:[0-9][0-9]\]'; }
+
+# This is the only retry boundary in the E2E. The helper prints a path and an
+# attempt number, never transcript content. A final exact-marker omission keeps
+# the evidence automatically; a CLI or probe failure remains a distinct error.
+land_exact_marker() {
+  local marker="$1" label="$2" result code attempt transcript
+  result="$(bash "$REPO/test/e2e/marker_turn.sh" \
+    "$PROJECT" "$CLAUDE_DIR" "$marker")"
+  code=$?
+  case "$code" in
+    0)
+      attempt="$(printf '%s\n' "$result" | sed -n 's/^attempt=//p')"
+      transcript="$(printf '%s\n' "$result" | sed -n 's/^transcript=//p')"
+      case "$attempt" in 1|2|3) ;; *) fail "$label returned an invalid attempt"; exit 1 ;; esac
+      case "$transcript" in
+        "$CLAUDE_DIR"/*.jsonl) ;;
+        *) fail "$label returned a transcript outside this run"; exit 1 ;;
+      esac
+      [ -f "$transcript" ] && [ ! -L "$transcript" ] \
+        || { fail "$label returned no regular transcript"; exit 1; }
+      MARKER_ATTEMPT="$attempt"
+      MARKER_TRANSCRIPT="$transcript"
+      ;;
+    1)
+      KEEP=1
+      echo "$label: exact assistant marker absent after three exit-zero turns" >&2
+      echo "preserving evidence: $TMP and $CLAUDE_DIR" >&2
+      exit 1
+      ;;
+    *)
+      fail "$label failed before an exact assistant marker landed"
+      exit 1
+      ;;
+  esac
+}
 
 for tool in claude codex node npm python3 sqlite3; do
   command -v "$tool" >/dev/null || { echo "gerekli araç yok: $tool" >&2; exit 2; }
@@ -313,14 +352,16 @@ esac
 # Two turns, so T5 has two distinct moments to place a cursor between. One
 # turn renders both of its lines in the same second, and the `>=` boundary
 # rule repeats the whole cohort sharing it — nothing to bound.
-(cd "$PROJECT" && claude -p "Respond with exactly one line and nothing else, no preamble: @codex $NONCE-one" >/dev/null 2>&1) \
-  && pass "the first claude -p turn exits 0" || fail "the first claude -p turn failed"
+land_exact_marker "@codex $NONCE-one" "the first claude -p turn"
+pass "the first claude -p turn exits 0"
+pass "the first exact assistant marker landed on attempt $MARKER_ATTEMPT"
 sleep 2
-(cd "$PROJECT" && claude -p "Respond with exactly one line and nothing else, no preamble: @codex $NONCE-two" >/dev/null 2>&1) \
-  && pass "the second claude -p turn exits 0" || fail "the second claude -p turn failed"
-TRANSCRIPT="$(ls -t "$CLAUDE_DIR"/*.jsonl 2>/dev/null | head -1)"
-[ -n "$TRANSCRIPT" ] && pass "claude -p wrote a transcript" || fail "claude -p wrote no transcript"
-grep -qr "@codex $NONCE-two" "$CLAUDE_DIR" 2>/dev/null && pass "the marker is in the transcript" || fail "the marker never reached the transcript"
+land_exact_marker "@codex $NONCE-two" "the second claude -p turn"
+pass "the second claude -p turn exits 0"
+pass "the second exact assistant marker landed on attempt $MARKER_ATTEMPT"
+# Stronger than "newest": this is the exact transcript whose assistant block
+# passed the second-marker predicate, and it is the only transcript T2 pushes.
+TRANSCRIPT="$MARKER_TRANSCRIPT"
 [ -d "$PROJECT/.antiphon" ] && pass "the hooks ran (.antiphon exists)" || fail "the hooks never ran"
 PUSH="$(printf '{"cwd":"%s","hook_event_name":"Stop","transcript_path":"%s","session_id":"%s"}' \
         "$PROJECT" "$TRANSCRIPT" "$(basename "$TRANSCRIPT" .jsonl)" | (cd "$PROJECT" && antiphon push codex 2>&1))"
