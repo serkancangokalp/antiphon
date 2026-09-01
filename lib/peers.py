@@ -1163,8 +1163,20 @@ def alive(pid):
     caller here wants to know. `_record_alive` is what they ask; this is one
     half of its answer.
     """
+    # A non-positive pid is not a process, and `os.kill` reads those numbers as
+    # something else entirely: `-1` means every process this user may signal,
+    # and `0` means this one's whole group. Both answer, so both read as alive
+    # — a record naming `-1` would have held its alias forever. `_pid_of`
+    # refuses them before they get here; this is the shape being refused where
+    # the question is actually asked.
     try:
-        os.kill(int(pid), 0)
+        number = int(pid)
+    except (TypeError, ValueError, OverflowError):
+        return False
+    if number <= 0:
+        return False
+    try:
+        os.kill(number, 0)
     except (OSError, TypeError, ValueError, OverflowError):
         # `OverflowError` is not an `OSError`, and this is the one liveness
         # question every reader in the registry goes through.

@@ -4834,8 +4834,15 @@ _PRIVATE_UUID = re.compile(
 # digest written immediately after a non-ASCII letter satisfied `\b` on one
 # side and not the other. Python was the leakier side, and Python is the one
 # that prints to a person's terminal. One flag aligns both classes at once.
-_PRIVATE_DIGEST = re.compile(r"\b[0-9a-fA-F]{64}\b", re.ASCII)
-_PRIVATE_OWNER = re.compile(r"\b\d+:(?:v\d+:)?[A-Z][a-z]{2} [A-Z][a-z]{2} "
+# The boundary belongs to the shape, not to the alphabet. `\b` asks whether a
+# word character sits beside a word character, so a digest wrapped in letters —
+# `x<digest>x` — had no boundary and passed through whole. A hex run's boundary
+# is hex: refuse a 64-run that is not part of a longer one. An owner key starts
+# with digits, so its boundary is a digit; anything else in front of it is
+# somebody's prose and the key still has to go.
+_PRIVATE_DIGEST = re.compile(
+    r"(?<![0-9a-fA-F])[0-9a-fA-F]{64}(?![0-9a-fA-F])", re.ASCII)
+_PRIVATE_OWNER = re.compile(r"(?<!\d)\d+:(?:v\d+:)?[A-Z][a-z]{2} [A-Z][a-z]{2} "
                             r"[ \d]?\d \d{2}:\d{2}:\d{2} \d{4}", re.ASCII)
 _PRIVATE_ROUTE = re.compile(r"\S*antiphon-channel-[0-9a-f]+\.sock")
 

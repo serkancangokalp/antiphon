@@ -17181,6 +17181,33 @@ class ReadinessParityTest(unittest.TestCase):
             f'"session_id": "{session_id or self.A}"{extra}}}')
 
     @staticmethod
+    def _bom(path, _ignored=None):
+        with open(path, "rb") as stream:
+            raw = stream.read()
+        with open(path, "wb") as stream:
+            stream.write(b"\xef\xbb\xbf" + raw)
+
+    @staticmethod
+    def _reaped_pid():
+        """A pid that named a process and does not now."""
+        child = subprocess.Popen([sys.executable, "-c", "pass"])
+        child.wait()
+        return child.pid
+
+    @staticmethod
+    def _read(path):
+        with open(path, encoding="utf-8") as stream:
+            return stream.read()
+
+    @staticmethod
+    def _corrupt_bytes(path):
+        """One byte no UTF-8 decoder may accept, inside a string value."""
+        with open(path, "rb") as stream:
+            raw = stream.read()
+        with open(path, "wb") as stream:
+            stream.write(raw.replace(b'"claude"', b'"cl\xffude"', 1))
+
+    @staticmethod
     def _rewrite(path, transform):
         with open(path, encoding="utf-8") as stream:
             text = stream.read()
@@ -17220,6 +17247,44 @@ class ReadinessParityTest(unittest.TestCase):
             antiphon.peers.peer_dir(project, "claude", alias),
             "session.json"), drop=drop, **over)
 
+    @staticmethod
+    def _snapshot(project):
+        """Every path under the project with its bytes, or its mode when the
+        bytes cannot be read — a fixture may deliberately make a file
+        unreadable, and that is a state to preserve, not an error."""
+        seen = {}
+        for root, _dirs, files in os.walk(project):
+            for name in sorted(files):
+                path = os.path.join(root, name)
+                key = os.path.relpath(path, project)
+                try:
+                    with open(path, "rb") as stream:
+                        seen[key] = stream.read()
+                except OSError:
+                    seen[key] = f"<mode {os.stat(path).st_mode:o}>".encode()
+        return seen
+
+    def _both(self, project, alias, digest):
+        """Both verdicts from the same state, Node first and provably so.
+
+        `read_peers` prunes as it reads: a record it judges dead is removed,
+        and the Python reader runs through it. Measured Python-first, the first
+        reader could delete the very record the second was about to be asked
+        about — and the second would answer about an absence rather than about
+        the state under test, hiding the disagreement.
+
+        The Node reader only reads, so it goes first; and rather than take that
+        on trust the project is snapshotted around it. Copying the tree instead
+        would be the other way to arrange it, but a fixture that makes a file
+        unreadable cannot be copied — that state is exactly what it is testing.
+        """
+        before = self._snapshot(project)
+        node = self._node(project, alias, digest)
+        self.assertEqual(self._snapshot(project), before,
+                         "the Node reader must not touch what Python is about "
+                         "to read; the order only works because it reads")
+        return (self._python(project, alias), node)
+
     def _python(self, project, alias):
         peer = next((p for p in antiphon.peers.read_peers(project, "claude")
                      if p.get("name") == alias), None)
@@ -17240,12 +17305,13 @@ class ReadinessParityTest(unittest.TestCase):
     def _node(self, project, alias, digest):
         script = (
             'import { automaticProofVerdict } from "./lib/identity.mjs";'
-            'const [d, a, g] = process.argv.slice(-3);'
-            'process.stdout.write(String(automaticProofVerdict(d, a, g)));'
+            'const [d, a, g, pid] = process.argv.slice(-4);'
+            'process.stdout.write(String('
+            'automaticProofVerdict(d, a, g, Number(pid))));'
         )
         done = subprocess.run(
             ["node", "--input-type=module", "-e", script, "--",
-             project, alias, digest],
+             project, alias, digest, str(os.getpid())],
             capture_output=True, text=True, cwd=self.ROOT)
         if done.returncode != 0:
             self.fail("node verdict failed: "
@@ -17255,6 +17321,35 @@ class ReadinessParityTest(unittest.TestCase):
     def test_readiness_parity_holds_across_every_fixture(self):
         cases = {
             "proof valid and current": lambda p, a: self._proof(p, self.A),
+            # A byte-order mark. The fatal decoder strips it by default and
+            # Python keeps it, so the same bytes were a valid record on one
+            # side and a parse failure on the other — and with a rotation
+            # tombstone beside it, the side that read on was the side that
+            # retires.
+            "proof carries a byte-order mark": lambda p, a: self._bom(
+                antiphon.peers.identity_proof_path(p, self.OWNER),
+                self._proof(p, self.A)),
+            "session half carries a byte-order mark": lambda p, a: (
+                self._proof(p, self.A),
+                self._bom(antiphon.peers._session_file(p, "claude", a))),
+            "rotated, tombstone carries a byte-order mark": lambda p, a: (
+                self._proof(p, self.B),
+                self._withdrawn(p, a),
+                self._bom(antiphon.peers.retired_half_path(p, "claude", a))),
+            # A key may be spelled two ways, and a pattern that matches text
+            # sees only one of them. A pattern also has no idea which object
+            # level it is looking at, so an unrelated nested number parted the
+            # readers in the other direction.
+            "proof spells version with an escape and a float": lambda p, a:
+                self._raw(p, self._body(p, self.A).replace(
+                    '{"version": 1', '{"ver\\u0073ion": 1.0', 1)),
+            "endpoint holds an unrelated nested float": lambda p, a: (
+                self._proof(p, self.A),
+                self._write(os.path.join(
+                    antiphon.peers.peer_dir(p, "claude", a), "endpoint.json"),
+                    self._read(os.path.join(
+                        antiphon.peers.peer_dir(p, "claude", a),
+                        "endpoint.json"))[:-1] + ', "extra": {"pid": 1.0}}')),
             "proof names another session": lambda p, a: self._proof(p, self.B),
             "proof absent": lambda p, a: None,
             "proof wrong kind": lambda p, a: self._proof(p, self.A,
@@ -17420,6 +17515,70 @@ class ReadinessParityTest(unittest.TestCase):
             "session half from another owner": lambda p, a: (
                 self._proof(p, self.A),
                 self._patch_session(p, a, owner=self.OTHER_OWNER)),
+            "records padded past the ceiling": lambda p, a: (
+                self._proof(p, self.A),
+                self._pad(antiphon.peers.identity_proof_path(p, self.OWNER))),
+            "padded tombstone after a rotation": lambda p, a: (
+                self._proof(p, self.B),
+                self._withdrawn(p, a),
+                self._pad(antiphon.peers.retired_half_path(p, "claude", a))),
+            # Duplicate keys: Node's `JSON.parse` keeps the last silently,
+            # Python's reader refuses the record. The exact-key check cannot
+            # see them — duplicates collapse at parse time — so the readers
+            # parted on a record neither should accept at all.
+            #
+            # The version spelling is the wrong key to test it with: the first
+            # duplicate trips the float scan, so the fixture passed for a
+            # reason that has nothing to do with duplication. A non-numeric
+            # key is what isolates it.
+            "proof repeats the version key": lambda p, a: self._raw(
+                p, self._body(p, self.A).replace(
+                    '{"version": 1', '{"version": 1.0, "version": 1', 1)),
+            "proof repeats a non-numeric key": lambda p, a: self._raw(
+                p, self._body(p, self.A).replace(
+                    '"kind": "claude"', '"kind": "codex", "kind": "claude"', 1)),
+            "tombstone repeats a non-numeric key": lambda p, a: (
+                self._proof(p, self.B),
+                self._withdrawn(p, a),
+                self._rewrite(
+                    antiphon.peers.retired_half_path(p, "claude", a),
+                    lambda text: text.replace(
+                        '"kind": "claude"',
+                        '"kind": "codex", "kind": "claude"', 1))),
+            # Duplicates are refused at every depth on the Python side, and
+            # only the object's own level was counted here. Endpoint and
+            # session records carry no exact-key rule — they may hold a
+            # `birth` or a `transcript` — so a nested object is reachable.
+            "session half holds a nested duplicate": lambda p, a: (
+                self._proof(p, self.A),
+                self._write(antiphon.peers._session_file(p, "claude", a),
+                            self._read(antiphon.peers._session_file(
+                                p, "claude", a))[:-1]
+                            + ', "extra": {"x": 1, "x": 2}}')),
+            # And the same name spelled two ways is one name to both parsers.
+            "session half repeats a key by escape": lambda p, a: (
+                self._proof(p, self.A),
+                self._write(antiphon.peers._session_file(p, "claude", a),
+                            self._read(antiphon.peers._session_file(
+                                p, "claude", a)).replace(
+                                    '"owner"', '"\\u006fwner": "x", "owner"',
+                                    1))),
+            # A decode that refuses is a torn record, not an unreadable one:
+            # the fatal decoder throws with a `code`, and a catch that reads
+            # the code first called it unreadable — UNKNOWN where Python says
+            # STRUCTURAL_INVALID.
+            "proof holds an undecodable byte": lambda p, a: (
+                self._proof(p, self.A),
+                self._corrupt_bytes(
+                    antiphon.peers.identity_proof_path(p, self.OWNER))),
+            # Invalid UTF-8: Node decodes it to a replacement character and
+            # reads on; Python refuses the bytes. A record one reader cannot
+            # decode is not one the other may route or retire on.
+            "proof carries an extra key": lambda p, a: self._raw(
+                p, self._body(p, self.A)[:-1] + ', "note": "hello"}'),
+            "tombstone carries an extra key": lambda p, a: (
+                self._proof(p, self.B),
+                self._withdrawn(p, a, extra=', "note": "hello"')),
         }
         # One case cannot be compared by equality, and saying so is more
         # honest than bending either side to match. With the endpoint's digest
@@ -17432,6 +17591,14 @@ class ReadinessParityTest(unittest.TestCase):
             "endpoint digest mismatched": lambda p, a: (
                 self._proof(p, self.A),
                 self._patch_endpoint(p, a, identity_digest="0" * 64)),
+            "endpoint holds a nested duplicate": lambda p, a: (
+                self._proof(p, self.A),
+                self._write(os.path.join(
+                    antiphon.peers.peer_dir(p, "claude", a), "endpoint.json"),
+                    self._read(os.path.join(
+                        antiphon.peers.peer_dir(p, "claude", a),
+                        "endpoint.json"))[:-1]
+                    + ', "extra": {"x": 1, "x": 2}}')),
             "endpoint name does not derive its digest": lambda p, a: (
                 self._proof(p, self.A),
                 self._patch_endpoint(p, a, name="bogus")),
@@ -17472,48 +17639,10 @@ class ReadinessParityTest(unittest.TestCase):
             # is "neither says READY" — they were inert: both are non-READY
             # with or without the ceiling, so the fixture written for the
             # ceiling could not detect its removal.
-            "records padded past the ceiling": lambda p, a: (
-                self._proof(p, self.A),
-                self._pad(antiphon.peers.identity_proof_path(p, self.OWNER))),
-            "padded tombstone after a rotation": lambda p, a: (
-                self._proof(p, self.B),
-                self._withdrawn(p, a),
-                self._pad(antiphon.peers.retired_half_path(p, "claude", a))),
-            # Duplicate keys: Node's `JSON.parse` keeps the last silently,
-            # Python's reader refuses the record. The exact-key check cannot
-            # see them — duplicates collapse at parse time — so the readers
-            # parted on a record neither should accept at all.
-            #
-            # The version spelling is the wrong key to test it with: the first
-            # duplicate trips the float scan, so the fixture passed for a
-            # reason that has nothing to do with duplication. A non-numeric
-            # key is what isolates it.
-            "proof repeats the version key": lambda p, a: self._raw(
-                p, self._body(p, self.A).replace(
-                    '{"version": 1', '{"version": 1.0, "version": 1', 1)),
-            "proof repeats a non-numeric key": lambda p, a: self._raw(
-                p, self._body(p, self.A).replace(
-                    '"kind": "claude"', '"kind": "codex", "kind": "claude"', 1)),
-            "tombstone repeats a non-numeric key": lambda p, a: (
-                self._proof(p, self.B),
-                self._withdrawn(p, a),
-                self._rewrite(
-                    antiphon.peers.retired_half_path(p, "claude", a),
-                    lambda text: text.replace(
-                        '"kind": "claude"',
-                        '"kind": "codex", "kind": "claude"', 1))),
-            # Invalid UTF-8: Node decodes it to a replacement character and
-            # reads on; Python refuses the bytes. A record one reader cannot
-            # decode is not one the other may route or retire on.
             "endpoint holds an undecodable byte": lambda p, a: (
                 self._proof(p, self.A),
                 self._corrupt(os.path.join(
                     antiphon.peers.peer_dir(p, "claude", a), "endpoint.json"))),
-            "proof carries an extra key": lambda p, a: self._raw(
-                p, self._body(p, self.A)[:-1] + ', "note": "hello"}'),
-            "tombstone carries an extra key": lambda p, a: (
-                self._proof(p, self.B),
-                self._withdrawn(p, a, extra=', "note": "hello"')),
             "endpoint pid is a numeric string": lambda p, a: (
                 self._proof(p, self.A),
                 self._patch_endpoint(p, a, pid=str(os.getpid()))),
@@ -17522,6 +17651,28 @@ class ReadinessParityTest(unittest.TestCase):
                 self._patch_endpoint(p, a, pid=float(os.getpid()))),
             # No common upper bound: `os.kill` raises OverflowError above the
             # platform's signed int and Node happily reads on.
+            "endpoint spells pid with an escape and a float": lambda p, a: (
+                self._proof(p, self.A),
+                self._write(os.path.join(
+                    antiphon.peers.peer_dir(p, "claude", a), "endpoint.json"),
+                    self._read(os.path.join(
+                        antiphon.peers.peer_dir(p, "claude", a),
+                        "endpoint.json")).replace(
+                            '"pid": ', '"p\\u0069d": ', 1)
+                    .replace('"p\\u0069d": %d' % os.getpid(),
+                             '"p\\u0069d": %d.0' % os.getpid(), 1))),
+            # A listener's own endpoint must name the listener. Node checked
+            # the pid's type and never whose it was, so a record naming a dead
+            # or unrelated process read as this listener's own — and with a
+            # rotation tombstone beside it, Node retired over a record Python
+            # prunes before it can be enumerated at all.
+            "endpoint names a dead process": lambda p, a: (
+                self._proof(p, self.A),
+                self._patch_endpoint(p, a, pid=self._reaped_pid())),
+            "rotated, endpoint names a dead process": lambda p, a: (
+                self._proof(p, self.B),
+                self._withdrawn(p, a),
+                self._patch_endpoint(p, a, pid=self._reaped_pid())),
             "endpoint pid is astronomically large": lambda p, a: (
                 self._proof(p, self.A),
                 self._patch_endpoint(p, a, pid=10 ** 100)),
@@ -17545,9 +17696,26 @@ class ReadinessParityTest(unittest.TestCase):
                 with tempfile.TemporaryDirectory() as project:
                     alias, digest = self._peer(project)
                     mutate(project, alias)
-                    for reader, verdict in (
-                            ("python", self._python(project, alias)),
-                            ("node", self._node(project, alias, digest))):
+                    # The bucket audits its own membership. Four times now a
+                    # fixture written for a real divergence has landed here,
+                    # where the only claim is "neither says READY" — and both
+                    # readers were non-READY with and without the code under
+                    # test, so the fixture asserted nothing. A state Python can
+                    # still reach a verdict about is comparable, and belongs in
+                    # `cases`; only a record it cannot enumerate at all lives
+                    # here. Getting that wrong is now a failure, not a silence.
+                    # Once, and reused. Calling it twice runs the pruning
+                    # reader twice: the first call can delete the record the
+                    # second measures, and the second answers about an absence.
+                    # That is the very trap `_both` was written to close, and
+                    # it came straight back in through calling it again.
+                    measured = self._both(project, alias, digest)
+                    self.assertEqual(
+                        measured[0], "NO-RECORD",
+                        f"{name}: Python reaches a verdict here, so the two "
+                        "readers can be compared — move this fixture to "
+                        "`cases`, where a disagreement is caught")
+                    for reader, verdict in zip(("python", "node"), measured):
                         self.assertNotEqual(
                             verdict, "READY",
                             f"{name}: {reader} must not call this routable")
@@ -17565,8 +17733,7 @@ class ReadinessParityTest(unittest.TestCase):
             with tempfile.TemporaryDirectory() as project:
                 alias, digest = self._peer(project)
                 mutate(project, alias)
-                python, node = (self._python(project, alias),
-                                self._node(project, alias, digest))
+                python, node = self._both(project, alias, digest)
                 if python != node:
                     disagreements.append(f"{name}: python={python} node={node}")
         self.assertEqual(disagreements, [],
@@ -17745,11 +17912,31 @@ class IdentityPrivacyTest(unittest.TestCase):
             "owner key": self.OWNER,
             "automatic socket route": route,
         }
+        cases["digest wrapped in word characters"] = self.DIGEST
+        cases["owner key run into a word"] = self.OWNER
+        # `zz` rather than `ab`: a word character that is not a hex digit. A
+        # 64-run inside a *longer* hex run is deliberately left alone — see
+        # the case below — and wrapping the fixture in hex would have been
+        # asking for that instead of for the boundary under test.
         for name, secret in cases.items():
             with self.subTest(shape=name):
-                cleaned = antiphon.redact_private(f"before {secret} after")
-                self.assertNotIn(secret, cleaned, name)
-                self.assertNotIn(secret.lower(), cleaned.lower(), name)
+                for wrapper in ("before {} after", "zz{}zz", "({})"):
+                    cleaned = antiphon.redact_private(wrapper.format(secret))
+                    self.assertNotIn(secret, cleaned, f"{name} in {wrapper}")
+                    self.assertNotIn(secret.lower(), cleaned.lower(),
+                                     f"{name} in {wrapper}")
+
+    def test_identity_privacy_leaves_a_longer_hex_run_alone(self):
+        """A 64-character window inside a longer hex string is not a digest.
+
+        Redacting it would cut the middle out of an unrelated value — a hash of
+        something else, a blob, a key — and hand the reader a corrupted string
+        while claiming to have protected something. Nothing on this bridge
+        writes a digest inside a longer run, and a reader who would have to
+        count characters to extract one is not the leak this guards.
+        """
+        text = f"ab{self.DIGEST}cd"
+        self.assertEqual(antiphon.redact_private(text), text)
 
     def test_identity_privacy_preserves_alias_and_remedy(self):
         text = (f"{self.ALIAS} is no longer this session; reconnect to be "
@@ -17929,9 +18116,19 @@ class IdentityPrivacyTest(unittest.TestCase):
             # ASCII-only in a JS RegExp. A private shape glued to a non-ASCII
             # letter therefore survived Python's redactor and not Node's —
             # and Python is the side that prints to a person's terminal.
+            # `\b` asks whether a word character sits beside a word
+            # character, which is the wrong question for a hex run and for a
+            # key that starts with digits: wrapped in letters, the whole
+            # private value passed through untouched — in both languages, so
+            # parity agreed on the wrong answer.
+            "digest wrapped in word characters": f"zz{self.DIGEST}zz refused",
+            "owner key run into a word": f"x{self.OWNER} refused",
             "owner key after a non-ASCII letter": f"iş{self.OWNER} refused",
             "digest after a non-ASCII letter": f"iş{self.DIGEST} refused",
             "digest before a non-ASCII letter": f"{self.DIGEST}ş refused",
+            "digest wrapped in word characters": f"zz{self.DIGEST}zz refused",
+            "owner key run into a word": f"x{self.OWNER} refused",
+            "digest inside a longer hex run": f"ab{self.DIGEST}cd refused",
         }
         script = (
             'import { redactPrivate } from "./lib/identity.mjs";'

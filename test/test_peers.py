@@ -2943,3 +2943,30 @@ class SweepWindowIsBoundedTest(unittest.TestCase):
             self.assertLessEqual(
                 len(swept), peers.IDENTITY_SWEEP_WINDOW + 2,
                 "one rotation examines a bounded window, not the inventory")
+
+
+class PidCeilingHalvesAreSeparateTest(unittest.TestCase):
+    """Two guards, each of which alone is invisible behind the other.
+
+    `_pid_of` refuses a pid above the platform's signed int, and `alive()`
+    catches the `OverflowError` `os.kill` raises for one. Reverting either on
+    its own left the whole suite green — the record never reached `alive()`
+    because `_pid_of` had already refused it, and `_pid_of`'s ceiling was never
+    the thing that stopped the raise. Each is asserted where it acts.
+    """
+
+    HUGE = 10 ** 100
+
+    def test_pid_ceiling_refuses_a_pid_no_kernel_hands_out(self):
+        self.assertIsNone(peers._pid_of({"pid": self.HUGE}))
+        self.assertIsNone(peers._pid_of({"pid": peers.PID_CEILING + 1}))
+        self.assertEqual(peers._pid_of({"pid": peers.PID_CEILING}),
+                         peers.PID_CEILING)
+
+    def test_pid_ceiling_liveness_answers_rather_than_raises(self):
+        """`alive()` is asked directly, past the ceiling that would normally
+        keep such a number away from it — the arm exists for the day some other
+        caller does the same."""
+        self.assertFalse(peers.alive(self.HUGE))
+        self.assertFalse(peers.alive(-1))
+        self.assertFalse(peers.alive("not a pid"))

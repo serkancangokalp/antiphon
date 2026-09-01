@@ -2485,3 +2485,59 @@ peers.rotate_identity_proof(${JSON.stringify(dir)}, owner,
 }
 
 await nothingResurrectsTheEndpointWhileRetirementRuns();
+
+// --- a silent client must not hold retirement open -------------------------
+// `close()` waits for every accepted connection to end. A peer that connects
+// and says nothing therefore keeps a listener that has just learned it is
+// stale holding its endpoint for the full idle timeout — measured at 30,124 ms
+// without the destroy, against 79 ms with it. Nothing detected its removal.
+async function aSilentClientDoesNotHoldRetirementOpen() {
+  const dir = await mkdtemp(join(tmpdir(), "antiphon-silent-hold-"));
+  const { session, stub } = await staleInboundSession(dir);
+  let socket = null;
+  let idle = null;
+  try {
+    socket = await boundSocketOf(session);
+    const endpoint = join(dir, ".antiphon", "peers",
+      `claude-${STALE_A_ALIAS}`, "endpoint.json");
+    runPeers(dir, `
+import json, os
+root = os.path.join(${JSON.stringify(dir)}, ".antiphon", "peers",
+                    "claude-${STALE_A_ALIAS}")
+owner = json.load(open(os.path.join(root, "endpoint.json")))["owner"]
+peers.write_session(${JSON.stringify(dir)}, "claude", "${STALE_A_ALIAS}",
+                    ${JSON.stringify(STALE_A)}, "/t/a.jsonl", owner,
+                    ${JSON.stringify(STALE_A_DIGEST)}, True)
+peers.write_identity_proof(${JSON.stringify(dir)}, owner,
+                           ${JSON.stringify(STALE_A)},
+                           ${JSON.stringify(STALE_A_DIGEST)})
+peers.rotate_identity_proof(${JSON.stringify(dir)}, owner,
+                            ${JSON.stringify(STALE_B)},
+                            peers.auto_identity(${JSON.stringify(STALE_B)})[1])
+`);
+    // A client that connects and then says nothing, accepted before the stale
+    // delivery arrives.
+    idle = connect(socket);
+    await once(idle, "connect");
+
+    const started = Date.now();
+    const refusal = await sendToSocketAt(socket, { content: "hi" });
+    assert.equal(refusal?.ok, false, "the stale listener refuses");
+    assert.ok(await waitFor(() => !existsSync(endpoint)),
+      `the endpoint must be withdrawn; stderr=${session.stderr()}`);
+    const took = Date.now() - started;
+    // Well inside CLIENT_IDLE_MS (30 s). Generous enough not to be a timing
+    // test, tight enough that waiting for the idle timeout cannot pass it.
+    assert.ok(took < 10_000,
+      `retirement waited ${took} ms for a silent client to go away`);
+  } finally {
+    if (idle) idle.destroy();
+    session.child.kill("SIGKILL");
+    await waitForExit(session.child, 2_000);
+    if (socket) await rm(socket, { force: true }).catch(() => {});
+    await rm(dir, { recursive: true, force: true }).catch(() => {});
+    await rm(stub.dir, { recursive: true, force: true }).catch(() => {});
+  }
+}
+
+await aSilentClientDoesNotHoldRetirementOpen();
