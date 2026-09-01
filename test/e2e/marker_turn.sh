@@ -13,8 +13,10 @@ PROJECT="$1"
 CLAUDE_DIR="$2"
 MARKER="$3"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
+source "$SCRIPT_DIR/marker_contract.sh" || exit 2
 
-for attempt in 1 2 3; do
+attempt=1
+while [ "$attempt" -le "$MAX_MARKER_ATTEMPTS" ]; do
   if ! (cd "$PROJECT" && claude -p \
       "Respond with exactly one line and nothing else, no preamble: $MARKER" \
       >/dev/null 2>&1); then
@@ -35,7 +37,8 @@ for attempt in 1 2 3; do
       exit 2
       ;;
   esac
+  attempt=$((attempt + 1))
 done
 
-echo "exact assistant marker absent after 3 successful Claude turns" >&2
+echo "exact assistant marker absent after $MAX_MARKER_ATTEMPTS successful Claude turns" >&2
 exit 1

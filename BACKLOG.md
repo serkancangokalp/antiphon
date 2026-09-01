@@ -1516,7 +1516,7 @@ transcripts to see. `test/e2e/fresh-user.sh` is the run that sees them: it
 packs this tree, installs it into a throwaway prefix, sets up a throwaway
 project, drives `claude -p` and `codex exec`, and asserts on what the person
 would actually get. It is not part of `npm test` (it needs both CLIs logged
-in, the network, and two small model calls) and belongs in the release ritual
+in, the network, and 2 to 6 small model calls) and belongs in the release ritual
 between the wrapper census and `npm version`.
 
 What the first run measured, in order of what it changed:
@@ -1552,8 +1552,8 @@ What the first run measured, in order of what it changed:
   The varying component was the live `claude -p` answer, while the compaction-
   only diff could not reach T2/T3. The candidate harness now accepts only an
   exact trimmed assistant text block — the prompt itself cannot satisfy it —
-  and retries only that marker-producing turn after exit zero, at most three
-  times. It prints the landing attempt and carries the exact second transcript
+  and retries only that marker-producing turn after exit zero, up to 3 attempts.
+  It prints the landing attempt and carries the exact second transcript
   into the one push. Push, queue, page delivery and all later T2/T3 behavior
   remain single-shot. Final marker exhaustion fails before those assertions
   can cascade and preserves both temporary evidence roots automatically;

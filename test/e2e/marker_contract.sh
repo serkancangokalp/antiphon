@@ -5,6 +5,7 @@
 
 : "${E2E_PUSH_RAN:=0}"
 : "${E2E_PAGE_RAN:=0}"
+MAX_MARKER_ATTEMPTS=3
 
 e2e_once() {
   case "${1:-}" in
@@ -24,7 +25,7 @@ e2e_once() {
 preserve_marker_evidence() {
   local label="$1" temp_root="$2" transcript_root="$3"
   KEEP=1
-  echo "$label: exact assistant marker absent after three exit-zero turns" >&2
+  echo "$label: exact assistant marker absent after $MAX_MARKER_ATTEMPTS exit-zero turns" >&2
   echo "preserving evidence: $temp_root and $transcript_root" >&2
   return 1
 }

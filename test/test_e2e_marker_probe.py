@@ -1,6 +1,7 @@
 import json
 import os
 from pathlib import Path
+import re
 import subprocess
 import sys
 import tempfile
@@ -219,6 +220,21 @@ class BoundedMarkerTurnTest(unittest.TestCase):
 
 
 class FreshUserMarkerContractTest(unittest.TestCase):
+
+    def test_documented_model_call_bound_follows_the_retry_constant(self):
+        contract = CONTRACT.read_text(encoding="utf-8")
+        match = re.search(
+            r"^MAX_MARKER_ATTEMPTS=([1-9][0-9]*)$", contract, re.MULTILINE)
+        self.assertIsNotNone(match, "marker retry bound needs one named constant")
+        attempts = int(match.group(1))
+        maximum = attempts * 2
+        claim = f"2 to {maximum} small model calls"
+        script = (ROOT / "test" / "e2e" / "fresh-user.sh").read_text(
+            encoding="utf-8")
+        backlog = (ROOT / "BACKLOG.md").read_text(encoding="utf-8")
+        self.assertIn(claim, script)
+        self.assertIn(claim, backlog)
+        self.assertIn(f"up to {attempts} attempts", backlog)
 
     def test_the_production_shell_guards_execute_each_stage_once_and_preserve(self):
         fixture = r'''

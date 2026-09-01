@@ -10,7 +10,7 @@
 # a throwaway prefix, sets up a throwaway project, and drives both CLIs.
 #
 # It is NOT part of `npm test`: it needs a logged-in `claude` and `codex`, the
-# network, and it spends two small model calls per run. Run it before a release,
+# network, and it spends 2 to 6 small model calls per run. Run it before a release,
 # after the wrapper census and before `npm version`.
 #
 # What it does not cover, and how to check those by hand:
@@ -35,7 +35,7 @@
 #     deleted: choosing a file to delete from a person's session store on the
 #     word of the code under test is a risk no test script may take.
 #   * A successful live model call can omit the exact marker it was asked for.
-#     Only that marker-producing turn is retried, at most three times, and only
+#     Only that marker-producing turn is retried up to the shared attempt limit,
 #     after exit zero. Push, queue, page delivery and the rest of T2/T3 stay
 #     single-shot. Final marker exhaustion preserves both evidence roots.
 #
@@ -109,7 +109,13 @@ land_exact_marker() {
     0)
       attempt="$(printf '%s\n' "$result" | sed -n 's/^attempt=//p')"
       transcript="$(printf '%s\n' "$result" | sed -n 's/^transcript=//p')"
-      case "$attempt" in 1|2|3) ;; *) fail "$label returned an invalid attempt"; exit 1 ;; esac
+      case "$attempt" in
+        ''|*[!0-9]*) fail "$label returned an invalid attempt"; exit 1 ;;
+      esac
+      if [ "$attempt" -lt 1 ] || [ "$attempt" -gt "$MAX_MARKER_ATTEMPTS" ]; then
+        fail "$label returned an out-of-range attempt"
+        exit 1
+      fi
       case "$transcript" in
         "$CLAUDE_DIR"/*.jsonl) ;;
         *) fail "$label returned a transcript outside this run"; exit 1 ;;
