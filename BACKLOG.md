@@ -1139,6 +1139,14 @@ with the attempt time and requested alias, no original message content and no
 new metadata field. The sender's refusal remains the result; an absent socket
 receives no bytes; no pending delivery state is created.
 
+Registry claims, releases and shutdown now share one order. Shutdown refuses
+new reassert work, waits for an in-flight claim, waits for startup to finish
+probing or acquiring its socket, then performs one final PID-guarded
+unregister. Socket ownership starts in the `listening` callback, before the
+following `chmod` await. Deterministic delayed-process tests cover SIGTERM
+during the first claim, EOF during a control reassert, and SIGTERM after a
+claim has completed but before bind; none may leave an endpoint or socket.
+
 New process observations now run `ps` under `LC_ALL=C` and `TZ=UTC`, parse its
 fields rather than slicing inherited output, mark endpoint births with their
 fingerprint generation and generate owner keys as `pid:vN:start`. A legacy

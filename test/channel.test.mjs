@@ -138,7 +138,9 @@ async function makeDelayedRegistryPython() {
   const registerStarted = join(dir, "register-started");
   const registerFinished = join(dir, "register-finished");
   const releaseRegister = join(dir, "release-register");
+  const unregisterArmed = join(dir, "unregister-armed");
   const unregisterStarted = join(dir, "unregister-started");
+  const releaseUnregister = join(dir, "release-unregister");
   const realPython = execFileSync("python3", [
     "-c", "import sys; print(sys.executable)",
   ], { encoding: "utf8" }).trim();
@@ -154,6 +156,8 @@ register_started = os.environ["ANTIPHON_TEST_REGISTER_STARTED"]
 register_finished = os.environ["ANTIPHON_TEST_REGISTER_FINISHED"]
 release_register = os.environ["ANTIPHON_TEST_REGISTER_RELEASE"]
 unregister_started = os.environ["ANTIPHON_TEST_UNREGISTER_STARTED"]
+unregister_armed = os.environ["ANTIPHON_TEST_UNREGISTER_ARMED"]
+release_unregister = os.environ["ANTIPHON_TEST_UNREGISTER_RELEASE"]
 real_python = os.environ["ANTIPHON_TEST_REAL_PYTHON"]
 
 if command == "register_peer" and os.path.exists(armed):
@@ -163,6 +167,8 @@ if command == "register_peer" and os.path.exists(armed):
 
 if command == "unregister_peer":
     open(unregister_started, "w").close()
+    while os.path.exists(unregister_armed) and not os.path.exists(release_unregister):
+        time.sleep(0.01)
     result = subprocess.run([real_python, *sys.argv[1:]])
     raise SystemExit(result.returncode)
 
@@ -179,14 +185,18 @@ os.execv(real_python, [real_python, *sys.argv[1:]])
     registerStarted,
     registerFinished,
     releaseRegister,
+    unregisterArmed,
     unregisterStarted,
+    releaseUnregister,
     env: {
       PATH: `${dir}:${process.env.PATH}`,
       ANTIPHON_TEST_REGISTER_ARMED: armed,
       ANTIPHON_TEST_REGISTER_STARTED: registerStarted,
       ANTIPHON_TEST_REGISTER_FINISHED: registerFinished,
       ANTIPHON_TEST_REGISTER_RELEASE: releaseRegister,
+      ANTIPHON_TEST_UNREGISTER_ARMED: unregisterArmed,
       ANTIPHON_TEST_UNREGISTER_STARTED: unregisterStarted,
+      ANTIPHON_TEST_UNREGISTER_RELEASE: releaseUnregister,
       ANTIPHON_TEST_REAL_PYTHON: realPython,
     },
   };
@@ -340,6 +350,56 @@ async function aStartupClaimCannotOutliveSignalShutdown() {
     return stale;
   } finally {
     writeFileSync(delayed.releaseRegister, "");
+    await cleanUp(session, dir);
+    await rm(delayed.dir, { recursive: true, force: true });
+  }
+}
+
+async function aCompletedClaimCannotBindAfterSignalShutdown() {
+  const dir = await mkdtemp(join(tmpdir(), "antiphon-bind-signal-"));
+  const delayed = await makeDelayedRegistryPython();
+  const gateEntered = join(delayed.dir, "socket-gate-entered");
+  const releaseGate = join(delayed.dir, "release-socket-gate");
+  writeFileSync(delayed.unregisterArmed, "");
+  const session = spawnChannel(dir, "ui", {
+    ...delayed.env,
+    NODE_ENV: "test",
+    ANTIPHON_TEST_SOCKET_GATE: "after-claim",
+    ANTIPHON_TEST_SOCKET_GATE_ENTERED: gateEntered,
+    ANTIPHON_TEST_SOCKET_GATE_RELEASE: releaseGate,
+  });
+  let stale = false;
+  try {
+    assert.ok(await waitFor(() => existsSync(gateEntered)
+      && registeredPeers(dir).length === 1),
+    `claim did not finish before the socket gate: ${session.stderr()}`);
+    assert.ok(!existsSync(session.socketPath),
+      "the fixture must stop after claim and before bind");
+
+    session.child.kill("SIGTERM");
+    // In the broken order shutdown reaches unregister while startup is still
+    // held before bind. In the corrected order it waits for startup first.
+    const unregisterStartedBeforeGate = await waitFor(
+      () => existsSync(delayed.unregisterStarted), 2_000);
+    writeFileSync(releaseGate, "");
+    if (unregisterStartedBeforeGate) {
+      assert.ok(await waitFor(() => existsSync(session.socketPath)),
+        "the regression fixture did not expose the post-cleanup bind");
+    } else {
+      assert.ok(await waitFor(() => existsSync(delayed.unregisterStarted)),
+        "shutdown did not reach its final unregister after startup settled");
+      assert.ok(!existsSync(session.socketPath),
+        "startup must not bind after shutdown begins");
+    }
+    writeFileSync(delayed.releaseUnregister, "");
+
+    assert.ok(await waitForExit(session.child, 5_000),
+      "shutdown did not finish after unregister was released");
+    stale = existsSync(session.socketPath) || registeredPeers(dir).length !== 0;
+    return stale;
+  } finally {
+    writeFileSync(releaseGate, "");
+    writeFileSync(delayed.releaseUnregister, "");
     await cleanUp(session, dir);
     await rm(delayed.dir, { recursive: true, force: true });
   }
@@ -1074,11 +1134,20 @@ await aRefusedClientCannotKeepStreaming();
 await aStalledClientDoesNotBlockShutdown();
 await aSocketPathItCannotClearDoesNotKillTheSession();
 const startupClaimOutlivedShutdown = await aStartupClaimCannotOutliveSignalShutdown();
+const postClaimBindOutlivedShutdown = await aCompletedClaimCannotBindAfterSignalShutdown();
 const controlClaimOutlivedShutdown = await aControlClaimCannotOutliveEofShutdown();
 assert.deepEqual(
-  { startupClaimOutlivedShutdown, controlClaimOutlivedShutdown },
-  { startupClaimOutlivedShutdown: false, controlClaimOutlivedShutdown: false },
-  "no register_peer operation may recreate an endpoint after shutdown unregisters it",
+  {
+    startupClaimOutlivedShutdown,
+    postClaimBindOutlivedShutdown,
+    controlClaimOutlivedShutdown,
+  },
+  {
+    startupClaimOutlivedShutdown: false,
+    postClaimBindOutlivedShutdown: false,
+    controlClaimOutlivedShutdown: false,
+  },
+  "shutdown must outlive both registry claims and socket acquisition",
 );
 await aLiveListenerReassertsItsOwnMissingEndpoint();
 await anArbitrarySocketBinderIsNotAdopted();
