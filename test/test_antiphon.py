@@ -16863,3 +16863,60 @@ class HookIdentityCommitTest(unittest.TestCase):
             state, proof = antiphon.peers.read_identity_proof(project,
                                                              self.OWNER)
             self.assertEqual((state, proof["session_id"]), ("valid", self.B))
+
+
+class AutomaticRegistrationBridgeTest(unittest.TestCase):
+    """The bridge is where the mode becomes mandatory for automatic Claude.
+
+    The direct API stays usable without one so explicit peers, Codex and the
+    suite's own fixtures keep working; the bridge is the caller that always
+    knows which kind of claim it is making, so it must always say.
+    """
+
+    OWNER = "4242:v1:Mon Sep  1 00:00:00 2026"
+    A = "8261c119-2c20-4bf4-87ab-f152ac87dbda"
+
+    def _call(self, project, payload):
+        out, err = io.StringIO(), io.StringIO()
+        with patch.object(antiphon, "project_dir", return_value=project), \
+             patch.object(antiphon.peers, "owner_key",
+                          return_value=self.OWNER), \
+             patch.object(sys, "stdin", io.StringIO(json.dumps(payload))), \
+             contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            code = antiphon.register_peer()
+        return code, out.getvalue() + err.getvalue()
+
+    def test_automatic_registration_bridge_requires_a_mode(self):
+        alias, digest = antiphon.peers.auto_identity(self.A)
+        with tempfile.TemporaryDirectory() as project:
+            code, printed = self._call(project, {
+                "kind": "claude", "name": alias,
+                "address": os.path.join(project, "a.sock"),
+                "pid": os.getpid(), "identity_digest": digest,
+            })
+            self.assertEqual(code, 1, printed)
+            self.assertEqual(antiphon.peers.read_peers(project, "claude"), [],
+                             "a modeless automatic claim registers nothing")
+
+    def test_automatic_registration_bridge_passes_a_valid_mode_through(self):
+        alias, digest = antiphon.peers.auto_identity(self.A)
+        with tempfile.TemporaryDirectory() as project:
+            code, printed = self._call(project, {
+                "kind": "claude", "name": alias,
+                "address": os.path.join(project, "a.sock"),
+                "pid": os.getpid(), "identity_digest": digest,
+                "mode": "initial",
+            })
+            self.assertEqual(code, 0, printed)
+            self.assertEqual(
+                [p.get("name") for p in
+                 antiphon.peers.read_peers(project, "claude")], [alias])
+
+    def test_automatic_registration_bridge_leaves_explicit_claims_alone(self):
+        with tempfile.TemporaryDirectory() as project:
+            code, printed = self._call(project, {
+                "kind": "claude", "name": "build",
+                "address": os.path.join(project, "b.sock"),
+                "pid": os.getpid(),
+            })
+            self.assertEqual(code, 0, printed)

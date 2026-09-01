@@ -5929,7 +5929,17 @@ def register_peer(*_):
     # The owner key this subprocess can see is the CLI root above the channel
     # server, which is what a Stop hook in the same session computes too. It is
     # how that hook later shows the alias is genuinely this session's.
+    mode = data.get("mode")
+    if data.get("identity_digest") is not None and kind == "claude" \
+            and mode not in peers.AUTOMATIC_REGISTRATION_MODES:
+        # The bridge always knows which kind of claim it is making, so it must
+        # always say. The direct API stays usable without a mode; this caller
+        # does not.
+        print("register_peer: an automatic claim needs initial or reassert",
+              file=sys.stderr)
+        return 1
     ok, detail = peers.register(project_dir(), kind, name, address,
+                                mode=mode,
                                 pid=data.get("pid"), owner_key=peers.owner_key(),
                                 identity_digest=data.get("identity_digest"))
     if not ok:

@@ -1916,3 +1916,107 @@ class HookIdentityRotationTest(unittest.TestCase):
                             or not self._half_exists(project, self.A),
                             "A's stale half did not survive both rotations")
             self.assertFalse(self._half_exists(project, self.A))
+
+
+class AutomaticRegistrationModeTest(unittest.TestCase):
+    """Initial and reassert carry different rules, so they must be told apart.
+
+    Both send the same payload today, and once an endpoint is pruned Python
+    cannot tell which it is looking at. The check also belongs inside the lock
+    that writes the endpoint: validated one hop earlier in Node, the proof could
+    move in the window before the write.
+    """
+
+    OWNER = "4242:v1:Mon Sep  1 00:00:00 2026"
+    A = "8261c119-2c20-4bf4-87ab-f152ac87dbda"
+    B = "0199a1b2-2222-7000-8000-00000000000b"
+
+    def _claim(self, project, session_id, mode, owner=None):
+        alias, digest = peers.auto_identity(session_id)
+        return peers.register(project, "claude", alias,
+                              os.path.join(project, alias + ".sock"),
+                              pid=os.getpid(), owner_key=owner or self.OWNER,
+                              identity_digest=digest, mode=mode)
+
+    def test_automatic_registration_first_claim_needs_a_genuinely_absent_proof(self):
+        with tempfile.TemporaryDirectory() as project:
+            ok, _ = self._claim(project, self.A, "initial")
+            self.assertTrue(ok, "no proof exists yet: an UNREADY candidate")
+
+    def test_automatic_registration_refuses_a_claim_on_an_unreadable_proof(self):
+        """Invalid and unreadable must not be mistaken for absent."""
+        with tempfile.TemporaryDirectory() as project:
+            peers.write_identity_proof(project, self.OWNER, self.A,
+                                       peers.auto_identity(self.A)[1])
+            path = peers.identity_proof_path(project, self.OWNER)
+            with open(path, "w", encoding="utf-8") as stream:
+                stream.write("{")
+            ok, detail = self._claim(project, self.A, "initial")
+            self.assertFalse(ok, detail)
+            with open(path, encoding="utf-8") as stream:
+                self.assertEqual(stream.read(), "{",
+                                 "a refused claim overwrites nothing")
+
+    def test_automatic_registration_must_match_an_existing_proof(self):
+        with tempfile.TemporaryDirectory() as project:
+            peers.write_identity_proof(project, self.OWNER, self.B,
+                                       peers.auto_identity(self.B)[1])
+            ok, detail = self._claim(project, self.A, "initial")
+            self.assertFalse(ok, detail)
+            ok, _ = self._claim(project, self.B, "initial")
+            self.assertTrue(ok)
+
+    def test_automatic_registration_reassert_always_needs_an_exact_proof(self):
+        with tempfile.TemporaryDirectory() as project:
+            ok, detail = self._claim(project, self.A, "reassert")
+            self.assertFalse(ok, "reassert never opens a candidate slot")
+            peers.write_identity_proof(project, self.OWNER, self.A,
+                                       peers.auto_identity(self.A)[1])
+            ok, _ = self._claim(project, self.A, "reassert")
+            self.assertTrue(ok)
+
+    def test_automatic_registration_modes_are_allowlisted(self):
+        with tempfile.TemporaryDirectory() as project:
+            for mode in ("Initial", "retire", "", "reassert-now"):
+                with self.subTest(mode=mode):
+                    ok, _ = self._claim(project, self.A, mode)
+                    self.assertFalse(ok, "an unknown mode fails closed")
+
+    def test_automatic_registration_leaves_explicit_and_codex_alone(self):
+        """Scope control: register is shared, this contract is not."""
+        with tempfile.TemporaryDirectory() as project:
+            ok, detail = peers.register(
+                project, "claude", "build", os.path.join(project, "b.sock"),
+                pid=os.getpid(), owner_key=self.OWNER)
+            self.assertTrue(ok, detail)
+            ok, detail = peers.register(
+                project, "codex", "worker", None,
+                pid=os.getpid(), owner_key=self.OWNER)
+            self.assertTrue(ok, detail)
+
+    def test_automatic_registration_checks_the_proof_under_the_write_lock(self):
+        """A Node-side precheck would pass; the locked check must not.
+
+        The proof is moved after the caller has read it and before the write
+        happens, which is exactly the window a precheck cannot close.
+        """
+        with tempfile.TemporaryDirectory() as project:
+            peers.write_identity_proof(project, self.OWNER, self.A,
+                                       peers.auto_identity(self.A)[1])
+            real = peers._read_identity_proof_file
+            moved = []
+
+            def move_then_read(path, digest):
+                if not moved:
+                    moved.append(True)
+                    # The unlocked core: `register` already holds the registry
+                    # lock here and it is not reentrant.
+                    peers._write_identity_proof_locked(
+                        project, self.OWNER, self.B,
+                        peers.auto_identity(self.B)[1])
+                return real(path, digest)
+
+            with patch.object(peers, "_read_identity_proof_file",
+                              move_then_read):
+                ok, detail = self._claim(project, self.A, "initial")
+            self.assertFalse(ok, detail)

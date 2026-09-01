@@ -897,8 +897,40 @@ def read_peers(cwd, kind=None):
     return found
 
 
+AUTOMATIC_REGISTRATION_MODES = ("initial", "reassert")
+
+
+def _automatic_claim_refusal(cwd, kind, owner_key, identity_digest, mode):
+    """Why this claim is refused, or "" to allow it. The lock is held.
+
+    Scoped structurally to automatic Claude: every Codex path and every
+    explicit or legacy Claude peer passes untouched, because `register` is
+    shared and this contract is not.
+    """
+    if mode not in AUTOMATIC_REGISTRATION_MODES:
+        return "unknown automatic registration mode; no claim was changed"
+    if kind != "claude" or identity_digest is None:
+        return ""
+    if not valid_owner_key(owner_key):
+        return "an automatic claim needs a canonical owner key"
+    state, proof = _read_identity_proof_file(
+        identity_proof_path(cwd, owner_key), _owner_digest(owner_key))
+    if state == "valid":
+        if proof.get("identity_digest") == identity_digest:
+            return ""
+        return ("the owner's current identity proof names another session; "
+                "no claim was changed")
+    if state == "absent":
+        if mode == "initial":
+            return ""        # nothing proved yet: an UNREADY candidate slot
+        return "reassert needs a current identity proof; none exists"
+    # Unreadable and invalid are not absent. Reading either as "no proof yet"
+    # would open the very claim this exists to refuse.
+    return f"the owner's identity proof is {state}; no claim was changed"
+
+
 def register(cwd, kind, name, address, pid=None, owner_key=None,
-             identity_digest=None):
+             identity_digest=None, mode=None):
     """Claims `name` for `pid`. Returns (ok, detail).
 
     `pid` is the process whose life the peer's life follows, and it is often not
@@ -1003,6 +1035,14 @@ def register(cwd, kind, name, address, pid=None, owner_key=None,
                 # either reached whichever actually held it.
                 return False, (f"address {address!r} is already served by peer "
                                f"{other.get('name')!r} (pid {other_pid})")
+        if mode is not None:
+            # Inside the lock that writes the endpoint, never one hop earlier:
+            # a proof validated in Node and a registration performed here are
+            # two moments, and the proof can move in between.
+            refusal = _automatic_claim_refusal(cwd, kind, owner_key,
+                                               identity_digest, mode)
+            if refusal:
+                return False, refusal
         path = _peer_file(cwd, kind, name)
         os.makedirs(os.path.dirname(path), exist_ok=True)
         record = {"kind": kind, "name": name, "pid": owner_pid,

@@ -1699,3 +1699,73 @@ try {
   await rm(projectDir, { recursive: true, force: true }).catch(() => {});
   await rm(stubDir, { recursive: true, force: true }).catch(() => {});
 }
+
+// --- Task 4: the bridge payload must say which claim this is -------------
+// Initial and reassert carry different rules and today send an identical
+// payload, so once an endpoint is pruned Python has nothing left to tell them
+// apart. The mode travels in the payload, and an unknown one fails closed.
+async function makeModeRecordingPython(identity) {
+  const dir = await mkdtemp(join(tmpdir(), "antiphon-mode-python-"));
+  const payloads = join(dir, "payloads.txt");
+  const realPython = execFileSync("python3", [
+    "-c", "import sys; print(sys.executable)",
+  ], { encoding: "utf8" }).trim();
+  writeFileSync(join(dir, "python3"), `#!${realPython}
+import os
+import sys
+
+command = sys.argv[2] if len(sys.argv) > 2 else ""
+if command == "claude_identity":
+    print(os.environ["ANTIPHON_TEST_IDENTITY_RESULT"])
+    raise SystemExit(0)
+if command == "register_peer":
+    body = sys.stdin.read()
+    with open(os.environ["ANTIPHON_TEST_MODE_PAYLOADS"], "a") as stream:
+        stream.write(body + "\\n")
+    raise SystemExit(0)
+
+real_python = os.environ["ANTIPHON_TEST_REAL_PYTHON"]
+os.execv(real_python, [real_python, *sys.argv[1:]])
+`, { mode: 0o755 });
+  return {
+    dir,
+    payloads,
+    env: {
+      PATH: `${dir}:${process.env.PATH}`,
+      ANTIPHON_TEST_MODE_PAYLOADS: payloads,
+      ANTIPHON_TEST_IDENTITY_RESULT: JSON.stringify(identity),
+      ANTIPHON_TEST_REAL_PYTHON: realPython,
+    },
+  };
+}
+
+async function automaticRegistrationDeclaresItsMode() {
+  // The real values, taken from peers.auto_identity rather than recomputed:
+  // the alias is lowercase base32 of the first 128 bits, and an alias that
+  // does not validate would silently leave the channel on the explicit path
+  // where no mode is sent at all.
+  const session_id = "8261c119-2c20-4bf4-87ab-f152ac87dbda";
+  const digest =
+    "9aa9141f2a5c704b91ef1d2122ad75e67a1ca8be84b7fe119a6edeca9f0b6937";
+  const alias = "auto-tkurihzklryexeppduqsfllv4y";
+  const stub = await makeModeRecordingPython({
+    alias, identity_digest: digest, session_id,
+  });
+  const dir = await mkdtemp(join(tmpdir(), "antiphon-mode-"));
+  const session = spawnChannel(dir, undefined, stub.env);
+  try {
+    assert.ok(await waitFor(() => existsSync(stub.payloads)),
+      `the channel never reached register_peer; stderr=${session.stderr()}`);
+    const first = JSON.parse(readFileSync(stub.payloads, "utf8")
+      .trim().split("\n")[0]);
+    assert.equal(first.mode, "initial",
+      "a startup claim is an initial claim, and must say so");
+  } finally {
+    session.child.kill("SIGKILL");
+    await waitForExit(session.child, 2_000);
+    await rm(dir, { recursive: true, force: true }).catch(() => {});
+    await rm(stub.dir, { recursive: true, force: true }).catch(() => {});
+  }
+}
+
+await automaticRegistrationDeclaresItsMode();

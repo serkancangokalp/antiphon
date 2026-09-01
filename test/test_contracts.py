@@ -132,7 +132,11 @@ class CrossBoundaryContractTest(unittest.TestCase):
         # `serveSocket` is defined above the branch that calls it. What matters is
         # evaluation order in the chain, plus binding living in exactly one place
         # so there is no second path to it.
-        self.assertLess(source.index("await claimPeer()"),
+        # The claim now declares which kind of claim it is, so match the call
+        # rather than one spelling of its argument: what this guards is the
+        # order, and a literal that pins the argument too would fail the next
+        # time the payload gains a field without the race ever returning.
+        self.assertLess(source.index("await claimPeer("),
                         source.index("await serveSocket()"),
                         "the address must be claimed before anything binds")
         self.assertEqual(source.count("socketServer.listen("), 1,
