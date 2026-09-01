@@ -1650,3 +1650,156 @@ class UnnamedKeyTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class IdentityProofTest(unittest.TestCase):
+    """The owner-current proof: which session an owner is running right now.
+
+    A stale automatic session half stays authoritative forever without it, and
+    a message addressed to the retired alias lands in the session that replaced
+    it. Everything here is about refusing to guess: an absent proof, an
+    unreadable one and a corrupt one are three different facts, and collapsing
+    them is what would let a corrupt file open a claim it must have refused.
+    """
+
+    OWNER = "4242:Mon Sep  1 00:00:00 2026"
+    SESSION = "8261c119-2c20-4bf4-87ab-f152ac87dbda"
+    OTHER = "0199a1b2-2222-7000-8000-00000000000b"
+
+    def _digest(self, session_id=None):
+        return peers.auto_identity(session_id or self.SESSION)[1]
+
+    def _write(self, project, **over):
+        """The record `write_identity_proof` would have written, then edited."""
+        peers.write_identity_proof(project, self.OWNER, self.SESSION,
+                                   self._digest())
+        path = peers.identity_proof_path(project, self.OWNER)
+        with open(path, encoding="utf-8") as stream:
+            record = json.load(stream)
+        record.update(over)
+        with open(path, "w", encoding="utf-8") as stream:
+            json.dump(record, stream)
+        return path
+
+    def test_an_identity_proof_round_trips_under_the_registry_lock(self):
+        with tempfile.TemporaryDirectory() as project:
+            self.assertTrue(peers.write_identity_proof(
+                project, self.OWNER, self.SESSION, self._digest()))
+            state, proof = peers.read_identity_proof(project, self.OWNER)
+            self.assertEqual(state, "valid")
+            self.assertEqual(proof["session_id"], self.SESSION)
+            self.assertEqual(proof["identity_digest"], self._digest())
+            self.assertEqual(proof["owner_key"], self.OWNER)
+            self.assertEqual(proof["kind"], "claude")
+            self.assertNotIn("written_at", proof,
+                             "nothing reads it, so it is not stored")
+
+    def test_identity_proof_read_separates_absent_unreadable_and_invalid(self):
+        """Three facts, never one None. A corrupt proof read as absent would
+        open the candidate claim that §2a exists to refuse."""
+        with tempfile.TemporaryDirectory() as project:
+            self.assertEqual(peers.read_identity_proof(project, self.OWNER),
+                             ("absent", None))
+
+            path = self._write(project, kind="codex")
+            self.assertEqual(peers.read_identity_proof(project, self.OWNER)[0],
+                             "invalid")
+
+            def refuse(*_a, **_k):
+                raise OSError(5, "Input/output error", path)
+
+            self._write(project)
+            with patch.object(peers.io, "open", side_effect=refuse) \
+                    if hasattr(peers, "io") else patch("builtins.open",
+                                                       side_effect=refuse):
+                self.assertEqual(
+                    peers.read_identity_proof(project, self.OWNER)[0],
+                    "unreadable")
+
+    def test_every_malformed_identity_proof_reads_as_no_proof(self):
+        cases = {
+            "version is a string": {"version": "1"},
+            "version is a bool": {"version": True},
+            "version is the wrong number": {"version": 99},
+            "kind is codex": {"kind": "codex"},
+            "session id is missing": {"session_id": None},
+            "session id is not canonical": {"session_id": "not-a-uuid"},
+            "identity digest is malformed": {"identity_digest": "zz"},
+            "identity digest is another session's":
+                {"identity_digest": peers.auto_identity(OTHER := "0199a1b2-"
+                                                        "2222-7000-8000-"
+                                                        "00000000000b")[1]},
+            "owner key is not canonical": {"owner_key": "no-start-time"},
+        }
+        for name, over in cases.items():
+            with self.subTest(case=name), \
+                 tempfile.TemporaryDirectory() as project:
+                self._write(project, **over)
+                state, proof = peers.read_identity_proof(project, self.OWNER)
+                self.assertEqual(state, "invalid", name)
+                self.assertIsNone(proof, name)
+
+    def test_a_proof_under_another_owners_filename_is_invalid(self):
+        """Without this a record could be planted or renamed under another
+        owner's digest and read as that owner's proof."""
+        other_owner = "4243:Mon Sep  1 00:00:00 2026"
+        with tempfile.TemporaryDirectory() as project:
+            source = self._write(project)
+            target = peers.identity_proof_path(project, other_owner)
+            os.replace(source, target)
+            self.assertEqual(
+                peers.read_identity_proof(project, other_owner)[0], "invalid")
+
+    def test_a_torn_or_empty_identity_proof_is_invalid(self):
+        for name, body in (("torn", '{"version": 1, "kind": "cla'),
+                           ("empty", "")):
+            with self.subTest(case=name), \
+                 tempfile.TemporaryDirectory() as project:
+                path = self._write(project)
+                with open(path, "w", encoding="utf-8") as stream:
+                    stream.write(body)
+                self.assertEqual(
+                    peers.read_identity_proof(project, self.OWNER)[0],
+                    "invalid", name)
+
+    def test_the_identity_proof_inventory_is_read_only_and_validated(self):
+        second = "4243:Mon Sep  1 00:00:00 2026"
+        with tempfile.TemporaryDirectory() as project:
+            peers.write_identity_proof(project, self.OWNER, self.SESSION,
+                                       self._digest())
+            peers.write_identity_proof(project, second, self.OTHER,
+                                       self._digest(self.OTHER))
+            before = sorted(os.listdir(peers.identity_proofs_dir(project)))
+            inventory = peers.identity_proofs(project)
+            self.assertEqual(inventory.completeness, "exact")
+            self.assertEqual(len(inventory.proofs), 2)
+            self.assertEqual(
+                sorted(os.listdir(peers.identity_proofs_dir(project))), before,
+                "reading the inventory writes nothing")
+
+    def test_identity_proof_inventory_never_reports_a_confident_zero(self):
+        """An unreadable directory is not an empty one."""
+        with tempfile.TemporaryDirectory() as project:
+            peers.write_identity_proof(project, self.OWNER, self.SESSION,
+                                       self._digest())
+
+            def refuse(*_a, **_k):
+                raise OSError(5, "Input/output error")
+
+            with patch.object(peers.os, "scandir", side_effect=refuse):
+                inventory = peers.identity_proofs(project)
+            self.assertEqual(inventory.completeness, "unknown")
+            self.assertEqual(inventory.proofs, ())
+
+        with tempfile.TemporaryDirectory() as project:
+            peers.write_identity_proof(project, self.OWNER, self.SESSION,
+                                       self._digest())
+            broken = peers.identity_proof_path(
+                project, "4243:Mon Sep  1 00:00:00 2026")
+            with open(broken, "w", encoding="utf-8") as stream:
+                stream.write("{")
+            inventory = peers.identity_proofs(project)
+            self.assertEqual(inventory.completeness, "lower-bound",
+                             "one unreadable neighbour must not hide a live "
+                             "peer, and must not be counted as complete")
+            self.assertEqual(len(inventory.proofs), 1)

@@ -20,6 +20,7 @@ than guessed at.
 """
 
 import base64
+import collections
 import contextlib
 import fcntl
 import hashlib
@@ -44,6 +45,7 @@ VERSIONED_OWNER_PATTERN = re.compile(
 PROCESS_FINGERPRINT_VERSION = 1
 OWNER_KEY_VERSION = f"v{PROCESS_FINGERPRINT_VERSION}"
 OBSERVATION_VERSION = 1
+IDENTITY_PROOF_VERSION = 1
 # The canonical UUID a Codex session is named by, lowercase as the CLI writes it
 # and as `antiphon.SESSION_ID` reads it back off a rollout file name. A contract
 # test keeps the two spellings from drifting apart.
@@ -258,6 +260,158 @@ def _session_file(cwd, kind, name):
     anyone reads it. Two files, one writer each.
     """
     return os.path.join(peer_dir(cwd, kind, name), "session.json")
+
+
+IdentityProofInventory = collections.namedtuple(
+    "IdentityProofInventory", "proofs completeness")
+
+
+def identity_proofs_dir(cwd):
+    """Owner-current automatic-Claude identity proofs, one file per owner."""
+    return os.path.join(cwd, ".antiphon", "identity", "claude")
+
+
+def _owner_digest(owner_key):
+    return hashlib.sha256(owner_key.encode("utf-8")).hexdigest()
+
+
+def identity_proof_path(cwd, owner_key):
+    """The proof file for one owner, named from a digest and never the key."""
+    return os.path.join(identity_proofs_dir(cwd),
+                        _owner_digest(owner_key) + ".json")
+
+
+def _valid_identity_proof(record, owner_digest):
+    """Whether a record is a usable proof for the owner whose digest names it.
+
+    Total on purpose. Every field is checked, including the two relations that
+    make the record self-consistent: the filename must be the digest of the
+    owner key stored inside, so a record cannot be planted or renamed under
+    another owner's name, and the identity digest must be the one derived from
+    the stored session id, so the two halves cannot disagree about who this is.
+    """
+    if not isinstance(record, dict):
+        return False
+    version = record.get("version")
+    if (not isinstance(version, int) or isinstance(version, bool)
+            or version != IDENTITY_PROOF_VERSION):
+        return False
+    if record.get("kind") != "claude":
+        return False
+    owner = record.get("owner_key")
+    if not valid_owner_key(owner) or _owner_digest(owner) != owner_digest:
+        return False
+    if record.get("owner_digest") != owner_digest:
+        return False
+    session_id = record.get("session_id")
+    if not valid_session_id(session_id):
+        return False
+    identity = auto_identity(session_id)
+    return identity is not None and record.get("identity_digest") == identity[1]
+
+
+def _read_identity_proof_file(path, owner_digest):
+    """`(state, proof)` for one proof file: valid, absent, unreadable, invalid.
+
+    Three facts, never one `None`. Absent means no proof was ever written and
+    a first automatic endpoint may claim a candidate slot; unreadable means the
+    answer is unknown and nothing may be concluded; invalid means a record is
+    there and cannot be trusted. Collapsing them would let a corrupt file read
+    as absent and open the claim it must have refused.
+    """
+    try:
+        with open(path, encoding="utf-8") as stream:
+            raw = stream.read()
+    except FileNotFoundError:
+        return "absent", None
+    except OSError:
+        return "unreadable", None
+    try:
+        record = json.loads(raw)
+    except ValueError:
+        return "invalid", None
+    if not _valid_identity_proof(record, owner_digest):
+        return "invalid", None
+    return "valid", record
+
+
+def read_identity_proof(cwd, owner_key):
+    """The classified proof for one owner. An unusable key is never absent."""
+    if not valid_owner_key(owner_key):
+        return "invalid", None
+    return _read_identity_proof_file(identity_proof_path(cwd, owner_key),
+                                     _owner_digest(owner_key))
+
+
+def _write_identity_proof_locked(cwd, owner_key, session_id, identity_digest):
+    """Replace one owner's proof atomically. The caller holds the lock."""
+    if not valid_owner_key(owner_key) or not valid_session_id(session_id):
+        return False
+    identity = auto_identity(session_id)
+    if identity is None or identity[1] != identity_digest:
+        return False
+    path = identity_proof_path(cwd, owner_key)
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    record = {
+        "version": IDENTITY_PROOF_VERSION,
+        "kind": "claude",
+        "owner_key": owner_key,
+        "owner_digest": _owner_digest(owner_key),
+        "session_id": session_id,
+        "identity_digest": identity_digest,
+    }
+    tmp = f"{path}.{os.getpid()}.tmp"
+    try:
+        with open(tmp, "w", encoding="utf-8") as stream:
+            json.dump(record, stream, ensure_ascii=False)
+        os.replace(tmp, path)
+    except OSError:
+        with contextlib.suppress(OSError):
+            os.unlink(tmp)
+        return False
+    return True
+
+
+def write_identity_proof(cwd, owner_key, session_id, identity_digest):
+    """Record which session this owner is running now, under the registry lock.
+
+    The unlocked core is separate because the rotation transaction holds the
+    lock across several steps and the registry lock is not reentrant.
+    """
+    with _registry_lock(cwd):
+        return _write_identity_proof_locked(cwd, owner_key, session_id,
+                                            identity_digest)
+
+
+def identity_proofs(cwd):
+    """Every valid proof, and how much of the truth this answer covers.
+
+    A bare list would make a genuinely empty directory and an unreadable one
+    both come back empty, and `status` would report a confident zero from a
+    state it could not read. `completeness` is `exact` when every entry was
+    read, `lower-bound` when some entry failed but a valid one survives, and
+    `unknown` when nothing valid could be read at all. Reading mutates nothing.
+    """
+    directory = identity_proofs_dir(cwd)
+    try:
+        names = sorted(entry.name for entry in os.scandir(directory)
+                       if entry.is_file() and entry.name.endswith(".json"))
+    except FileNotFoundError:
+        return IdentityProofInventory((), "exact")
+    except OSError:
+        return IdentityProofInventory((), "unknown")
+    found, failed = [], False
+    for name in names:
+        state, proof = _read_identity_proof_file(
+            os.path.join(directory, name), name[:-len(".json")])
+        if state == "valid":
+            found.append(proof)
+        else:
+            failed = True
+    if not failed:
+        return IdentityProofInventory(tuple(found), "exact")
+    return IdentityProofInventory(
+        tuple(found), "lower-bound" if found else "unknown")
 
 
 def observations_dir(cwd):
