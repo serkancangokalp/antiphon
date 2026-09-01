@@ -260,24 +260,27 @@ invalid/unknown evidence is never converted or deleted by compaction.
 
 Relevant cursor files and the owner evidence deciding dormant/relevant are
 snapshotted one at a time under their own locks, then released before the
-catalog lock is acquired. Under the catalog lock the command re-proves that the
-source is missing, the catalog generation has not changed and the set plus
-classification inputs of cursor files are unchanged. It then writes a durable
-prepared journal naming the old and proposed states plus hashes of the exact
-candidate records. Readers continue to expose the old state after the atomic
-switch until source/cursor/owner evidence is revalidated and the journal is
-marked committed. Only a committed journal authorizes deletion of its matching,
-still-detached regular records. A crash, failed rollback or failed unlink is
-therefore retryable; an unjournaled detached record is evidence of nothing and
-is retained. Hooks may roll a prepared transaction back but never finalize or
-delete a retired candidate. Manifest cleanup waits until the journal no longer
-needs either generation.
+catalog lock is acquired. Under that lock the command re-proves **every input
+the retirement decision actually read**: catalog state and manifests, each
+eligible candidate record's deeply typed values, source absence, and the set
+plus classification inputs of cursor files. The record signature is limited to
+the candidates being retired, so an unrelated hook update cannot starve a safe
+compaction. It then writes a durable prepared journal naming the old and
+proposed states plus hashes of the exact candidate records. Readers continue to
+expose the old state after the atomic switch until source/cursor/owner evidence
+is revalidated and the journal is marked committed. Only a committed journal
+authorizes deletion of its matching, still-detached regular records. A crash,
+failed rollback or failed unlink is therefore retryable; an unjournaled
+detached record is evidence of nothing and is retained. Hooks may roll a
+prepared transaction back but never finalize or delete a retired candidate.
+Manifest cleanup waits until the journal no longer needs either generation.
 
 Because the source is already gone and older than every new reader's lookback,
 a cursor created immediately after the census cannot make its bytes readable;
 the command nevertheless refuses if the rechecked cursor-file set changed.
 Output is aggregate only: candidates considered/retired/refused and bytes/files
-reclaimed, never paths, source ids, cursor hashes or transcript content.
+reclaimed, never paths, source ids, cursor hashes or transcript content. A
+`snapshot-raced` refusal explicitly tells the operator to retry.
 
 Ordinary `sources scan` does not retire candidates. It may reclaim unreferenced
 manifests because that proof is catalog-local; it cannot infer that all readers

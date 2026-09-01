@@ -2956,26 +2956,19 @@ class CatchUpTest(unittest.TestCase):
             self.assertFalse(os.path.exists(antiphon.state_path(project, "claude")))
 
     def test_catch_up_never_reverts_a_concurrent_v4_advance(self):
-        """A refused source has no measured frontier for catch-up to replace.
+        """A measured frontier can go stale before the cursor transaction.
 
-        If a hook advances that source after catch-up's read but before its
-        cursor transaction, the freshly held v4 position wins. Replaying the
-        stale pre-lock snapshot would move the reader backwards.
+        If a hook advances after catch-up measures the old EOF, the freshly
+        held v4 position wins and the operator is told that zero sources were
+        actually moved rather than the size of the stale measured frontier.
         """
-        stale = {"gen": "same-generation", "offset": 100,
-                 "anchor": {"start": 50, "sha256": "a" * 64}}
-        fresh = {"gen": "same-generation", "offset": 200,
-                 "anchor": {"start": 150, "sha256": "b" * 64}}
         with tempfile.TemporaryDirectory() as project, \
-             tempfile.TemporaryDirectory() as root, \
-             tempfile.TemporaryDirectory() as outside:
-            target = os.path.join(outside, self.SID_CLAUDE + ".jsonl")
-            with open(target, "w", encoding="utf-8") as stream:
-                stream.write("{}\n")
+             tempfile.TemporaryDirectory() as root:
             path = os.path.join(root, self.SID_CLAUDE + ".jsonl")
-            os.symlink(target, path)
-            discovered = antiphon._discovered_source_path(
-                path, root, "claude")
+            with open(path, "w", encoding="utf-8") as stream:
+                stream.write('{"first":true}\n')
+            generation = antiphon.source_generation(path)
+            stale = {"gen": generation, "offset": 0, "anchor": None}
             key = antiphon.anchored_page_cursor_key("codex")
             initial = {key: {
                 "v": antiphon.ANCHORED_PAGE_CURSOR_VERSION,
@@ -2983,12 +2976,18 @@ class CatchUpTest(unittest.TestCase):
                 "adopting_v3": {}, "next_lane": "active",
             }}
             antiphon.write_cursor(project, initial, "codex")
-            refusal = antiphon.Discovery(
-                (discovered,), "degraded", 0, 0, 0,
-                "some project sources could not be proved")
+            discovery = antiphon.Discovery(
+                (path,), "complete", 0, 0, 0, None)
             real_update = antiphon.update_cursor
+            fresh = None
 
             def race(cwd, side, mutate):
+                nonlocal fresh
+                with open(path, "a", encoding="utf-8") as stream:
+                    stream.write('{"second":true}\n')
+                end = os.path.getsize(path)
+                fresh = {"gen": generation, "offset": end,
+                         "anchor": antiphon._path_anchor_at(path, end)}
                 current = {key: {
                     "v": antiphon.ANCHORED_PAGE_CURSOR_VERSION,
                     "sources": {self.SID_CLAUDE: fresh},
@@ -2998,16 +2997,19 @@ class CatchUpTest(unittest.TestCase):
                     antiphon.state_path(cwd, side), current))
                 return real_update(cwd, side, mutate)
 
+            out = io.StringIO()
             with patch.object(antiphon, "project_dir", return_value=project), \
                  patch.object(antiphon, "_discover_sources",
-                              return_value=refusal), \
+                              return_value=discovery), \
                  patch.object(antiphon, "update_cursor", side_effect=race), \
-                 contextlib.redirect_stdout(io.StringIO()), \
+                 contextlib.redirect_stdout(out), \
                  contextlib.redirect_stderr(io.StringIO()):
                 self.assertEqual(antiphon.catch_up("codex"), 0)
             after = antiphon.read_cursor(project, "codex")[key]
         self.assertEqual(after["sources"][self.SID_CLAUDE], fresh)
         self.assertEqual(after["next_lane"], "dead")
+        self.assertIn("0 source(s) moved", out.getvalue())
+        self.assertIn("0 bytes", out.getvalue())
 
     def test_status_reports_raw_unread_bytes_per_reader(self):
         """A person asking "why is the bridge delivering yesterday?" gets the
@@ -6600,6 +6602,98 @@ class SourceCompactionTest(unittest.TestCase):
             self.project, "claude").view.candidates)
         self.assertIn("snapshot-raced=1", printed)
 
+    def test_refreshed_candidate_record_invalidates_the_stale_retirement_proof(self):
+        sid, relative, record_path, old_proof = self._aged_gone(33)
+        source_path = os.path.join(self.claude_root, relative)
+        self._shared_v4(sid, old_proof)
+        self.assertEqual(self._scan(), 0)
+        real_inputs = antiphon._compaction_cursor_inputs
+        refreshed = False
+        new_proof = None
+
+        def refresh_after_proof(cwd, side, locked=True, **kwargs):
+            nonlocal refreshed, new_proof
+            result = real_inputs(cwd, side, locked, **kwargs)
+            if locked and not refreshed:
+                with open(source_path, "w", encoding="utf-8") as stream:
+                    stream.write(json.dumps({
+                        "type": "assistant",
+                        "timestamp": "2026-09-01T00:00:02Z",
+                        "message": {"content": [{"type": "text",
+                                                   "text": "new generation"}]},
+                    }) + "\n")
+                observation = antiphon._record_current_source(
+                    self.project, "claude", source_path)
+                self.assertTrue(observation.ok, observation)
+                record = antiphon._read_catalog_record(
+                    self.project, "claude", relative)
+                new_proof = (record["last_complete_generation"],
+                             record["last_complete_size"])
+                self.assertNotEqual(new_proof, old_proof)
+                os.unlink(source_path)
+                refreshed = True
+            return result
+
+        with patch.object(antiphon, "_scan_source_catalogs",
+                          return_value=(False, 0, 0, 0)), \
+             patch.object(antiphon, "_compaction_cursor_inputs",
+                          side_effect=refresh_after_proof):
+            code, printed = self._compact()
+
+        self.assertTrue(refreshed, "the fixture must replace the proof record")
+        self.assertIsNotNone(new_proof)
+        self.assertEqual(code, 1, printed)
+        self.assertTrue(os.path.exists(record_path))
+        self.assertEqual(
+            (antiphon._read_catalog_record(
+                self.project, "claude", relative)["last_complete_generation"],
+             antiphon._read_catalog_record(
+                self.project, "claude", relative)["last_complete_size"]),
+            new_proof)
+        self.assertIn(relative, antiphon._catalog_snapshot(
+            self.project, "claude").view.candidates)
+        self.assertIn("snapshot-raced=1", printed)
+        self.assertIn("retry", printed.lower())
+
+    def test_unrelated_record_refresh_does_not_starve_compaction(self):
+        sid, relative, record_path, proof = self._aged_gone(37)
+        other_sid, other_path = self._source(38, "unrelated live source")
+        self.assertEqual(self._scan(), 0)
+        other_relative = os.path.relpath(other_path, self.claude_root)
+        other_record_path = antiphon._catalog_record_path(
+            self.project, "claude", other_relative)
+        self._shared_v4(sid, proof)
+        real_inputs = antiphon._compaction_cursor_inputs
+        refreshed = False
+
+        def refresh_unrelated_after_proof(cwd, side, locked=True, **kwargs):
+            nonlocal refreshed
+            result = real_inputs(cwd, side, locked, **kwargs)
+            if locked and not refreshed:
+                observation = antiphon._record_current_source(
+                    self.project, "claude", other_path)
+                self.assertTrue(observation.ok, observation)
+                refreshed = True
+            return result
+
+        with patch.object(antiphon, "_scan_source_catalogs",
+                          return_value=(False, 0, 0, 0)), \
+             patch.object(antiphon, "_compaction_cursor_inputs",
+                          side_effect=refresh_unrelated_after_proof):
+            code, printed = self._compact()
+
+        self.assertTrue(refreshed, "the fixture must refresh an unrelated record")
+        self.assertEqual(code, 1, printed)
+        self.assertIn("1 retired", printed)
+        self.assertIn("source-not-gone=1", printed)
+        self.assertFalse(os.path.exists(record_path))
+        self.assertTrue(os.path.exists(other_record_path))
+        view = antiphon._catalog_snapshot(self.project, "claude").view
+        self.assertNotIn(relative, view.candidates)
+        self.assertIn(other_relative, view.candidates)
+        self.assertNotIn("snapshot-raced=1", printed)
+        self.assertNotEqual(sid, other_sid)
+
     def test_failed_post_switch_rollback_keeps_a_durable_safe_view(self):
         sid, relative, record_path, proof = self._aged_gone(28)
         cursor_path = self._shared_v4(sid, proof)
@@ -6698,6 +6792,94 @@ class SourceCompactionTest(unittest.TestCase):
         self.assertEqual(antiphon._read_compaction_journal(
             self.project, "claude")[1], "missing")
 
+    def test_prepared_journal_with_a_third_catalog_state_fails_closed(self):
+        sid, relative, record_path, proof = self._aged_gone(35)
+        self._shared_v4(sid, proof)
+        self.assertEqual(self._scan(), 0)
+        old_state = antiphon._read_source_catalog(self.project).state
+        old_generation = old_state["kinds"]["claude"]["generation"]
+        real_write = antiphon._write_catalog_state
+
+        class SimulatedCrash(BaseException):
+            pass
+
+        def crash_after_switch(cwd, state, cleanup=True):
+            written = real_write(cwd, state, cleanup)
+            generation = state["kinds"]["claude"]["generation"]
+            if written and generation != old_generation:
+                raise SimulatedCrash()
+            return written
+
+        with patch.object(antiphon, "_scan_source_catalogs",
+                          return_value=(False, 0, 0, 0)), \
+             patch.object(antiphon, "_write_catalog_state",
+                          side_effect=crash_after_switch), \
+             self.assertRaises(SimulatedCrash):
+            self._compact()
+
+        journal, status = antiphon._read_compaction_journal(
+            self.project, "claude")
+        self.assertEqual((status, journal["phase"]), ("valid", "prepared"))
+        third_state = json.loads(json.dumps(old_state))
+        generation = uuid.uuid4().hex
+        common = {
+            "v": antiphon.CATALOG_VERSION,
+            "project": os.path.abspath(self.project), "kind": "claude",
+            "generation": generation,
+            "root_stamp": third_state["kinds"]["claude"].get("root_stamp"),
+        }
+        base_name = antiphon._catalog_manifest_name(
+            "claude", generation, "base")
+        delta_name = antiphon._catalog_manifest_name(
+            "claude", generation, "delta")
+        self.assertTrue(antiphon._write_catalog_manifest(
+            self.project, base_name,
+            dict(common, phase="base", paths=[relative])))
+        self.assertTrue(antiphon._write_catalog_manifest(
+            self.project, delta_name,
+            dict(common, phase="delta", paths=[])))
+        third_state["kinds"]["claude"] = {
+            "generation": generation, "phase": "complete",
+            "base_manifest": base_name, "base_next": 1,
+            "delta_manifest": delta_name, "delta_next": 0,
+            "root_stamp": common["root_stamp"], "inflight": None,
+        }
+        self.assertTrue(antiphon._atomic_json(
+            antiphon._catalog_state_path(self.project), third_state))
+
+        loaded = antiphon._read_source_catalog(self.project)
+        self.assertEqual(
+            (loaded.status, loaded.reason),
+            ("invalid", "compaction-journal-raced"))
+        with antiphon.catalog_lock(self.project) as locked:
+            self.assertTrue(locked)
+            self.assertFalse(antiphon._recover_prepared_compactions_locked(
+                self.project))
+        self.assertTrue(os.path.exists(record_path))
+        self.assertEqual(antiphon._read_compaction_journal(
+            self.project, "claude")[1], "valid")
+
+    def test_malformed_or_newer_compaction_journal_blocks_without_mutation(self):
+        sid, relative, record_path, proof = self._aged_gone(36)
+        self._shared_v4(sid, proof)
+        journal_path = antiphon._compaction_journal_path(
+            self.project, "claude")
+        fixtures = ("{", json.dumps({"v": 999, "future": True}))
+
+        for contents in fixtures:
+            with self.subTest(contents=contents):
+                with open(journal_path, "w", encoding="utf-8") as stream:
+                    stream.write(contents)
+                before = DoctorTest.snapshot(self.project)
+                with patch.object(antiphon, "_scan_source_catalogs",
+                                  return_value=(False, 0, 0, 0)):
+                    code, printed = self._compact()
+                self.assertEqual(code, 1, printed)
+                self.assertIn("snapshot-raced=1", printed)
+                self.assertIn("retry", printed.lower())
+                self.assertEqual(DoctorTest.snapshot(self.project), before)
+                self.assertTrue(os.path.exists(record_path))
+
     def test_unjournaled_detached_record_is_never_assumed_retired(self):
         sid, relative, record_path, proof = self._aged_gone(29)
         self._shared_v4(sid, proof)
@@ -6780,6 +6962,34 @@ class SourceCompactionTest(unittest.TestCase):
         printed = out.getvalue() + err.getvalue()
         self.assertEqual(code, 1)
         self.assertIn("Permission denied", printed)
+        for secret in (self.project, secret_path, sid, relative, record_path,
+                       "private source text", "a" * 64):
+            self.assertNotIn(secret, printed)
+
+    def test_missing_exclusive_catalog_lock_is_a_private_cli_refusal(self):
+        sid, relative, record_path, proof = self._aged_gone(34)
+        self._shared_v4(sid, proof)
+        secret_path = os.path.join(self.project, "missing-secret-lock")
+        out, err = io.StringIO(), io.StringIO()
+
+        def failed_scan(cwd):
+            failure = FileNotFoundError(
+                errno.ENOENT, "No such file or directory", secret_path)
+            with patch.object(antiphon.os, "open", side_effect=failure):
+                with antiphon.catalog_lock(cwd) as locked:
+                    self.assertFalse(locked)
+            return True, 0, 1, 0
+
+        with patch.object(antiphon, "project_dir", return_value=self.project), \
+             patch.object(antiphon, "_scan_source_catalogs",
+                          side_effect=failed_scan), \
+             contextlib.redirect_stdout(out), \
+             contextlib.redirect_stderr(err):
+            code = antiphon.sources("compact")
+
+        printed = out.getvalue() + err.getvalue()
+        self.assertEqual(code, 1)
+        self.assertIn("No such file or directory", printed)
         for secret in (self.project, secret_path, sid, relative, record_path,
                        "private source text", "a" * 64):
             self.assertNotIn(secret, printed)

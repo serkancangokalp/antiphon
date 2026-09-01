@@ -124,12 +124,15 @@ the write-and-flush-before-advance transaction.
   It retires only whole aged, gone source groups every relevant v4 reader
   proves consumed or has no entry for after lookback. The shared cursor is
   always relevant; a named cursor is dormant only when the recorded owner is
-  proved dead by a current process fingerprint. Cursor, owner, source and
-  catalog inputs are revalidated around the atomic state switch. A durable
-  prepared/committed journal exposes the old catalog through a crash or failed
-  rollback and authorizes cleanup only after post-switch proof; an unjournaled
-  detached record is never guessed safe. Output exposes only aggregate blocker
-  classes and reclaimed files/bytes across stdout and stderr. Hooks never retire
+  proved dead by a current process fingerprint. Every decision input —
+  including cursor, owner, source and the deeply typed values of only the
+  candidate records being retired — is revalidated under the catalog lock
+  around the atomic state switch. Unrelated hook updates do not starve the
+  command. A durable prepared/committed journal exposes the old catalog through
+  a crash or failed rollback and authorizes cleanup only after post-switch
+  proof; an unjournaled detached record is never guessed safe. Output exposes
+  only aggregate blocker classes and reclaimed files/bytes across stdout and
+  stderr, and tells the operator to retry a snapshot race. Hooks never retire
   candidates.
 
 ### Still open, by name

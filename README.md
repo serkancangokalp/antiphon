@@ -324,12 +324,14 @@ first completes discovery, then retires only a whole aged, gone source that
 every relevant v4 reader proves consumed (or has no entry for after lookback).
 The shared cursor is always relevant; a named cursor is dormant only when its
 current process fingerprint proves its recorded owner dead. Unknown ownership
-stays relevant. The command revalidates catalog generation, source absence,
-cursor bytes and owner evidence around its atomic state switch, reports only
-aggregate blocker classes and reclaimed files/bytes, and preserves all cursor
-files. A durable prepared/committed journal keeps the old catalog visible until
-post-switch proof succeeds; a crash or failed rollback therefore retries or
-rolls back instead of turning an unproved detached record into deletion proof.
+stays relevant. The command revalidates every value its decision read —
+including the deeply typed values of the candidate records it would retire —
+under the catalog lock around its atomic state switch. Unrelated record updates
+do not block it. Output reports only aggregate blocker classes and reclaimed
+files/bytes, tells the operator to retry a snapshot race, and preserves all
+cursor files. A durable prepared/committed journal keeps the old catalog visible
+until post-switch proof succeeds; a crash or failed rollback therefore retries
+or rolls back instead of turning an unproved detached record into deletion proof.
 Hooks never retire candidates; they may only recover a prepared safe view.
 Committed record cleanup remains an explicit `sources compact` operation.
 

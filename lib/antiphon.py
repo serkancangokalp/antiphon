@@ -671,11 +671,15 @@ def catalog_lock(cwd, patience=None, shared=False):
         else:
             os.makedirs(os.path.dirname(path), exist_ok=True)
             fd = os.open(path, os.O_CREAT | os.O_RDWR, 0o600)
-    except FileNotFoundError:
+    except FileNotFoundError as exc:
         if shared:
             yield False
             return
-        raise
+        detail = exc.strerror or "operating system error"
+        print(f"antiphon: source catalog lock could not be opened: {detail}",
+              file=sys.stderr)
+        yield False
+        return
     except OSError as exc:
         detail = exc.strerror or "operating system error"
         print(f"antiphon: source catalog lock could not be opened: {detail}",
@@ -7735,7 +7739,7 @@ def catch_up(side=None):
                     unpinned += 1
                     continue
                 frontier[source.source] = entry
-        skipped = {"bytes": 0}
+        skipped = {"bytes": 0, "sources": 0}
 
         def mutate(cursor, key=key, frontier=frontier, skipped=skipped,
                    reader_side=one):
@@ -7778,6 +7782,7 @@ def catch_up(side=None):
                     continue
                 was = current_offset if isinstance(current_offset, int) else 0
                 skipped["bytes"] += max(0, entry["offset"] - was)
+                skipped["sources"] += 1
                 merge({sid: entry})
             cursor[key] = {
                 "v": ANCHORED_PAGE_CURSOR_VERSION,
@@ -7792,7 +7797,7 @@ def catch_up(side=None):
                   "moved", file=sys.stderr)
             status = 1
             continue
-        print(f"{key}: {len(frontier)} source(s) moved to the live edge; "
+        print(f"{key}: {skipped['sources']} source(s) moved to the live edge; "
               f"{skipped['bytes']:,} bytes of undelivered history will not be "
               "delivered")
         if unpinned:
@@ -8255,6 +8260,25 @@ def _compaction_receipts(cwd, kind, eligible):
     return receipts
 
 
+def _compaction_record_signature(records):
+    """Type-preserving values that authorized one retirement decision.
+
+    Only records for the sources actually being retired belong here. Signing
+    the whole inventory would let an unrelated live hook update starve an
+    otherwise independent compaction forever. Canonical JSON distinguishes the
+    JSON types Python's ordinary equality conflates (notably ``true``/``1`` and
+    ``1``/``1.0``) while ignoring irrelevant object-key order and whitespace.
+    """
+    try:
+        return tuple(sorted(
+            (record["relative"], json.dumps(
+                record, ensure_ascii=True, sort_keys=True,
+                separators=(",", ":"), allow_nan=False))
+            for record in records))
+    except (KeyError, TypeError, ValueError):
+        return None
+
+
 def _finish_committed_compaction_locked(cwd, kind, journal):
     """Delete only records named by a durable committed proof receipt."""
     current = _read_source_catalog_raw(cwd)
@@ -8348,6 +8372,15 @@ def _compact_catalog_kind(cwd, kind):
     old_generation = old_entry["generation"]
     retired_relatives = {
         relative for relatives in eligible.values() for relative in relatives}
+    analyzed_records = {
+        record["relative"]: record for record in analysis.records
+        if record["relative"] in retired_relatives}
+    record_signature = _compaction_record_signature(
+        analyzed_records.values())
+    if (set(analyzed_records) != retired_relatives
+            or record_signature is None):
+        result["blockers"]["snapshot-raced"] += max(1, len(eligible))
+        return result
     retained = tuple(relative for relative in view.candidates
                      if relative not in retired_relatives)
 
@@ -8363,6 +8396,14 @@ def _compact_catalog_kind(cwd, kind):
                 or current.state != old_state
                 or current_entry.get("generation") != old_generation
                 or tuple(current_view.candidates) != tuple(view.candidates)):
+            result["blockers"]["snapshot-raced"] += max(1, len(eligible))
+            return result
+        current_records = [
+            _read_catalog_record(cwd, kind, relative)
+            for relative in sorted(retired_relatives)]
+        if (any(record is None for record in current_records)
+                or _compaction_record_signature(current_records)
+                != record_signature):
             result["blockers"]["snapshot-raced"] += max(1, len(eligible))
             return result
         _inputs, signature = _compaction_cursor_inputs(
@@ -8508,6 +8549,9 @@ def sources(action=None):
               f"{combined['bytes']} bytes reclaimed; {combined['dormant']} "
               f"dormant readers ignored; {combined['pending']} cleanup "
               f"transaction(s) pending; blockers {blockers}")
+        if combined["blockers"]["snapshot-raced"]:
+            print("source compaction: inputs changed while proofs were checked; "
+                  "retry `antiphon sources compact`")
         return 1 if blocked or combined["pending"] else 0
     state = "degraded" if failed or refused else "complete"
     cleanup_pending = _catalog_cleanup_pending(cwd)
