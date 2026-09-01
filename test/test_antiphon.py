@@ -1015,7 +1015,7 @@ class AntiphonTest(unittest.TestCase):
         recipient's name. The exact named socket may hear only the refusal
         notice; an absent socket receives no bytes and changes no cursor."""
         err = io.StringIO()
-        chan = self._Channel(missing=1)
+        chan = self._Channel(missing=2)
         with tempfile.TemporaryDirectory() as project:
             input_data = {"cwd": project, "transcript_path": "/tmp/rollout"}
             with patch.object(antiphon.os.path, "exists", return_value=True), \
@@ -1030,7 +1030,8 @@ class AntiphonTest(unittest.TestCase):
                  contextlib.redirect_stderr(err):
                 self.assertEqual(antiphon.push("claude"), 0)
                 write.assert_not_called()
-        self.assertEqual(chan.connects, 1)
+        self.assertEqual(chan.connects, 2,
+                         "one recovery probe and one refused-attempt notice")
         self.assertEqual(chan.sent, b"")
         self.assertIn("api", err.getvalue())
         self.assertIn("not delivered", err.getvalue())
@@ -1338,6 +1339,121 @@ class AntiphonTest(unittest.TestCase):
             data, self.reply = self.reply, b""
             return data
 
+    class _RecoveringSockets:
+        """Two connections: listener-owned reassert, then the real delivery."""
+
+        class Socket:
+            def __init__(self, owner):
+                self.owner = owner
+                self.reply = b""
+
+            def __enter__(self): return self
+            def __exit__(self, *_a): return False
+            def settimeout(self, _): pass
+            def close(self): pass
+            def shutdown(self, _how): pass
+
+            def connect(self, path):
+                self.owner.paths.append(path)
+
+            def sendall(self, data):
+                body = json.loads(data.decode())
+                self.owner.payloads.append(body)
+                if body.get("control") == "antiphon.channel":
+                    ok, detail = antiphon.peers.register(
+                        self.owner.project, "claude", self.owner.alias,
+                        antiphon.claude_socket_path(
+                            self.owner.project, self.owner.alias),
+                        pid=os.getpid())
+                    if not ok:
+                        raise AssertionError(detail)
+                    answer = {
+                        "ok": True,
+                        "control": "antiphon.channel",
+                        "version": 1,
+                        "action": "reasserted",
+                        "alias": self.owner.alias,
+                        "nonce": body["nonce"],
+                        "pid": os.getpid(),
+                    }
+                else:
+                    answer = {"ok": True, "message_id": body["message_id"]}
+                self.reply = json.dumps(answer).encode()
+
+            def recv(self, _n):
+                data, self.reply = self.reply, b""
+                return data
+
+        def __init__(self, project, alias):
+            self.project = project
+            self.alias = alias
+            self.paths = []
+            self.payloads = []
+
+        def __call__(self, *_a, **_k):
+            return self.Socket(self)
+
+    def test_a_named_send_recovers_then_delivers_the_original_once(self):
+        secret = "the original words travel only after registry resolution"
+        with tempfile.TemporaryDirectory() as project:
+            channels = self._RecoveringSockets(project, "ui")
+            with patch.object(antiphon, "CONNECT_PATIENCE", 0), \
+                 patch.object(antiphon.socket, "socket", channels), \
+                 patch.object(antiphon, "_notify_unregistered_claude") as notice:
+                ok, detail = antiphon.send_to_claude(
+                    project, secret, alias="ui", sender_alias="build",
+                    message_id="1d5a03e0-0548-4339-87c3-45c5dbf7e9d7")
+        self.assertTrue(ok, detail)
+        self.assertEqual(len(channels.payloads), 2)
+        control, delivered = channels.payloads
+        self.assertEqual(control["control"], "antiphon.channel")
+        self.assertEqual(control["action"], "reassert")
+        self.assertEqual(control["alias"], "ui")
+        self.assertNotIn("content", control)
+        self.assertNotIn(secret, json.dumps(control))
+        self.assertEqual(delivered["content"], secret)
+        self.assertEqual(sum(secret in json.dumps(item)
+                             for item in channels.payloads), 1)
+        expected = antiphon.claude_socket_path(project, "ui")
+        self.assertEqual(channels.paths, [expected, expected])
+        notice.assert_not_called()
+
+    def test_a_control_reply_without_its_registry_record_proves_nothing(self):
+        class Replying(self._Channel):
+            def sendall(sock, data):
+                request = json.loads(data.decode())
+                sock.sent += data
+                sock.reply = json.dumps({
+                    "ok": True,
+                    "control": "antiphon.channel",
+                    "version": 1,
+                    "action": "reasserted",
+                    "alias": "ui",
+                    "nonce": request["nonce"],
+                    "pid": os.getpid(),
+                }).encode()
+
+        with tempfile.TemporaryDirectory() as project:
+            channel = Replying()
+            with patch.object(antiphon.socket, "socket", channel):
+                self.assertFalse(
+                    antiphon._request_claude_reassert(project, "ui"))
+        request = json.loads(channel.sent.decode())
+        self.assertEqual(set(request),
+                         {"control", "version", "action", "alias", "nonce"})
+
+    def test_a_generic_or_mismatched_control_reply_is_not_accepted(self):
+        for reply in (b'{"ok":true}', json.dumps({
+                "ok": True, "control": "antiphon.channel", "version": 1,
+                "action": "reasserted", "alias": "ui",
+                "nonce": "somebody-elses", "pid": os.getpid(),
+        }).encode()):
+            with self.subTest(reply=reply), tempfile.TemporaryDirectory() as project:
+                channel = self._Channel(reply=reply)
+                with patch.object(antiphon.socket, "socket", channel):
+                    self.assertFalse(
+                        antiphon._request_claude_reassert(project, "ui"))
+
     def test_a_named_message_waits_for_the_peer_to_publish_its_alias(self):
         """The MCP handshake completes before `channel.mjs` runs its registry
         claim. After named routing was added, an early `to="ui"` therefore
@@ -1346,6 +1462,8 @@ class AntiphonTest(unittest.TestCase):
         absent = "not delivered: no live claude peer named 'ui'"
         with tempfile.TemporaryDirectory() as project, \
              patch.object(antiphon.socket, "socket", chan), \
+             patch.object(antiphon, "_request_claude_reassert",
+                          return_value=False) as recover, \
              patch.object(antiphon, "_resolve_target",
                           side_effect=[
                               antiphon.ResolvedTarget(None, absent, "refusal"),
@@ -1356,6 +1474,7 @@ class AntiphonTest(unittest.TestCase):
                 project, "the first named message", alias="ui")
         self.assertTrue(ok, detail)
         self.assertEqual(resolve.call_count, 3)
+        recover.assert_called_once_with(project, "ui")
         self.assertEqual(chan.connects, 1,
                          "the socket is touched only after the alias exists")
 
@@ -1370,6 +1489,8 @@ class AntiphonTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as project, \
              patch.object(antiphon, "CONNECT_PATIENCE", 0), \
              patch.object(antiphon.socket, "socket", chan), \
+             patch.object(antiphon, "_request_claude_reassert",
+                          return_value=False), \
              patch.object(
                  antiphon, "_resolve_target",
                  return_value=antiphon.ResolvedTarget(
@@ -1403,6 +1524,8 @@ class AntiphonTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as project, \
              patch.object(antiphon, "CONNECT_PATIENCE", 0), \
              patch.object(antiphon.socket, "socket", chan), \
+             patch.object(antiphon, "_request_claude_reassert",
+                          return_value=False), \
              patch.object(
                  antiphon, "_resolve_target",
                  return_value=antiphon.ResolvedTarget(
@@ -1436,7 +1559,8 @@ class AntiphonTest(unittest.TestCase):
     def test_a_bare_channel_that_never_appears_refuses_within_a_bounded_time(self):
         chan = self._Channel(missing=10_000)
         with tempfile.TemporaryDirectory() as project, \
-             patch.object(antiphon.socket, "socket", chan):
+             patch.object(antiphon.socket, "socket", chan), \
+             patch.object(antiphon, "_request_claude_reassert") as recover:
             started = time.monotonic()
             ok, detail = antiphon.send_to_claude(project, "hello")
             elapsed = time.monotonic() - started
@@ -1444,6 +1568,7 @@ class AntiphonTest(unittest.TestCase):
         self.assertEqual(detail.refusal_class, "no-peer")
         self.assertIn("not delivered", detail)
         self.assertLess(elapsed, 3.0, "retrying must stay bounded")
+        recover.assert_not_called()
 
     def test_an_ambiguous_target_is_not_retried(self):
         """Waiting cannot resolve ambiguity — more peers will not become fewer."""
@@ -7488,6 +7613,8 @@ class RoutingTest(unittest.TestCase):
              patch.object(antiphon, "codex_session_id",
                           return_value="sess-legacy") as rollout, \
              patch.object(antiphon.socket, "socket", side_effect=touched) as sock, \
+             patch.object(antiphon, "_request_claude_reassert",
+                          return_value=False) as recover, \
              patch.object(antiphon, "_notify_unregistered_claude") as notice, \
              patch.object(antiphon, "CONNECT_PATIENCE", 0), \
              patch.object(antiphon.subprocess, "run",
@@ -7500,6 +7627,7 @@ class RoutingTest(unittest.TestCase):
             self.assertFalse(antiphon.send_to_claude(project, "hi", "ghost")[0])
             self.assertEqual(notice.call_count, 1)
             self.assertEqual(notice.call_args.args[:2], (project, "ghost"))
+            recover.assert_called_once_with(project, "ghost")
             rollout.assert_not_called()
             sock.assert_not_called()
             run.assert_not_called()
@@ -7973,6 +8101,8 @@ class ToolRecipientTest(unittest.TestCase):
             antiphon.peers.register(project, "claude", "ui", "/tmp/ui.sock")
             antiphon.peers.register(project, "claude", "api", "/tmp/api.sock")
             with patch.object(antiphon.socket, "socket", side_effect=touched), \
+                 patch.object(antiphon, "_request_claude_reassert",
+                              return_value=False) as recover, \
                  patch.object(antiphon, "_notify_unregistered_claude") as notice, \
                  patch.object(antiphon, "CONNECT_PATIENCE", 0):
                 for alias, expected in cases:
@@ -7981,6 +8111,7 @@ class ToolRecipientTest(unittest.TestCase):
                     self.assertIn(expected, result["content"][0]["text"])
         self.assertEqual(notice.call_count, 1)
         self.assertEqual(notice.call_args.args[1], "ghost")
+        recover.assert_called_once_with(project, "ghost")
 
     def test_a_recipient_that_is_not_a_string_is_refused_before_anything_else(self):
         """`to` arrives from JSON, so it can be any type at all."""

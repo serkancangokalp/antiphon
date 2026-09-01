@@ -2539,6 +2539,68 @@ MAX_CHANNEL_BYTES = 128 * 1024
 NOT_LISTENING_YET = frozenset({errno.ENOENT, errno.ECONNREFUSED})
 CONNECT_PATIENCE = 1.5            # seconds; a real outage still fails promptly
 CONNECT_RETRY_DELAY = 0.05
+CHANNEL_CONTROL = "antiphon.channel"
+CHANNEL_CONTROL_VERSION = 1
+
+
+def _request_claude_reassert(cwd, alias):
+    """Ask the exact named listener to restore its own endpoint record.
+
+    The request carries no message content. A protocol-shaped reply is still
+    only a claim, so success also requires the listener's matching pid and
+    deterministic address to appear in the registry. The caller never writes a
+    record on another process's behalf.
+    """
+    if not peers.valid_name(alias):
+        return False
+    nonce = delivery_id()
+    request = {
+        "control": CHANNEL_CONTROL,
+        "version": CHANNEL_CONTROL_VERSION,
+        "action": "reassert",
+        "alias": alias,
+        "nonce": nonce,
+    }
+    address = claude_socket_path(cwd, alias)
+    sock = None
+    try:
+        sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        sock.settimeout(1)
+        sock.connect(address)
+        with sock:
+            sock.sendall(json.dumps(request, ensure_ascii=False).encode())
+            sock.shutdown(socket.SHUT_WR)
+            reply_bytes = b""
+            while len(reply_bytes) <= 64 * 1024:
+                chunk = sock.recv(8192)
+                if not chunk:
+                    break
+                reply_bytes += chunk
+        if len(reply_bytes) > 64 * 1024:
+            return False
+    except OSError:
+        if sock is not None:
+            sock.close()
+        return False
+    try:
+        result = json.loads(reply_bytes.decode())
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        return False
+    pid = result.get("pid") if isinstance(result, dict) else None
+    if not (isinstance(pid, int) and not isinstance(pid, bool) and pid > 0
+            and result.get("ok") is True
+            and result.get("control") == CHANNEL_CONTROL
+            and result.get("version") == CHANNEL_CONTROL_VERSION
+            and result.get("action") == "reasserted"
+            and result.get("alias") == alias
+            and result.get("nonce") == nonce):
+        return False
+    return any(
+        peer.get("name") == alias
+        and peer.get("pid") == pid
+        and peers._address_of(peer) == address
+        for peer in peers.read_peers(cwd, "claude")
+    )
 
 
 def _notify_unregistered_claude(cwd, alias, sender_alias, message_id):
@@ -2591,12 +2653,22 @@ def send_to_claude(cwd, text, alias=None, sender_alias=None, message_id=None):
             f"most {MAX_CHANNEL_BYTES}", "oversize")
 
     deadline = time.monotonic() + CONNECT_PATIENCE
+    recovery_attempted = False
     while True:
         # Re-resolved every attempt: a named peer can register in the meantime,
         # which moves the address from the project-wide path to its own.
         target = _resolve_target(cwd, "claude", alias)
         address, detail = target.address, target.detail
         if address is None:
+            valid_alias = alias is not None and peers.valid_name(alias)
+            # The listener may be alive at its deterministic named socket even
+            # though a bad legacy process fingerprint pruned its endpoint. It
+            # alone may restore the record; after that, routing resolves again
+            # through the registry before any user bytes are sent.
+            if valid_alias and not recovery_attempted:
+                recovery_attempted = True
+                if _request_claude_reassert(cwd, alias):
+                    continue
             # `mcp.connect` finishes before channel.mjs publishes its registry
             # claim. With an explicit, valid alias the first lookup can
             # therefore miss the peer altogether, before there is even an
@@ -2604,11 +2676,10 @@ def send_to_claude(cwd, text, alias=None, sender_alias=None, message_id=None):
             # indistinguishable from a real outage as ENOENT below. Invalid
             # aliases and bare ambiguity are decisions, not readiness races,
             # and still fail immediately.
-            if (alias is not None and peers.valid_name(alias)
-                    and time.monotonic() < deadline):
+            if valid_alias and time.monotonic() < deadline:
                 time.sleep(CONNECT_RETRY_DELAY)
                 continue
-            if alias is not None and peers.valid_name(alias):
+            if valid_alias:
                 _notify_unregistered_claude(
                     cwd, alias, sender_alias, request["message_id"])
             return False, detail
