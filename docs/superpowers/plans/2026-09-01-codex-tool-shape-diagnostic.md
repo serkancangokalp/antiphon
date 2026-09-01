@@ -17,6 +17,10 @@ finding without weakening the fail-closed parser.
 - Reuse `_codex_tool_fields`; do not create a second accepted-shape parser.
 - Aggregate only. No payload/type/name/path/source output.
 - Read-only and catalog/cursor neutral.
+- The full scan runs only in explicit `doctor`, never in a hook, page, setup
+  or status path.
+- The green result is worded as zero rejected call-like records, not proof
+  that an entirely renamed future tool shape cannot be missed.
 - Stop at a reviewed local exact commit. No push, merge, version or publish.
 
 ### Task 1: Pin the silent regression red-before-green

@@ -66,9 +66,22 @@ visibility is known to be incomplete. An unknown count is a note because the
 existing catalog diagnostic already decides whether the underlying boundary is
 broken or still building.
 
+The green line proves only that no call-like record matching this deliberately
+narrow grammar was rejected. It does **not** prove that no tool call was
+missed: a future host could abandon the `_call` suffix entirely (for example,
+use `tool_use`) and remain invisible to both parser and counter. Broadening the
+heuristic to arbitrary response items would trade this named blind spot for
+false alarms over ordinary records, so the line states its exact claim rather
+than overstating it.
+
 ## 5. Boundaries
 
 No page event, retrieval result, cursor, catalog, registry, attachment,
 configuration, setup surface or protocol schema changes. No persistent
 counter or index is added. No transcript content enters doctor output.
 
+The complete-set scan belongs only to the explicit `antiphon doctor` command.
+The measured indexless scan over 243 MB of Codex rollouts cost about 579 ms,
+which is acceptable for an operator-requested diagnostic and unacceptable on
+every hook turn. This counter must not be moved into setup, status, paging or a
+hook path without a new measurement and design gate.
