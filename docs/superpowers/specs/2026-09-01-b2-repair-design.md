@@ -122,10 +122,21 @@ the others are already inert because routing consults the proof.
   this bridge: positive proof or nothing.
 - It is removed only when its owner is **positively proved dead**, and only on
   a mutation path that is already writing the registry. That path is named, not
-  implied: each `write_identity_proof` sweeps at most eight proofs under the
-  lock it already holds and reclaims only those whose owner death is proved.
-  A reclamation function with no real caller would let a unit test pass while
-  production never reclaimed anything. A read-only surface —
+  implied: each `write_identity_proof` sweeps under the lock it already holds
+  and reclaims only those whose owner death is proved. A reclamation function
+  with no real caller would let a unit test pass while production never
+  reclaimed anything.
+- **The sweep must make progress, not merely be bounded.** Scanning the first
+  eight of a sorted inventory on every write is a latency bound with no
+  progress guarantee: eight live or unknown records at the front would starve
+  every dead record behind them forever. A persistent sweep cursor is stored
+  beside the proofs and advanced atomically under the same lock, so each
+  mutation examines the next window of at most eight and the whole inventory is
+  covered in a finite number of writes.
+- A malformed or unreadable cursor **resets to the start** rather than
+  refusing. Rescanning is harmless here — every reclamation still requires
+  positive death proof for the record it touches — so the safe failure is to
+  repeat work, not to stop doing it. A read-only surface —
   `status`, `doctor`, any resolver — never prunes it. Unproved or unknown
   liveness leaves it alone: an unreclaimed record costs a file, and a wrongly
   reclaimed one costs a live session its identity.
@@ -219,6 +230,13 @@ unnamed. None of the captured bytes are emitted.
 The child starts in its own session before any group-directed signal. If that
 isolation cannot be established, only the child pid is signalled — never widen a
 signal past a boundary you failed to create.
+
+That distinction carries a named limitation, and the two cases must not be
+written as one. When isolation succeeds the group signal reaches the child and
+its descendants, and their death is asserted. When isolation cannot be
+established only the child is signalled, and **descendant death is neither
+guaranteed nor claimed**: a grandchild may outlive the probe. Promising
+descendant death in both cases would be a promise the second case cannot keep.
 
 ## 9. Privacy
 
