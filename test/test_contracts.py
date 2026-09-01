@@ -284,6 +284,14 @@ class CrossBoundaryContractTest(unittest.TestCase):
         self.assertNotRegex(open_phase, r"(?i)stable event ids|tool-call retrieval")
         self.assertRegex(p0, r"(?i)Completed by Wave 1D")
 
+    def test_readme_distinguishes_claude_details_from_codex_name_only_pages(self):
+        limits = section(read("README.md"), "Limits")
+        self.assertIsNotNone(limits)
+        self.assertRegex(
+            limits,
+            r"(?is)Claude.{0,160}(file_path|command|pattern).{0,240}Codex.{0,80}name-only")
+        self.assertNotRegex(limits, r"(?i)Their arguments are absent")
+
     def test_both_sides_agree_on_the_channel_message_limit(self):
         """The sender refuses before transport and the server refuses on arrival.
         If the two numbers drift the sender lets through what the server then

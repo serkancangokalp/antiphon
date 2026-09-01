@@ -258,9 +258,12 @@ most 40 completed source records — the byte number is measured against the
 installed hosts' injection limits, not a permanent host guarantee. Non-tool
 records are no longer cut or flattened: line structure, indentation, code and
 SQL formatting travel intact, and a record is never split across pages.
-Tool calls appear as compact name-and-id events. Their arguments are absent
-from the page and tool results remain unavailable. Tool outputs remain filtered
-while still advancing the safe scanned frontier.
+Tool calls appear as compact events with ids. Claude tool entries retain the
+pre-existing selected `file_path`, `command` or `pattern` value as a compact
+detail; the rest of the argument object is absent. Codex tool entries remain
+name-only. Complete invocations require retrieval, and tool results remain
+unavailable. Tool outputs remain filtered while still advancing the safe
+scanned frontier.
 
 #### Tool invocation ids and retrieval
 

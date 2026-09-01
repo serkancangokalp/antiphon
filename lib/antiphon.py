@@ -1218,6 +1218,55 @@ def _anchor_from_stream(stream, offset):
     return {"start": start, "sha256": digest.hexdigest()}
 
 
+def _retrieval_records_from_stream(stream):
+    """Yield the raw bytes of every record in one captured complete prefix.
+
+    Retrieval has a stronger trust contract than passive paging: a read fault
+    must poison the answer instead of looking like an ordinary end of file.
+    Capture the last newline-terminated frontier first, then prove that every
+    byte up to it was traversed. A concurrently appended suffix and an
+    unterminated tail are deliberately outside that snapshot.
+    """
+    size = os.fstat(stream.fileno()).st_size
+    frontier = 0
+    if size:
+        stream.seek(size - 1)
+        last = stream.read(1)
+        if len(last) != 1:
+            raise OSError(errno.EIO, "short read at retrieval frontier")
+        if last == b"\n":
+            frontier = size
+        else:
+            position = size - 1
+            while position > 0:
+                start = max(0, position - 65536)
+                stream.seek(start)
+                expected = position - start
+                block = stream.read(expected)
+                if len(block) != expected:
+                    raise OSError(errno.EIO,
+                                  "short read while finding retrieval frontier")
+                newline = block.rfind(b"\n")
+                if newline >= 0:
+                    frontier = start + newline + 1
+                    break
+                position = start
+
+    stream.seek(0)
+    position = 0
+    while position < frontier:
+        raw = stream.readline(frontier - position)
+        if not raw or not raw.endswith(b"\n"):
+            raise OSError(errno.EIO,
+                          "incomplete traversal of retrieval frontier")
+        start, position = position, position + len(raw)
+        if position > frontier:
+            raise OSError(errno.EIO, "retrieval record crossed its frontier")
+        yield start, position, raw[:-1]
+    if position != frontier:
+        raise OSError(errno.EIO, "retrieval frontier was not fully traversed")
+
+
 def head_lines(path, limit=12, num_bytes=64 * 1024):
     """Returns the lines at the start of the file, used for session metadata."""
     try:
@@ -1323,6 +1372,11 @@ class SafeSource:
                            raw[:-1].decode("utf-8", "replace"), anchor)
         except OSError:
             return
+
+    def read_retrieval_records(self):
+        """Yield strict raw records or propagate any incomplete traversal."""
+        with self._reader() as stream:
+            yield from _retrieval_records_from_stream(stream)
 
     def anchor_at(self, offset):
         try:
@@ -1472,6 +1526,10 @@ class _PathSource:
             anchor = {"start": start,
                       "sha256": hashlib.sha256(raw).hexdigest()}
             yield start, end, line, anchor
+
+    def read_retrieval_records(self):
+        with open(self.path, "rb") as stream:
+            yield from _retrieval_records_from_stream(stream)
 
     def anchor_at(self, offset):
         try:
@@ -3192,15 +3250,19 @@ def _scan_invocations(cwd, kind, paths, public_id):
         if isinstance(opened, SourceRefusal):
             return [], True
         with opened as source:
-            for start, _end, line, _anchor in source.read_anchored_records(0):
-                try:
-                    record = json.loads(line)
-                except (json.JSONDecodeError, ValueError):
-                    continue
-                matches.extend(
-                    invocation for invocation in _record_invocations(
-                        kind, record, source.source, start)
-                    if invocation.public_id == public_id)
+            try:
+                for start, _end, raw in source.read_retrieval_records():
+                    try:
+                        line = raw.decode("utf-8", "strict")
+                        record = json.loads(line)
+                    except (UnicodeDecodeError, json.JSONDecodeError, ValueError):
+                        continue
+                    matches.extend(
+                        invocation for invocation in _record_invocations(
+                            kind, record, source.source, start)
+                        if invocation.public_id == public_id)
+            except OSError:
+                return [], True
     return matches, False
 
 

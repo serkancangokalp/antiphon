@@ -2960,13 +2960,13 @@ class ToolInvocationIdentityTest(unittest.TestCase):
                     if event.kind != "tool":
                         self.assertIsNone(event.public_id)
 
-    def test_a_multi_call_record_renders_every_public_id_without_payloads(self):
+    def test_a_multi_call_record_keeps_claude_details_and_every_public_id(self):
         records = [{
             "type": "assistant", "timestamp": "2026-09-01T00:00:00Z",
             "message": {"content": [
-                self._claude({"path": "secret-one"}, native_id=None,
+                self._claude({"file_path": "selected-one"}, native_id=None,
                              name="Read"),
-                self._claude({"path": "secret-two"}, native_id=None,
+                self._claude({"command": "selected-two"}, native_id=None,
                              name="Write"),
             ]},
         }]
@@ -2976,8 +2976,10 @@ class ToolInvocationIdentityTest(unittest.TestCase):
         self.assertEqual(len(set(public_ids)), 2)
         for public_id in public_ids:
             self.assertIn("[%s]" % public_id, page)
-        self.assertNotIn("secret-one", " ".join(public_ids))
-        self.assertNotIn("secret-two", " ".join(public_ids))
+        self.assertIn("Read selected-one", page)
+        self.assertIn("Write selected-two", page)
+        self.assertNotIn("selected-one", " ".join(public_ids))
+        self.assertNotIn("selected-two", " ".join(public_ids))
         self.assertEqual(count, 0)
 
     def test_forty_record_limit_keeps_every_selected_tool_id(self):
@@ -3195,6 +3197,89 @@ class ToolInvocationRetrievalTest(unittest.TestCase):
         self.assertFalse(unsafe)
         self.assertEqual([match.public_id for match in matches], [public_id])
         self.assertEqual(matches[0].arguments, {"argument": "target"})
+
+    def test_production_reader_fault_after_a_match_is_untrusted(self):
+        block = self._block("target", "toolu_target")
+        public_id = antiphon._claude_invocation(
+            block, self.SOURCE, 0, 0).public_id
+
+        class FaultAfterOneRecord:
+            def __init__(self, stream):
+                self.stream = stream
+                self.records = 0
+
+            def __getattr__(self, name):
+                return getattr(self.stream, name)
+
+            def seek(self, *args):
+                position = self.stream.seek(*args)
+                if position == 0:
+                    self.records = 0
+                return position
+
+            def readline(self, *args):
+                if self.records:
+                    raise OSError(errno.EIO, "injected retrieval read fault")
+                raw = self.stream.readline(*args)
+                if raw.endswith(b"\n"):
+                    self.records += 1
+                return raw
+
+            def __iter__(self):
+                return self
+
+            def __next__(self):
+                raw = self.readline()
+                if raw == b"":
+                    raise StopIteration
+                return raw
+
+        real_reader = antiphon.SafeSource._reader
+
+        @contextlib.contextmanager
+        def faulting_reader(source, offset=0):
+            with real_reader(source, offset) as stream:
+                yield FaultAfterOneRecord(stream)
+
+        cases = (
+            ("after match", [block, self._block("later", "toolu_later")]),
+            ("before match", [self._block("earlier", "toolu_earlier"), block]),
+        )
+        for name, blocks in cases:
+            with self.subTest(name=name), \
+                 tempfile.TemporaryDirectory() as project:
+                root = os.path.join(project, "host")
+                prefix = "project"
+                path = os.path.join(root, prefix, self.SOURCE + ".jsonl")
+                self._write(path, [self._record(item) for item in blocks])
+                discovered = antiphon._discovered_source_path(
+                    path, root, "claude", prefix)
+                with patch.object(antiphon.SafeSource, "_reader",
+                                  new=faulting_reader):
+                    result = antiphon._retrieve_invocation(
+                        project, public_id, source_paths=[discovered])
+            self.assertEqual(result.status, "untrusted")
+            self.assertIsNone(result.invocation)
+
+    def test_invalid_utf8_records_do_not_invent_replacement_invocations(self):
+        replacement = "bad \ufffd byte"
+        public_id = antiphon._claude_invocation(
+            self._block(replacement, "toolu_invalid"),
+            self.SOURCE, 0, 0).public_id
+        for invalid in (b"\x80", b"\x81"):
+            with self.subTest(invalid=invalid), \
+                 tempfile.TemporaryDirectory() as project:
+                path = os.path.join(project, self.SOURCE + ".jsonl")
+                record = self._record(
+                    self._block("INVALID_BYTE", "toolu_invalid"))
+                raw = json.dumps(record).encode("utf-8").replace(
+                    b"INVALID_BYTE", b"bad " + invalid + b" byte")
+                with open(path, "wb") as stream:
+                    stream.write(raw + b"\n")
+                result = antiphon._retrieve_invocation(
+                    project, public_id, source_paths=[path])
+            self.assertEqual(result.status, "unavailable")
+            self.assertIsNone(result.invocation)
 
     def test_degraded_or_unsafe_discovery_is_untrusted(self):
         public_id = antiphon._claude_invocation(
