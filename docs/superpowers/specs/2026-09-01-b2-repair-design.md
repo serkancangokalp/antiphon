@@ -233,10 +233,16 @@ the others are already inert because routing consults the proof.
   Pid reuse can only make a dead owner look alive, which costs one lingering
   file. It can never make a live owner look dead, which would cost a session
   its identity. The cheap check is sound in the direction that matters.
-- The sweep also carries a literal total patience of **50 ms**. It stops when
-  that is spent, whatever it has covered, and the cursor keeps the position for
-  the next mutation. The bound exists so the guarantee survives someone later
-  making the check more expensive.
+- The sweep carries a **cooperative budget of 50 ms**, and the word cooperative
+  is load-bearing. Python cannot preempt a syscall running on the same thread:
+  once `os.scandir`, a read, or `os.kill` has been entered it runs to
+  completion whatever the clock says. So the budget is checked between records,
+  not enforced across them, and it is not an absolute wall-clock cap. Calling
+  it one would promise something only a separate process or an interruptible
+  mechanism could deliver, and neither is warranted here.
+  The rule is therefore: check the budget before and after each record, stop
+  when it is spent, and always make at least one record of progress per sweep
+  so the cursor cannot stall. The position is kept for the next mutation.
 - **A failing sweep never costs the rotation.** Once the new proof has been
   committed atomically, any garbage-collection or cursor read/write error is
   swallowed: the hook still succeeds, the current proof stands, the correct
