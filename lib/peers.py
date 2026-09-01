@@ -326,8 +326,18 @@ def retired_half(cwd, kind, name, owner, identity_digest, current_session_id):
     record = _read_record(retired_half_path(cwd, kind, name))
     if not (record and _valid_retired_half(record, owner, identity_digest)):
         return False
-    return (valid_session_id(current_session_id)
-            and current_session_id != record.get("session_id"))
+    if not (valid_session_id(current_session_id)
+            and current_session_id != record.get("session_id")):
+        return False
+    # The caller's proof was read before any of this observed the filesystem,
+    # and a rotation can land in between. `record_claude_session` writes the
+    # new proof before the new half, so an A→B→A resume has a window where the
+    # proof names A, the half is still gone and the tombstone still names A —
+    # and a reader holding the older snapshot would retire the identity that
+    # just became current again. Re-read and require agreement; a snapshot that
+    # moved is not one this may destroy anything on.
+    state, current = read_identity_proof(cwd, owner)
+    return state == "valid" and current.get("session_id") == current_session_id
 
 
 def _session_file(cwd, kind, name):
@@ -405,11 +415,13 @@ def _read_identity_proof_file(path, owner_digest):
     # is exactly what "a record is there and cannot be trusted" means.
     try:
         with open(path, "rb") as stream:
-            raw = stream.read()
+            raw = stream.read(RECORD_CEILING + 1)
     except FileNotFoundError:
         return "absent", None
     except OSError:
         return "unreadable", None
+    if len(raw) > RECORD_CEILING:
+        return "invalid", None
     try:
         record = json.loads(raw.decode("utf-8"))
     except (ValueError, UnicodeDecodeError):
@@ -764,10 +776,23 @@ def _collect_retired_halves_locked(cwd, entries):
         if not valid_key("claude", name):
             continue
         path = retired_half_path(cwd, "claude", name)
-        if not os.path.exists(path):
+        # `os.path.exists` is False on EACCES and ENOTDIR as well as on
+        # absence, so a transient stat failure on a peer directory would have
+        # read as "the endpoint is gone" and discarded the evidence that lets a
+        # live stale listener retire — degrading it to UNREADY for good. Every
+        # other deletion in this contract waits for positive proof; so does
+        # this one.
+        try:
+            os.stat(path)
+        except OSError:
             continue
-        if os.path.exists(_peer_file(cwd, "claude", name)):
-            continue
+        try:
+            os.stat(_peer_file(cwd, "claude", name))
+            continue                      # the endpoint is there; keep it
+        except FileNotFoundError:
+            pass
+        except OSError:
+            continue                      # unreadable is not gone
         with contextlib.suppress(OSError):
             os.unlink(path)
 
@@ -925,13 +950,23 @@ def _registry_lock(cwd):
         os.close(fd)
 
 
+# Every record here is a handful of fields, and these readers sit on the
+# inbound-delivery path. A ceiling costs nothing and matches the Node mirror,
+# which grew one first — leaving Python willing to read a padded record the
+# other reader refused, which is a divergence in the destructive direction.
+RECORD_CEILING = 64 * 1024
+
+
 def _read_record(path):
     """The record as a dict, or None. Valid JSON of the wrong shape is not a
     record: a bare array used to raise out of `read_peers` on `.get`."""
     try:
-        with open(path, encoding="utf-8") as f:
-            record = json.load(f)
-    except (OSError, ValueError):
+        with open(path, "rb") as f:
+            raw = f.read(RECORD_CEILING + 1)
+        if len(raw) > RECORD_CEILING:
+            return None
+        record = json.loads(raw.decode("utf-8"))
+    except (OSError, ValueError, UnicodeDecodeError):
         return None
     return record if isinstance(record, dict) else None
 

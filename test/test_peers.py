@@ -2571,6 +2571,66 @@ class TombstoneIsPositiveEvidenceTest(unittest.TestCase):
                 "the owner is on this identity again; the stale tombstone must "
                 "not retire the listener that just reconnected")
 
+    def _tombstoned(self, project, **over):
+        """The state a real rotation leaves: proof names B, tombstone names A.
+
+        Every negative tombstone fixture has to be built on this. Written with
+        the proof naming A instead, the `current_session_id != withdrawn` guard
+        short-circuits first and the field under test is never consulted — so a
+        fixture meant to protect the owner, kind or digest check protects
+        nothing, and dropping that check leaves the whole suite green.
+        """
+        owner = peers.owner_key()
+        alias, digest = peers.auto_identity(self.A)
+        peers.register(project, "claude", alias,
+                       os.path.join(project, alias + ".sock"),
+                       pid=os.getpid(), owner_key=owner,
+                       identity_digest=digest, mode="initial")
+        peers.write_identity_proof(project, owner, self.B,
+                                   peers.auto_identity(self.B)[1])
+        record = {"version": 1, "kind": "claude", "owner": owner,
+                  "identity_digest": digest, "session_id": self.A}
+        record.update(over)
+        path = peers.retired_half_path(project, "claude", alias)
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w", encoding="utf-8") as stream:
+            json.dump(record, stream)
+        return owner, alias
+
+    def test_tombstone_every_field_is_load_bearing(self):
+        """One case per field, each on the rotated state so the field decides.
+
+        Without this the guards beside `session_id` were dead weight: measured,
+        dropping the owner, kind, digest or id-derives-digest check left all
+        1020 tests green.
+        """
+        cases = {
+            "owner names another CLI root":
+                {"owner": "4243:v1:Mon Sep  1 00:00:00 2026"},
+            "kind is not claude": {"kind": "codex"},
+            "digest names another identity": {"identity_digest": "0" * 64},
+            "withdrawn id does not derive the digest": {"session_id": self.B},
+            "withdrawn id is not canonical": {"session_id": "not-a-uuid"},
+            "version is a float": {"version": 1.0},
+            "version is a bool": {"version": True},
+        }
+        for name, over in cases.items():
+            with self.subTest(field=name):
+                with tempfile.TemporaryDirectory() as project:
+                    _owner, alias = self._tombstoned(project, **over)
+                    self.assertEqual(
+                        self._verdict(project, alias), "UNREADY",
+                        f"{name}: a tombstone this cannot trust must not "
+                        "authorise retirement")
+
+    def test_tombstone_the_rotated_state_itself_is_proved_stale(self):
+        """The positive control beside the seven negatives above: with every
+        field right, the same construction does reach PROVED_STALE — so those
+        seven fail for the field under test and not for the fixture."""
+        with tempfile.TemporaryDirectory() as project:
+            _owner, alias = self._tombstoned(project)
+            self.assertEqual(self._verdict(project, alias), "PROVED_STALE")
+
     def test_tombstone_records_the_session_it_withdrew(self):
         with tempfile.TemporaryDirectory() as project:
             owner, alias = self._rotated(project)
@@ -2648,3 +2708,73 @@ class TombstoneRecordCeilingTest(unittest.TestCase):
                   "identity_digest": digest, "session_id": self.A}
         self.assertFalse(peers._valid_retired_half(
             record, "4242:v1:Mon Sep  1 00:00:00 2026", digest))
+
+
+class WithdrawalPathValidationTest(unittest.TestCase):
+    """Two loops turn a directory name off disk into a path.
+
+    `_scan` validates the same way. These did not, and the guards that fixed
+    that had no test — removing both left the whole suite green.
+    """
+
+    def test_withdrawal_ignores_a_peer_directory_with_an_unusable_name(self):
+        with tempfile.TemporaryDirectory() as project:
+            owner = peers.owner_key()
+            bad = os.path.join(peers.peers_dir(project), "claude-Not A Name")
+            os.makedirs(bad, exist_ok=True)
+            with open(os.path.join(bad, "session.json"), "w",
+                      encoding="utf-8") as stream:
+                json.dump({"kind": "claude", "name": "Not A Name",
+                           "owner": owner, "session_id": "x",
+                           "automatic": True, "identity_digest": "0" * 64},
+                          stream)
+            with open(os.path.join(bad, "retired.json"), "w",
+                      encoding="utf-8") as stream:
+                stream.write("{}")
+            session = "0199a1b2-2222-7000-8000-00000000000b"
+            outcome = peers.rotate_identity_proof(
+                project, owner, session, peers.auto_identity(session)[1])
+            self.assertTrue(outcome.ok)
+            self.assertEqual(list(outcome.withdrawn), [],
+                             "a name that could never be a peer is not one to "
+                             "withdraw")
+            self.assertTrue(os.path.exists(os.path.join(bad, "session.json")),
+                            "and nothing under it is touched")
+            self.assertTrue(os.path.exists(os.path.join(bad, "retired.json")))
+
+
+class TombstoneReadSkewTest(unittest.TestCase):
+    """The proof is read before the filesystem is observed, and it can move.
+
+    `record_claude_session` rotates the proof and only then writes the half, so
+    during an A→B→A resume there is a window where the proof names A, the half
+    is still gone and the tombstone still names A. A reader holding the earlier
+    snapshot (B) sees a missing half plus a valid tombstone and answers
+    PROVED_STALE about the identity that has just become current again —
+    costing that terminal a reconnect it did not need.
+    """
+
+    A = "8261c119-2c20-4bf4-87ab-f152ac87dbda"
+    B = "0199a1b2-2222-7000-8000-00000000000b"
+
+    def test_tombstone_read_skew_a_moved_proof_is_not_a_rotation(self):
+        with tempfile.TemporaryDirectory() as project:
+            owner = peers.owner_key()
+            alias, digest = peers.auto_identity(self.A)
+            peers.register(project, "claude", alias,
+                           os.path.join(project, alias + ".sock"),
+                           pid=os.getpid(), owner_key=owner,
+                           identity_digest=digest, mode="initial")
+            peers.write_identity_proof(project, owner, self.A, digest)
+            path = peers.retired_half_path(project, "claude", alias)
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            with open(path, "w", encoding="utf-8") as stream:
+                json.dump({"version": 1, "kind": "claude", "owner": owner,
+                           "identity_digest": digest,
+                           "session_id": self.A}, stream)
+            # The caller's snapshot still says B; the proof on disk says A.
+            self.assertFalse(
+                peers.retired_half(project, "claude", alias, owner, digest,
+                                   self.B),
+                "a decision taken against a proof that has since moved is not "
+                "a decision this may act on")

@@ -8709,7 +8709,11 @@ def _doctor_peers(report, cwd):
         elif verdict in ("UNKNOWN", "STRUCTURAL_INVALID"):
             report.note(f"peer {who}: {_VERDICT_NOTE[verdict]}")
         elif verdict == "UNREADY":
-            report.note(f"peer {who}: live, waiting for its first turn")
+            # Same suppression the untyped path has always had: an endpoint and
+            # session whose owner-key generations differ already got their own
+            # note above, and two lines about one peer read as two faults.
+            if not mixed_owner_generation:
+                report.note(f"peer {who}: live, waiting for its first turn")
         elif peers._address_of(diagnostic) is None:
             if not mixed_owner_generation:
                 report.note(f"peer {who}: live, waiting for its first turn")

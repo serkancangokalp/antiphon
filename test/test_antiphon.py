@@ -17057,15 +17057,19 @@ class StaleInboundClassTest(unittest.TestCase):
                 project, {"ok": False, "error": "identity moved",
                           "refusal_class": "no-peer"}, close_first=True)
             try:
-                self.assertTrue(answered.wait(0) or True)
                 target = antiphon.ResolvedTarget(path, "", "registered")
+                # The failure is injected, not waited for. Hoping the listener
+                # closes first made this bite 4 runs in 12 — and the waits that
+                # were supposed to force the ordering were `x or True`, which
+                # cannot fail and cannot order anything either.
                 with patch.object(antiphon, "_resolve_target",
-                                  return_value=target):
-                    # The listener has answered and closed before the send is
-                    # attempted, which is the worst ordering rather than a rare
-                    # one; the flaky version reached it about half the time.
-                    self.assertTrue(answered.wait(2) or True)
+                                  return_value=target), \
+                     patch.object(antiphon.socket, "socket",
+                                  _RefusesShutdown):
                     ok, detail = antiphon.send_to_claude(project, "hello")
+                self.assertTrue(answered.wait(2),
+                                "the listener did answer; its words are what "
+                                "must survive")
             finally:
                 thread.join(2)
                 server.close()
@@ -17073,6 +17077,18 @@ class StaleInboundClassTest(unittest.TestCase):
         self.assertIn("identity moved", str(detail),
                       "the listener's own words survive its early close")
         self.assertEqual(getattr(detail, "refusal_class", None), "no-peer")
+
+
+class _RefusesShutdown(socket.socket):
+    """A socket whose half-close fails the way this platform's does.
+
+    `shutdown(SHUT_WR)` raises ENOTCONN once the peer has gone, and that call
+    sat inside the arm that relabels every refusal `transport`. Injecting it is
+    the only way to test the consequence without racing the scheduler.
+    """
+
+    def shutdown(self, how):
+        raise OSError(errno.ENOTCONN, "Socket is not connected")
 
 
 class ReadinessParityTest(unittest.TestCase):
@@ -17160,6 +17176,15 @@ class ReadinessParityTest(unittest.TestCase):
             f'"owner": "{owner or self.OWNER}", '
             f'"identity_digest": "{digest or own_digest}", '
             f'"session_id": "{self.A}"}}')
+
+    @staticmethod
+    def _pad(path):
+        """Push a record past any sane ceiling without changing its meaning."""
+        with open(path, encoding="utf-8") as stream:
+            record = json.load(stream)
+        record["padding"] = "x" * (64 * 1024)
+        with open(path, "w", encoding="utf-8") as stream:
+            json.dump(record, stream)
 
     def _patch_endpoint(self, project, alias, drop=None, **over):
         self._patch(os.path.join(
@@ -17253,12 +17278,18 @@ class ReadinessParityTest(unittest.TestCase):
             "endpoint owner spans a newline": lambda p, a: (
                 self._proof(p, self.A),
                 self._patch_endpoint(p, a, owner="1:a\nb")),
-            # L8: the tombstone's version check was `== 1` on both sides, so a
-            # JSON float passed where the proof reader refuses one. Parity held
-            # only because both were lax.
-            "tombstone version is a float": lambda p, a: (
-                self._proof(p, self.A),
-                self._withdrawn(p, a, version_literal="1.0")),
+            # The alias↔digest binding. Python derives the alias from the
+            # digest and requires the record's own `name` to match; Node's
+            # mirror had no name check at all, so a half whose name does not
+            # derive its digest read as a valid join there — and with a proof
+            # naming another session, Node reached PROVED_STALE and destroyed
+            # a listener Python was still telling to wait.
+            "session half name does not derive its digest": lambda p, a: (
+                self._proof(p, self.B),
+                self._patch_session(p, a, name="bogus")),
+            "session half has no name": lambda p, a: (
+                self._proof(p, self.B),
+                self._patch_session(p, a, drop="name")),
             "session half has no digest": lambda p, a: (
                 self._proof(p, self.A),
                 self._patch_session(p, a, drop="identity_digest")),
@@ -17271,18 +17302,48 @@ class ReadinessParityTest(unittest.TestCase):
             "session half id disagrees with its own digest": lambda p, a: (
                 self._proof(p, self.A),
                 self._patch_session(p, a, session_id=self.B)),
+            # Every tombstone fixture is built on the state a real rotation
+            # leaves — proof naming B, tombstone naming A. Written with the
+            # proof naming A, the `current_session_id != withdrawn` guard
+            # short-circuits first and the field under test is never reached,
+            # so the fixture protects nothing.
             "half withdrawn by a rotation": lambda p, a: (
-                self._proof(p, self.A),
+                self._proof(p, self.B),
                 self._withdrawn(p, a)),
             "tombstone from another owner": lambda p, a: (
-                self._proof(p, self.A),
+                self._proof(p, self.B),
                 self._withdrawn(p, a, owner=self.OTHER_OWNER)),
+            "tombstone version is a float": lambda p, a: (
+                self._proof(p, self.B),
+                self._withdrawn(p, a, version_literal="1.0")),
             "tombstone torn": lambda p, a: (
-                self._proof(p, self.A),
+                self._proof(p, self.B),
                 os.unlink(os.path.join(
                     antiphon.peers.peer_dir(p, "claude", a), "session.json")),
                 self._write(antiphon.peers.retired_half_path(
                     p, "claude", a), "{")),
+            # The Node half of the headline fix had no fixture at all: with the
+            # absence guard deleted, a rotated peer whose half is torn, empty
+            # or from another owner read PROVED_STALE there and UNREADY here —
+            # the destructive direction, and §2 forbids exactly it.
+            "tombstone with a torn half": lambda p, a: (
+                self._proof(p, self.B),
+                self._withdrawn(p, a),
+                self._write(antiphon.peers._session_file(p, "claude", a), "{")),
+            "tombstone with an empty half": lambda p, a: (
+                self._proof(p, self.B),
+                self._withdrawn(p, a),
+                self._write(antiphon.peers._session_file(p, "claude", a), "")),
+            "tombstone with a half from another owner": lambda p, a: (
+                self._proof(p, self.B),
+                self._withdrawn(p, a),
+                self._write(
+                    antiphon.peers._session_file(p, "claude", a),
+                    json.dumps({"kind": "claude", "name": a,
+                                "owner": self.OTHER_OWNER,
+                                "session_id": self.A, "automatic": True,
+                                "identity_digest":
+                                    antiphon.peers.auto_identity(self.A)[1]}))),
             "session half from another owner": lambda p, a: (
                 self._proof(p, self.A),
                 self._patch_session(p, a, owner=self.OTHER_OWNER)),
@@ -17298,11 +17359,39 @@ class ReadinessParityTest(unittest.TestCase):
             "endpoint digest mismatched": lambda p, a: (
                 self._proof(p, self.A),
                 self._patch_endpoint(p, a, identity_digest="0" * 64)),
+            # L1: Node grew a record ceiling and Python did not, so a padded
+            # tombstone made Node UNREADY while Python still said PROVED_STALE
+            # — the pre-tombstone bug back for that record.
+            "records padded past the ceiling": lambda p, a: (
+                self._proof(p, self.A),
+                self._pad(antiphon.peers.identity_proof_path(p, self.OWNER))),
+            "padded tombstone after a rotation": lambda p, a: (
+                self._proof(p, self.B),
+                self._withdrawn(p, a),
+                self._pad(antiphon.peers.retired_half_path(p, "claude", a))),
+            "endpoint name does not derive its digest": lambda p, a: (
+                self._proof(p, self.A),
+                self._patch_endpoint(p, a, name="bogus")),
             "endpoint torn": lambda p, a: (
                 self._proof(p, self.A),
                 self._write(os.path.join(
                     antiphon.peers.peer_dir(p, "claude", a),
                     "endpoint.json"), "{")),
+            # L2: §5 names pid and address mismatches, and neither had a
+            # fixture. Python's `read_peers` filters on kind, pid and address;
+            # Node's verdict consulted none of them.
+            "endpoint pid dropped": lambda p, a: (
+                self._proof(p, self.A),
+                self._patch_endpoint(p, a, drop="pid")),
+            "endpoint pid is not a number": lambda p, a: (
+                self._proof(p, self.A),
+                self._patch_endpoint(p, a, pid="many")),
+            "endpoint address dropped": lambda p, a: (
+                self._proof(p, self.A),
+                self._patch_endpoint(p, a, drop="address")),
+            "endpoint kind is codex": lambda p, a: (
+                self._proof(p, self.A),
+                self._patch_endpoint(p, a, kind="codex")),
             "endpoint missing": lambda p, a: (
                 self._proof(p, self.A),
                 os.unlink(os.path.join(
