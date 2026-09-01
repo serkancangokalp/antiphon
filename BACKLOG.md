@@ -1440,10 +1440,21 @@ does not reproduce.
 exactly what a census measured (2026-08-30; re-run 2026-08-31 before 0.3.1,
 which moved `ide_opened_file` into the Codex set on 4 directly inspected
 records; re-run 2026-08-31 before 0.3.2 — 991 Claude text blocks in 86 files,
-1,060 Codex in 134, nothing outside either set, no change), and nothing else. They will go
-stale as each host adds, renames or drops its own wrapper tags, and the
-obligation to re-measure must not live only in a planning document that ships
-nowhere. Re-run it before every release:
+1,060 Codex in 134, nothing outside either set, no change; re-run 2026-09-01
+with the checked-in aggregate-only utility — 1,884 Claude user blocks in 508
+files and 1,152 Codex user blocks in 152 files, with both observed tag sets
+matching the constants exactly, no change), and nothing else. They will go
+stale as each host adds, renames or drops its own wrapper tags. Re-run before
+every release with:
+
+```sh
+python3 test/host_wrapper_census.py \
+  --claude-root "$HOME/.claude/projects" \
+  --codex-root "$HOME/.codex/sessions"
+```
+
+The utility prints aggregate counts only — never transcript text or individual
+paths. Review its tag keys, then:
 
 - count every `role: user` text record whose text opens with `<`, split by
   side, each one carrying its `promptSource` value (or its absence);

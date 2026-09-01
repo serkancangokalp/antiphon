@@ -360,8 +360,11 @@ def _join_text_blocks(blocks):
 # records; re-measured on 2026-08-31 over 4,309 and 872 (one change:
 # `ide_opened_file` joined the Codex set on direct evidence); re-measured
 # again on 2026-08-31 before 0.3.2 over 991 Claude text blocks in 86 files
-# and 1,060 Codex in 134 (no `<` opening outside either set; no change). See
-# BACKLOG.md for when this census has to be re-run.
+# and 1,060 Codex in 134 (no `<` opening outside either set; no change);
+# re-measured on 2026-09-01 with `test/host_wrapper_census.py` over 1,884
+# Claude user blocks in 508 files and 1,152 Codex user blocks in 152 files
+# (the observed tag sets matched these sets exactly; no change). See
+# BACKLOG.md for the repeatable release check.
 CLAUDE_HOST_WRAPPERS = (
     "channel", "task-notification", "ide_opened_file",
     "command-name", "command-message",
