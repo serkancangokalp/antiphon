@@ -70,8 +70,16 @@ If a proof does exist, the registration must match it. Every automatic
 republish after proof B lands — which is the whole point of putting the check
 on register and reassert rather than on delivery alone.
 
-When a hook replaces the proof it captures the prior one first, then under the
-same lock withdraws every same-owner stale automatic session half. It sends at
+The whole rotation is **one transaction under one lock acquisition**, exposed
+as a single production call — capture the prior proof, validate and write the
+new one, withdraw every same-owner stale automatic session half relative to the
+new current proof, and run the bounded GC window. It cannot be assembled from
+helpers that each take the lock, because the registry lock is not reentrant and
+because two concurrent hooks would interleave between acquisitions and corrupt
+both the prior-proof answer and the judgement of which half is stale.
+
+Within that transaction the hook captures the prior proof first, then withdraws
+every same-owner stale automatic session half. It sends at
 most **one** wakeup, to the previous current alias, and that one is bounded at
 250 ms. Waking every stale half would make hook latency grow with history; the
 previous current alias is the only one with a live listener worth waking, and
