@@ -492,6 +492,43 @@ class OwnerKeyTest(unittest.TestCase):
             peers.owner_key_version("300:Sat Aug 30 01:00:00 2026"))
         self.assertIsNone(peers.owner_key_version("not-an-owner"))
 
+    def test_current_owner_liveness_requires_a_reproducible_fingerprint(self):
+        key = "300:v1:Sat Aug 30 01:00:00 2026"
+        with patch.object(peers, "alive", return_value=True), \
+             patch.object(peers, "_process_birth",
+                          return_value="Sat Aug 30 01:00:00 2026"):
+            self.assertEqual(peers._owner_liveness(key), "live")
+        with patch.object(peers, "alive", return_value=True), \
+             patch.object(peers, "_process_birth", return_value=None):
+            self.assertEqual(peers._owner_liveness(key), "unknown")
+        with patch.object(peers, "alive", return_value=True), \
+             patch.object(peers, "_process_birth",
+                          return_value="Sun Aug 31 09:00:00 2026"):
+            self.assertEqual(peers._owner_liveness(key), "dead")
+        with patch.object(peers, "alive", return_value=False), \
+             patch.object(peers, "_process_birth") as process_birth:
+            self.assertEqual(peers._owner_liveness(key), "dead")
+            process_birth.assert_not_called()
+
+    def test_legacy_or_future_owner_identity_is_unknown(self):
+        for key in ("300:Sat Aug 30 01:00:00 2026",
+                    "300:v2:Sat Aug 30 01:00:00 2026",
+                    "not-an-owner"):
+            with patch.object(peers, "alive") as alive:
+                self.assertEqual(peers._owner_liveness(key), "unknown")
+                alive.assert_not_called()
+
+    def test_owner_liveness_observation_is_cached_by_owner_key(self):
+        key = "300:v1:Sat Aug 30 01:00:00 2026"
+        cache = {}
+        with patch.object(peers, "alive", return_value=True) as alive, \
+             patch.object(peers, "_process_birth",
+                          return_value="Sat Aug 30 01:00:00 2026") as birth:
+            self.assertEqual(peers._owner_liveness(key, cache), "live")
+            self.assertEqual(peers._owner_liveness(key, cache), "live")
+        self.assertEqual(alive.call_count, 1)
+        self.assertEqual(birth.call_count, 1)
+
     def test_the_walk_finds_this_session_for_real(self):
         """Not a stub: this test process is running under a real CLI, so the
         walk has something to find. Skipped where it is not."""

@@ -382,6 +382,35 @@ def _record_alive(record):
     return observed is None or observed == recorded
 
 
+def _record_liveness(record, cache=None):
+    """Strict read-only endpoint liveness for scheduling evidence.
+
+    Registry routing preserves legacy PID-only behavior in ``_record_alive``.
+    Scheduling is a different decision: it may demote a source only from
+    reproducible current-generation evidence, so legacy fingerprints and a
+    failed process read are ``unknown`` rather than guessed live or dead.
+    """
+    pid = _pid_of(record)
+    birth = _birth_of(record)
+    version = (record.get("birth_version")
+               if hasattr(record, "get") else None)
+    key = (pid, version, birth)
+    if cache is not None and key in cache:
+        return cache[key]
+    result = "unknown"
+    if (pid is not None and version == PROCESS_FINGERPRINT_VERSION
+            and birth is not None):
+        if not alive(pid):
+            result = "dead"
+        else:
+            observed = _process_birth(pid)
+            if observed is not None:
+                result = "live" if observed == birth else "dead"
+    if cache is not None:
+        cache[key] = result
+    return result
+
+
 def _prune(cwd, kind, name, dead_pid):
     """Removes a dead peer's record, but only if it is still that peer's.
 
@@ -434,6 +463,30 @@ def _scan(cwd):
         if record is None:
             continue
         if record.get("kind") != kind or record.get("name") != name:
+            continue
+        records.append(record)
+    return records
+
+
+def _scan_sessions(cwd, kind=None):
+    """Validated session records, without pruning or writing registry state."""
+    try:
+        entries = sorted(os.listdir(peers_dir(cwd)))
+    except OSError:
+        return []
+    records = []
+    for entry in entries:
+        entry_kind, _, name = entry.partition("-")
+        if not (valid_kind(entry_kind) and valid_key(entry_kind, name)):
+            continue
+        if kind is not None and entry_kind != kind:
+            continue
+        record = _read_record(os.path.join(
+            peers_dir(cwd), entry, "session.json"))
+        if record is None:
+            continue
+        if (record.get("kind") != entry_kind
+                or record.get("name") != name):
             continue
         records.append(record)
     return records
@@ -722,6 +775,31 @@ def _process_birth(pid):
     """
     info = _process_info(pid)
     return (info[1] or None) if info else None
+
+
+def _owner_liveness(key, cache=None):
+    """Return ``live``, ``dead`` or ``unknown`` for a current owner key.
+
+    Only the current canonical generation can prove either direction. Legacy
+    and future keys have no reproducible fingerprint here, while a failed
+    process observation is evidence of nothing. ``cache`` is keyed by the
+    complete owner key so every page census asks about one CLI owner once.
+    """
+    if cache is not None and key in cache:
+        return cache[key]
+    result = "unknown"
+    if owner_key_version(key) == PROCESS_FINGERPRINT_VERSION:
+        pid_text, _version, recorded = key.split(":", 2)
+        pid = int(pid_text)
+        if not alive(pid):
+            result = "dead"
+        else:
+            observed = _process_birth(pid)
+            if observed is not None:
+                result = "live" if observed == recorded else "dead"
+    if cache is not None:
+        cache[key] = result
+    return result
 
 
 def owner_key(pid=None):

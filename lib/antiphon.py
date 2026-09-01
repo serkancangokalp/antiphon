@@ -834,9 +834,10 @@ ANCHORED_PAGE_CURSOR_VERSION = 4
 class RuntimePositions(dict):
     """Dict-compatible cursor view with non-persisted adoption provenance."""
 
-    def __init__(self, values=None, adopting=()):
+    def __init__(self, values=None, adopting=(), next_lane="active"):
         super().__init__(values or {})
         self.adopting = frozenset(adopting)
+        self.next_lane = next_lane if next_lane in ("active", "dead") else "active"
 
 
 def page_cursor_key(side):
@@ -924,7 +925,8 @@ def positions_for(cursor, side, loader_state="valid"):
             sources = json.loads(json.dumps(value["sources"]))
             sources.update(json.loads(json.dumps(value["adopting_v3"])))
             return RuntimePositions(
-                sources, adopting=value["adopting_v3"]), since, value.get("replay")
+                sources, adopting=value["adopting_v3"],
+                next_lane=value["next_lane"]), since, value.get("replay")
         print("antiphon: anchored paging cursor state was invalid; restarting "
               "discovered transcript history", file=sys.stderr)
         return RuntimePositions(), None, "cursor_recovery"
@@ -996,6 +998,8 @@ def _advance_page_cursor(cwd, kind, cursor, side, positions, advance):
 
     merge(positions)
     merge(advance.sources)
+    if advance.next_lane in ("active", "dead"):
+        next_lane = advance.next_lane
     value = {"v": ANCHORED_PAGE_CURSOR_VERSION, "sources": sources,
              "adopting_v3": adopting, "next_lane": next_lane}
     if advance.has_more and advance.replay_reason in REPLAY_NOTICES:
@@ -2345,7 +2349,7 @@ Record = collections.namedtuple(
     "Record", "time source generation offset end events before_anchor anchor",
     defaults=(None, None))
 PageAdvance = collections.namedtuple(
-    "PageAdvance", "sources has_more replay_reason")
+    "PageAdvance", "sources has_more replay_reason next_lane", defaults=(None,))
 REPLAY_NOTICES = {
     "legacy_upgrade": (
         "replay: replaying discovered history after an upgrade; duplicates "
@@ -2884,11 +2888,82 @@ OTHER_SIDE = {
 
 
 # What one page build knows about the sessions behind the other side's peers.
-SessionJoin = collections.namedtuple("SessionJoin", "aliases unnamed")
+# The first two fields preserve the existing label contract; ``states`` is the
+# conservative scheduler classification for source ids known to the registry.
+SessionJoin = collections.namedtuple(
+    "SessionJoin", "aliases unnamed states", defaults=({},))
 
 # A page with nothing to join against: no source is labelled, no envelope line
 # fires, and every byte is what it was before any of this existed.
-NO_SESSION_JOIN = SessionJoin({}, False)
+NO_SESSION_JOIN = SessionJoin({}, False, {})
+
+
+def _source_activity(cwd, kind):
+    """One read-only live/unknown/dead census for a source kind.
+
+    Labels keep their rolling-compatible registry join. Scheduling is stricter:
+    only a current owner fingerprint can prove a session live or dead, process
+    lookup failure is unknown, and multiple claims for one source are never
+    resolved by directory order.
+    """
+    endpoints = [record for record in peers._scan(cwd)
+                 if record.get("kind") == kind]
+    by_name = {record.get("name"): record for record in endpoints}
+
+    claims = {}
+    owner_cache = {}
+    endpoint_cache = {}
+    for session in peers._scan_sessions(cwd, kind):
+        source = session.get("session_id")
+        if not peers.valid_session_id(source):
+            continue
+        name = session.get("name")
+        owner = peers._owner_of(session)
+        owner_state = peers._owner_liveness(owner, owner_cache)
+        endpoint = by_name.get(name)
+        endpoint_state = (peers._record_liveness(endpoint, endpoint_cache)
+                          if endpoint is not None else "unknown")
+        joined_live = bool(
+            endpoint is not None
+            and peers.owner_key_version(owner)
+            == peers.PROCESS_FINGERPRINT_VERSION
+            and peers._owner_of(endpoint) == owner
+            and owner_state == "live"
+            and endpoint_state == "live")
+        claims.setdefault(source, []).append(
+            (name, owner_state, joined_live))
+
+    states = {}
+    for source, source_claims in claims.items():
+        if len(source_claims) != 1:
+            states[source] = "unknown"
+        elif source_claims[0][2]:
+            states[source] = "live"
+        elif source_claims[0][1] == "dead":
+            states[source] = "dead"
+        else:
+            states[source] = "unknown"
+
+    # Existing display identity remains rolling-compatible. It still requires
+    # one live endpoint/session join and drops a multiply claimed source.
+    label_claims = {}
+    unnamed = False
+    for record in endpoints:
+        if not peers._record_alive(record):
+            continue
+        name = record.get("name")
+        if name == peers.UNNAMED:
+            unnamed = True
+            continue
+        if not peers.valid_name(name):
+            continue
+        session = peers._session_address(cwd, record)
+        if session is not None:
+            label_claims.setdefault(session, set()).add(name)
+    aliases = {source: next(iter(names))
+               for source, names in label_claims.items()
+               if len(names) == 1}
+    return SessionJoin(aliases, unnamed, states)
 
 
 def _session_join(cwd, kind):
@@ -2917,23 +2992,7 @@ def _session_join(cwd, kind):
     It is read here, once, with everything else: the page's remedy line needs
     it, and the budget loop must never go back to the registry for it.
     """
-    claims = {}
-    unnamed = False
-    for record in peers._scan(cwd):
-        if record.get("kind") != kind or not peers._record_alive(record):
-            continue
-        name = record.get("name")
-        if name == peers.UNNAMED:
-            unnamed = True
-            continue
-        if not peers.valid_name(name):
-            continue
-        session = peers._session_address(cwd, record)
-        if session is not None:
-            claims.setdefault(session, set()).add(name)
-    return SessionJoin({session: next(iter(names))
-                        for session, names in claims.items()
-                        if len(names) == 1}, unnamed)
+    return _source_activity(cwd, kind)
 
 
 def _ordered_records(events):
@@ -3135,9 +3194,13 @@ def _render_page(side, records, has_more, replay_reason, join=None,
 
 def _page_frontier(records, selected, scanned):
     """Return offsets that stop at each source's first undelivered record."""
+    delivered = {(record.source, record.generation, record.offset, record.end)
+                 for record in selected}
     first_remaining = {}
-    for record in records[selected:]:
-        first_remaining.setdefault(record.source, record)
+    for record in records:
+        key = (record.source, record.generation, record.offset, record.end)
+        if key not in delivered:
+            first_remaining.setdefault(record.source, record)
     frontier = {}
     for source, position in scanned.items():
         remaining = first_remaining.get(source)
@@ -3151,7 +3214,7 @@ def _page_frontier(records, selected, scanned):
 
 
 def _build_page(events, scanned, side, replay_reason=None, join=None,
-                discovery=None):
+                discovery=None, next_lane="active"):
     """Build one bounded, whole-record page and its safe source frontier."""
     if replay_reason not in REPLAY_NOTICES and replay_reason is not None:
         raise ValueError("unknown replay reason")
@@ -3164,34 +3227,55 @@ def _build_page(events, scanned, side, replay_reason=None, join=None,
                 return text, None, 0
             return "", None, 0
         if replay_reason is None:
-            return "", PageAdvance(dict(scanned), False, None), 0
+            return "", PageAdvance(
+                dict(scanned), False, None, next_lane), 0
         # No records, so no sources and nothing to label. The join this
         # replay would have used says the same thing; passing the empty one
         # says it where a reader can see it.
         text = _render_page(side, [], False, replay_reason, NO_SESSION_JOIN,
                             discovery)
-        return text, PageAdvance(dict(scanned), False, replay_reason), 0
+        return text, PageAdvance(
+            dict(scanned), False, replay_reason, next_lane), 0
 
-    maximum = min(EVENT_LIMIT, len(records))
+    activity = (join or NO_SESSION_JOIN).states
+    active = [record for record in records
+              if activity.get(record.source, "unknown") != "dead"]
+    dead = [record for record in records
+            if activity.get(record.source, "unknown") == "dead"]
+    mixed = bool(active and dead)
+    scheduled = next_lane if next_lane in ("active", "dead") else "active"
+    if mixed:
+        candidates = active if scheduled == "active" else dead
+    else:
+        candidates = active or dead
+    maximum = min(EVENT_LIMIT, len(candidates))
     selected = 0
     text = ""
     for length in range(1, maximum + 1):
-        has_more = length < len(records)
-        candidate = _render_page(side, records[:length], has_more, replay_reason,
-                                 join, discovery)
+        has_more = length < len(candidates) or (mixed and bool(
+            dead if scheduled == "active" else active))
+        candidate = _render_page(
+            side, candidates[:length], has_more, replay_reason,
+            join, discovery)
         if len(candidate.encode("utf-8")) <= PAGE_BUDGET:
             selected = length
             text = candidate
 
     if selected == 0:
         selected = 1
-        text = _render_page(side, records[:selected], len(records) > selected,
-                            replay_reason, join, discovery)
+        has_more = selected < len(candidates) or mixed
+        text = _render_page(
+            side, candidates[:selected], has_more,
+            replay_reason, join, discovery)
 
-    has_more = selected < len(records)
-    frontier = _page_frontier(records, selected, scanned)
-    count = sum(_record_message_count(record) for record in records[:selected])
-    return text, PageAdvance(frontier, has_more, replay_reason), count
+    chosen = candidates[:selected]
+    has_more = selected < len(candidates) or mixed
+    frontier = _page_frontier(records, chosen, scanned)
+    count = sum(_record_message_count(record) for record in chosen)
+    following = ({"active": "dead", "dead": "active"}[scheduled]
+                 if mixed else scheduled)
+    return text, PageAdvance(
+        frontier, has_more, replay_reason, following), count
 
 
 def build_summary(cwd, side, positions=None, since=None, replay_reason=None,
@@ -3237,7 +3321,9 @@ def build_summary(cwd, side, positions=None, since=None, replay_reason=None,
     # walks the registry, `ps` and all: measured, 343 ms per turn if it were
     # built there, against a 46 ms whole-page build.
     join = _session_join(cwd, OTHER_SIDE[side][0])
-    return _build_page(events, reached, side, replay_reason, join, discovery)
+    return _build_page(
+        events, reached, side, replay_reason, join, discovery,
+        getattr(positions, "next_lane", "active"))
 
 
 # ---------- hook (both sides share the same contract) ----------

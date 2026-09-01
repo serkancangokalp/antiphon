@@ -4556,6 +4556,109 @@ class PagedSummaryModelTest(unittest.TestCase):
         self.assertEqual(count, 1)
 
 
+class FairPageSchedulingTest(unittest.TestCase):
+    ACTIVE = "1d5a03e0-0548-4339-87c3-45c5dbf7e9d7"
+    DEAD = "2e6b14f1-1659-544a-98d4-56d6eca8fa48"
+    UNKNOWN = "3f7c25a2-2760-655b-a9e5-67e7fdb90b59"
+
+    @staticmethod
+    def _event(source, text, offset, when):
+        before = (None if offset == 0 else {
+            "start": offset - 100, "sha256": "a" * 64})
+        return antiphon.Event(
+            when, "claude", text, source, "g", offset, offset + 100,
+            before, {"start": offset, "sha256": "b" * 64})
+
+    @classmethod
+    def _events(cls):
+        return [
+            cls._event(cls.DEAD, "dead one", 0, 0),
+            cls._event(cls.DEAD, "dead two", 100, 1),
+            cls._event(cls.ACTIVE, "active one", 0, 10),
+            cls._event(cls.ACTIVE, "active two", 100, 11),
+        ]
+
+    @classmethod
+    def _scanned(cls, *sources):
+        return {source: {"gen": "g", "offset": 200,
+                         "anchor": {"start": 100, "sha256": "c" * 64}}
+                for source in sources}
+
+    @staticmethod
+    def _remaining(events, advance):
+        return [event for event in events
+                if event.offset >= advance.sources[event.source]["offset"]]
+
+    def test_first_mixed_page_serves_active_before_older_dead_backlog(self):
+        join = antiphon.SessionJoin(
+            {}, False, {self.ACTIVE: "live", self.DEAD: "dead"})
+        with patch.object(antiphon, "EVENT_LIMIT", 1):
+            text, advance, _count = antiphon._build_page(
+                self._events(), self._scanned(self.ACTIVE, self.DEAD),
+                "codex", join=join, next_lane="active")
+        self.assertIn("active one", text)
+        self.assertNotIn("dead one", text)
+        self.assertTrue(advance.has_more)
+        self.assertEqual(advance.next_lane, "dead")
+
+    def test_mixed_pages_alternate_without_starving_either_lane(self):
+        join = antiphon.SessionJoin(
+            {}, False, {self.ACTIVE: "live", self.DEAD: "dead"})
+        events = self._events()
+        scanned = self._scanned(self.ACTIVE, self.DEAD)
+        lane = "active"
+        pages = []
+        with patch.object(antiphon, "EVENT_LIMIT", 1):
+            for _ in range(4):
+                text, advance, _count = antiphon._build_page(
+                    events, scanned, "codex", join=join, next_lane=lane)
+                pages.append(text)
+                lane = advance.next_lane
+                events = self._remaining(events, advance)
+        self.assertEqual([
+            "active one" if "active one" in page else
+            "active two" if "active two" in page else
+            "dead one" if "dead one" in page else "dead two"
+            for page in pages],
+            ["active one", "dead one", "active two", "dead two"])
+        self.assertEqual(lane, "dead",
+                         "a one-lane takeover does not spend the preference")
+        self.assertFalse(advance.has_more)
+
+    def test_unknown_shares_the_active_lane(self):
+        events = [self._event(self.DEAD, "dead older", 0, 0),
+                  self._event(self.UNKNOWN, "unknown current", 0, 10)]
+        join = antiphon.SessionJoin(
+            {}, False, {self.DEAD: "dead"})
+        with patch.object(antiphon, "EVENT_LIMIT", 1):
+            text, advance, _count = antiphon._build_page(
+                events, self._scanned(self.DEAD, self.UNKNOWN), "codex",
+                join=join, next_lane="active")
+        self.assertIn("unknown current", text)
+        self.assertNotIn("dead older", text)
+        self.assertEqual(advance.next_lane, "dead")
+
+    def test_empty_lane_takeover_keeps_the_owed_preference(self):
+        join = antiphon.SessionJoin(
+            {}, False, {self.ACTIVE: "live", self.DEAD: "dead"})
+        only_active = [self._event(self.ACTIVE, "active takeover", 0, 10)]
+        text, advance, _count = antiphon._build_page(
+            only_active, self._scanned(self.ACTIVE), "codex", join=join,
+            next_lane="dead")
+        self.assertIn("active takeover", text)
+        self.assertEqual(advance.next_lane, "dead")
+
+        mixed = [self._event(self.ACTIVE, "active waits once", 0, 20),
+                 self._event(self.DEAD, "dead was owed", 0, 0)]
+        with patch.object(antiphon, "EVENT_LIMIT", 1):
+            text, advance, _count = antiphon._build_page(
+                mixed, self._scanned(self.ACTIVE, self.DEAD), "codex",
+                join=join, next_lane=advance.next_lane)
+        self.assertIn("dead was owed", text)
+        self.assertNotIn("active waits once", text)
+        self.assertEqual(advance.next_lane, "active")
+
+
 class OffsetReadingTest(unittest.TestCase):
     """`read_records` reads a transcript forward from a byte offset instead of
     seeking a fixed window from its end, and `source_generation` says when the
@@ -6103,6 +6206,7 @@ class PositionCursorTest(unittest.TestCase):
         self.assertEqual(positions["anchored"], anchored)
         self.assertEqual(positions["adopting"], adopting)
         self.assertEqual(positions.adopting, frozenset({"adopting"}))
+        self.assertEqual(positions.next_lane, "active")
         self.assertNotIn("legacy", positions)
         self.assertIsNotNone(since)
         self.assertIsNone(replay)
@@ -7085,6 +7189,54 @@ class PagedDeliveryTest(_PagingIntegrationCase):
         self.assertIn("mcp record 0", texts[0])
         self.assertIn("mcp record 40", texts[1])
         self.assertIn("Nothing new", texts[2])
+
+    def test_hook_persists_a_mixed_lane_turn_only_after_delivery(self):
+        join = antiphon.SessionJoin(
+            {}, False, {self.SID_A: "live", self.SID_B: "dead"})
+        attempted = []
+        with tempfile.TemporaryDirectory() as project:
+            active = self._write_source(project, self.SID_A, [
+                self._claude_record("active first", 10)])
+            dead = self._write_source(project, self.SID_B, [
+                self._claude_record("dead backlog", 0)])
+            positions = {
+                self.SID_A: {"gen": antiphon.source_generation(active),
+                             "offset": 0, "anchor": None},
+                self.SID_B: {"gen": antiphon.source_generation(dead),
+                             "offset": 0, "anchor": None},
+            }
+            antiphon.write_cursor(project, {
+                antiphon.anchored_page_cursor_key("codex"): {
+                    "v": 4, "sources": positions, "adopting_v3": {},
+                    "next_lane": "active",
+                }}, "codex")
+            cursor_path = os.path.join(project, ".antiphon", "cursor.json")
+            with open(cursor_path, "rb") as stream:
+                before = stream.read()
+            with patch.object(antiphon, "_session_join", return_value=join), \
+                 patch.object(antiphon, "EVENT_LIMIT", 1):
+                failed = self._hook(
+                    project, [active, dead],
+                    deliver=lambda line: attempted.append(line) or False)[0]
+                with open(cursor_path, "rb") as stream:
+                    after_failure = stream.read()
+                first = self._hook(project, [active, dead])[1]
+                after_first = antiphon.read_cursor(project, "codex")
+                second = self._hook(project, [active, dead])[1]
+                after_second = antiphon.read_cursor(project, "codex")
+        self.assertEqual(failed, 1)
+        self.assertEqual(after_failure, before)
+        self.assertIn("active first", attempted[0])
+        self.assertIn("active first", first)
+        self.assertNotIn("dead backlog", first)
+        self.assertEqual(
+            after_first[antiphon.anchored_page_cursor_key("codex")]
+            ["next_lane"], "dead")
+        self.assertIn("dead backlog", second)
+        self.assertEqual(
+            after_second[antiphon.anchored_page_cursor_key("codex")]
+            ["next_lane"], "dead",
+            "a dead-only takeover retains the owed dead preference")
 
     def test_multiblock_source_record_is_not_split_by_hook_or_mcp_limits(self):
         blocks = [{"type": "text", "text": "first atomic block"},
@@ -8880,6 +9032,129 @@ class ClaudeSessionWiringTest(unittest.TestCase):
                 antiphon.peers.peer_dir(project, "codex", "build")))
         self.assertEqual(mine["session_id"], self.UUID)
 
+
+
+class SourceActivityTest(unittest.TestCase):
+    A = "1d5a03e0-0548-4339-87c3-45c5dbf7e9d7"
+    B = "2e6b14f1-1659-544a-98d4-56d6eca8fa48"
+    ENDPOINT_START = "Sat Aug 30 01:00:01 2026"
+    OWNER_START = "Sat Aug 30 01:00:00 2026"
+
+    def _claim(self, project, name, source, endpoint_pid=100, owner_pid=300,
+               owner_version=1, endpoint_owner=None, session_owner=None,
+               endpoint_birth_version=1):
+        owner = (f"{owner_pid}:v{owner_version}:{self.OWNER_START}"
+                 if owner_version is not None
+                 else f"{owner_pid}:{self.OWNER_START}")
+        endpoint_owner = owner if endpoint_owner is None else endpoint_owner
+        session_owner = owner if session_owner is None else session_owner
+        directory = antiphon.peers.peer_dir(project, "codex", name)
+        os.makedirs(directory, exist_ok=True)
+        endpoint = {
+            "kind": "codex", "name": name, "pid": endpoint_pid,
+            "address": source, "owner": endpoint_owner,
+            "birth": self.ENDPOINT_START,
+            "started_at": 1.0,
+        }
+        if endpoint_birth_version is not None:
+            endpoint["birth_version"] = endpoint_birth_version
+        with open(os.path.join(directory, "endpoint.json"), "w",
+                  encoding="utf-8") as stream:
+            json.dump(endpoint, stream)
+        with open(os.path.join(directory, "session.json"), "w",
+                  encoding="utf-8") as stream:
+            json.dump({"kind": "codex", "name": name,
+                       "owner": session_owner, "session_id": source}, stream)
+        return owner
+
+    def _census(self, project, alive=None, births=None):
+        alive = alive or {}
+        births = births or {}
+        with patch.object(antiphon.peers, "alive",
+                          side_effect=lambda pid: alive.get(int(pid), False)), \
+             patch.object(antiphon.peers, "_process_birth",
+                          side_effect=lambda pid: births.get(int(pid))):
+            return antiphon._source_activity(project, "codex")
+
+    def test_live_join_names_and_classifies_one_source(self):
+        with tempfile.TemporaryDirectory() as project:
+            self._claim(project, "build", self.A)
+            snapshot = self._census(
+                project, alive={100: True, 300: True},
+                births={100: self.ENDPOINT_START, 300: self.OWNER_START})
+        self.assertEqual(snapshot.states[self.A], "live")
+        self.assertEqual(snapshot.aliases[self.A], "build")
+
+    def test_only_current_owner_proof_can_classify_a_source_dead(self):
+        cases = (
+            (1, False, None, "dead"),
+            (1, True, None, "unknown"),
+            (None, False, None, "unknown"),
+            (2, False, None, "unknown"),
+        )
+        for version, owner_alive, observed, expected in cases:
+            with self.subTest(version=version, expected=expected), \
+                 tempfile.TemporaryDirectory() as project:
+                self._claim(project, "build", self.A,
+                            owner_version=version)
+                snapshot = self._census(
+                    project, alive={100: False, 300: owner_alive},
+                    births={300: observed})
+            self.assertEqual(snapshot.states[self.A], expected)
+            self.assertNotIn(self.A, snapshot.aliases)
+
+    def test_mixed_owner_generations_and_unreadable_processes_are_unknown(self):
+        legacy = f"300:{self.OWNER_START}"
+        with tempfile.TemporaryDirectory() as project:
+            self._claim(project, "build", self.A, endpoint_owner=legacy)
+            snapshot = self._census(
+                project, alive={100: True, 300: True},
+                births={100: self.ENDPOINT_START, 300: None})
+        self.assertEqual(snapshot.states[self.A], "unknown")
+        self.assertEqual(snapshot.aliases, {})
+
+    def test_conflicting_current_claims_are_unknown_even_when_both_are_live(self):
+        with tempfile.TemporaryDirectory() as project:
+            self._claim(project, "build", self.A, endpoint_pid=100,
+                        owner_pid=300)
+            self._claim(project, "review", self.A, endpoint_pid=101,
+                        owner_pid=301)
+            snapshot = self._census(
+                project, alive={100: True, 101: True, 300: True, 301: True},
+                births={100: self.ENDPOINT_START, 101: self.ENDPOINT_START,
+                        300: self.OWNER_START, 301: self.OWNER_START})
+        self.assertEqual(snapshot.states[self.A], "unknown")
+        self.assertEqual(snapshot.aliases, {})
+
+    def test_owner_observation_is_cached_across_session_claims(self):
+        with tempfile.TemporaryDirectory() as project:
+            self._claim(project, "build", self.A, endpoint_pid=100,
+                        owner_pid=300)
+            self._claim(project, "review", self.B, endpoint_pid=101,
+                        owner_pid=300)
+            calls = []
+
+            def birth(pid):
+                calls.append(int(pid))
+                return (self.OWNER_START if int(pid) == 300
+                        else self.ENDPOINT_START)
+
+            with patch.object(antiphon.peers, "alive", return_value=True), \
+                 patch.object(antiphon.peers, "_process_birth",
+                              side_effect=birth):
+                snapshot = antiphon._source_activity(project, "codex")
+        self.assertEqual(snapshot.states,
+                         {self.A: "live", self.B: "live"})
+        self.assertEqual(calls.count(300), 1,
+                         "one owner key is observed once per census")
+
+    def test_activity_census_is_read_only(self):
+        with tempfile.TemporaryDirectory() as project:
+            self._claim(project, "build", self.A)
+            before = DoctorTest.snapshot(project)
+            self._census(project, alive={100: False, 300: False})
+            after = DoctorTest.snapshot(project)
+        self.assertEqual(after, before)
 
 
 class SourceAwarePullTest(unittest.TestCase):
