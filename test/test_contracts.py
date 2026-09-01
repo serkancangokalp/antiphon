@@ -1000,6 +1000,63 @@ class IdentityPrivacyContractTest(unittest.TestCase):
         # And no surface cuts before it redacts.
         self.assertNotIn(".trim().slice(0, 500)", node)
         self.assertNotIn("detail.slice(0, 500)", node)
+        # `error?.code || error` falls through to the whole error whenever
+        # there is no code, and a message can carry a path, a session id or an
+        # owner key. Every such interpolation goes through one helper.
+        self.assertNotIn("error?.code || error", node,
+                         "an uncoded error must not be interpolated raw")
+        self.assertIn("function errorCode(", node)
+
+    def test_the_proof_diagnosis_names_a_directory_a_person_can_find(self):
+        """Doctor says a proof could not be read or could not be trusted, and
+        correctly prints no path — the filename is a digest and the contract
+        keeps it private. But a diagnosis whose subject appears nowhere a
+        person would look is a diagnosis with no action behind it, so the
+        directory is named once where the layout is described."""
+        readme = read("README.md")
+        self.assertIn(".antiphon/identity/claude/", readme)
+        for verdict in ("could not be read", "cannot be trusted"):
+            self.assertIn(verdict, antiphon._VERDICT_NOTE["UNKNOWN"]
+                          + antiphon._VERDICT_NOTE["STRUCTURAL_INVALID"],
+                          verdict)
+
+    def test_a_retiring_listener_refuses_to_republish_itself(self):
+        """Retirement must be the last registry mutation a process makes.
+
+        It sets `retiring`, closes the server and then releases the endpoint —
+        and the release is a subprocess, so a connection accepted beforehand
+        can still ask for a reassert while it runs. Without the flag in that
+        branch the answer re-creates the record naming a listener on its way
+        out.
+
+        The ordering half is measured behaviourally: `channel.test.mjs` holds
+        the release open through the production registry seam and asserts that
+        nothing can connect inside the window. The flag is a different matter,
+        and the distinction is worth stating rather than hiding. Retirement now
+        destroys open connections and closes the server *before* the release,
+        so no request can reach the control branch at all while `retiring` is
+        true — which means no behavioural test can exercise the flag without
+        first breaking the ordering that makes it unreachable. It is belt
+        against a future reordering, and a pin on the source is the honest
+        instrument for a guard that cannot otherwise be reached. Measured: with
+        both halves reverted a reassert is answered `reasserted`; with either
+        one alone the other masks it.
+        """
+        node = read("lib", "channel.mjs")
+        branch = node[node.index("payload?.control === CHANNEL_CONTROL"):]
+        branch = branch[:branch.index("if (typeof payload.content")]
+        self.assertIn("shuttingDown || retiring", branch,
+                      "the reassert path must refuse while retirement runs")
+        # And the flag has to be set before the first await inside retirement,
+        # or a reassert already queued behind that turn would not see it.
+        retire = node[node.index("async function retireSelf()"):]
+        retire = retire[:retire.index("\n}")]
+        # Comments first: this one talks about awaiting, and a substring search
+        # that reads prose is a search that measures the prose.
+        code = "\n".join(line for line in retire.splitlines()
+                         if not line.strip().startswith("//"))
+        self.assertLess(code.index("retiring = true"), code.index("await "),
+                        "set before anything yields")
 
     def test_the_lockfile_agrees_with_the_package_it_locks(self):
         """A version lives in two tracked files, and one of them is easy to

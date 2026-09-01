@@ -2851,6 +2851,15 @@ class WithdrawalRequiresAValidAutomaticHalfTest(unittest.TestCase):
                 "kind": "claude", "name": alias, "owner": owner,
                 "session_id": "not-a-uuid", "automatic": True,
                 "identity_digest": "0" * 64},
+            # The silent path. Five lines below the guard, the tombstone write
+            # is `if valid_session_id(withdrawn) and not _write(...)`: with no
+            # `session_id` at all that `and` short-circuits, the `continue` is
+            # skipped, and the record is unlinked with nothing written to say
+            # why — the exact "vanished with nothing to explain it" case the
+            # tombstone was added to close.
+            "session id is absent entirely": {
+                "kind": "claude", "name": alias, "owner": owner,
+                "automatic": True, "identity_digest": digest},
             "digest is not a digest": {
                 "kind": "claude", "name": alias, "owner": owner,
                 "session_id": self.A, "automatic": True,

@@ -17181,6 +17181,22 @@ class ReadinessParityTest(unittest.TestCase):
             f'"session_id": "{session_id or self.A}"{extra}}}')
 
     @staticmethod
+    def _rewrite(path, transform):
+        with open(path, encoding="utf-8") as stream:
+            text = stream.read()
+        with open(path, "w", encoding="utf-8") as stream:
+            stream.write(transform(text))
+
+    @staticmethod
+    def _corrupt(path):
+        """One byte no UTF-8 decoder may accept, inside a string value."""
+        with open(path, "rb") as stream:
+            raw = stream.read()
+        assert b'"address"' in raw, raw[:80]
+        with open(path, "wb") as stream:
+            stream.write(raw.replace(b'"address": "', b'"address": "\xff', 1))
+
+    @staticmethod
     def _pad(path):
         """Push a record past the ceiling without changing what it says.
 
@@ -17463,14 +17479,36 @@ class ReadinessParityTest(unittest.TestCase):
                 self._proof(p, self.B),
                 self._withdrawn(p, a),
                 self._pad(antiphon.peers.retired_half_path(p, "claude", a))),
-            # Duplicate keys: Node reads the version's spelling from the raw
-            # text and matches the first token, Python parses and keeps the
-            # last. The exact-key check cannot see them — duplicates collapse
-            # at parse time — so the readers parted on a record neither should
-            # accept at all.
+            # Duplicate keys: Node's `JSON.parse` keeps the last silently,
+            # Python's reader refuses the record. The exact-key check cannot
+            # see them — duplicates collapse at parse time — so the readers
+            # parted on a record neither should accept at all.
+            #
+            # The version spelling is the wrong key to test it with: the first
+            # duplicate trips the float scan, so the fixture passed for a
+            # reason that has nothing to do with duplication. A non-numeric
+            # key is what isolates it.
             "proof repeats the version key": lambda p, a: self._raw(
                 p, self._body(p, self.A).replace(
                     '{"version": 1', '{"version": 1.0, "version": 1', 1)),
+            "proof repeats a non-numeric key": lambda p, a: self._raw(
+                p, self._body(p, self.A).replace(
+                    '"kind": "claude"', '"kind": "codex", "kind": "claude"', 1)),
+            "tombstone repeats a non-numeric key": lambda p, a: (
+                self._proof(p, self.B),
+                self._withdrawn(p, a),
+                self._rewrite(
+                    antiphon.peers.retired_half_path(p, "claude", a),
+                    lambda text: text.replace(
+                        '"kind": "claude"',
+                        '"kind": "codex", "kind": "claude"', 1))),
+            # Invalid UTF-8: Node decodes it to a replacement character and
+            # reads on; Python refuses the bytes. A record one reader cannot
+            # decode is not one the other may route or retire on.
+            "endpoint holds an undecodable byte": lambda p, a: (
+                self._proof(p, self.A),
+                self._corrupt(os.path.join(
+                    antiphon.peers.peer_dir(p, "claude", a), "endpoint.json"))),
             "proof carries an extra key": lambda p, a: self._raw(
                 p, self._body(p, self.A)[:-1] + ', "note": "hello"}'),
             "tombstone carries an extra key": lambda p, a: (
@@ -17482,6 +17520,11 @@ class ReadinessParityTest(unittest.TestCase):
             "endpoint pid is a float": lambda p, a: (
                 self._proof(p, self.A),
                 self._patch_endpoint(p, a, pid=float(os.getpid()))),
+            # No common upper bound: `os.kill` raises OverflowError above the
+            # platform's signed int and Node happily reads on.
+            "endpoint pid is astronomically large": lambda p, a: (
+                self._proof(p, self.A),
+                self._patch_endpoint(p, a, pid=10 ** 100)),
             "endpoint pid is a bool": lambda p, a: (
                 self._proof(p, self.A),
                 self._patch_endpoint(p, a, pid=True)),

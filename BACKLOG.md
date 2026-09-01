@@ -174,7 +174,7 @@ the write-and-flush-before-advance transaction.
   indexless scan over 243 MB cost about 579 ms, acceptable for an explicit
   diagnostic and not for every turn.
 
-### Completed by Wave 1D stable tool invocation retrieval (candidate, not published)
+### Completed by Wave 1D stable tool invocation retrieval (shipped in 0.4.0)
 
 - Every recognized tool invocation now carries a 22-character opaque,
   content-bound `tc1.<kind>.<digest>` id on its compact page entry. The digest
@@ -1578,7 +1578,7 @@ terminal with a distinct `ANTIPHON_NAME`, then address it by name. This closes
 visibility and honest ambiguity, not automatic identity or unnamed
 addressability; those remain the next entry's work.
 
-## P2 — Automatic peer identity (candidate complete)
+## P2 — Automatic peer identity (shipped in 0.4.0)
 
 The design is approved after measuring both hosts on 2026-09-01. Claude Code
 2.1.251 returned exactly one interactive record from `claude agents --json
@@ -1652,10 +1652,11 @@ same canonical UUID grammar, including a pinned UUIDv7 regression case.
 README, setup guidance, both generated rules and live channel instructions now
 state the first-hook/probe windows, ignored Claude display name, explicit
 override, one-vs-many bare-send rule, mixed-version refusal and privacy
-boundary. The candidate's complete `npm test` run is green at 927 Python tests
-(2 skipped) plus the real Node MCP/channel integration. This work is not pushed,
-merged, versioned or published; exact-commit fresh-user certification and an
-independent review remain release gates.
+boundary. This work ships in 0.4.0: merged to `main`, certified on an exact
+commit by `fresh-user.sh`, and reviewed independently before release. The test
+count moves with the suite and is not restated here — a number written into
+prose is stale the next time anyone adds a test, and this one was stale by a
+hundred.
 
 ## P2 — Cross-vendor managed workers
 

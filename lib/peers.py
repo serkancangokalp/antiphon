@@ -51,6 +51,11 @@ OWNER_PATTERN = re.compile(
     r"[1-9][0-9]*:[^\s\ufeff](?:[^\n]*[^\s\ufeff])?")
 VERSIONED_OWNER_PATTERN = re.compile(
     r"([1-9][0-9]*):v([1-9][0-9]*):\S(?:.*\S)?")
+# The largest pid any of these readers will treat as naming a process. Two
+# bounds meet here: `os.kill` refuses a value above the platform's signed int,
+# and JavaScript's numbers stop being exact integers past 2**53 - 1. The
+# smaller of the two is what both sides can agree on.
+PID_CEILING = 2 ** 31 - 1
 PROCESS_FINGERPRINT_VERSION = 1
 OWNER_KEY_VERSION = f"v{PROCESS_FINGERPRINT_VERSION}"
 OBSERVATION_VERSION = 1
@@ -1114,7 +1119,11 @@ def _pid_of(record):
     pid = record.get("pid") if hasattr(record, "get") else None
     if not isinstance(pid, int) or isinstance(pid, bool):
         return None
-    return pid if pid > 0 else None
+    # An upper bound as well as a lower one. Above the platform's signed int
+    # `os.kill` raises `OverflowError` rather than answering, and the Node
+    # reader — where every number is a double — read on regardless. A number
+    # no kernel will ever hand out names no process either way.
+    return pid if 0 < pid <= PID_CEILING else None
 
 
 def _birth_of(record):
@@ -1156,7 +1165,9 @@ def alive(pid):
     """
     try:
         os.kill(int(pid), 0)
-    except (OSError, TypeError, ValueError):
+    except (OSError, TypeError, ValueError, OverflowError):
+        # `OverflowError` is not an `OSError`, and this is the one liveness
+        # question every reader in the registry goes through.
         return False
     return True
 

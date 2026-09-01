@@ -211,6 +211,53 @@ os.execv(real_python, [real_python, *sys.argv[1:]])
   };
 }
 
+// One shim doing both jobs: the identity probe a channel needs to take an
+// automatic alias, and a `unregister_peer` that blocks until released. Two
+// separate stubs cannot be used together — each installs its own `python3` on
+// PATH — and the retirement race needs both at once.
+async function makeRetireRaceHarness(identity) {
+  const dir = await mkdtemp(join(tmpdir(), "antiphon-retire-race-"));
+  const unregisterStarted = join(dir, "unregister-started");
+  const releaseUnregister = join(dir, "release-unregister");
+  const realPython = execFileSync("python3", [
+    "-c", "import sys; print(sys.executable)",
+  ], { encoding: "utf8" }).trim();
+  writeFileSync(join(dir, "python3"), `#!${realPython}
+import os
+import subprocess
+import sys
+import time
+
+command = sys.argv[2] if len(sys.argv) > 2 else ""
+real_python = os.environ["ANTIPHON_TEST_REAL_PYTHON"]
+
+if command == "claude_identity":
+    print(os.environ["ANTIPHON_TEST_IDENTITY_RESULT"])
+    raise SystemExit(0)
+
+if command == "unregister_peer":
+    open(os.environ["ANTIPHON_TEST_UNREGISTER_STARTED"], "w").close()
+    while not os.path.exists(os.environ["ANTIPHON_TEST_UNREGISTER_RELEASE"]):
+        time.sleep(0.01)
+    result = subprocess.run([real_python, *sys.argv[1:]])
+    raise SystemExit(result.returncode)
+
+os.execv(real_python, [real_python, *sys.argv[1:]])
+`, { mode: 0o755 });
+  return {
+    dir,
+    unregisterStarted,
+    releaseUnregister,
+    env: {
+      PATH: `${dir}:${process.env.PATH}`,
+      ANTIPHON_TEST_IDENTITY_RESULT: JSON.stringify(identity),
+      ANTIPHON_TEST_UNREGISTER_STARTED: unregisterStarted,
+      ANTIPHON_TEST_UNREGISTER_RELEASE: releaseUnregister,
+      ANTIPHON_TEST_REAL_PYTHON: realPython,
+    },
+  };
+}
+
 async function makeAutomaticIdentityPython(identity) {
   const dir = await mkdtemp(join(tmpdir(), "antiphon-identity-python-"));
   const calls = join(dir, "calls.txt");
@@ -2295,3 +2342,146 @@ async function neitherTheControlNorADoctorProbeTouchesAnExplicitPeer() {
 }
 
 await neitherTheControlNorADoctorProbeTouchesAnExplicitPeer();
+
+// --- a retired listener stops claiming the socket it gave up ----------------
+// `shutdown()` unlinks the path when this process owns it. Retirement gives the
+// socket up outside that path, so leaving the flag set means the exit unlinks a
+// path a successor may by then have bound — deleting a live listener's socket,
+// which is what the flag exists to prevent.
+async function retirementGivesUpSocketOwnership() {
+  const dir = await mkdtemp(join(tmpdir(), "antiphon-own-"));
+  const { session, stub } = await staleInboundSession(dir);
+  let socket = null;
+  try {
+    socket = await boundSocketOf(session);
+    runPeers(dir, `
+import json, os
+root = os.path.join(${JSON.stringify(dir)}, ".antiphon", "peers",
+                    "claude-${STALE_A_ALIAS}")
+owner = json.load(open(os.path.join(root, "endpoint.json")))["owner"]
+peers.write_session(${JSON.stringify(dir)}, "claude", "${STALE_A_ALIAS}",
+                    ${JSON.stringify(STALE_A)}, "/t/a.jsonl", owner,
+                    ${JSON.stringify(STALE_A_DIGEST)}, True)
+peers.write_identity_proof(${JSON.stringify(dir)}, owner,
+                           ${JSON.stringify(STALE_A)},
+                           ${JSON.stringify(STALE_A_DIGEST)})
+peers.rotate_identity_proof(${JSON.stringify(dir)}, owner,
+                            ${JSON.stringify(STALE_B)},
+                            peers.auto_identity(${JSON.stringify(STALE_B)})[1])
+`);
+    const reply = await sendToSocketAt(socket, { content: "hi" });
+    assert.equal(reply?.ok, false, "the stale listener refuses");
+    assert.ok(await waitFor(() => !existsSync(socket)),
+      "and unlinks its own socket on the way out");
+
+    // A successor binds the same path while the retired process is still up.
+    const successor = createServer(() => {});
+    await new Promise((resolve) => successor.listen(socket, resolve));
+    assert.ok(existsSync(socket), "the successor bound the path");
+    try {
+      // Now end the retired process the ordinary way. Its shutdown must not
+      // unlink a socket it no longer owns.
+      session.child.stdin.end();
+      assert.ok(await waitForExit(session.child, 5_000),
+        `the retired session must exit; stderr=${session.stderr()}`);
+      assert.ok(existsSync(socket),
+        "the successor's socket survives the retired process's exit");
+    } finally {
+      await new Promise((resolve) => successor.close(resolve));
+    }
+  } finally {
+    session.child.kill("SIGKILL");
+    await waitForExit(session.child, 2_000);
+    if (socket) await rm(socket, { force: true }).catch(() => {});
+    await rm(dir, { recursive: true, force: true }).catch(() => {});
+    await rm(stub.dir, { recursive: true, force: true }).catch(() => {});
+  }
+}
+
+await retirementGivesUpSocketOwnership();
+
+// --- retirement is the last registry mutation, measured in its own window ---
+// The window is real and narrow: `retiring` is set, the server closes, and then
+// the release runs as a subprocess. A structural pin on the flag would measure
+// today's spelling; this holds the release open through the production registry
+// seam and asks what a caller can actually do inside it.
+async function nothingResurrectsTheEndpointWhileRetirementRuns() {
+  const dir = await mkdtemp(join(tmpdir(), "antiphon-retire-window-"));
+  const harness = await makeRetireRaceHarness({
+    alias: STALE_A_ALIAS, identity_digest: STALE_A_DIGEST,
+    session_id: STALE_A,
+  });
+  const session = spawnChannel(dir, undefined, harness.env);
+  let socket = null;
+  try {
+    socket = await boundSocketOf(session);
+    const endpoint = join(dir, ".antiphon", "peers",
+      `claude-${STALE_A_ALIAS}`, "endpoint.json");
+    runPeers(dir, `
+import json, os
+root = os.path.join(${JSON.stringify(dir)}, ".antiphon", "peers",
+                    "claude-${STALE_A_ALIAS}")
+owner = json.load(open(os.path.join(root, "endpoint.json")))["owner"]
+peers.write_session(${JSON.stringify(dir)}, "claude", "${STALE_A_ALIAS}",
+                    ${JSON.stringify(STALE_A)}, "/t/a.jsonl", owner,
+                    ${JSON.stringify(STALE_A_DIGEST)}, True)
+peers.write_identity_proof(${JSON.stringify(dir)}, owner,
+                           ${JSON.stringify(STALE_A)},
+                           ${JSON.stringify(STALE_A_DIGEST)})
+peers.rotate_identity_proof(${JSON.stringify(dir)}, owner,
+                            ${JSON.stringify(STALE_B)},
+                            peers.auto_identity(${JSON.stringify(STALE_B)})[1])
+`);
+    const refusal = await sendToSocketAt(socket, { content: "hi" });
+    assert.equal(refusal?.ok, false, "the stale listener refuses");
+
+    // Provably inside the window: the release has started and is blocked.
+    assert.ok(await waitFor(() => existsSync(harness.unregisterStarted)),
+      `retirement never reached the release; stderr=${session.stderr()}`);
+    assert.ok(existsSync(endpoint),
+      "the endpoint is still there — the release has not completed");
+
+    // The listener stopped accepting before it started releasing, so nothing
+    // can even reach it inside the window. Asserting that the connect is
+    // refused — rather than tolerating a failure — is what makes the ordering
+    // load-bearing: released first and closed after, this connects, and the
+    // reassert is answered by a process that is giving its endpoint away.
+    for (let attempt = 0; attempt < 5; attempt += 1) {
+      const reply = await sendToSocketAt(socket, {
+        control: "antiphon.channel",
+        version: 1,
+        action: "reassert",
+        alias: STALE_A_ALIAS,
+        nonce: `n0nce_window-${attempt}`,
+      }).catch(() => "refused");
+      assert.equal(reply, "refused",
+        `attempt ${attempt}: a retiring listener accepts nothing; got `
+        + JSON.stringify(reply));
+    }
+
+    writeFileSync(harness.releaseUnregister, "");
+    assert.ok(await waitFor(() => !existsSync(endpoint)),
+      "the release completes and the endpoint is withdrawn");
+    // And stays withdrawn: nothing queued behind the release brings it back.
+    for (let attempt = 0; attempt < 5; attempt += 1) {
+      await sendToSocketAt(socket, {
+        control: "antiphon.channel",
+        version: 1,
+        action: "reassert",
+        alias: STALE_A_ALIAS,
+        nonce: `n0nce_after-${attempt}`,
+      }).catch(() => null);
+      assert.ok(!existsSync(endpoint),
+        `attempt ${attempt}: the endpoint must not come back`);
+    }
+  } finally {
+    writeFileSync(harness.releaseUnregister, "");
+    session.child.kill("SIGKILL");
+    await waitForExit(session.child, 2_000);
+    if (socket) await rm(socket, { force: true }).catch(() => {});
+    await rm(dir, { recursive: true, force: true }).catch(() => {});
+    await rm(harness.dir, { recursive: true, force: true }).catch(() => {});
+  }
+}
+
+await nothingResurrectsTheEndpointWhileRetirementRuns();
