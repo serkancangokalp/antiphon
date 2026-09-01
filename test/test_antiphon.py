@@ -4878,9 +4878,12 @@ class SafeSourceTest(unittest.TestCase):
             antiphon.write_cursor(project, {"codex_pages": {
                 "v": antiphon.PAGE_CURSOR_VERSION,
                 "sources": {self.UUID: held}}}, "codex")
+            refusal = antiphon.Discovery(
+                (discovered,), "degraded", 0, 0, 0,
+                "some project sources could not be proved")
             with patch.object(antiphon, "project_dir", return_value=project), \
-                 patch.dict(antiphon.CATCH_UP_SOURCES,
-                            {"codex": lambda _cwd: [discovered]}), \
+                 patch.object(antiphon, "_discover_sources",
+                              return_value=refusal), \
                  contextlib.redirect_stdout(io.StringIO()) as out, \
                  contextlib.redirect_stderr(io.StringIO()):
                 self.assertEqual(antiphon.catch_up("codex"), 0)
@@ -5175,6 +5178,202 @@ class SourceCatalogStateTest(unittest.TestCase):
                 counts.append((len(writes), sum(writes)))
         self.assertEqual(counts[0][0], counts[1][0])
         self.assertLess(abs(counts[0][1] - counts[1][1]), 200)
+
+
+class CatalogDiscoveryTest(unittest.TestCase):
+    def setUp(self):
+        self.stack = contextlib.ExitStack()
+        self.addCleanup(self.stack.close)
+        self.project = self.stack.enter_context(tempfile.TemporaryDirectory())
+        self.claude_root = self.stack.enter_context(tempfile.TemporaryDirectory())
+        self.codex_root = self.stack.enter_context(tempfile.TemporaryDirectory())
+        self.claude_dir = os.path.join(
+            self.claude_root, antiphon._claude_slug(self.project))
+        os.makedirs(self.claude_dir)
+        self.stack.enter_context(
+            patch.object(antiphon, "CLAUDE_PROJECTS", self.claude_root))
+        self.stack.enter_context(
+            patch.object(antiphon, "CODEX_SESSIONS", self.codex_root))
+
+    def _claude(self, number, text, timestamp=None):
+        sid = f"{number:08x}-4444-4444-8444-{number:012x}"
+        path = os.path.join(self.claude_dir, sid + ".jsonl")
+        record = {"type": "assistant",
+                  "timestamp": timestamp or f"2026-09-01T00:00:0{number}Z",
+                  "message": {"content": [{"type": "text", "text": text}]}}
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(json.dumps(record) + "\n")
+        os.utime(path, (100 + number, 100 + number))
+        return sid, path
+
+    def _scan(self):
+        with patch.object(antiphon, "project_dir", return_value=self.project), \
+             contextlib.redirect_stdout(io.StringIO()), \
+             contextlib.redirect_stderr(io.StringIO()):
+            self.assertEqual(antiphon.sources("scan"), 0)
+
+    def test_a_complete_catalog_delivers_the_fourth_older_source(self):
+        for number, text in enumerate(("oldest", "two", "three", "newest")):
+            self._claude(number, text)
+        self._scan()
+        text, _advance, _count = antiphon.build_summary(
+            self.project, "codex", {}, since=0)
+        self.assertIn("oldest", text)
+        self.assertIn("has_more_scope: catalogued project sources", text)
+        self.assertNotIn("discovery:", text)
+
+    def test_building_and_malformed_catalogs_cannot_look_complete(self):
+        for number in range(4):
+            self._claude(number, str(number))
+        with patch.object(antiphon, "CATALOG_BATCH", 1):
+            antiphon._catalog_scan_step(self.project, "claude")
+        building, _advance, _count = antiphon.build_summary(
+            self.project, "codex", {}, since=0)
+        self.assertIn("discovery: building", building)
+        state_path = antiphon._catalog_state_path(self.project)
+        with open(state_path, "wb") as f:
+            f.write(b"{broken\n")
+        degraded, _advance, _count = antiphon.build_summary(
+            self.project, "codex", {}, since=0)
+        self.assertIn("discovery: degraded", degraded)
+
+    def test_two_distinct_codex_files_claiming_one_source_are_both_refused(self):
+        sid = "eeeeeeee-4444-4444-8444-eeeeeeeeeeee"
+        for day, text in (("01", "first copy"), ("02", "second copy")):
+            path = os.path.join(
+                self.codex_root, "2026", "09", day,
+                f"rollout-2026-09-{day}T00-00-00-{sid}.jsonl")
+            os.makedirs(os.path.dirname(path))
+            with open(path, "w", encoding="utf-8") as f:
+                f.write(json.dumps({"type": "session_meta",
+                                    "payload": {"cwd": self.project}}) + "\n")
+                f.write(codex_msg(text) + "\n")
+        self._scan()
+        text, _advance, _count = antiphon.build_summary(
+            self.project, "claude", {}, since=0)
+        self.assertNotIn("first copy", text)
+        self.assertNotIn("second copy", text)
+        self.assertIn("discovery: degraded", text)
+
+    def test_a_proved_codex_source_that_changes_project_is_unproven(self):
+        sid = "dddddddd-4444-4444-8444-dddddddddddd"
+        path = os.path.join(
+            self.codex_root, "2026", "09", "01",
+            f"rollout-2026-09-01T00-00-00-{sid}.jsonl")
+        os.makedirs(os.path.dirname(path))
+
+        def write(cwd, text):
+            with open(path, "w", encoding="utf-8") as f:
+                f.write(json.dumps({"type": "session_meta",
+                                    "payload": {"cwd": cwd}}) + "\n")
+                f.write(codex_msg(text) + "\n")
+
+        write(self.project, "proved here")
+        self._scan()
+        write("/a/different/project", "not ours now")
+        text, _advance, _count = antiphon.build_summary(
+            self.project, "claude", {}, since=0)
+        self.assertNotIn("not ours now", text)
+        self.assertIn("discovery: degraded", text)
+
+    def test_a_path_swap_after_discovery_is_refused_and_visible(self):
+        _sid, path = self._claude(9, "original inode")
+        self._scan()
+        real = antiphon.claude_events
+
+        def swap_then_read(*args, **kwargs):
+            replacement = path + ".replacement"
+            record = {"type": "assistant",
+                      "timestamp": "2026-09-01T00:00:10Z",
+                      "message": {"content": [{"type": "text",
+                                                 "text": "replacement inode"}]}}
+            with open(replacement, "w", encoding="utf-8") as f:
+                f.write(json.dumps(record) + "\n")
+            os.replace(replacement, path)
+            return real(*args, **kwargs)
+
+        with patch.object(antiphon, "claude_events",
+                          side_effect=swap_then_read):
+            text, advance, _count = antiphon.build_summary(
+                self.project, "codex", {}, since=0)
+        self.assertNotIn("original inode", text)
+        self.assertNotIn("replacement inode", text)
+        self.assertIn("discovery: degraded", text)
+        self.assertIsNone(advance)
+
+    def test_gone_relevance_is_computed_per_reader_without_writing(self):
+        sid, path = self._claude(7, "gone but maybe unread")
+        self._scan()
+        record = antiphon._read_catalog_record(
+            self.project, "claude", os.path.relpath(path, self.claude_root))
+        os.unlink(path)
+        consumed = {sid: {"gen": record["generation"],
+                          "offset": record["complete_size"]}}
+        behind = {sid: {"gen": record["generation"], "offset": 0}}
+        before = {}
+        for root, _dirs, files in os.walk(os.path.join(
+                self.project, ".antiphon", "sources")):
+            for name in files:
+                full = os.path.join(root, name)
+                with open(full, "rb") as f:
+                    before[full] = f.read()
+        done = antiphon._discover_sources(
+            self.project, "claude", "codex", consumed, since=0)
+        unread = antiphon._discover_sources(
+            self.project, "claude", "codex", behind, since=0)
+        self.assertEqual((done.state, unread.state), ("complete", "degraded"))
+        self.assertEqual((done.gone, unread.gone), (1, 1))
+        for full, raw in before.items():
+            with open(full, "rb") as f:
+                self.assertEqual(f.read(), raw)
+
+    def test_gone_is_aged_out_strictly_before_the_lookback_boundary(self):
+        sid, path = self._claude(8, "gone at the boundary")
+        self._scan()
+        relative = os.path.relpath(path, self.claude_root)
+        record = antiphon._read_catalog_record(
+            self.project, "claude", relative)
+        os.unlink(path)
+        boundary = 1_000_000.0
+        with patch.object(antiphon.time, "time",
+                          return_value=boundary + antiphon.LOOKBACK):
+            record["last_complete_observed"] = boundary - 1
+            antiphon._atomic_json(antiphon._catalog_record_path(
+                self.project, "claude", relative), record)
+            aged = antiphon._discover_sources(
+                self.project, "claude", "codex", {sid: {
+                    "gen": record["generation"], "offset": 0}}, since=0)
+            record["last_complete_observed"] = boundary
+            antiphon._atomic_json(antiphon._catalog_record_path(
+                self.project, "claude", relative), record)
+            exact = antiphon._discover_sources(
+                self.project, "claude", "codex", {sid: {
+                    "gen": record["generation"], "offset": 0}}, since=0)
+        self.assertEqual((aged.state, exact.state), ("complete", "degraded"))
+        self.assertEqual((aged.gone, exact.gone), (1, 1))
+
+    def test_backlog_and_catch_up_include_catalog_sources_beyond_recent(self):
+        sources = [self._claude(number, f"source {number}")
+                   for number in range(4)]
+        self._scan()
+        held = {"gen": "unresolved-generation", "offset": 123}
+        cursor = {"codex_pages": {"v": antiphon.PAGE_CURSOR_VERSION,
+                                  "sources": {"unresolved": held}}}
+        unread, positioned, unpositioned, replay = antiphon.reader_backlog(
+            self.project, "codex", cursor)
+        self.assertEqual(unread, sum(os.path.getsize(path)
+                                     for _sid, path in sources))
+        self.assertEqual((positioned, unpositioned, replay), (0, 4, None))
+
+        antiphon.write_cursor(self.project, cursor, "codex")
+        with patch.object(antiphon, "project_dir", return_value=self.project), \
+             contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(antiphon.catch_up("codex"), 0)
+        after = antiphon.read_cursor(self.project, "codex")
+        positions = after["codex_pages"]["sources"]
+        self.assertEqual(positions["unresolved"], held)
+        for sid, path in sources:
+            self.assertEqual(positions[sid]["offset"], os.path.getsize(path))
 
 
 class SourceCatalogLockTest(unittest.TestCase):
@@ -8300,9 +8499,9 @@ class SourceAwarePullTest(unittest.TestCase):
     def test_labelling_keeps_the_budget_monotone(self):
         """The fixture's parameters are part of the assertion: 200-byte bodies,
         30 records from the first source and 5 from the second, interleaved,
-        the first source claimed. Measured, the 35→34 flip holds there and at
-        20-20 and not at 5-30, because the split decides how many blocks carry
-        a suffix.
+        the first source claimed. With the incomplete-discovery marker in the
+        envelope, the measured 35→33 flip holds there; the label suffixes and
+        marker consume the same fixed page budget.
 
         The property is what matters and it holds everywhere: a label can only
         be added as the prefix grows, never removed, so candidate size stays
@@ -8317,8 +8516,8 @@ class SourceAwarePullTest(unittest.TestCase):
         self.assertLessEqual(len(text.encode("utf-8")), antiphon.PAGE_BUDGET)
         self.assertEqual(base_text.count("] Codex"), 35)
         self.assertFalse(base_advance.has_more)
-        self.assertEqual(text.count("] Codex"), 34)
-        self.assertTrue(advance.has_more, "the page defers one record instead")
+        self.assertEqual(text.count("] Codex"), 33)
+        self.assertTrue(advance.has_more, "the page defers two records instead")
 
         records = antiphon._ordered_records(events)
         join = antiphon._session_join(project, "codex")

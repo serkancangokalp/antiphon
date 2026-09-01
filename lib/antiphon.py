@@ -1303,6 +1303,13 @@ def _open_discovered_source(path, cwd, kind, report=True):
         if report:
             _report_source_refusal(kind, opened)
         return opened
+    expected = getattr(path, "expected_generation", None)
+    if expected is not None and opened.generation != expected:
+        opened.close()
+        refusal = SourceRefusal("changed-after-discovery")
+        if report:
+            _report_source_refusal(kind, refusal)
+        return refusal
     return opened
 
 
@@ -1315,6 +1322,8 @@ CatalogProgress = collections.namedtuple(
     "CatalogProgress", "state pending processed refusals gone")
 CatalogObservation = collections.namedtuple(
     "CatalogObservation", "ok reason record")
+Discovery = collections.namedtuple(
+    "Discovery", "sources state pending refusals gone reason")
 
 
 def _catalog_root(cwd):
@@ -1424,8 +1433,21 @@ def _read_catalog_record(cwd, kind, relative):
 
 def _write_catalog_record(cwd, kind, relative, record):
     path = _catalog_record_path(cwd, kind, relative)
-    if os.path.exists(path) and _read_catalog_record(cwd, kind, relative) is None:
-        return False
+    previous = None
+    if os.path.exists(path):
+        previous = _read_catalog_record(cwd, kind, relative)
+        if previous is None:
+            return False
+    record = json.loads(json.dumps(record))
+    if record.get("status") == "ready":
+        record["last_complete_generation"] = record.get("generation")
+        record["last_complete_size"] = record.get("complete_size")
+        record["last_complete_observed"] = record.get("observed")
+    elif previous is not None:
+        for key in ("last_complete_generation", "last_complete_size",
+                    "last_complete_observed"):
+            if key in previous:
+                record[key] = previous[key]
     return _atomic_json(path, record)
 
 
@@ -1711,6 +1733,158 @@ def _record_current_source(cwd, kind, transcript_path):
     return CatalogObservation(True, None, record)
 
 
+def _catalog_records(cwd, kind):
+    """Return valid candidate records plus a structural-refusal count."""
+    pattern = os.path.join(_catalog_root(cwd), "records", kind, "*", "*.json")
+    records, malformed = [], 0
+    for path in glob.glob(pattern):
+        try:
+            with open(path, encoding="utf-8") as stream:
+                value = json.load(stream)
+        except (OSError, json.JSONDecodeError, ValueError):
+            malformed += 1
+            continue
+        relative = value.get("relative") if isinstance(value, dict) else None
+        if (not isinstance(relative, str)
+                or _read_catalog_record(cwd, kind, relative) != value
+                or os.path.abspath(_catalog_record_path(cwd, kind, relative))
+                != os.path.abspath(path)):
+            malformed += 1
+            continue
+        records.append(value)
+    return records, malformed
+
+
+def _catalog_marker(kind, relative):
+    root = CLAUDE_PROJECTS if kind == "claude" else CODEX_SESSIONS
+    prefix = os.path.dirname(relative) if kind == "claude" else None
+    path = os.path.join(root, relative)
+    return DiscoveredSourcePath(
+        path, root, SourceCandidate(
+            kind, relative, source_id(os.path.basename(relative)), prefix))
+
+
+def _gone_irrelevant(records, positions, boundary):
+    for record in records:
+        generation = record.get("last_complete_generation") or record.get("generation")
+        size = record.get("last_complete_size")
+        observed = record.get("last_complete_observed") or record.get("observed")
+        position = (positions or {}).get(record.get("source"))
+        consumed = (isinstance(position, dict)
+                    and position.get("gen") == generation
+                    and isinstance(position.get("offset"), int)
+                    and isinstance(size, int)
+                    and position["offset"] >= size)
+        aged_out = (isinstance(observed, (int, float)) and observed < boundary)
+        if not consumed and not aged_out:
+            return False
+    return True
+
+
+def _discover_sources(cwd, kind, reader_side, positions, since):
+    """Safely union catalog and recent candidates for one reader, read-only."""
+    del reader_side, since                 # the v3 position map is the authority here
+    loaded = _read_source_catalog(cwd)
+    pending = 0
+    structural = 0
+    if loaded.status in ("invalid", "newer", "unreadable"):
+        base_state, structural = "degraded", 1
+        entry = None
+    else:
+        entry = (((loaded.state or {}).get("kinds") or {}).get(kind))
+        if not isinstance(entry, dict):
+            base_state = "building"
+        elif entry.get("phase") == "complete":
+            base_state = "complete"
+        else:
+            base_state = "building"
+            pending = _catalog_pending(cwd, kind)
+
+    records, malformed = _catalog_records(cwd, kind)
+    structural += malformed
+    by_relative = {record["relative"]: record for record in records}
+    markers = {relative: _catalog_marker(kind, relative)
+               for relative in by_relative}
+    recent = (claude_transcripts(cwd) if kind == "claude"
+              else codex_rollout_files(cwd))[:RECENT_FILES]
+    uncatalogued = 0
+    legacy_recent = []
+    for path in recent:
+        if not isinstance(path, DiscoveredSourcePath):
+            # Unit-level callers historically inject plain temporary paths.
+            # Production discovery always returns a rooted candidate and is
+            # never allowed onto this compatibility road.
+            legacy_recent.append(path)
+            continue
+        relative = path.candidate.relative_path
+        if relative not in markers:
+            uncatalogued += 1
+        markers.setdefault(relative, path)
+
+    groups = collections.defaultdict(list)
+    for relative, marker in markers.items():
+        groups[marker.candidate.expected_source].append((relative, marker))
+
+    selected = list(legacy_recent)
+    refusals = structural
+    gone = 0
+    boundary = time.time() - LOOKBACK
+    for sid, candidates in groups.items():
+        ready, missing, excluded, unproven = [], [], [], []
+        for relative, marker in candidates:
+            opened = _open_safe_source(marker.root, marker.candidate, cwd)
+            if isinstance(opened, SourceRefusal):
+                if opened.reason == "missing":
+                    missing.append(relative)
+                elif kind == "codex" and opened.reason == "project-mismatch":
+                    record = by_relative.get(relative)
+                    if (record is not None
+                            and record.get("status") != "unrelated"):
+                        # This path was previously proved as ours. A later
+                        # metadata mismatch is a replacement/refusal, not an
+                        # ordinary candidate for another project.
+                        unproven.append(relative)
+                    else:
+                        excluded.append(relative)
+                else:
+                    unproven.append(relative)
+                continue
+            identity = (opened.stat.st_dev, opened.stat.st_ino)
+            marker.expected_generation = opened.generation
+            ready.append((identity, marker))
+            opened.close()
+        if unproven:
+            refusals += len(unproven)
+        identities = {identity for identity, _marker in ready}
+        if len(identities) > 1:
+            refusals += len(identities)
+            continue
+        if ready:
+            selected.append(ready[0][1])
+            continue
+        relevant_records = [by_relative[relative] for relative in missing
+                            if relative in by_relative]
+        recorded_candidates = [relative for relative, _marker in candidates
+                               if relative in by_relative
+                               and by_relative[relative].get("status") != "unrelated"]
+        if (recorded_candidates and len(missing) == len(recorded_candidates)
+                and not unproven):
+            gone += 1
+            if not _gone_irrelevant(relevant_records, positions, boundary):
+                refusals += 1
+
+    if structural or refusals:
+        state = "degraded"
+        reason = "some project sources could not be proved"
+    elif base_state == "degraded":
+        state, reason = base_state, "source catalog state could not be trusted"
+    elif base_state == "building" or uncatalogued:
+        state, reason = "building", "source catalog bootstrap is incomplete"
+    else:
+        state, reason = "complete", None
+    return Discovery(tuple(selected), state, pending, refusals, gone, reason)
+
+
 def iso_epoch(s):
     if not s:
         return 0.0
@@ -1973,7 +2147,8 @@ def claude_transcripts(cwd):
             for _mtime, path in files]
 
 
-def claude_events(cwd, positions=None, since=None, visible_record_limit=None):
+def claude_events(cwd, positions=None, since=None, visible_record_limit=None,
+                  source_paths=None):
     """Return visible events and the safe scanned position for each source.
 
     A completed JSONL record consumes at most one visible lookahead slot even
@@ -1983,7 +2158,9 @@ def claude_events(cwd, positions=None, since=None, visible_record_limit=None):
     events = []
     reached = {}
     position = itertools.count()
-    for path in claude_transcripts(cwd)[:RECENT_FILES]:
+    paths = (claude_transcripts(cwd)[:RECENT_FILES]
+             if source_paths is None else source_paths)
+    for path in paths:
         opened = _open_discovered_source(path, cwd, "claude")
         if isinstance(opened, SourceRefusal):
             continue
@@ -2103,12 +2280,15 @@ def codex_rollout_files(cwd, days=3):
     return matched
 
 
-def codex_events(cwd, positions=None, since=None, visible_record_limit=None):
+def codex_events(cwd, positions=None, since=None, visible_record_limit=None,
+                 source_paths=None):
     """Return visible events and the safe scanned position for each rollout."""
     events = []
     reached = {}
     position = itertools.count()
-    for path in codex_rollout_files(cwd)[:RECENT_FILES]:
+    paths = (codex_rollout_files(cwd)[:RECENT_FILES]
+             if source_paths is None else source_paths)
+    for path in paths:
         opened = _open_discovered_source(path, cwd, "codex")
         if isinstance(opened, SourceRefusal):
             continue
@@ -2342,7 +2522,8 @@ def _append_page_section(text, section):
     return text + "\n" + section
 
 
-def _render_page(side, records, has_more, replay_reason, join=None):
+def _render_page(side, records, has_more, replay_reason, join=None,
+                 discovery=None):
     """Render the exact visible envelope whose UTF-8 size is page-bounded."""
     # Over the SELECTED records, never the candidates. The measured shape of a
     # real page is two sources discovered and one delivered — 55 of 60 — and a
@@ -2369,7 +2550,12 @@ def _render_page(side, records, has_more, replay_reason, join=None):
     other = OTHER_SIDE[side][1]
     text = "## What happened on the {} side (since your last turn)".format(other)
     text = _append_page_section(text, "has_more: {}".format(str(has_more).lower()))
-    text = _append_page_section(text, "has_more_scope: currently discovered sources")
+    scope = ("catalogued project sources" if discovery is not None
+             else "currently discovered sources")
+    text = _append_page_section(text, f"has_more_scope: {scope}")
+    if discovery is not None and discovery.state != "complete":
+        text = _append_page_section(
+            text, f"discovery: {discovery.state} — {discovery.reason}")
     if replay_reason is not None:
         text = _append_page_section(text, REPLAY_NOTICES[replay_reason])
     for record in records:
@@ -2434,20 +2620,26 @@ def _page_frontier(records, selected, scanned):
     return frontier
 
 
-def _build_page(events, scanned, side, replay_reason=None, join=None):
+def _build_page(events, scanned, side, replay_reason=None, join=None,
+                discovery=None):
     """Build one bounded, whole-record page and its safe source frontier."""
     if replay_reason not in (None, "legacy_upgrade", "cursor_recovery"):
         raise ValueError("unknown replay reason")
     records = _ordered_records(events)
     if not records:
         if not scanned:
+            if discovery is not None and discovery.state == "degraded":
+                text = _render_page(side, [], False, replay_reason,
+                                    NO_SESSION_JOIN, discovery)
+                return text, None, 0
             return "", None, 0
         if replay_reason is None:
             return "", PageAdvance(dict(scanned), False, None), 0
         # No records, so no sources and nothing to label. The join this
         # replay would have used says the same thing; passing the empty one
         # says it where a reader can see it.
-        text = _render_page(side, [], False, replay_reason, NO_SESSION_JOIN)
+        text = _render_page(side, [], False, replay_reason, NO_SESSION_JOIN,
+                            discovery)
         return text, PageAdvance(dict(scanned), False, replay_reason), 0
 
     maximum = min(EVENT_LIMIT, len(records))
@@ -2456,7 +2648,7 @@ def _build_page(events, scanned, side, replay_reason=None, join=None):
     for length in range(1, maximum + 1):
         has_more = length < len(records)
         candidate = _render_page(side, records[:length], has_more, replay_reason,
-                                 join)
+                                 join, discovery)
         if len(candidate.encode("utf-8")) <= PAGE_BUDGET:
             selected = length
             text = candidate
@@ -2464,7 +2656,7 @@ def _build_page(events, scanned, side, replay_reason=None, join=None):
     if selected == 0:
         selected = 1
         text = _render_page(side, records[:selected], len(records) > selected,
-                            replay_reason, join)
+                            replay_reason, join, discovery)
 
     has_more = selected < len(records)
     frontier = _page_frontier(records, selected, scanned)
@@ -2480,18 +2672,33 @@ def build_summary(cwd, side, positions=None, since=None, replay_reason=None):
     Returns ``(text, page_advance, message_count)``. The page advance is the
     safe contiguous delivered prefix, plus filtered bytes before the first
     undelivered visible record; it is not the parser's scanned EOF."""
+    kind = "codex" if side == "claude" else "claude"
+    discovery = _discover_sources(cwd, kind, side, positions, since)
     if side == "claude":
         events, reached = codex_events(
-            cwd, positions, since, visible_record_limit=EVENT_LIMIT + 1)
+            cwd, positions, since, visible_record_limit=EVENT_LIMIT + 1,
+            source_paths=discovery.sources)
     else:
         events, reached = claude_events(
-            cwd, positions, since, visible_record_limit=EVENT_LIMIT + 1)
+            cwd, positions, since, visible_record_limit=EVENT_LIMIT + 1,
+            source_paths=discovery.sources)
+    expected = {
+        (path.candidate.expected_source
+         if isinstance(path, DiscoveredSourcePath) else source_id(path))
+        for path in discovery.sources
+    }
+    missing = expected - set(reached)
+    if missing:
+        discovery = discovery._replace(
+            state="degraded",
+            refusals=discovery.refusals + len(missing),
+            reason="some project sources could not be proved")
     # Once per build, and threaded down. `_render_page` runs once per prefix
     # length inside the budget loop — up to `EVENT_LIMIT` times — and the join
     # walks the registry, `ps` and all: measured, 343 ms per turn if it were
     # built there, against a 46 ms whole-page build.
     join = _session_join(cwd, OTHER_SIDE[side][0])
-    return _build_page(events, reached, side, replay_reason, join)
+    return _build_page(events, reached, side, replay_reason, join, discovery)
 
 
 # ---------- hook (both sides share the same contract) ----------
@@ -6510,11 +6717,9 @@ def _complete_prefix_end(path):
 
 
 # What each side's page reader looks at: Claude's page is built from Codex
-# rollouts and Codex's from Claude transcripts. Same window as the readers.
-CATCH_UP_SOURCES = {
-    "claude": lambda cwd: codex_rollout_files(cwd)[:RECENT_FILES],
-    "codex": lambda cwd: claude_transcripts(cwd)[:RECENT_FILES],
-}
+# The source kind each page reader consumes. Discovery itself is catalog-backed;
+# this map is only the side/kind contract shared by backlog and catch-up.
+CATCH_UP_SOURCES = {"claude": "codex", "codex": "claude"}
 
 
 def reader_backlog(cwd, side, cursor, cursor_state="valid"):
@@ -6537,9 +6742,10 @@ def reader_backlog(cwd, side, cursor, cursor_state="valid"):
     if cursor_state == "invalid":
         return None
     positions, since, replay = positions_for(cursor, side, cursor_state)
+    kind = CATCH_UP_SOURCES[side]
+    discovery = _discover_sources(cwd, kind, side, positions, since)
     unread, positioned, unpositioned = 0, 0, 0
-    for path in CATCH_UP_SOURCES[side](cwd):
-        kind = "codex" if side == "claude" else "claude"
+    for path in discovery.sources:
         opened = _open_discovered_source(path, cwd, kind)
         if isinstance(opened, SourceRefusal):
             continue
@@ -6588,16 +6794,20 @@ def catch_up(side=None):
     status = 0
     for one in sides:
         key = page_cursor_key(one)
-        frontier, unpinned = {}, []
-        for path in CATCH_UP_SOURCES[one](cwd):
-            kind = "codex" if one == "claude" else "claude"
+        held_cursor, held_state = _read_cursor_state(cwd, one)
+        positions, since, _replay = positions_for(
+            held_cursor, one, held_state)
+        kind = CATCH_UP_SOURCES[one]
+        discovery = _discover_sources(cwd, kind, one, positions, since)
+        frontier, unpinned = {}, discovery.refusals
+        for path in discovery.sources:
             opened = _open_discovered_source(path, cwd, kind)
             if isinstance(opened, SourceRefusal):
-                unpinned.append(opened.reason)
+                unpinned += 1
                 continue
             with opened as source:
                 if source.generation is None:
-                    unpinned.append("incomplete-first-record")
+                    unpinned += 1
                     continue
                 frontier[source.source] = {
                     "gen": source.generation,
@@ -6627,7 +6837,7 @@ def catch_up(side=None):
               f"{skipped['bytes']:,} bytes of undelivered history will not be "
               "delivered")
         if unpinned:
-            print(f"{key}: {len(unpinned)} source(s) could not be measured "
+            print(f"{key}: {unpinned} source(s) could not be measured "
                   "safely and were left alone")
     return status
 
