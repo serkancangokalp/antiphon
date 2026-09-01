@@ -2241,3 +2241,57 @@ json.dump(record, open(path, "w"))
 }
 
 await anAutomaticListenerRefusesWhenItsEndpointStopsDescribingIt();
+
+// --- two guarantees the plan names and nothing measured --------------------
+// Both hold by construction — a configured name leaves `automaticIdentityDigest`
+// null, and doctor's probe half-closes with an empty payload, which fails the
+// content check long before any verdict. Construction changes; these do not.
+async function neitherTheControlNorADoctorProbeTouchesAnExplicitPeer() {
+  const dir = await mkdtemp(join(tmpdir(), "antiphon-explicit-auto-"));
+  // The exact string a prior automatic identity would have used, configured by
+  // hand. §4 devotes a paragraph to this: the alias grammar allows it, so the
+  // control must not act on the address alone.
+  const session = spawnChannel(dir, STALE_A_ALIAS);
+  try {
+    assert.ok(await waitFor(() => /channel ready/.test(session.stderr())),
+      `channel never bound; stderr=${session.stderr()}`);
+    const socket = socketFor(dir, STALE_A_ALIAS);
+    const endpoint = join(dir, ".antiphon", "peers",
+      `claude-${STALE_A_ALIAS}`, "endpoint.json");
+    assert.ok(existsSync(endpoint), "the explicit peer registered");
+
+    const ack = await sendToSocketAt(socket, {
+      control: "antiphon.channel",
+      version: 1,
+      action: "identity-retire",
+      alias: STALE_A_ALIAS,
+      nonce: "n0nce_explicit",
+    });
+    assert.equal(ack?.ok, false, "an explicit peer retires nothing");
+    assert.notEqual(ack?.verdict, "PROVED_STALE",
+      `an explicit peer has no automatic verdict: ${JSON.stringify(ack)}`);
+    assert.ok(existsSync(endpoint), "and keeps its endpoint");
+
+    // Doctor's probe: connect, half-close, expect an object with `ok`.
+    const probe = await new Promise((resolve, reject) => {
+      const client = connect(socket);
+      let out = "";
+      client.setEncoding("utf8");
+      client.on("connect", () => client.end());
+      client.on("data", (chunk) => { out += chunk; });
+      client.on("end", () => resolve(out ? JSON.parse(out) : null));
+      client.on("error", reject);
+    });
+    assert.equal(probe?.ok, false, "the probe is answered, not acted on");
+    assert.ok(existsSync(endpoint),
+      "a read-only diagnostic never retires a listener");
+    assert.ok(existsSync(socket), "nor removes its socket");
+  } finally {
+    session.child.kill("SIGKILL");
+    await waitForExit(session.child, 2_000);
+    await rm(socketFor(dir, STALE_A_ALIAS), { force: true }).catch(() => {});
+    await rm(dir, { recursive: true, force: true }).catch(() => {});
+  }
+}
+
+await neitherTheControlNorADoctorProbeTouchesAnExplicitPeer();

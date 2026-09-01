@@ -40,7 +40,15 @@ KIND_PATTERN = re.compile(r"claude|codex")
 # A pid and the start time that tells it from a recycled one, as `owner_key`
 # below produces it. A bare pid is refused deliberately: it is the recycled
 # number the start time exists to rule out.
-OWNER_PATTERN = re.compile(r"[1-9][0-9]*:\S(?:.*\S)?")
+# `\S` is not the same set in the two languages this record is read by, and it
+# differs in both directions: `\u001c`-`\u001f` and `\u0085` are whitespace to
+# Python and not to JS, `\ufeff` is the reverse. Whichever way a key fell
+# through, one reader accepted a record the other refused — and one of those
+# rows had Node retiring a listener Python would not even enumerate. Both sides
+# now spell the union: anything either language calls whitespace is refused
+# here. `re.ASCII` would not have done it; it opens a new gap on `\u00a0`.
+OWNER_PATTERN = re.compile(
+    r"[1-9][0-9]*:[^\s\ufeff](?:[^\n]*[^\s\ufeff])?")
 VERSIONED_OWNER_PATTERN = re.compile(
     r"([1-9][0-9]*):v([1-9][0-9]*):\S(?:.*\S)?")
 PROCESS_FINGERPRINT_VERSION = 1
@@ -437,7 +445,8 @@ def _read_identity_proof_file(path, owner_digest):
     if len(raw) > RECORD_CEILING:
         return "invalid", None
     try:
-        record = json.loads(raw.decode("utf-8"))
+        record = json.loads(raw.decode("utf-8"),
+                            object_pairs_hook=_no_duplicate_keys)
     except (ValueError, UnicodeDecodeError):
         return "invalid", None
     if not _valid_identity_proof(record, owner_digest):
@@ -980,6 +989,24 @@ def _registry_lock(cwd):
 RECORD_CEILING = 64 * 1024
 
 
+def _no_duplicate_keys(pairs):
+    """Reject an object that names the same key twice.
+
+    JSON allows it and the two languages resolve it differently — Python's
+    parser keeps the last, and the Node reader takes a number's spelling from
+    the raw text, where the first token is the one it meets. So a record could
+    read one way here and another way there while both parsers called it valid.
+    Nothing this project writes repeats a key; a record that does is not one
+    either reader should trust.
+    """
+    seen = {}
+    for key, value in pairs:
+        if key in seen:
+            raise ValueError(f"duplicate key {key!r}")
+        seen[key] = value
+    return seen
+
+
 def _read_record(path):
     """The record as a dict, or None. Valid JSON of the wrong shape is not a
     record: a bare array used to raise out of `read_peers` on `.get`."""
@@ -988,7 +1015,8 @@ def _read_record(path):
             raw = f.read(RECORD_CEILING + 1)
         if len(raw) > RECORD_CEILING:
             return None
-        record = json.loads(raw.decode("utf-8"))
+        record = json.loads(raw.decode("utf-8"),
+                            object_pairs_hook=_no_duplicate_keys)
     except (OSError, ValueError, UnicodeDecodeError):
         return None
     return record if isinstance(record, dict) else None

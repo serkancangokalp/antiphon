@@ -17102,6 +17102,7 @@ class ReadinessParityTest(unittest.TestCase):
     OWNER = "4242:v1:Mon Sep  1 00:00:00 2026"
     A = "8261c119-2c20-4bf4-87ab-f152ac87dbda"
     B = "0199a1b2-2222-7000-8000-00000000000b"
+    C = "0199a1b2-3333-7000-8000-00000000000c"
     ROOT = os.path.dirname(os.path.dirname(os.path.abspath(antiphon.__file__)))
 
     def _peer(self, project):
@@ -17166,26 +17167,32 @@ class ReadinessParityTest(unittest.TestCase):
             json.dump(record, stream)
 
     def _withdrawn(self, project, alias, owner=None, digest=None,
-                   version_literal="1", extra=""):
+                   version_literal="1", extra="", kind="claude",
+                   session_id=None):
         """The state a rotation actually leaves: no half, one tombstone."""
         os.unlink(os.path.join(
             antiphon.peers.peer_dir(project, "claude", alias), "session.json"))
         _name, own_digest = antiphon.peers.auto_identity(self.A)
         self._write(
             antiphon.peers.retired_half_path(project, "claude", alias),
-            '{"version": ' + version_literal + ', "kind": "claude", '
+            '{"version": ' + version_literal + f', "kind": "{kind}", '
             f'"owner": "{owner or self.OWNER}", '
             f'"identity_digest": "{digest or own_digest}", '
-            f'"session_id": "{self.A}"{extra}}}')
+            f'"session_id": "{session_id or self.A}"{extra}}}')
 
     @staticmethod
     def _pad(path):
-        """Push a record past any sane ceiling without changing its meaning."""
+        """Push a record past the ceiling without changing what it says.
+
+        Whitespace between tokens, not an extra key: JSON ignores it, so both
+        parsers read exactly the same record and the only thing under test is
+        the size. Padding with a field measured the exact-key check instead —
+        the fixture agreed with itself for the wrong reason.
+        """
         with open(path, encoding="utf-8") as stream:
-            record = json.load(stream)
-        record["padding"] = "x" * (64 * 1024)
+            raw = stream.read()
         with open(path, "w", encoding="utf-8") as stream:
-            json.dump(record, stream)
+            stream.write(" " * (64 * 1024) + raw)
 
     def _patch_endpoint(self, project, alias, drop=None, **over):
         self._patch(os.path.join(
@@ -17276,6 +17283,24 @@ class ReadinessParityTest(unittest.TestCase):
             # half naming another identity read READY there and UNREADY here.
             # L7: `[\s\S]` where Python's OWNER_PATTERN uses `.` without
             # DOTALL, so a newline inside an owner key parted the two readers.
+            # M3: `\S` is Unicode-aware in Python and ASCII-only in JS, and
+            # the two disagree in both directions. `\u0085` and `\u001c`-`\u001f`
+            # are whitespace to Python and not to JS; `\ufeff` is the reverse.
+            # One row was Node-destroys-where-Python-refuses. `re.ASCII` is not
+            # the fix — it would open a new gap on `\u00a0`.
+            "endpoint owner holds a Unicode space": lambda p, a: (
+                self._proof(p, self.A),
+                self._patch_endpoint(p, a, owner="1:\u0085")),
+            "rotated, owner holds a Unicode space": lambda p, a: (
+                self._proof(p, self.B),
+                self._withdrawn(p, a),
+                self._patch_endpoint(p, a, owner="1:\u0085")),
+            "endpoint owner holds a file separator": lambda p, a: (
+                self._proof(p, self.A),
+                self._patch_endpoint(p, a, owner="1:\u001c")),
+            "endpoint owner holds a byte-order mark": lambda p, a: (
+                self._proof(p, self.A),
+                self._patch_endpoint(p, a, owner="1:\ufeff")),
             "endpoint owner spans a newline": lambda p, a: (
                 self._proof(p, self.A),
                 self._patch_endpoint(p, a, owner="1:a\nb")),
@@ -17303,6 +17328,37 @@ class ReadinessParityTest(unittest.TestCase):
             "session half id disagrees with its own digest": lambda p, a: (
                 self._proof(p, self.A),
                 self._patch_session(p, a, session_id=self.B)),
+            # The Node mirror of `test_tombstone_every_field_is_load_bearing`.
+            # That table drives `automatic_verdict` and nothing else, so ten
+            # mutations of the Node validator survived both suites — including
+            # two that are destructive and reachable in ordinary operation.
+            # Driving the same states through both readers is what closes it.
+            "tombstone kind is not claude": lambda p, a: (
+                self._proof(p, self.B),
+                self._withdrawn(p, a, kind="codex")),
+            "tombstone digest names another identity": lambda p, a: (
+                self._proof(p, self.B),
+                self._withdrawn(p, a, digest="0" * 64)),
+            "tombstone withdrew a third session": lambda p, a: (
+                self._proof(p, self.B),
+                self._withdrawn(p, a, session_id=self.C)),
+            # The A→B→A resume, which is the only shape that isolates the
+            # current-session guard: the tombstone withdrew A, its digest is
+            # A's, and the owner is on A again. Written with a third session
+            # the digest binding refuses first and this guard is never reached.
+            "the owner came back to the identity it withdrew": lambda p, a: (
+                self._proof(p, self.A),
+                self._withdrawn(p, a)),
+            "tombstone withdrew a non-canonical id": lambda p, a: (
+                self._proof(p, self.B),
+                self._withdrawn(p, a, session_id="not-a-uuid")),
+            "tombstone owner is not a usable key": lambda p, a: (
+                self._proof(p, self.B),
+                self._withdrawn(p, a, owner="not-an-owner-key")),
+            "rotated, and the proof is unreadable": lambda p, a: (
+                self._proof(p, self.B),
+                self._withdrawn(p, a),
+                os.chmod(antiphon.peers.identity_proof_path(p, self.OWNER), 0)),
             # Every tombstone fixture is built on the state a real rotation
             # leaves — proof naming B, tombstone naming A. Written with the
             # proof naming A, the `current_session_id != withdrawn` guard
@@ -17360,18 +17416,17 @@ class ReadinessParityTest(unittest.TestCase):
             "endpoint digest mismatched": lambda p, a: (
                 self._proof(p, self.A),
                 self._patch_endpoint(p, a, identity_digest="0" * 64)),
-            # L1: Node grew a record ceiling and Python did not, so a padded
-            # tombstone made Node UNREADY while Python still said PROVED_STALE
-            # — the pre-tombstone bug back for that record.
-            "records padded past the ceiling": lambda p, a: (
-                self._proof(p, self.A),
-                self._pad(antiphon.peers.identity_proof_path(p, self.OWNER))),
-            "padded tombstone after a rotation": lambda p, a: (
-                self._proof(p, self.B),
-                self._withdrawn(p, a),
-                self._pad(antiphon.peers.retired_half_path(p, "claude", a))),
             "endpoint name does not derive its digest": lambda p, a: (
                 self._proof(p, self.A),
+                self._patch_endpoint(p, a, name="bogus")),
+            # Node had no mirror of `_scan`'s name-to-directory binding, so an
+            # endpoint whose `name` is not the directory it sits in read as a
+            # peer there and as nothing at all here. With a rotation tombstone
+            # beside it Node reached PROVED_STALE — it retired a listener over
+            # a record that, to the other reader, does not exist.
+            "rotated, endpoint name is not its directory": lambda p, a: (
+                self._proof(p, self.B),
+                self._withdrawn(p, a),
                 self._patch_endpoint(p, a, name="bogus")),
             "endpoint torn": lambda p, a: (
                 self._proof(p, self.A),
@@ -17396,6 +17451,26 @@ class ReadinessParityTest(unittest.TestCase):
             # and a record nobody wrote is not one either should trust. The
             # version field exists so a shape change can be coordinated; until
             # it is bumped, an unknown key means this is not that shape.
+            # Both readers reach a verdict on a padded record, so these belong
+            # with the equality cases. In `ungovernable` — whose only assertion
+            # is "neither says READY" — they were inert: both are non-READY
+            # with or without the ceiling, so the fixture written for the
+            # ceiling could not detect its removal.
+            "records padded past the ceiling": lambda p, a: (
+                self._proof(p, self.A),
+                self._pad(antiphon.peers.identity_proof_path(p, self.OWNER))),
+            "padded tombstone after a rotation": lambda p, a: (
+                self._proof(p, self.B),
+                self._withdrawn(p, a),
+                self._pad(antiphon.peers.retired_half_path(p, "claude", a))),
+            # Duplicate keys: Node reads the version's spelling from the raw
+            # text and matches the first token, Python parses and keeps the
+            # last. The exact-key check cannot see them — duplicates collapse
+            # at parse time — so the readers parted on a record neither should
+            # accept at all.
+            "proof repeats the version key": lambda p, a: self._raw(
+                p, self._body(p, self.A).replace(
+                    '{"version": 1', '{"version": 1.0, "version": 1', 1)),
             "proof carries an extra key": lambda p, a: self._raw(
                 p, self._body(p, self.A)[:-1] + ', "note": "hello"}'),
             "tombstone carries an extra key": lambda p, a: (
@@ -17433,6 +17508,14 @@ class ReadinessParityTest(unittest.TestCase):
                         self.assertNotEqual(
                             verdict, "READY",
                             f"{name}: {reader} must not call this routable")
+                        # And must not destroy anything over it either. A
+                        # record one reader cannot even enumerate is the last
+                        # thing the other should retire a listener on, and
+                        # "neither says READY" was blind to that.
+                        self.assertNotEqual(
+                            verdict, "PROVED_STALE",
+                            f"{name}: {reader} must not retire on a record "
+                            "the other cannot enumerate")
 
         disagreements = []
         for name, mutate in cases.items():

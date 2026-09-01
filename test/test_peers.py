@@ -1859,9 +1859,24 @@ class HookIdentityRotationTest(unittest.TestCase):
             peers.write_session(project, "claude", "build", self.A,
                                 "/t/build.jsonl", self.OWNER)
 
+            # The half for the session becoming current, which every Stop
+            # hook after the first actually rotates into. Without it the test
+            # measured "same owner" and "automatic" but never the word `stale`
+            # in the function's own name: dropping that check tombstoned and
+            # unlinked the live identity's own half on every turn, and a
+            # lock-acquisition later `write_session` wrote it back — a
+            # per-turn window in which the current peer reads UNREADY.
+            self._automatic_half(project, self.B)
+
             peers.rotate_identity_proof(project, self.OWNER, self.B,
                                         peers.auto_identity(self.B)[1])
 
+            self.assertTrue(self._half_exists(project, self.B),
+                            "the half becoming current is not stale")
+            self.assertFalse(
+                os.path.exists(peers.retired_half_path(
+                    project, "claude", peers.auto_identity(self.B)[0])),
+                "and nothing tombstones it")
             self.assertFalse(self._half_exists(project, self.A),
                              "the same owner's stale automatic half goes")
             self.assertTrue(self._half_exists(project, self.C),
@@ -2494,6 +2509,7 @@ class TombstoneIsPositiveEvidenceTest(unittest.TestCase):
 
     A = "8261c119-2c20-4bf4-87ab-f152ac87dbda"
     B = "0199a1b2-2222-7000-8000-00000000000b"
+    C = "0199a1b2-3333-7000-8000-00000000000c"
 
     def _verdict(self, project, alias):
         sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "lib"))
@@ -2535,8 +2551,22 @@ class TombstoneIsPositiveEvidenceTest(unittest.TestCase):
                 self.assertNotEqual(
                     self._verdict(project, alias), "PROVED_STALE",
                     "an unreadable record must not destroy a listener")
-            finally:
+                # `chmod 000` does not stop `os.stat`, so the assertion above
+                # exercises the existence check rather than the read-failure
+                # branch it is named for. A directory in place of the half is
+                # what makes `os.stat` succeed and the read fail — and an
+                # unreadable *parent* is what makes `os.stat` itself fail.
                 os.chmod(half, 0o600)
+                os.unlink(half)
+                os.makedirs(half)
+                self.assertFalse(
+                    peers.session_half_missing(project, "claude", alias),
+                    "a directory in place of the half is not an absent half")
+                self.assertNotEqual(self._verdict(project, alias),
+                                    "PROVED_STALE")
+            finally:
+                if os.path.isdir(half):
+                    os.rmdir(half)
 
     def test_tombstone_a_torn_half_never_authorises_retirement(self):
         with tempfile.TemporaryDirectory() as project:
@@ -2609,7 +2639,11 @@ class TombstoneIsPositiveEvidenceTest(unittest.TestCase):
                 {"owner": "4243:v1:Mon Sep  1 00:00:00 2026"},
             "kind is not claude": {"kind": "codex"},
             "digest names another identity": {"identity_digest": "0" * 64},
-            "withdrawn id does not derive the digest": {"session_id": self.B},
+            # A third session, not the current one: with `self.B` the
+            # current-session guard answers first and the binding under test is
+            # never consulted. That is the same short-circuit the previous
+            # round fixed one guard further up.
+            "withdrawn id does not derive the digest": {"session_id": self.C},
             "withdrawn id is not canonical": {"session_id": "not-a-uuid"},
             "version is a float": {"version": 1.0},
             "version is a bool": {"version": True},
@@ -2861,3 +2895,42 @@ class WithdrawalRequiresAValidAutomaticHalfTest(unittest.TestCase):
             self.assertFalse(os.path.exists(path))
             self.assertTrue(os.path.exists(
                 peers.retired_half_path(project, "claude", alias)))
+
+
+class SweepWindowIsBoundedTest(unittest.TestCase):
+    """The per-rotation latency bound, asserted rather than assumed.
+
+    The progress test retries up to twelve rotations and stops as soon as the
+    dead record goes, so a window of any size passes it. The bound is the other
+    half of the contract: one rotation examines at most eight records, however
+    many are there, because this runs inside a hook.
+    """
+
+    A = "8261c119-2c20-4bf4-87ab-f152ac87dbda"
+    B = "0199a1b2-2222-7000-8000-00000000000b"
+
+    def test_sweep_window_examines_at_most_eight_records_per_rotation(self):
+        with tempfile.TemporaryDirectory() as project:
+            owner = peers.owner_key()
+            for n in range(1, 26):
+                peers.write_identity_proof(
+                    project, f"{os.getpid()}:v1:Mon Sep  1 00:00:{n:02d} 2026",
+                    self.A, peers.auto_identity(self.A)[1])
+            reads = []
+            real = peers._read_identity_proof_file
+
+            def counted(path, digest):
+                reads.append(path)
+                return real(path, digest)
+
+            with patch.object(peers, "_read_identity_proof_file",
+                              side_effect=counted):
+                peers.rotate_identity_proof(project, owner, self.B,
+                                            peers.auto_identity(self.B)[1])
+            swept = [path for path in reads
+                     if path.startswith(peers.identity_proofs_dir(project))]
+            # The rotation's own capture and re-read of its proof are not sweep
+            # reads; the window is what the sweep itself examined.
+            self.assertLessEqual(
+                len(swept), peers.IDENTITY_SWEEP_WINDOW + 2,
+                "one rotation examines a bounded window, not the inventory")
