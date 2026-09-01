@@ -412,8 +412,9 @@ async function aControlClaimCannotOutliveEofShutdown() {
   let stale = false;
   try {
     assert.ok(await waitFor(() => registeredPeers(dir).length === 1
-      && existsSync(delayed.registerFinished)),
-    `listener never completed its startup claim: ${session.stderr()}`);
+      && existsSync(delayed.registerFinished)
+      && existsSync(session.socketPath)),
+    `listener never completed startup: ${session.stderr()}`);
     await rm(endpointFor(dir, "ui"), { force: true });
     await rm(delayed.registerStarted, { force: true });
     await rm(delayed.registerFinished, { force: true });
@@ -427,7 +428,9 @@ async function aControlClaimCannotOutliveEofShutdown() {
       nonce: "shutdown-during-reassert",
     }));
     assert.ok(await waitFor(() => existsSync(delayed.registerStarted)),
-      "control request never entered register_peer");
+      `control request never entered register_peer; stderr=${session.stderr()} ` +
+      `exit=${session.child.exitCode}/${session.child.signalCode} ` +
+      `socket=${existsSync(session.socketPath)}`);
 
     session.child.stdin.end();
     await waitFor(() => existsSync(delayed.unregisterStarted), 2_000);
