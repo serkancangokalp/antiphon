@@ -78,6 +78,8 @@ LOOKBACK = 6 * 3600       # anything older than this doesn't count as part of "t
 CATALOG_VERSION = 1
 CATALOG_BATCH = 8
 ANCHOR_HASH_CHUNK = 64 * 1024
+CATALOG_MANIFEST_PATTERN = re.compile(
+    r"[0-9a-f]{32}-(?:claude|codex)-(?:base|delta)\.json")
 
 # EVENT_LIMIT and PAGE_BUDGET bound a complete page. The catalog is the
 # correctness inventory; RECENT_FILES bounds only degraded fallback and cheap
@@ -656,15 +658,23 @@ def cursor_lock(cwd, kind, patience=None):
 
 
 @contextlib.contextmanager
-def catalog_lock(cwd, patience=None):
-    """Take the source-catalog lock without ever hanging a prompt turn."""
+def catalog_lock(cwd, patience=None, shared=False):
+    """Take a shared snapshot or exclusive mutation catalog lock, bounded."""
     _refuse_nested_project_lock("catalog")
     if patience is None:
         patience = CATALOG_LOCK_PATIENCE
     path = os.path.join(cwd, ".antiphon", "sources", ".lock")
     try:
-        os.makedirs(os.path.dirname(path), exist_ok=True)
-        fd = os.open(path, os.O_CREAT | os.O_RDWR, 0o600)
+        if shared:
+            fd = os.open(path, os.O_RDONLY)
+        else:
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            fd = os.open(path, os.O_CREAT | os.O_RDWR, 0o600)
+    except FileNotFoundError:
+        if shared:
+            yield False
+            return
+        raise
     except OSError as exc:
         print(f"antiphon: source catalog lock could not be opened: {exc}",
               file=sys.stderr)
@@ -675,7 +685,8 @@ def catalog_lock(cwd, patience=None):
     try:
         while True:
             try:
-                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                mode = fcntl.LOCK_SH if shared else fcntl.LOCK_EX
+                fcntl.flock(fd, mode | fcntl.LOCK_NB)
                 held = True
                 break
             except BlockingIOError:
@@ -1503,6 +1514,7 @@ CatalogObservation = collections.namedtuple(
     "CatalogObservation", "ok reason record")
 CatalogView = collections.namedtuple(
     "CatalogView", "state pending candidates reason")
+CatalogSnapshot = collections.namedtuple("CatalogSnapshot", "loaded view")
 Discovery = collections.namedtuple(
     "Discovery", "sources state pending refusals gone reason")
 
@@ -1646,11 +1658,82 @@ def _new_catalog_state(cwd):
 
 
 def _write_catalog_state(cwd, state):
-    return _atomic_json(_catalog_state_path(cwd), state)
+    written = _atomic_json(_catalog_state_path(cwd), state)
+    if (written
+            and getattr(_PROJECT_LOCK_STATE, "kind", None) == "catalog"):
+        # State is already durable. Cleanup is best effort and can only remove
+        # grammar-valid manifests the just-written state does not reference.
+        _cleanup_catalog_manifests(cwd)
+    return written
 
 
 def _catalog_manifest_path(cwd, filename):
     return os.path.join(_catalog_root(cwd), "manifests", filename)
+
+
+def _referenced_catalog_manifests(cwd):
+    """Referenced manifest basenames, or None when state cannot be trusted."""
+    loaded = _read_source_catalog(cwd)
+    if loaded.status == "absent":
+        return set()
+    if loaded.status != "valid":
+        return None
+    referenced = set()
+    for entry in loaded.state["kinds"].values():
+        for key in ("base_manifest", "delta_manifest"):
+            filename = entry.get(key)
+            if filename is not None:
+                referenced.add(filename)
+    return referenced
+
+
+def _unreferenced_catalog_manifests(cwd):
+    """Owned regular manifest files safe to unlink, never links or odd names."""
+    referenced = _referenced_catalog_manifests(cwd)
+    if referenced is None:
+        return ()
+    directory = os.path.join(_catalog_root(cwd), "manifests")
+    try:
+        entries = list(os.scandir(directory))
+    except OSError:
+        return ()
+    pending = []
+    for entry in entries:
+        if (not CATALOG_MANIFEST_PATTERN.fullmatch(entry.name)
+                or entry.name in referenced):
+            continue
+        try:
+            if not entry.is_file(follow_symlinks=False):
+                continue
+        except OSError:
+            continue
+        pending.append(os.path.join(directory, entry.name))
+    return tuple(pending)
+
+
+def _cleanup_catalog_manifests(cwd):
+    """Best-effort removal of unreferenced owned manifests; return pending."""
+    pending = 0
+    for path in _unreferenced_catalog_manifests(cwd):
+        try:
+            os.unlink(path)
+        except OSError:
+            pending += 1
+    return pending
+
+
+def _catalog_cleanup_pending(cwd):
+    """Count owned cleanup candidates under a read-only catalog snapshot."""
+    root = _catalog_root(cwd)
+    lock_path = os.path.join(root, ".lock")
+    if (not os.path.exists(_catalog_state_path(cwd))
+            and not os.path.exists(os.path.join(root, "manifests"))
+            and not os.path.exists(lock_path)):
+        return 0
+    with catalog_lock(cwd, shared=True) as locked:
+        if not locked or _referenced_catalog_manifests(cwd) is None:
+            return None
+        return len(_unreferenced_catalog_manifests(cwd))
 
 
 def _write_catalog_manifest(cwd, filename, data):
@@ -1736,6 +1819,20 @@ def _catalog_view(cwd, kind, loaded=None):
             return CatalogView("degraded", 0, (), "malformed-reservation")
     state = "complete" if phase == "complete" else "building"
     return CatalogView(state, pending, tuple(candidates), None)
+
+
+def _catalog_snapshot(cwd, kind):
+    """Copy validated state and manifest candidates under one shared lock."""
+    if not os.path.exists(_catalog_state_path(cwd)):
+        loaded = _read_source_catalog(cwd)
+        return CatalogSnapshot(loaded, _catalog_view(cwd, kind, loaded))
+    with catalog_lock(cwd, shared=True) as locked:
+        if not locked:
+            loaded = CatalogLoad(None, "unreadable", "lock-contention")
+            return CatalogSnapshot(
+                loaded, CatalogView("degraded", 0, (), "lock-contention"))
+        loaded = _read_source_catalog(cwd)
+        return CatalogSnapshot(loaded, _catalog_view(cwd, kind, loaded))
 
 
 def _catalog_record_path(cwd, kind, relative):
@@ -2233,11 +2330,12 @@ def _gone_irrelevant(records, positions, boundary):
     return True
 
 
-def _discover_sources(cwd, kind, reader_side, positions, since):
+def _discover_sources(cwd, kind, reader_side, positions, since,
+                      catalog_snapshot=None):
     """Safely union catalog and recent candidates for one reader, read-only."""
     del reader_side, since                 # the v3 position map is the authority here
-    loaded = _read_source_catalog(cwd)
-    view = _catalog_view(cwd, kind, loaded)
+    snapshot = catalog_snapshot or _catalog_snapshot(cwd, kind)
+    loaded, view = snapshot.loaded, snapshot.view
     base_state, pending = view.state, view.pending
     structural = 1 if view.state == "degraded" else 0
     trust_inventory = view.state != "degraded"
@@ -3279,7 +3377,7 @@ def _build_page(events, scanned, side, replay_reason=None, join=None,
 
 
 def build_summary(cwd, side, positions=None, since=None, replay_reason=None,
-                  catalog_degraded=False):
+                  catalog_degraded=False, catalog_snapshot=None):
     """`side` is the side that will READ the summary ('claude' | 'codex').
     Turns what happened on the other side, and what the user said, into
     compact text.
@@ -3288,7 +3386,8 @@ def build_summary(cwd, side, positions=None, since=None, replay_reason=None,
     safe contiguous delivered prefix, plus filtered bytes before the first
     undelivered visible record; it is not the parser's scanned EOF."""
     kind = "codex" if side == "claude" else "claude"
-    discovery = _discover_sources(cwd, kind, side, positions, since)
+    discovery = _discover_sources(
+        cwd, kind, side, positions, since, catalog_snapshot)
     if catalog_degraded:
         discovery = discovery._replace(
             state="degraded", refusals=max(1, discovery.refusals),
@@ -3399,6 +3498,12 @@ def hook(side="claude"):
         # summary nobody was shown has not been seen.
         return 0
 
+    # Snapshot the catalog before the cursor transaction. The snapshot owns
+    # ordinary Python values, so the shared catalog lock is already released
+    # when delivery takes the cursor lock; neither lock family nests.
+    source_kind = "codex" if side == "claude" else "claude"
+    catalog_snapshot = _catalog_snapshot(cwd, source_kind)
+
     with cursor_lock(cwd, side) as locked:
         if not locked:
             # `cursor_lock` has already said why on stderr, but its message is
@@ -3414,7 +3519,8 @@ def hook(side="claude"):
             cursor, side, cursor_state)
         text, advance, _ = build_summary(
             cwd, side, positions, since, replay_reason,
-            catalog_degraded=not catalog_ok)
+            catalog_degraded=not catalog_ok,
+            catalog_snapshot=catalog_snapshot)
         if not text:
             # Nothing to deliver this turn, so the write-then-advance order
             # below does not protect anything -- there is no page to lose.
@@ -5438,6 +5544,7 @@ def _mcp_serve(cwd, alias=None):
             p = p if isinstance(p, dict) else {}
             name = p.get("name")
             if name == "antiphon_read":
+                catalog_snapshot = _catalog_snapshot(cwd, "claude")
                 with cursor_lock(cwd, "codex") as locked:
                     if not locked:
                         # A JSON-RPC request must always be answered: a tool
@@ -5453,7 +5560,8 @@ def _mcp_serve(cwd, alias=None):
                         positions, since, replay_reason = positions_for(
                             cursor, "codex", cursor_state)
                         text, advance, _ = build_summary(
-                            cwd, "codex", positions, since, replay_reason)
+                            cwd, "codex", positions, since, replay_reason,
+                            catalog_snapshot=catalog_snapshot)
                         oversized = (text
                                      and len(text.encode("utf-8")) > PAGE_BUDGET)
                         if oversized:
@@ -6470,6 +6578,11 @@ def status():
         cursor, cursor_state = snapshots[side]
         print(_catalog_status_line(
             side, _reader_discovery(cwd, side, cursor, cursor_state)))
+    cleanup_pending = _catalog_cleanup_pending(cwd)
+    if cleanup_pending is None:
+        print("source manifests: cleanup pending unknown")
+    else:
+        print(f"source manifests: {cleanup_pending} cleanup pending")
     for side in ("claude", "codex"):
         cursor, cursor_state = snapshots[side]
         print(_backlog_line(page_cursor_key(side),
@@ -7360,6 +7473,13 @@ def _doctor_sources(report, cwd):
         else:
             report.bad(f"{line} — run `antiphon sources scan` and inspect "
                        "its stderr; delivery remains explicitly incomplete")
+    cleanup_pending = _catalog_cleanup_pending(cwd)
+    if cleanup_pending is None:
+        report.bad("source manifests: cleanup pending amount unknown because "
+                   "the catalog snapshot could not be trusted")
+    elif cleanup_pending:
+        report.note(f"source manifests: {cleanup_pending} cleanup pending — "
+                    "the next catalog mutation retries it")
 
 
 def _complete_prefix_end(path):
@@ -7573,8 +7693,11 @@ def sources(action=None):
             failed = True
         refused += kind_refused
     state = "degraded" if failed or refused else "complete"
+    cleanup_pending = _catalog_cleanup_pending(cwd)
+    cleanup = ("cleanup pending unknown" if cleanup_pending is None else
+               f"{cleanup_pending} cleanup pending")
     print(f"source catalog: {state}; {processed} candidate(s) inspected; "
-          f"{refused} refused; {gone} gone")
+          f"{refused} refused; {gone} gone; {cleanup}")
     return 1 if state != "complete" else 0
 
 

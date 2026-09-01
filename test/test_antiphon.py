@@ -5375,6 +5375,71 @@ class SourceCatalogStateTest(unittest.TestCase):
         self.assertNotIn(codex_sid, printed)
         self.assertNotIn(self.project, printed)
 
+    def test_repeated_forced_scans_reclaim_superseded_manifests(self):
+        self._source(1)
+        for _cycle in range(3):
+            progress = antiphon._catalog_scan_step(
+                self.project, "claude", force=True)
+            while progress.state != "complete":
+                progress = antiphon._catalog_scan_step(
+                    self.project, "claude")
+        loaded = antiphon._read_source_catalog(self.project)
+        entry = loaded.state["kinds"]["claude"]
+        referenced = {entry["base_manifest"], entry["delta_manifest"]}
+        directory = os.path.join(
+            self.project, ".antiphon", "sources", "manifests")
+        retained = set(os.listdir(directory))
+        self.assertEqual(retained, referenced)
+
+    def test_a_manifest_published_before_a_crash_is_reclaimed_later(self):
+        self._source(1)
+        while antiphon._catalog_scan_step(
+                self.project, "claude").state != "complete":
+            pass
+        orphan_name = antiphon._catalog_manifest_name(
+            "claude", "f" * 32, "base")
+        orphan = antiphon._catalog_manifest_path(self.project, orphan_name)
+        with antiphon.catalog_lock(self.project) as locked:
+            self.assertTrue(locked)
+            self.assertTrue(antiphon._write_catalog_manifest(
+                self.project, orphan_name, {
+                    "v": antiphon.CATALOG_VERSION,
+                    "project": os.path.abspath(self.project),
+                    "kind": "claude", "generation": "f" * 32,
+                    "phase": "base", "paths": [], "root_stamp": None,
+                }))
+        self.assertTrue(os.path.exists(orphan))
+
+        antiphon._catalog_scan_step(self.project, "claude", force=True)
+
+        self.assertFalse(os.path.exists(orphan))
+
+    def test_sources_scan_reports_failed_cleanup_without_failing_delivery(self):
+        self._source(1)
+        with patch.object(antiphon, "project_dir", return_value=self.project), \
+             contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(antiphon.sources("scan"), 0)
+        orphan_name = antiphon._catalog_manifest_name(
+            "claude", "e" * 32, "base")
+        orphan = antiphon._catalog_manifest_path(self.project, orphan_name)
+        with open(orphan, "w", encoding="utf-8") as stream:
+            stream.write("orphan")
+        real_unlink = os.unlink
+
+        def unlink(path):
+            if path == orphan:
+                raise OSError("busy")
+            return real_unlink(path)
+
+        out = io.StringIO()
+        with patch.object(antiphon, "project_dir", return_value=self.project), \
+             patch.object(antiphon.os, "unlink", side_effect=unlink), \
+             contextlib.redirect_stdout(out):
+            self.assertEqual(antiphon.sources("scan"), 0)
+        self.assertIn("1 cleanup pending", out.getvalue())
+        self.assertNotIn(orphan_name, out.getvalue())
+        self.assertTrue(os.path.exists(orphan))
+
     def test_sources_command_refuses_every_action_but_scan(self):
         with contextlib.redirect_stderr(io.StringIO()) as err:
             self.assertEqual(antiphon.sources("repair"), 2)
@@ -5967,6 +6032,37 @@ class CatalogDiscoveryTest(unittest.TestCase):
             self.assertNotIn(secret, printed)
         self.assertEqual(DoctorTest.snapshot(self.project), before)
 
+    def test_cleanup_pending_is_aggregate_and_read_only_in_status_and_doctor(self):
+        self._claude(9, "private transcript content")
+        self._scan()
+        orphan_name = antiphon._catalog_manifest_name(
+            "claude", "e" * 32, "base")
+        orphan = antiphon._catalog_manifest_path(self.project, orphan_name)
+        with open(orphan, "w", encoding="utf-8") as stream:
+            stream.write("private manifest content")
+        before = DoctorTest.snapshot(self.project)
+
+        status_out = io.StringIO()
+        with patch.object(antiphon, "project_dir", return_value=self.project), \
+             patch.object(antiphon, "_live_by_kind",
+                          return_value={"claude": [], "codex": []}), \
+             patch.object(antiphon, "_channel_answering", return_value=False), \
+             patch.object(antiphon, "build_summary",
+                          return_value=("", None, 0)), \
+             contextlib.redirect_stdout(status_out):
+            self.assertEqual(antiphon.status(), 0)
+        doctor_out = io.StringIO()
+        report = antiphon._Report()
+        with contextlib.redirect_stdout(doctor_out):
+            antiphon._doctor_sources(report, self.project)
+
+        for printed in (status_out.getvalue(), doctor_out.getvalue()):
+            self.assertIn("source manifests: 1 cleanup pending", printed)
+            self.assertNotIn(orphan_name, printed)
+            self.assertNotIn("private manifest content", printed)
+        self.assertFalse(report.broken)
+        self.assertEqual(DoctorTest.snapshot(self.project), before)
+
     def test_doctor_reports_catalog_advice_read_only(self):
         before = DoctorTest.snapshot(self.project)
         out = io.StringIO()
@@ -6008,6 +6104,162 @@ class SourceCatalogLockTest(unittest.TestCase):
                 with self.assertRaisesRegex(RuntimeError, "nested project locks"):
                     with antiphon.catalog_lock(project):
                         pass
+
+    def test_exclusive_cleanup_waits_for_a_shared_manifest_reader(self):
+        with tempfile.TemporaryDirectory() as project:
+            generation = "a" * 32
+            filename = antiphon._catalog_manifest_name(
+                "claude", generation, "base")
+            state = antiphon._new_catalog_state(project)
+            state["kinds"]["claude"] = {
+                "generation": generation, "phase": "base",
+                "base_manifest": filename, "base_next": 0,
+                "delta_manifest": None, "delta_next": 0,
+                "root_stamp": None, "inflight": None,
+            }
+            with antiphon.catalog_lock(project) as locked:
+                self.assertTrue(locked)
+                self.assertTrue(antiphon._write_catalog_manifest(
+                    project, filename, {
+                        "v": 1, "project": os.path.abspath(project),
+                        "kind": "claude", "generation": generation,
+                        "phase": "base", "paths": [], "root_stamp": None,
+                    }))
+                self.assertTrue(antiphon._write_catalog_state(project, state))
+            orphan = antiphon._catalog_manifest_path(
+                project, antiphon._catalog_manifest_name(
+                    "claude", "b" * 32, "base"))
+            with open(orphan, "w", encoding="utf-8") as stream:
+                stream.write("orphan")
+            entered = threading.Event()
+            finished = threading.Event()
+
+            def clean():
+                entered.set()
+                with antiphon.catalog_lock(project, patience=1.0) as locked:
+                    if locked:
+                        antiphon._cleanup_catalog_manifests(project)
+                finished.set()
+
+            with antiphon.catalog_lock(
+                    project, patience=1.0, shared=True) as locked:
+                self.assertTrue(locked)
+                worker = threading.Thread(target=clean)
+                worker.start()
+                self.assertTrue(entered.wait(1.0))
+                self.assertFalse(finished.wait(0.05),
+                                 "exclusive cleanup crossed a shared snapshot")
+                self.assertTrue(os.path.exists(orphan))
+            worker.join(2.0)
+            self.assertFalse(worker.is_alive())
+            self.assertTrue(os.path.exists(
+                antiphon._catalog_manifest_path(project, filename)))
+            self.assertFalse(os.path.exists(orphan))
+
+    def test_manifest_cleanup_ignores_malformed_names_and_symlinks(self):
+        with tempfile.TemporaryDirectory() as project, \
+             tempfile.TemporaryDirectory() as outside:
+            manifests = os.path.join(
+                project, ".antiphon", "sources", "manifests")
+            os.makedirs(manifests)
+            malformed = os.path.join(manifests, "keep-me.txt")
+            target = os.path.join(outside, "outside.json")
+            link = os.path.join(
+                manifests, antiphon._catalog_manifest_name(
+                    "claude", "c" * 32, "base"))
+            with open(malformed, "w", encoding="utf-8") as stream:
+                stream.write("keep")
+            with open(target, "w", encoding="utf-8") as stream:
+                stream.write("outside")
+            os.symlink(target, link)
+            with antiphon.catalog_lock(project) as locked:
+                self.assertTrue(locked)
+                self.assertEqual(
+                    antiphon._cleanup_catalog_manifests(project), 0)
+            self.assertTrue(os.path.exists(malformed))
+            self.assertTrue(os.path.islink(link))
+            self.assertTrue(os.path.exists(target))
+
+    def test_failed_manifest_unlink_stays_pending_without_other_io(self):
+        with tempfile.TemporaryDirectory() as project:
+            manifests = os.path.join(
+                project, ".antiphon", "sources", "manifests")
+            os.makedirs(manifests)
+            orphan = os.path.join(
+                manifests, antiphon._catalog_manifest_name(
+                    "claude", "d" * 32, "base"))
+            with open(orphan, "w", encoding="utf-8") as stream:
+                stream.write("orphan")
+            real_unlink = os.unlink
+
+            def unlink(path):
+                if path == orphan:
+                    raise OSError("busy")
+                return real_unlink(path)
+
+            with antiphon.catalog_lock(project) as locked, \
+                 patch.object(antiphon.os, "unlink", side_effect=unlink), \
+                 patch.object(antiphon, "_read_cursor_state",
+                              side_effect=AssertionError("cursor read")), \
+                 patch.object(antiphon.peers, "_process_birth",
+                              side_effect=AssertionError("process probe")), \
+                 patch.object(antiphon, "_open_discovered_source",
+                              side_effect=AssertionError("transcript read")):
+                self.assertTrue(locked)
+                self.assertEqual(
+                    antiphon._cleanup_catalog_manifests(project), 1)
+            self.assertTrue(os.path.exists(orphan))
+
+    def test_shared_snapshot_releases_before_transcript_cursor_or_process_io(self):
+        with tempfile.TemporaryDirectory() as project, \
+             tempfile.TemporaryDirectory() as claude_root, \
+             tempfile.TemporaryDirectory() as codex_root, \
+             patch.object(antiphon, "CLAUDE_PROJECTS", claude_root), \
+             patch.object(antiphon, "CODEX_SESSIONS", codex_root):
+            directory = os.path.join(
+                claude_root, antiphon._claude_slug(project))
+            os.makedirs(directory)
+            path = os.path.join(
+                directory, "aaaaaaaa-1111-4111-8111-aaaaaaaaaaaa.jsonl")
+            with open(path, "w", encoding="utf-8") as stream:
+                stream.write(json.dumps({
+                    "type": "assistant",
+                    "timestamp": "2026-09-01T00:00:00Z",
+                    "message": {"content": [{"type": "text",
+                                                "text": "safe"}]},
+                }) + "\n")
+            while antiphon._catalog_scan_step(
+                    project, "claude").state != "complete":
+                pass
+            real_inventory = antiphon._catalog_record_inventory
+            real_recent = antiphon.claude_transcripts
+            real_open = antiphon._open_safe_source
+
+            def outside_lock(operation, *args, **kwargs):
+                self.assertIsNone(
+                    getattr(antiphon._PROJECT_LOCK_STATE, "kind", None))
+                return operation(*args, **kwargs)
+
+            with patch.object(
+                    antiphon, "_catalog_record_inventory",
+                    side_effect=lambda *a, **kw: outside_lock(
+                        real_inventory, *a, **kw)), \
+                 patch.object(
+                    antiphon, "claude_transcripts",
+                    side_effect=lambda *a, **kw: outside_lock(
+                        real_recent, *a, **kw)), \
+                 patch.object(
+                    antiphon, "_open_safe_source",
+                    side_effect=lambda *a, **kw: outside_lock(
+                        real_open, *a, **kw)), \
+                 patch.object(antiphon, "_read_cursor_state") as cursor_read, \
+                 patch.object(antiphon.peers,
+                              "_process_birth") as process_probe:
+                discovery = antiphon._discover_sources(
+                    project, "claude", "codex", {}, since=0)
+            self.assertEqual(discovery.state, "complete")
+            cursor_read.assert_not_called()
+            process_probe.assert_not_called()
 
     def test_two_hooks_finish_the_catalog_phase_before_the_cursor_phase(self):
         trace = []
