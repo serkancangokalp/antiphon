@@ -51,7 +51,17 @@ the write-and-flush-before-advance transaction.
   one-line summaries with no `antiphon_read(id)` route.
 - The durable source catalog and the degraded-discovery marker: discovery
   still reads the newest 3 transcripts per side, and `has_more: false` cannot
-  distinguish complete discovery from that window.
+  distinguish complete discovery from that window. Wave 1A selected a fixed
+  batch of 8 from a read-only 25-sample descriptor benchmark on 2026-09-01:
+  the main project exposed 3 Claude and 156 Codex candidates; batch 8 measured
+  Claude median/p95 0.171/0.175 ms and Codex 1.192/3.896 ms. The resumed-hook
+  write harness then compared 8 versus 563 synthetic candidates: both inspected
+  8 and made exactly 11 atomic writes, totalling 5,164 versus 5,155 bytes (the
+  largest single write was 1,284 bytes in both). Initial immutable manifest
+  publication is one-time; subsequent hook write count and volume are therefore
+  independent of catalog size. The state machine and explicit scanner are in
+  the local Wave 1A branch; page discovery and its degraded marker remain the
+  next review unit before this item can close.
 - Backward paging into history an older version already marked seen —
   **settled for the published path, ruled for the rest.** Its cost was
   measured on 2026-08-31: the byte-zero `legacy_upgrade` replay of two days

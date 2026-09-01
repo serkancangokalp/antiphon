@@ -4889,6 +4889,294 @@ class SafeSourceTest(unittest.TestCase):
         self.assertIn("1 source(s) could not be measured safely", out.getvalue())
 
 
+class SourceCatalogStateTest(unittest.TestCase):
+    def setUp(self):
+        self.project_stack = contextlib.ExitStack()
+        self.addCleanup(self.project_stack.close)
+        self.project = self.project_stack.enter_context(
+            tempfile.TemporaryDirectory())
+        self.host = self.project_stack.enter_context(
+            tempfile.TemporaryDirectory())
+        self.codex_host = self.project_stack.enter_context(
+            tempfile.TemporaryDirectory())
+        self.directory = os.path.join(
+            self.host, antiphon._claude_slug(self.project))
+        os.makedirs(self.directory)
+        self.project_stack.enter_context(
+            patch.object(antiphon, "CLAUDE_PROJECTS", self.host))
+        self.project_stack.enter_context(
+            patch.object(antiphon, "CODEX_SESSIONS", self.codex_host))
+
+    def _source(self, number, text=None):
+        sid = f"{number:08x}-1111-4111-8111-{number:012x}"
+        path = os.path.join(self.directory, sid + ".jsonl")
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(json.dumps({
+                "type": "assistant", "timestamp": "2026-09-01T00:00:00Z",
+                "message": {"content": [{"type": "text",
+                                            "text": text or str(number)}]}}) + "\n")
+        return sid, path
+
+    def _state(self):
+        loaded = antiphon._read_source_catalog(self.project)
+        self.assertEqual(loaded.status, "valid")
+        return loaded.state
+
+    def test_malformed_and_newer_catalogs_are_preserved_byte_for_byte(self):
+        root = os.path.join(self.project, ".antiphon", "sources")
+        os.makedirs(root)
+        path = os.path.join(root, "state.json")
+        for raw in (b"{not json\n", b'{"v":999,"project":"x"}\n'):
+            with open(path, "wb") as f:
+                f.write(raw)
+            with contextlib.redirect_stderr(io.StringIO()):
+                progress = antiphon._catalog_scan_step(self.project, "claude")
+            with open(path, "rb") as f:
+                self.assertEqual(f.read(), raw)
+            self.assertEqual(progress.state, "degraded")
+
+    def test_bootstrap_is_bounded_resumable_and_reconciles_once(self):
+        for number in range(5):
+            self._source(number)
+        with patch.object(antiphon, "CATALOG_BATCH", 2):
+            first = antiphon._catalog_scan_step(self.project, "claude")
+            state = self._state()["kinds"]["claude"]
+            generation = state["generation"]
+            manifest = os.path.join(
+                self.project, ".antiphon", "sources", "manifests",
+                state["base_manifest"])
+            with open(manifest, "rb") as f:
+                original_manifest = f.read()
+            self.assertEqual((first.processed, first.pending), (2, 3))
+
+            second = antiphon._catalog_scan_step(self.project, "claude")
+            third = antiphon._catalog_scan_step(self.project, "claude")
+            self.assertEqual((second.processed, third.processed), (2, 1))
+            self.assertEqual(self._state()["kinds"]["claude"]["phase"],
+                             "reconcile")
+
+            self._source(90, "created after base snapshot")
+            fourth = antiphon._catalog_scan_step(self.project, "claude")
+            self.assertEqual(fourth.processed, 1)
+            finished = self._state()["kinds"]["claude"]
+            self.assertEqual(finished["phase"], "complete")
+            self.assertEqual(finished["generation"], generation)
+            with open(manifest, "rb") as f:
+                self.assertEqual(f.read(), original_manifest,
+                                 "the base manifest is immutable")
+
+            self._source(91, "created after reconciliation cutoff")
+            refreshed = antiphon._catalog_scan_step(self.project, "claude")
+            self.assertNotEqual(
+                self._state()["kinds"]["claude"]["generation"], generation)
+            self.assertLessEqual(refreshed.processed, 2)
+
+    def test_a_reserved_batch_repeats_after_interruption_instead_of_skipping(self):
+        for number in range(3):
+            self._source(number)
+        enumeration = antiphon._enumerate_catalog_candidates(
+            self.project, "claude")
+        with antiphon.catalog_lock(self.project) as held:
+            self.assertTrue(held)
+            antiphon._start_catalog_generation(
+                self.project, "claude", enumeration)
+            first = antiphon._reserve_catalog_batch(self.project, "claude", 2)
+        with antiphon.catalog_lock(self.project) as held:
+            self.assertTrue(held)
+            repeated = antiphon._reserve_catalog_batch(self.project, "claude", 2)
+        self.assertEqual(repeated.token, first.token)
+        self.assertEqual(repeated.relative_paths, first.relative_paths)
+
+    def test_codex_refresh_does_not_depend_on_the_top_root_mtime(self):
+        day = os.path.join(self.codex_host, "2026", "09", "01")
+        os.makedirs(day)
+
+        def rollout(number):
+            sid = f"{number:08x}-3333-4333-8333-{number:012x}"
+            path = os.path.join(
+                day, f"rollout-2026-09-01T00-00-00-{sid}.jsonl")
+            with open(path, "w", encoding="utf-8") as f:
+                f.write(json.dumps({"type": "session_meta",
+                                    "payload": {"cwd": self.project}}) + "\n")
+            return path
+
+        rollout(1)
+        while antiphon._catalog_scan_step(
+                self.project, "codex").state != "complete":
+            pass
+        generation = self._state()["kinds"]["codex"]["generation"]
+        root_stamp = os.stat(self.codex_host).st_mtime_ns
+        rollout(2)
+        self.assertEqual(os.stat(self.codex_host).st_mtime_ns, root_stamp,
+                         "the nested day changed, not the top sessions root")
+        antiphon._catalog_scan_step(self.project, "codex")
+        self.assertNotEqual(
+            self._state()["kinds"]["codex"]["generation"], generation)
+
+    def test_current_source_recording_ignores_alias_and_peer_identity(self):
+        sid, path = self._source(7)
+        with patch.dict(os.environ, {"ANTIPHON_NAME": "named"}), \
+             patch.object(antiphon.peers, "owner_key",
+                          side_effect=AssertionError("peer identity consulted")):
+            observed = antiphon._record_current_source(
+                self.project, "claude", path)
+        self.assertTrue(observed.ok)
+        record = antiphon._read_catalog_record(
+            self.project, "claude",
+            os.path.relpath(path, self.host))
+        self.assertEqual((record["source"], record["status"]), (sid, "ready"))
+
+    def test_candidate_records_use_full_digest_prefix_partitioning(self):
+        _sid, path = self._source(8)
+        relative = os.path.relpath(path, self.host)
+        antiphon._record_current_source(self.project, "claude", path)
+        digest = hashlib.sha256(
+            ("claude\0" + relative).encode("utf-8")).hexdigest()
+        expected = os.path.join(
+            self.project, ".antiphon", "sources", "records", "claude",
+            digest[:2], digest + ".json")
+        self.assertTrue(os.path.isfile(expected))
+
+    def test_hook_records_current_before_bounded_bootstrap(self):
+        paths = [self._source(number)[1] for number in range(6)]
+        trace = []
+        real_record = antiphon._record_current_source
+        real_scan = antiphon._catalog_scan_step
+
+        def record(*args, **kwargs):
+            trace.append("current")
+            return real_record(*args, **kwargs)
+
+        def scan(*args, **kwargs):
+            trace.append("scan " + args[1])
+            return real_scan(*args, **kwargs)
+
+        payload = {"cwd": self.project, "hook_event_name": "SessionStart",
+                   "transcript_path": paths[-1]}
+        with patch.object(antiphon, "CATALOG_BATCH", 2), \
+             patch.object(antiphon, "_record_current_source", side_effect=record), \
+             patch.object(antiphon, "_catalog_scan_step", side_effect=scan), \
+             patch.object(antiphon, "record_claude_session"), \
+             patch.object(antiphon, "sweep_attachments"), \
+             patch.object(antiphon.sys, "stdin", io.StringIO(json.dumps(payload))), \
+             contextlib.redirect_stdout(io.StringIO()), \
+             contextlib.redirect_stderr(io.StringIO()):
+            self.assertEqual(antiphon.hook("claude"), 0)
+        self.assertEqual(trace, ["current", "scan claude", "scan codex"])
+        self.assertTrue(antiphon._read_catalog_record(
+            self.project, "claude", os.path.relpath(paths[-1], self.host)))
+        self.assertEqual(self._state()["kinds"]["claude"]["base_next"], 2)
+
+    def test_sources_scan_completes_both_hosts_without_moving_a_cursor(self):
+        for number in range(3):
+            self._source(number)
+        codex_sid = "dddddddd-1111-4111-8111-dddddddddddd"
+        codex_path = os.path.join(
+            self.codex_host, "2026", "09", "01",
+            "rollout-2026-09-01T00-00-00-" + codex_sid + ".jsonl")
+        os.makedirs(os.path.dirname(codex_path))
+        with open(codex_path, "w", encoding="utf-8") as f:
+            f.write(json.dumps({"type": "session_meta",
+                                "payload": {"cwd": self.project}}) + "\n")
+        antiphon.write_cursor(self.project, {"codex_seen": 123.0}, "codex")
+        cursor_path = antiphon.state_path(self.project, "codex")
+        with open(cursor_path, "rb") as f:
+            before = f.read()
+        with patch.object(antiphon, "project_dir", return_value=self.project), \
+             contextlib.redirect_stdout(io.StringIO()) as out:
+            self.assertEqual(antiphon.sources("scan"), 0)
+        with open(cursor_path, "rb") as f:
+            self.assertEqual(f.read(), before)
+        state = self._state()["kinds"]
+        self.assertEqual((state["claude"]["phase"], state["codex"]["phase"]),
+                         ("complete", "complete"))
+        printed = out.getvalue()
+        self.assertIn("source catalog: complete", printed)
+        self.assertNotIn(codex_sid, printed)
+        self.assertNotIn(self.project, printed)
+
+    def test_sources_command_refuses_every_action_but_scan(self):
+        with contextlib.redirect_stderr(io.StringIO()) as err:
+            self.assertEqual(antiphon.sources("repair"), 2)
+        self.assertIn("sources scan", err.getvalue())
+
+    def test_a_malformed_manifest_is_preserved_and_degraded(self):
+        self._source(1)
+        enumeration = antiphon._enumerate_catalog_candidates(
+            self.project, "claude")
+        with antiphon.catalog_lock(self.project) as held:
+            self.assertTrue(held)
+            antiphon._start_catalog_generation(
+                self.project, "claude", enumeration)
+        entry = self._state()["kinds"]["claude"]
+        path = os.path.join(self.project, ".antiphon", "sources", "manifests",
+                            entry["base_manifest"])
+        raw = b"{broken manifest\n"
+        with open(path, "wb") as f:
+            f.write(raw)
+        progress = antiphon._catalog_scan_step(self.project, "claude")
+        with open(path, "rb") as f:
+            self.assertEqual(f.read(), raw)
+        self.assertEqual(progress.state, "degraded")
+
+    def test_a_malformed_candidate_record_is_not_overwritten(self):
+        _sid, path = self._source(2)
+        relative = os.path.relpath(path, self.host)
+        antiphon._record_current_source(self.project, "claude", path)
+        record_path = antiphon._catalog_record_path(
+            self.project, "claude", relative)
+        raw = b"{broken record\n"
+        with open(record_path, "wb") as f:
+            f.write(raw)
+        enumeration = antiphon._enumerate_catalog_candidates(
+            self.project, "claude")
+        with antiphon.catalog_lock(self.project) as held:
+            self.assertTrue(held)
+            antiphon._start_catalog_generation(
+                self.project, "claude", enumeration)
+        progress = antiphon._catalog_scan_step(self.project, "claude")
+        with open(record_path, "rb") as f:
+            self.assertEqual(f.read(), raw)
+        self.assertEqual(progress.state, "degraded")
+
+    def test_a_resumed_hook_write_count_is_independent_of_catalog_size(self):
+        counts = []
+        for total in (3, 30):
+            with tempfile.TemporaryDirectory() as project, \
+                 tempfile.TemporaryDirectory() as host, \
+                 patch.object(antiphon, "CLAUDE_PROJECTS", host):
+                directory = os.path.join(host, antiphon._claude_slug(project))
+                os.makedirs(directory)
+                paths = []
+                for number in range(total):
+                    sid = f"{number:08x}-2222-4222-8222-{number:012x}"
+                    path = os.path.join(directory, sid + ".jsonl")
+                    with open(path, "w", encoding="utf-8") as f:
+                        f.write(json.dumps({"type": "assistant"}) + "\n")
+                    paths.append(path)
+                enumeration = antiphon._enumerate_catalog_candidates(
+                    project, "claude")
+                with antiphon.catalog_lock(project) as held:
+                    self.assertTrue(held)
+                    antiphon._start_catalog_generation(
+                        project, "claude", enumeration)
+                writes = []
+                real = antiphon._atomic_json
+
+                def measured(path, data):
+                    writes.append(len(json.dumps(data, sort_keys=True)))
+                    return real(path, data)
+
+                with patch.object(antiphon, "CATALOG_BATCH", 2), \
+                     patch.object(antiphon, "_atomic_json", side_effect=measured):
+                    antiphon._record_current_source(project, "claude", paths[-1])
+                    progress = antiphon._catalog_scan_step(project, "claude")
+                self.assertEqual(progress.processed, 2)
+                counts.append((len(writes), sum(writes)))
+        self.assertEqual(counts[0][0], counts[1][0])
+        self.assertLess(abs(counts[0][1] - counts[1][1]), 200)
+
+
 class SourceCatalogLockTest(unittest.TestCase):
     """The catalog phase ends before the cursor transaction begins."""
 
@@ -4923,8 +5211,10 @@ class SourceCatalogLockTest(unittest.TestCase):
             trace.append("cursor exit")
 
         def catalog_update(_cwd, _side, _payload):
-            trace.append("catalog operation")
-            return True
+            with antiphon.catalog_lock(_cwd) as held:
+                self.assertTrue(held)
+                trace.append("catalog operation")
+                return True
 
         payload = json.dumps({"cwd": "/tmp/catalog-order",
                               "hook_event_name": "UserPromptSubmit"})
@@ -4993,6 +5283,20 @@ class SourceCatalogLockTest(unittest.TestCase):
                 os.close(holder)
         self.assertEqual(code, 0)
         self.assertIn("catalog", err.getvalue().lower())
+
+    def test_one_degraded_catalog_phase_skips_the_rest_of_that_hook(self):
+        progress = antiphon.CatalogProgress("degraded", 0, 0, 1, 0)
+        calls = []
+
+        def scan(_cwd, kind):
+            calls.append(kind)
+            return progress
+
+        with patch.object(antiphon, "_catalog_scan_step", side_effect=scan), \
+             contextlib.redirect_stderr(io.StringIO()):
+            self.assertFalse(antiphon._hook_catalog_update(
+                "/tmp/project", "claude", {}))
+        self.assertEqual(calls, ["claude"])
 
 
 class PositionCursorTest(unittest.TestCase):
@@ -7465,6 +7769,7 @@ class ClaudeSessionWiringTest(unittest.TestCase):
         with self._named(name), \
              patch.object(antiphon.sys, "stdin", io.StringIO(json.dumps(payload))), \
              patch.object(antiphon.peers, "owner_key", return_value=owner), \
+             patch.object(antiphon, "_hook_catalog_update", return_value=True), \
              patch.object(antiphon, "build_summary", return_value=("", None, 0)), \
              patch.object(antiphon, "read_cursor", return_value={}), \
              patch.object(antiphon, "write_cursor",

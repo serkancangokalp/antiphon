@@ -73,6 +73,8 @@ EVENT_LIMIT = 40          # completed source records per page
 PAGE_BUDGET = 8_000       # UTF-8 bytes in an ordinary complete page envelope
 RECENT_FILES = 3          # transcript files per side the summary reads at all
 LOOKBACK = 6 * 3600       # anything older than this doesn't count as part of "this session"
+CATALOG_VERSION = 1
+CATALOG_BATCH = 8
 
 # EVENT_LIMIT and PAGE_BUDGET bound a complete page. RECENT_FILES still bounds
 # discovery; it does not authorize cutting any record selected from that set.
@@ -710,8 +712,22 @@ def _catalog_phase(cwd, operation):
 
 
 def _hook_catalog_update(cwd, side, payload):
-    """Wave 1A hook seam; the bounded state-machine work lands in Task 3."""
-    return None
+    """Record the live source first, then advance one bounded batch per host."""
+    transcript = payload.get("transcript_path") if isinstance(payload, dict) else None
+    if isinstance(transcript, str) and transcript:
+        current = _record_current_source(cwd, side, transcript)
+        if not current.ok:
+            print(f"antiphon: current {side} transcript was not catalogued "
+                  f"({current.reason}); discovery is incomplete", file=sys.stderr)
+            if current.reason == "lock-contention":
+                return False
+    for kind in (side, OTHER_SIDE[side][0]):
+        progress = _catalog_scan_step(cwd, kind)
+        if progress.state == "degraded":
+            print(f"antiphon: {kind} source catalog is degraded; recent "
+                  "discovery remains available", file=sys.stderr)
+            return False
+    return True
 
 
 def sender_side(target):
@@ -1288,6 +1304,411 @@ def _open_discovered_source(path, cwd, kind, report=True):
             _report_source_refusal(kind, opened)
         return opened
     return opened
+
+
+CatalogLoad = collections.namedtuple("CatalogLoad", "state status reason")
+CatalogEnumeration = collections.namedtuple(
+    "CatalogEnumeration", "kind relative_paths root_stamp")
+CatalogReservation = collections.namedtuple(
+    "CatalogReservation", "kind generation phase token relative_paths start end")
+CatalogProgress = collections.namedtuple(
+    "CatalogProgress", "state pending processed refusals gone")
+CatalogObservation = collections.namedtuple(
+    "CatalogObservation", "ok reason record")
+
+
+def _catalog_root(cwd):
+    return os.path.join(cwd, ".antiphon", "sources")
+
+
+def _catalog_state_path(cwd):
+    return os.path.join(_catalog_root(cwd), "state.json")
+
+
+def _atomic_json(path, data):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    temporary = f"{path}.{os.getpid()}.{uuid.uuid4().hex}.tmp"
+    try:
+        with open(temporary, "w", encoding="utf-8") as stream:
+            json.dump(data, stream, ensure_ascii=False, sort_keys=True,
+                      separators=(",", ":"))
+            stream.write("\n")
+        os.replace(temporary, path)
+        return True
+    except OSError:
+        try:
+            os.unlink(temporary)
+        except OSError:
+            pass
+        return False
+
+
+def _read_source_catalog(cwd):
+    path = _catalog_state_path(cwd)
+    try:
+        with open(path, encoding="utf-8") as stream:
+            state = json.load(stream)
+    except FileNotFoundError:
+        return CatalogLoad(None, "absent", None)
+    except PermissionError:
+        return CatalogLoad(None, "unreadable", "unreadable")
+    except (OSError, json.JSONDecodeError, ValueError):
+        return CatalogLoad(None, "invalid", "malformed")
+    if not isinstance(state, dict):
+        return CatalogLoad(None, "invalid", "malformed")
+    version = state.get("v")
+    if isinstance(version, int) and version > CATALOG_VERSION:
+        return CatalogLoad(None, "newer", "newer-version")
+    if (version != CATALOG_VERSION
+            or state.get("project") != os.path.abspath(cwd)
+            or not isinstance(state.get("kinds"), dict)):
+        return CatalogLoad(None, "invalid", "wrong-project-or-schema")
+    return CatalogLoad(state, "valid", None)
+
+
+def _new_catalog_state(cwd):
+    return {"v": CATALOG_VERSION, "project": os.path.abspath(cwd), "kinds": {}}
+
+
+def _write_catalog_state(cwd, state):
+    return _atomic_json(_catalog_state_path(cwd), state)
+
+
+def _catalog_manifest_path(cwd, filename):
+    return os.path.join(_catalog_root(cwd), "manifests", filename)
+
+
+def _write_catalog_manifest(cwd, filename, data):
+    path = _catalog_manifest_path(cwd, filename)
+    if os.path.exists(path):
+        return False
+    return _atomic_json(path, data)
+
+
+def _read_catalog_manifest(cwd, filename):
+    try:
+        with open(_catalog_manifest_path(cwd, filename), encoding="utf-8") as stream:
+            data = json.load(stream)
+    except (OSError, json.JSONDecodeError, ValueError):
+        return None
+    if (not isinstance(data, dict)
+            or data.get("v") != CATALOG_VERSION
+            or data.get("project") != os.path.abspath(cwd)
+            or not isinstance(data.get("paths"), list)
+            or any(not isinstance(path, str) for path in data["paths"])):
+        return None
+    return data
+
+
+def _catalog_record_path(cwd, kind, relative):
+    digest = hashlib.sha256((kind + "\0" + relative).encode("utf-8")).hexdigest()
+    return os.path.join(
+        _catalog_root(cwd), "records", kind, digest[:2], digest + ".json")
+
+
+def _read_catalog_record(cwd, kind, relative):
+    try:
+        with open(_catalog_record_path(cwd, kind, relative),
+                  encoding="utf-8") as stream:
+            value = json.load(stream)
+    except (OSError, json.JSONDecodeError, ValueError):
+        return None
+    if (not isinstance(value, dict)
+            or value.get("v") != CATALOG_VERSION
+            or value.get("project") != os.path.abspath(cwd)
+            or value.get("kind") != kind
+            or value.get("relative") != relative):
+        return None
+    return value
+
+
+def _write_catalog_record(cwd, kind, relative, record):
+    path = _catalog_record_path(cwd, kind, relative)
+    if os.path.exists(path) and _read_catalog_record(cwd, kind, relative) is None:
+        return False
+    return _atomic_json(path, record)
+
+
+def _directory_stamp(path):
+    try:
+        info = os.stat(path)
+        return [info.st_dev, info.st_ino, info.st_mtime_ns]
+    except OSError:
+        return None
+
+
+def _enumerate_catalog_candidates(cwd, kind):
+    """Capture names only; transcript descriptors are opened by the batch."""
+    if kind == "claude":
+        directory = claude_project_dir(cwd)
+        if not directory:
+            return CatalogEnumeration(kind, (), None)
+        prefix = os.path.relpath(directory, CLAUDE_PROJECTS)
+        try:
+            names = [entry.name for entry in os.scandir(directory)
+                     if entry.name.endswith(".jsonl")]
+        except OSError:
+            return None
+        relative = tuple(sorted(os.path.join(prefix, name) for name in names))
+        return CatalogEnumeration(kind, relative, _directory_stamp(directory))
+    if kind == "codex":
+        pattern = os.path.join(CODEX_SESSIONS, "**", "rollout-*.jsonl")
+        try:
+            relative = tuple(sorted(
+                os.path.relpath(path, CODEX_SESSIONS)
+                for path in glob.glob(pattern, recursive=True)))
+        except OSError:
+            return None
+        return CatalogEnumeration(kind, relative, None)
+    return None
+
+
+def _start_catalog_generation(cwd, kind, enumeration):
+    loaded = _read_source_catalog(cwd)
+    if loaded.status in ("invalid", "newer", "unreadable"):
+        return False
+    state = (json.loads(json.dumps(loaded.state)) if loaded.state is not None
+             else _new_catalog_state(cwd))
+    generation = uuid.uuid4().hex
+    filename = f"{generation}-{kind}-base.json"
+    manifest = {
+        "v": CATALOG_VERSION, "project": os.path.abspath(cwd),
+        "kind": kind, "generation": generation, "phase": "base",
+        "paths": list(enumeration.relative_paths),
+        "root_stamp": enumeration.root_stamp,
+    }
+    if not _write_catalog_manifest(cwd, filename, manifest):
+        return False
+    state["kinds"][kind] = {
+        "generation": generation, "phase": "base",
+        "base_manifest": filename, "base_next": 0,
+        "delta_manifest": None, "delta_next": 0,
+        "root_stamp": enumeration.root_stamp, "inflight": None,
+    }
+    return _write_catalog_state(cwd, state)
+
+
+def _phase_manifest(entry):
+    if entry.get("phase") == "base":
+        return entry.get("base_manifest"), entry.get("base_next", 0)
+    if entry.get("phase") == "delta":
+        return entry.get("delta_manifest"), entry.get("delta_next", 0)
+    return None, 0
+
+
+def _reserve_catalog_batch(cwd, kind, limit=None):
+    limit = CATALOG_BATCH if limit is None else limit
+    loaded = _read_source_catalog(cwd)
+    if loaded.status != "valid":
+        return None
+    state = json.loads(json.dumps(loaded.state))
+    entry = state["kinds"].get(kind)
+    if not isinstance(entry, dict):
+        return None
+    inflight = entry.get("inflight")
+    if isinstance(inflight, dict):
+        return CatalogReservation(
+            kind, entry["generation"], inflight["phase"], inflight["token"],
+            tuple(inflight["paths"]), inflight["start"], inflight["end"])
+    filename, start = _phase_manifest(entry)
+    if not filename:
+        return None
+    manifest = _read_catalog_manifest(cwd, filename)
+    if manifest is None:
+        return None
+    paths = manifest["paths"]
+    if start >= len(paths):
+        entry["phase"] = "reconcile" if entry["phase"] == "base" else "complete"
+        _write_catalog_state(cwd, state)
+        return None
+    end = min(len(paths), start + max(1, int(limit)))
+    token = uuid.uuid4().hex
+    entry["inflight"] = {
+        "phase": entry["phase"], "token": token,
+        "paths": paths[start:end], "start": start, "end": end,
+    }
+    if not _write_catalog_state(cwd, state):
+        return None
+    return CatalogReservation(
+        kind, entry["generation"], entry["phase"], token,
+        tuple(paths[start:end]), start, end)
+
+
+def _observe_catalog_candidate(cwd, kind, relative):
+    root = CLAUDE_PROJECTS if kind == "claude" else CODEX_SESSIONS
+    prefix = os.path.dirname(relative) if kind == "claude" else None
+    candidate = SourceCandidate(
+        kind, relative, source_id(os.path.basename(relative)), prefix)
+    opened = _open_safe_source(root, candidate, cwd)
+    observed = time.time()
+    if isinstance(opened, SourceRefusal):
+        status = ("unrelated" if opened.reason == "project-mismatch"
+                  and kind == "codex" else "refused")
+        return {
+            "v": CATALOG_VERSION, "project": os.path.abspath(cwd),
+            "kind": kind, "relative": relative,
+            "source": candidate.expected_source, "status": status,
+            "reason": opened.reason, "observed": observed,
+            "generation": None, "complete_size": None,
+        }
+    with opened as source:
+        return {
+            "v": CATALOG_VERSION, "project": os.path.abspath(cwd),
+            "kind": kind, "relative": relative, "source": source.source,
+            "status": "ready", "reason": None, "observed": observed,
+            "generation": source.generation,
+            "complete_size": source.complete_prefix_end(),
+        }
+
+
+def _merge_catalog_batch(cwd, reservation, observations):
+    loaded = _read_source_catalog(cwd)
+    if loaded.status != "valid":
+        return False
+    state = json.loads(json.dumps(loaded.state))
+    entry = state["kinds"].get(reservation.kind)
+    inflight = entry.get("inflight") if isinstance(entry, dict) else None
+    if (not isinstance(inflight, dict)
+            or entry.get("generation") != reservation.generation
+            or inflight.get("token") != reservation.token):
+        return False
+    for relative, record in zip(reservation.relative_paths, observations):
+        if not _write_catalog_record(cwd, reservation.kind, relative, record):
+            return False
+    key = "base_next" if reservation.phase == "base" else "delta_next"
+    entry[key] = reservation.end
+    entry["inflight"] = None
+    filename = (entry["base_manifest"] if reservation.phase == "base"
+                else entry["delta_manifest"])
+    manifest = _read_catalog_manifest(cwd, filename)
+    if manifest is None:
+        return False
+    if reservation.end >= len(manifest["paths"]):
+        entry["phase"] = "reconcile" if reservation.phase == "base" else "complete"
+    return _write_catalog_state(cwd, state)
+
+
+def _install_reconciliation(cwd, kind, enumeration):
+    loaded = _read_source_catalog(cwd)
+    if loaded.status != "valid":
+        return False
+    state = json.loads(json.dumps(loaded.state))
+    entry = state["kinds"].get(kind)
+    if not isinstance(entry, dict) or entry.get("phase") != "reconcile":
+        return False
+    base = _read_catalog_manifest(cwd, entry["base_manifest"])
+    if base is None:
+        return False
+    unseen = sorted(set(enumeration.relative_paths) - set(base["paths"]))
+    filename = f"{entry['generation']}-{kind}-delta.json"
+    manifest = {
+        "v": CATALOG_VERSION, "project": os.path.abspath(cwd),
+        "kind": kind, "generation": entry["generation"], "phase": "delta",
+        "paths": unseen, "root_stamp": enumeration.root_stamp,
+    }
+    if not _write_catalog_manifest(cwd, filename, manifest):
+        return False
+    entry["delta_manifest"] = filename
+    entry["delta_next"] = 0
+    entry["root_stamp"] = enumeration.root_stamp
+    entry["phase"] = "delta" if unseen else "complete"
+    return _write_catalog_state(cwd, state)
+
+
+def _catalog_pending(cwd, kind):
+    loaded = _read_source_catalog(cwd)
+    if loaded.status != "valid":
+        return 0
+    entry = loaded.state["kinds"].get(kind) or {}
+    filename, index = _phase_manifest(entry)
+    manifest = _read_catalog_manifest(cwd, filename) if filename else None
+    return max(0, len(manifest["paths"]) - index) if manifest else 0
+
+
+def _catalog_refresh_needed(cwd, kind, entry):
+    if not isinstance(entry, dict) or entry.get("phase") != "complete":
+        return False
+    if kind == "claude":
+        directory = claude_project_dir(cwd)
+        return bool(directory and _directory_stamp(directory) != entry.get("root_stamp"))
+    if kind == "codex":
+        for path in codex_rollout_files(cwd):
+            if (isinstance(path, DiscoveredSourcePath)
+                    and _read_catalog_record(
+                        cwd, kind, path.candidate.relative_path) is None):
+                return True
+    return False
+
+
+def _catalog_scan_step(cwd, kind, force=False):
+    loaded = _read_source_catalog(cwd)
+    if loaded.status in ("invalid", "newer", "unreadable"):
+        return CatalogProgress("degraded", 0, 0, 1, 0)
+    entry = ((loaded.state or {}).get("kinds") or {}).get(kind)
+    if (entry is None
+            or ((force or _catalog_refresh_needed(cwd, kind, entry))
+                and entry.get("phase") == "complete")):
+        enumeration = _enumerate_catalog_candidates(cwd, kind)
+        if enumeration is None:
+            return CatalogProgress("degraded", 0, 0, 1, 0)
+        result = _catalog_phase(
+            cwd, lambda: _start_catalog_generation(cwd, kind, enumeration))
+        if not result.ok or not result.value:
+            return CatalogProgress("degraded", 0, 0, 1, 0)
+    loaded = _read_source_catalog(cwd)
+    entry = loaded.state["kinds"].get(kind)
+    if entry.get("phase") == "reconcile":
+        enumeration = _enumerate_catalog_candidates(cwd, kind)
+        if enumeration is None:
+            return CatalogProgress("degraded", 0, 0, 1, 0)
+        result = _catalog_phase(
+            cwd, lambda: _install_reconciliation(cwd, kind, enumeration))
+        if not result.ok or not result.value:
+            return CatalogProgress("degraded", 0, 0, 1, 0)
+    reservation_result = _catalog_phase(
+        cwd, lambda: _reserve_catalog_batch(cwd, kind))
+    reservation = reservation_result.value if reservation_result.ok else None
+    if reservation is None:
+        entry = ((_read_source_catalog(cwd).state or {}).get("kinds") or {}).get(
+            kind, {})
+        phase = entry.get("phase")
+        filename, _index = _phase_manifest(entry)
+        if filename and _read_catalog_manifest(cwd, filename) is None:
+            return CatalogProgress("degraded", 0, 0, 1, 0)
+        state = "complete" if phase == "complete" else "building"
+        return CatalogProgress(state, _catalog_pending(cwd, kind), 0, 0, 0)
+    observations = [
+        _observe_catalog_candidate(cwd, kind, relative)
+        for relative in reservation.relative_paths]
+    merged = _catalog_phase(
+        cwd, lambda: _merge_catalog_batch(cwd, reservation, observations))
+    if not merged.ok or not merged.value:
+        return CatalogProgress("degraded", _catalog_pending(cwd, kind), 0, 1, 0)
+    refusals = sum(record.get("status") == "refused" for record in observations)
+    phase = _read_source_catalog(cwd).state["kinds"][kind]["phase"]
+    return CatalogProgress(
+        "complete" if phase == "complete" else "building",
+        _catalog_pending(cwd, kind), len(observations), refusals, 0)
+
+
+def _record_current_source(cwd, kind, transcript_path):
+    if not isinstance(transcript_path, str) or not transcript_path:
+        return CatalogObservation(False, "missing-path", None)
+    root = CLAUDE_PROJECTS if kind == "claude" else CODEX_SESSIONS
+    relative = os.path.relpath(transcript_path, root)
+    if relative == ".." or relative.startswith(".." + os.sep):
+        return CatalogObservation(False, "outside-root", None)
+    record = _observe_catalog_candidate(cwd, kind, relative)
+    if record["status"] != "ready":
+        return CatalogObservation(False, record["reason"], record)
+    loaded = _read_source_catalog(cwd)
+    if loaded.status in ("invalid", "newer", "unreadable"):
+        return CatalogObservation(False, loaded.reason, record)
+    result = _catalog_phase(
+        cwd, lambda: _write_catalog_record(cwd, kind, relative, record))
+    if not result.ok or not result.value:
+        return CatalogObservation(False, result.reason or "write-failed", record)
+    return CatalogObservation(True, None, record)
 
 
 def iso_epoch(s):
@@ -2121,10 +2542,10 @@ def hook(side="claude"):
             print(f"antiphon: the attachment sweep failed: {error}",
                   file=sys.stderr)
 
-    # The catalog phase is deliberately complete before any cursor lock is
-    # attempted. Future source inspection happens outside both locks; this
-    # small mutation seam only reserves/merges bounded catalog state.
-    _catalog_phase(cwd, lambda: _hook_catalog_update(cwd, side, input_data))
+    # Every reserve and merge inside this bounded update releases the catalog
+    # lock before transcript inspection. The whole update returns before any
+    # cursor lock is attempted, keeping the two lock families unnested.
+    _hook_catalog_update(cwd, side, input_data)
 
     if side == "codex":
         # On every event, not only `SessionStart`. A missed one then costs a
@@ -6211,6 +6632,38 @@ def catch_up(side=None):
     return status
 
 
+def sources(action=None):
+    """Build or refresh the durable transcript-source catalog explicitly."""
+    if action != "scan":
+        print("antiphon: sources takes exactly `scan`: `antiphon sources scan`",
+              file=sys.stderr)
+        return 2
+    cwd = project_dir()
+    processed = refused = gone = 0
+    failed = False
+    for kind in ("claude", "codex"):
+        loaded = _read_source_catalog(cwd)
+        entry = ((loaded.state or {}).get("kinds") or {}).get(kind)
+        force = bool(entry and entry.get("phase") == "complete")
+        for _iteration in range(100000):
+            progress = _catalog_scan_step(cwd, kind, force=force)
+            force = False
+            processed += progress.processed
+            refused += progress.refusals
+            gone += progress.gone
+            if progress.state == "degraded":
+                failed = True
+                break
+            if progress.state == "complete":
+                break
+        else:
+            failed = True
+    state = "degraded" if failed or refused else "complete"
+    print(f"source catalog: {state}; {processed} candidate(s) inspected; "
+          f"{refused} refused; {gone} gone")
+    return 1 if state != "complete" else 0
+
+
 def print_summary(side="claude"):
     cwd = project_dir()
     text, _, _ = build_summary(cwd, side, since=time.time() - LOOKBACK)
@@ -6220,6 +6673,7 @@ def print_summary(side="claude"):
 
 COMMANDS = {
     "setup": setup, "status": status, "doctor": doctor, "catch-up": catch_up,
+    "sources": sources,
     "hook": hook, "summary": print_summary,
     "push": push, "reply": reply, "mcp": mcp, "register_peer": register_peer,
     "unregister_peer": unregister_peer,
