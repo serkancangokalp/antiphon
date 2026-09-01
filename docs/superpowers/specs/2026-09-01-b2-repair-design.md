@@ -279,6 +279,20 @@ the others are already inert because routing consults the proof.
   already made routing safe without the control.
 - The listener alone unregisters its own pid-owned endpoint and closes only its
   channel socket.
+- **Retirement is destructive only for an automatic endpoint that a valid
+  current proof shows `PROVED_STALE`.** The control travels to the deterministic
+  socket of the previous auto alias, and `auto-…` fits the alias grammar — 31
+  characters of `[a-z0-9][a-z0-9_-]{0,31}` — so a person may legitimately set
+  `ANTIPHON_NAME` to exactly that string. If the stale automatic listener is
+  gone and an explicit peer now holds that alias and socket, a control that
+  acted on the address alone would destroy a peer it has no claim over.
+  So the listener checks what it *is* before it destroys anything: the endpoint
+  must carry the automatic identity digest, and the proof must classify it
+  stale. An explicit or legacy endpoint, and an automatic one that is merely
+  `UNREADY` or `UNKNOWN`, answer the control with a non-destructive refusal.
+  Reserving the `auto-` prefix from explicit names would also close this, and is
+  deliberately not done: it would restrict a namespace to compensate for a
+  destructive action that should be guarded on its own terms.
 
 ## 5. Two readers, one format, parity proved
 
