@@ -1415,6 +1415,15 @@ routing is unusable without it, then the surfaces, then loop bounds.
 
 ## P1 — An unnamed peer is invisible, and two of them are indistinguishable (fixed)
 
+**Current-status note.** The observation writer, positive-liveness rule and
+lower-bound census from this entry remain the storage foundation. Its interim
+public UUID row and “not addressable” boundary were deliberately superseded by
+the Automatic peer identity entry immediately below: a positively live
+observation is now projected only as a public `auto-…` alias, while the UUID,
+route and digest stay private. Unknown observations remain count-only. The
+paragraphs below describe the B1 checkpoint and its evidence, not the final B2
+presentation contract.
+
 Measured on 2026-08-31, from a real session on a second machine: with two
 unnamed Codex terminals and one Claude, Claude could only answer whichever
 Codex it had last exchanged with, and could not reach the other at all. A Codex
@@ -1465,7 +1474,7 @@ item, not an Antiphon product migration: tell the user and remove or re-evaluate
 the stale entries only with their direct participation; do not silently edit
 their global Codex configuration.
 
-**The fixed contract.** Every unnamed Codex hook event with a canonical host
+**The B1 checkpoint contract.** Every unnamed Codex hook event with a canonical host
 UUID atomically refreshes one project-local observation file under
 `.antiphon/observations/codex/`. It contains only a schema version, the side,
 the full host session id and the observation time — never a name, transcript or
@@ -1505,7 +1514,7 @@ terminal with a distinct `ANTIPHON_NAME`, then address it by name. This closes
 visibility and honest ambiguity, not automatic identity or unnamed
 addressability; those remain the next entry's work.
 
-## P2 — Automatic peer identity
+## P2 — Automatic peer identity (candidate complete)
 
 The design is approved after measuring both hosts on 2026-09-01. Claude Code
 2.1.251 returned exactly one interactive record from `claude agents --json
@@ -1557,6 +1566,32 @@ the first trustworthy observation/probe, the Claude host's generated display
 name is ignored, and `ANTIPHON_NAME` is the explicit override. Older peers that
 cannot supply the new proof remain on the existing unnamed/explicit paths; no
 mixed-version guess or automatic migration rewrites their records.
+
+**What is implemented on the candidate branch.** The registry derives the
+pinned 31-character alias, stores and validates the complete digest, rejects
+explicit/automatic and same-prefix/full-digest collisions, and refuses an
+automatic session whose digest does not belong to its canonical UUID. Codex
+routing, Stop labels, passive-page labels, status and doctor share the same
+positive writer-lock projection; exact unrelated explicit aliases still bypass
+the private observation census. One automatic Codex candidate preserves the
+bare single-pair road, while multiple positives or a collision refuse without
+printing an internal route.
+
+The Claude channel runs the fixed probe only when no `ANTIPHON_NAME` was
+configured, validates the alias/digest relation independently in Node, stores
+the automatic metadata on its endpoint and publishes the alias only after the
+hook's session record matches endpoint, owner, UUID-derived digest and current
+channel pid. Probe failure, a mismatched join and malformed probe output remain
+unnamed; an explicit valid name skips the probe. Node and Python now accept the
+same canonical UUID grammar, including a pinned UUIDv7 regression case.
+
+README, setup guidance, both generated rules and live channel instructions now
+state the first-hook/probe windows, ignored Claude display name, explicit
+override, one-vs-many bare-send rule, mixed-version refusal and privacy
+boundary. The candidate's complete `npm test` run is green at 927 Python tests
+(2 skipped) plus the real Node MCP/channel integration. This work is not pushed,
+merged, versioned or published; exact-commit fresh-user certification and an
+independent review remain release gates.
 
 ## P2 — Cross-vendor managed workers
 

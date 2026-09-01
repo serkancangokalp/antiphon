@@ -4,13 +4,12 @@ A peer is one agent session working in one project directory. Antiphon assumed
 exactly one per side and never said so; this module is the part that lets
 several coexist without taking each other's sockets and cursors.
 
-An explicit name is what buys isolation, and it is the only thing that does. A
-Claude session started without one occupies the reserved `UNNAMED` key below:
-it is counted, it is served, and it cannot be addressed by name — which is
-exactly what having no name means. An unnamed Codex hook instead records only a
-non-routable observation. Nothing is ever invented on a session's behalf; a
-name it did not choose is a name the other side could address without the
-session having agreed to answer to it.
+An explicit name is the operator's identity override. Without one, a canonical
+host session UUID may derive a stable public `auto-` alias, but only after the
+host-specific proof described by each caller. A Claude session whose proof
+fails occupies the reserved `UNNAMED` key below; a Codex hook records only a
+private observation until positive writer-lock evidence projects its automatic
+alias. The full UUID and digest remain internal.
 
 A Codex peer is written by two processes that never meet. The MCP server owns
 `endpoint.json` and knows the pid; the hook owns `session.json` and knows the
@@ -20,6 +19,7 @@ read. Anything that cannot be joined is listed as live and unroutable rather
 than guessed at.
 """
 
+import base64
 import contextlib
 import fcntl
 import hashlib
@@ -49,6 +49,8 @@ OBSERVATION_VERSION = 1
 # test keeps the two spellings from drifting apart.
 SESSION_ID_PATTERN = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-"
                                 r"[0-9a-f]{4}-[0-9a-f]{12}")
+IDENTITY_DIGEST_PATTERN = re.compile(r"[0-9a-f]{64}")
+AUTO_NAME_PREFIX = "auto-"
 
 
 def explicit_name():
@@ -84,13 +86,14 @@ def valid_name(name):
 def valid_key(kind, name):
     """Whether `name` may be this kind of peer's place in the registry.
 
-    Every public alias may, on either side. The reserved key may only on the
-    Claude side, because that is the only thing it represents: an unnamed
-    channel server, which registers because it serves a socket somebody has to
-    be able to find. An unnamed Codex session deliberately has no **peer**
-    record; its separate hook-owned observation carries no key or address. A
-    peer record under this reserved key would be live but impossible to name,
-    making every bare message ambiguous while remaining unreachable itself.
+    Every explicit or automatic public alias may, on either side. The reserved
+    key may only on the Claude side, because that is the only thing it
+    represents: a channel server whose automatic proof failed but which still
+    serves the legacy socket. An unproved Codex session deliberately has no
+    **peer** record; its separate hook-owned observation carries no key or
+    address until a read-only positive-liveness projection derives the public
+    alias. A peer record under the reserved key would be live but impossible to
+    name, making every bare message ambiguous while remaining unreachable.
 
     Directory names and record fields are checked with this; addressing is
     checked with `valid_name`, which is narrower still.
@@ -157,6 +160,64 @@ def looks_like_session_id(value):
     """
     return (isinstance(value, str)
             and bool(SESSION_ID_PATTERN.fullmatch(value.strip().lower())))
+
+
+def valid_identity_digest(value):
+    """A complete lower-case SHA-256 digest, never its public truncation."""
+    return (isinstance(value, str)
+            and bool(IDENTITY_DIGEST_PATTERN.fullmatch(value)))
+
+
+def auto_name_from_digest(digest):
+    """The public alias carried by one complete identity digest, or None."""
+    if not valid_identity_digest(digest):
+        return None
+    raw = bytes.fromhex(digest)
+    public = base64.b32encode(raw[:16]).decode("ascii").rstrip("=").lower()
+    return AUTO_NAME_PREFIX + public
+
+
+def auto_identity(session_id):
+    """``(public alias, full digest)`` for one canonical host UUID."""
+    if not valid_session_id(session_id):
+        return None
+    digest = hashlib.sha256(session_id.encode("ascii")).hexdigest()
+    return auto_name_from_digest(digest), digest
+
+
+def _identity_digest_of(record):
+    """A valid automatic record's full digest, else None.
+
+    Explicit and legacy records carry neither field. A partial or malformed
+    automatic marker is not silently treated as explicit: callers that need to
+    distinguish corruption use ``_record_identity_valid`` alongside this.
+    """
+    if not hasattr(record, "get") or record.get("automatic") is not True:
+        return None
+    digest = record.get("identity_digest")
+    if not valid_identity_digest(digest):
+        return None
+    return (digest if auto_name_from_digest(digest) == record.get("name")
+            else None)
+
+
+def _record_identity_valid(record):
+    """Whether explicit/legacy or automatic identity metadata is coherent."""
+    if not hasattr(record, "get"):
+        return False
+    automatic = record.get("automatic")
+    digest_present = "identity_digest" in record
+    if automatic is None and not digest_present:
+        return True
+    if automatic is not True:
+        return False
+    digest = _identity_digest_of(record)
+    if digest is None:
+        return False
+    if "session_id" in record:
+        identity = auto_identity(record.get("session_id"))
+        return identity is not None and identity[1] == digest
+    return True
 
 
 def socket_key(cwd, name=""):
@@ -350,11 +411,17 @@ def _session_address(cwd, peer):
     comes off disk, and `../..` would read a record from outside the project.
     """
     kind, name = peer.get("kind"), peer.get("name")
-    if not (valid_kind(kind) and valid_key(kind, name)):
+    if not (valid_kind(kind) and valid_key(kind, name)
+            and _record_identity_valid(peer)):
         return None
     owner = _owner_of(peer)
     session = _read_record(_session_file(cwd, kind, name))
-    if not (owner and session and session.get("owner") == owner):
+    if not (owner and session and _record_identity_valid(session)
+            and session.get("owner") == owner):
+        return None
+    endpoint_digest = _identity_digest_of(peer)
+    session_digest = _identity_digest_of(session)
+    if endpoint_digest != session_digest:
         return None
     claimed = session.get("session_id")
     return claimed if valid_session_id(claimed) else None
@@ -540,6 +607,8 @@ def _scan(cwd):
             continue
         if record.get("kind") != kind or record.get("name") != name:
             continue
+        if not _record_identity_valid(record):
+            continue
         records.append(record)
     return records
 
@@ -563,6 +632,8 @@ def _scan_sessions(cwd, kind=None):
             continue
         if (record.get("kind") != entry_kind
                 or record.get("name") != name):
+            continue
+        if not _record_identity_valid(record):
             continue
         records.append(record)
     return records
@@ -606,7 +677,8 @@ def read_peers(cwd, kind=None):
     return found
 
 
-def register(cwd, kind, name, address, pid=None, owner_key=None):
+def register(cwd, kind, name, address, pid=None, owner_key=None,
+             identity_digest=None):
     """Claims `name` for `pid`. Returns (ok, detail).
 
     `pid` is the process whose life the peer's life follows, and it is often not
@@ -643,6 +715,11 @@ def register(cwd, kind, name, address, pid=None, owner_key=None):
     if not valid_key(kind, name):
         return False, (f"invalid peer name {name!r} for a {kind} peer: "
                        "expected [a-z0-9][a-z0-9_-]{0,31}")
+    automatic = identity_digest is not None
+    if automatic and (not valid_identity_digest(identity_digest)
+                      or auto_name_from_digest(identity_digest) != name):
+        return False, ("invalid automatic identity: the full digest does not "
+                       "derive the requested peer name")
     if address is None:
         if kind != "codex":
             return False, (f"invalid peer address {address!r}: only a Codex peer "
@@ -672,6 +749,11 @@ def register(cwd, kind, name, address, pid=None, owner_key=None):
             if other.get("kind") != kind:
                 continue                  # a rollout id and a socket path never collide
             if other.get("name") == name:
+                other_digest = _identity_digest_of(other)
+                if ((automatic and other_digest != identity_digest)
+                        or (not automatic and other_digest is not None)):
+                    return False, (f"automatic identity collision at peer name "
+                                   f"{name!r}; no claim was changed")
                 if other_pid == owner_pid:
                     continue              # this process refreshing its own record
                 if kind == "codex" and owner_key and _owner_of(other) == owner_key:
@@ -707,6 +789,9 @@ def register(cwd, kind, name, address, pid=None, owner_key=None):
                   "address": address, "started_at": time.time()}
         if owner_key:
             record["owner"] = owner_key
+        if automatic:
+            record["automatic"] = True
+            record["identity_digest"] = identity_digest
         if birth:
             # Kept apart from `started_at`, which is when the claim was made and
             # is what the listing sorts on. This is when the process was born,
@@ -743,10 +828,12 @@ def read_session(cwd, kind, name):
     """The hook's record for an alias as a dict, or None."""
     if not (valid_kind(kind) and valid_key(kind, name)):
         return None
-    return _read_record(_session_file(cwd, kind, name))
+    record = _read_record(_session_file(cwd, kind, name))
+    return record if record and _record_identity_valid(record) else None
 
 
-def write_session(cwd, kind, name, session_id, transcript, owner):
+def write_session(cwd, kind, name, session_id, transcript, owner,
+                  identity_digest=None, require_endpoint=False):
     """Records which session is behind an alias. Returns (ok, detail).
 
     Refuses when a live endpoint holds the alias for a different owner, and
@@ -773,8 +860,28 @@ def write_session(cwd, kind, name, session_id, transcript, owner):
     if not valid_owner_key(owner):
         return False, (f"invalid owner key {owner!r}: expected a pid and the "
                        "start time that tells it from a recycled one")
+    automatic = identity_digest is not None
+    if automatic and (not valid_identity_digest(identity_digest)
+                      or auto_name_from_digest(identity_digest) != name
+                      or auto_identity(session_id) != (name, identity_digest)):
+        return False, ("invalid automatic identity: the full digest does not "
+                       "derive the requested peer and session")
     with _registry_lock(cwd):
         endpoint = _read_record(_peer_file(cwd, kind, name))
+        endpoint_alive = bool(
+            endpoint and _record_identity_valid(endpoint)
+            and _record_alive(endpoint))
+        endpoint_digest = (_identity_digest_of(endpoint)
+                           if endpoint_alive else None)
+        if endpoint_alive and ((automatic and endpoint_digest != identity_digest)
+                               or (not automatic and endpoint_digest is not None)):
+            return False, (f"automatic identity collision at peer name {name!r}; "
+                           "its record was not touched")
+        if require_endpoint and (not endpoint_alive
+                                 or _owner_of(endpoint) != owner
+                                 or endpoint_digest != identity_digest):
+            return False, (f"automatic peer {name!r} has no matching live "
+                           "endpoint proof; its record was not touched")
         if endpoint and _owner_of(endpoint) != owner and _record_alive(endpoint):
             if _owner_of(endpoint) is None:
                 # An unreadable owner is not a different owner. The write is
@@ -790,6 +897,9 @@ def write_session(cwd, kind, name, session_id, transcript, owner):
                            f"(pid {_pid_of(endpoint)}); its record was not touched")
         record = {"kind": kind, "name": name, "owner": owner,
                   "session_id": session_id}
+        if automatic:
+            record["automatic"] = True
+            record["identity_digest"] = identity_digest
         if isinstance(transcript, str) and transcript.strip():
             # Nothing is ever delivered to a transcript path. Refusing the whole
             # record over a missing one would cost the session its address for a

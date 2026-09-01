@@ -4573,7 +4573,7 @@ class DoctorTest(unittest.TestCase):
                             f"{name}: {self.line_for(printed, name)!r}")
         self.assertEqual(code, 0, printed)
 
-    def test_doctor_names_only_live_unnamed_observations_and_stays_read_only(self):
+    def test_doctor_names_only_live_automatic_peers_and_stays_read_only(self):
         project = self.project()
         self.set_up(project)
         antiphon.peers.write_observation(project, self.OBSERVED)
@@ -4590,14 +4590,25 @@ class DoctorTest(unittest.TestCase):
         self.assertIn("additional sessions before their first hook may be invisible",
                       printed)
         self.assertIn("1 stored observation has unknown liveness", printed)
-        carrying_id = [line for line in printed.splitlines()
-                       if self.OBSERVED in line]
-        self.assertEqual(carrying_id, [
-            f"· Codex unnamed observation {self.OBSERVED} — live, not addressable"
-            " — restart it with ANTIPHON_NAME set",
-        ])
+        alias = antiphon.peers.auto_identity(self.OBSERVED)[0]
+        self.assertIn(f"peer codex/{alias}: live and addressed", printed)
+        self.assertNotIn(self.OBSERVED, printed)
         self.assertNotIn(self.UNKNOWN, printed,
                          "unknown historical observations expose only a count")
+
+    def test_doctor_renders_a_live_observation_only_as_an_automatic_peer(self):
+        project = self.project()
+        self.set_up(project)
+        antiphon.peers.write_observation(project, self.OBSERVED)
+        before = self.snapshot(project)
+        with patch.object(antiphon, "codex_thread_alive", return_value=True):
+            code, printed = self.run_doctor(project)
+        self.assertEqual(code, 0, printed)
+        self.assertEqual(self.snapshot(project), before)
+        alias = antiphon.peers.auto_identity(self.OBSERVED)[0]
+        self.assertIn(f"peer codex/{alias}: live and addressed", printed)
+        self.assertNotIn(self.OBSERVED, printed)
+        self.assertNotIn("unnamed observation", printed)
 
     def test_doctor_takes_one_observation_snapshot_for_one_report(self):
         project = self.project()
@@ -5158,8 +5169,6 @@ class DoctorTest(unittest.TestCase):
         child = subprocess.Popen([sys.executable, os.path.join(root, "lib", "antiphon.py"), "mcp"],
                                  stdin=subprocess.PIPE, stdout=subprocess.DEVNULL,
                                  stderr=subprocess.DEVNULL, env=env)
-        self.addCleanup(child.wait)
-        self.addCleanup(child.kill)
         try:
             deadline = time.time() + 5
             while time.time() < deadline:
@@ -5178,7 +5187,10 @@ class DoctorTest(unittest.TestCase):
             line = self.line_for(out.getvalue(), f"pid {child.pid}")
             self.assertTrue(line.startswith("✗ running: codex mcp"), line)
         finally:
-            child.kill()
+            child.stdin.close()
+            if child.poll() is None:
+                child.kill()
+            child.wait()
 
     def test_a_server_from_another_install_is_not_this_project_s_verdict(self):
         """Measured on a fresh temp project (first e2e run, 2026-08-31): the
@@ -5682,17 +5694,16 @@ class SetupShapeCharacterizationTest(unittest.TestCase):
             "  In the research preview, the first launch needs both a "
             "development channel and an MCP approval.",
             "",
-            "— More than one terminal on either side? Name every one of them:",
+            "— More than one terminal? Explicit names are recommended:",
             "  ANTIPHON_NAME=ui claude --dangerously-load-development-channels "
             "server:antiphon",
             "  ANTIPHON_NAME=build codex",
-            "  An unnamed session still runs, but it cannot be addressed by "
-            "name. Name the",
-            "  Codex terminals above all: an unnamed observation is diagnostic "
-            "only,",
-            "  so once any Codex peer is named, an unaddressed message to "
-            "Codex is refused",
-            "  rather than sent to a guess.",
+            "  Antiphon may assign an automatic auto- alias after host identity "
+            "is proved.",
+            "  ANTIPHON_NAME overrides it and remains the clearest choice for "
+            "several",
+            "  terminals; a bare send is refused when more than one candidate "
+            "is live.",
             "",
         ]))
 
@@ -7589,7 +7600,7 @@ class CatalogDiscoveryTest(unittest.TestCase):
                   sources[2][0]: "dead"}
         out = io.StringIO()
 
-        def activity(_cwd, kind):
+        def activity(_cwd, kind, _identities=None):
             return (antiphon.SessionJoin({}, False, states)
                     if kind == "claude" else antiphon.NO_SESSION_JOIN)
 
@@ -11218,6 +11229,199 @@ def _as_records(lines):
     return records
 
 
+class AutomaticIdentityPrimitiveTest(unittest.TestCase):
+    UUID = "1d5a03e0-0548-4339-87c3-45c5dbf7e9d7"
+    ALIAS = "auto-yzmcrss6whnnsjxthq2pclz3l4"
+    DIGEST = "c65828ca5eb1dad926f33c34f12f3b5f" \
+             "b031dca2f2e33d83dd70aa072a959928"
+
+    def test_a_canonical_session_id_has_one_pinned_public_identity(self):
+        self.assertEqual(antiphon.peers.auto_identity(self.UUID),
+                         (self.ALIAS, self.DIGEST))
+        self.assertEqual(len(self.ALIAS), 31)
+        self.assertTrue(antiphon.peers.valid_name(self.ALIAS))
+        for invalid in (None, "", self.UUID.upper(), "{" + self.UUID + "}"):
+            self.assertIsNone(antiphon.peers.auto_identity(invalid), invalid)
+
+    def test_an_automatic_endpoint_stores_and_validates_the_full_digest(self):
+        with tempfile.TemporaryDirectory() as project:
+            ok, detail = antiphon.peers.register(
+                project, "claude", self.ALIAS, "/tmp/auto.sock",
+                pid=os.getpid(), owner_key="300:x",
+                identity_digest=self.DIGEST)
+            self.assertTrue(ok, detail)
+            peer = antiphon.peers.read_peers(project, "claude")[0]
+        self.assertIs(peer["automatic"], True)
+        self.assertEqual(peer["identity_digest"], self.DIGEST)
+
+    def test_an_automatic_name_must_be_derived_from_its_full_digest(self):
+        with tempfile.TemporaryDirectory() as project:
+            ok, detail = antiphon.peers.register(
+                project, "claude", "auto-not-the-digest", "/tmp/auto.sock",
+                pid=os.getpid(), owner_key="300:x",
+                identity_digest=self.DIGEST)
+        self.assertFalse(ok)
+        self.assertIn("automatic identity", detail)
+        self.assertNotIn(self.DIGEST, detail)
+
+    def test_a_short_alias_collision_with_another_digest_refuses(self):
+        other_digest = self.DIGEST[:32] + "0" * 31 + "1"
+        self.assertEqual(antiphon.peers.auto_name_from_digest(other_digest),
+                         self.ALIAS, "the fixture shares exactly the public 128 bits")
+        with tempfile.TemporaryDirectory() as project:
+            first, detail = antiphon.peers.register(
+                project, "claude", self.ALIAS, "/tmp/first.sock",
+                pid=os.getpid(), owner_key="300:first",
+                identity_digest=self.DIGEST)
+            self.assertTrue(first, detail)
+            second, detail = antiphon.peers.register(
+                project, "claude", self.ALIAS, "/tmp/second.sock",
+                pid=os.getppid(), owner_key="301:second",
+                identity_digest=other_digest)
+        self.assertFalse(second)
+        self.assertIn("collision", detail)
+        self.assertNotIn(self.DIGEST, detail)
+        self.assertNotIn(other_digest, detail)
+
+    def test_an_explicit_and_automatic_alias_never_claim_each_other(self):
+        for automatic_first in (True, False):
+            with self.subTest(automatic_first=automatic_first), \
+                 tempfile.TemporaryDirectory() as project:
+                first_digest = self.DIGEST if automatic_first else None
+                second_digest = None if automatic_first else self.DIGEST
+                first, detail = antiphon.peers.register(
+                    project, "claude", self.ALIAS, "/tmp/first.sock",
+                    pid=os.getpid(), owner_key="300:first",
+                    identity_digest=first_digest)
+                self.assertTrue(first, detail)
+                second, detail = antiphon.peers.register(
+                    project, "claude", self.ALIAS, "/tmp/second.sock",
+                    pid=os.getppid(), owner_key="301:second",
+                    identity_digest=second_digest)
+                self.assertFalse(second)
+                self.assertIn("collision", detail)
+
+    def test_an_automatic_session_joins_only_its_live_endpoint_proof(self):
+        with tempfile.TemporaryDirectory() as project:
+            ok, detail = antiphon.peers.register(
+                project, "claude", self.ALIAS, "/tmp/auto.sock",
+                pid=os.getpid(), owner_key="300:x",
+                identity_digest=self.DIGEST)
+            self.assertTrue(ok, detail)
+            refused, detail = antiphon.peers.write_session(
+                project, "claude", self.ALIAS, self.UUID, "/t/wrong.jsonl",
+                "301:wrong", identity_digest=self.DIGEST,
+                require_endpoint=True)
+            self.assertFalse(refused)
+            self.assertIsNone(
+                antiphon.peers.read_session(project, "claude", self.ALIAS))
+            joined, detail = antiphon.peers.write_session(
+                project, "claude", self.ALIAS, self.UUID, "/t/right.jsonl",
+                "300:x", identity_digest=self.DIGEST,
+                require_endpoint=True)
+            self.assertTrue(joined, detail)
+            peer = antiphon.peers.read_peers(project, "claude")[0]
+            session = antiphon.peers.read_session(
+                project, "claude", self.ALIAS)
+            address = antiphon.peers._session_address(project, peer)
+        self.assertEqual(address, self.UUID)
+        self.assertIs(session["automatic"], True)
+        self.assertEqual(session["identity_digest"], self.DIGEST)
+
+    def test_an_automatic_session_digest_must_belong_to_its_session_id(self):
+        other = "2e6b14f1-1659-544a-98d4-56d6eca8fa48"
+        with tempfile.TemporaryDirectory() as project:
+            ok, detail = antiphon.peers.register(
+                project, "claude", self.ALIAS, "/tmp/auto.sock",
+                pid=os.getpid(), owner_key="300:x",
+                identity_digest=self.DIGEST)
+            self.assertTrue(ok, detail)
+            joined, detail = antiphon.peers.write_session(
+                project, "claude", self.ALIAS, other, "/t/wrong.jsonl",
+                "300:x", identity_digest=self.DIGEST,
+                require_endpoint=True)
+            self.assertFalse(joined)
+            self.assertIn("automatic identity", detail)
+            self.assertNotIn(other, detail)
+            self.assertNotIn(self.DIGEST, detail)
+            self.assertIsNone(
+                antiphon.peers.read_session(project, "claude", self.ALIAS))
+
+
+class ClaudeAutomaticIdentityProbeTest(unittest.TestCase):
+    UUID = "8261c119-2c20-4bf4-87ab-f152ac87dbda"
+    CWD = "/tmp/exact-project"
+    OWNER = "10566:v1:Mon Aug 31 14:27:18 2026"
+
+    @staticmethod
+    def result(records, returncode=0):
+        return subprocess.CompletedProcess(
+            ["claude"], returncode, stdout=json.dumps(records), stderr="")
+
+    def test_the_probe_accepts_one_exact_interactive_cli_root(self):
+        records = [{"pid": 10566, "cwd": self.CWD, "kind": "interactive",
+                    "sessionId": self.UUID,
+                    "name": "host-display-name-is-ignored"}]
+        with patch.object(antiphon.peers, "owner_key",
+                          return_value=self.OWNER), \
+             patch.object(antiphon.subprocess, "run",
+                          return_value=self.result(records)) as run:
+            found = antiphon._claude_auto_identity(self.CWD)
+        alias, digest = antiphon.peers.auto_identity(self.UUID)
+        self.assertEqual(found,
+                         {"alias": alias, "identity_digest": digest})
+        self.assertNotIn("host-display", json.dumps(found))
+        self.assertEqual(run.call_args.args[0],
+                         ["claude", "agents", "--json", "--cwd", self.CWD])
+        self.assertIs(run.call_args.kwargs.get("shell"), False)
+        self.assertGreater(run.call_args.kwargs.get("timeout", 0), 0)
+
+    def test_the_probe_filters_background_and_requires_one_exact_match(self):
+        exact = {"pid": 10566, "cwd": self.CWD, "kind": "interactive",
+                 "sessionId": self.UUID, "name": "ignored"}
+        background = {"pid": 10566, "cwd": self.CWD, "kind": "background",
+                      "sessionId": "2e6b14f1-1659-544a-98d4-56d6eca8fa48"}
+        with patch.object(antiphon.peers, "owner_key",
+                          return_value=self.OWNER), \
+             patch.object(antiphon.subprocess, "run",
+                          return_value=self.result([background, exact])):
+            self.assertIsNotNone(antiphon._claude_auto_identity(self.CWD))
+        with patch.object(antiphon.peers, "owner_key",
+                          return_value=self.OWNER), \
+             patch.object(antiphon.subprocess, "run",
+                          return_value=self.result([exact, dict(exact)])):
+            self.assertIsNone(antiphon._claude_auto_identity(self.CWD))
+
+    def test_every_unproved_shape_fails_unnamed(self):
+        exact = {"pid": 10566, "cwd": self.CWD, "kind": "interactive",
+                 "sessionId": self.UUID}
+        cases = (
+            (None, self.result([exact])),
+            ("999:v1:x", self.result([exact])),
+            (self.OWNER, self.result([dict(exact, pid=10567)])),
+            (self.OWNER, self.result([dict(exact, cwd=self.CWD + "-other")])),
+            (self.OWNER, self.result([dict(exact, sessionId=self.UUID.upper())])),
+            (self.OWNER, self.result({"agents": [exact]})),
+            (self.OWNER, subprocess.CompletedProcess(
+                ["claude"], 1, stdout="[]", stderr="private failure")),
+        )
+        for owner, result in cases:
+            with self.subTest(owner=owner, stdout=result.stdout), \
+                 patch.object(antiphon.peers, "owner_key",
+                              return_value=owner), \
+                 patch.object(antiphon.subprocess, "run",
+                              return_value=result):
+                self.assertIsNone(antiphon._claude_auto_identity(self.CWD))
+
+    def test_a_probe_exception_is_bounded_and_anonymous(self):
+        with patch.object(antiphon.peers, "owner_key",
+                          return_value=self.OWNER), \
+             patch.object(antiphon.subprocess, "run",
+                          side_effect=subprocess.TimeoutExpired(
+                              ["claude"], 2)):
+            self.assertIsNone(antiphon._claude_auto_identity(self.CWD))
+
+
 class CodexPeerWiringTest(unittest.TestCase):
     """The two Codex writers, wired to the processes that actually run them.
 
@@ -12008,6 +12212,9 @@ class ClaudeSessionWiringTest(unittest.TestCase):
 
     UUID = "1d5a03e0-0548-4339-87c3-45c5dbf7e9d7"
     OTHER = "2e6b14f1-1659-544a-98d4-56d6eca8fa48"
+    AUTO = "auto-yzmcrss6whnnsjxthq2pclz3l4"
+    DIGEST = "c65828ca5eb1dad926f33c34f12f3b5f" \
+             "b031dca2f2e33d83dd70aa072a959928"
 
     @staticmethod
     @contextlib.contextmanager
@@ -12068,13 +12275,43 @@ class ClaudeSessionWiringTest(unittest.TestCase):
             self.assertIn("canonical UUID", err)
             self.assertNotIn(self.UUID, err.lower())
 
-    def test_an_unnamed_claude_turn_records_nothing(self):
-        """Measured before this change and pinned after it: an unnamed session
-        asked for nothing, so there is nothing to record and nothing to say."""
+    def test_an_unnamed_claude_turn_without_an_endpoint_records_no_session(self):
+        """The host UUID alone cannot manufacture a channel endpoint."""
         with tempfile.TemporaryDirectory() as project:
             _, _, err, _ = self._hook(project, name="", session_id=self.UUID)
-            self.assertFalse(os.path.exists(antiphon.peers.peers_dir(project)))
+            self.assertIsNone(antiphon.peers.read_session(
+                project, "claude", self.AUTO))
+            self.assertFalse(os.path.exists(antiphon.peers._session_file(
+                project, "claude", self.AUTO)))
         self.assertEqual(err, "")
+
+    def test_an_unnamed_claude_hook_joins_its_matching_automatic_endpoint(self):
+        with tempfile.TemporaryDirectory() as project:
+            ok, detail = antiphon.peers.register(
+                project, "claude", self.AUTO, "/t/auto.sock",
+                pid=os.getpid(), owner_key="300:x",
+                identity_digest=self.DIGEST)
+            self.assertTrue(ok, detail)
+            code, _, err, _ = self._hook(
+                project, name="", session_id=self.UUID, owner="300:x")
+            record = antiphon.peers.read_session(
+                project, "claude", self.AUTO)
+        self.assertEqual(code, 0, err)
+        self.assertEqual(record["session_id"], self.UUID)
+        self.assertIs(record["automatic"], True)
+        self.assertEqual(record["identity_digest"], self.DIGEST)
+
+    def test_an_automatic_hook_cannot_join_a_different_owner(self):
+        with tempfile.TemporaryDirectory() as project:
+            ok, detail = antiphon.peers.register(
+                project, "claude", self.AUTO, "/t/auto.sock",
+                pid=os.getpid(), owner_key="300:first",
+                identity_digest=self.DIGEST)
+            self.assertTrue(ok, detail)
+            self._hook(project, name="", session_id=self.UUID,
+                       owner="301:second")
+            self.assertIsNone(antiphon.peers.read_session(
+                project, "claude", self.AUTO))
 
     def test_the_reserved_key_never_gains_a_session_record(self):
         """`<unnamed>` is where a channel server without a name puts its socket,
@@ -12151,6 +12388,16 @@ class SourceActivityTest(unittest.TestCase):
     B = "2e6b14f1-1659-544a-98d4-56d6eca8fa48"
     ENDPOINT_START = "Sat Aug 30 01:00:01 2026"
     OWNER_START = "Sat Aug 30 01:00:00 2026"
+
+    def test_a_live_codex_observation_is_a_labelled_automatic_source(self):
+        with tempfile.TemporaryDirectory() as project:
+            antiphon.peers.write_observation(project, self.A)
+            with patch.object(antiphon, "codex_thread_alive",
+                              return_value=True):
+                join = antiphon._source_activity(project, "codex")
+        self.assertEqual(join.aliases,
+                         {self.A: antiphon.peers.auto_identity(self.A)[0]})
+        self.assertEqual(join.states, {self.A: "live"})
 
     def _claim(self, project, name, source, endpoint_pid=100, owner_pid=300,
                owner_version=1, endpoint_owner=None, session_owner=None,
@@ -12741,6 +12988,7 @@ class RoutingTest(unittest.TestCase):
 
     UUID = "1d5a03e0-0548-4339-87c3-45c5dbf7e9d7"
     OTHER = "2e6b14f1-1659-544a-98d4-56d6eca8fa48"
+    AUTO = "auto-yzmcrss6whnnsjxthq2pclz3l4"
 
     @staticmethod
     def _codex_peer(project, alias, owner, session=None):
@@ -12921,14 +13169,54 @@ class RoutingTest(unittest.TestCase):
             legacy.assert_not_called()
         self.assertIsNone(address)
         self.assertEqual(detail.refusal_class, "no-peer")
-        self.assertIn("at least 2", detail)
-        self.assertIn("unnamed", detail)
-        self.assertIn("not addressable", detail)
-        self.assertIn("ANTIPHON_NAME", detail)
-        self.assertIn("additional", detail)
+        self.assertIn("2 codex peers", detail)
+        self.assertIn(self.AUTO, detail)
         self.assertNotIn(self.UUID, detail)
         self.assertNotIn(self.OTHER, detail)
         self.assertNotIn(project, detail)
+
+    def test_one_live_observation_is_an_addressable_automatic_peer(self):
+        with tempfile.TemporaryDirectory() as project:
+            antiphon.peers.write_observation(project, self.UUID)
+            with patch.object(antiphon, "codex_thread_alive",
+                              return_value=True), \
+                 patch.object(antiphon, "codex_session_id") as legacy:
+                self.assertEqual(
+                    antiphon.resolve_target(project, "codex", self.AUTO),
+                    (self.UUID, ""))
+                self.assertEqual(antiphon.resolve_target(project, "codex"),
+                                 (self.UUID, ""))
+            legacy.assert_not_called()
+
+    def test_two_automatic_peers_are_named_without_exposing_their_routes(self):
+        other_alias = antiphon.peers.auto_identity(self.OTHER)[0]
+        with tempfile.TemporaryDirectory() as project:
+            antiphon.peers.write_observation(project, self.UUID)
+            antiphon.peers.write_observation(project, self.OTHER)
+            with patch.object(antiphon, "codex_thread_alive",
+                              return_value=True):
+                address, detail = antiphon.resolve_target(project, "codex")
+                exact = antiphon.resolve_target(
+                    project, "codex", other_alias)
+        self.assertIsNone(address)
+        self.assertIn(self.AUTO, detail)
+        self.assertIn(other_alias, detail)
+        self.assertNotIn(self.UUID, detail)
+        self.assertNotIn(self.OTHER, detail)
+        self.assertEqual(exact, (self.OTHER, ""))
+
+    def test_an_automatic_alias_colliding_with_an_explicit_peer_refuses(self):
+        with tempfile.TemporaryDirectory() as project:
+            self._codex_peer(project, self.AUTO, "300:explicit", self.OTHER)
+            antiphon.peers.write_observation(project, self.UUID)
+            with patch.object(antiphon, "codex_thread_alive",
+                              return_value=True):
+                address, detail = antiphon.resolve_target(
+                    project, "codex", self.AUTO)
+        self.assertIsNone(address)
+        self.assertIn("collision", detail)
+        self.assertNotIn(self.UUID, detail)
+        self.assertNotIn(self.OTHER, detail)
 
     def test_a_named_and_a_live_unnamed_candidate_refuse_only_when_bare(self):
         with tempfile.TemporaryDirectory() as project:
@@ -12943,13 +13231,13 @@ class RoutingTest(unittest.TestCase):
             with patch.object(antiphon, "codex_thread_alive", return_value=True):
                 address, detail = antiphon.resolve_target(project, "codex")
         self.assertIsNone(address)
-        self.assertIn("at least 2", detail)
-        self.assertIn("1 registered", detail)
-        self.assertIn("1 unnamed", detail)
+        self.assertIn("2 codex peers", detail)
+        self.assertIn("build", detail)
+        self.assertIn(antiphon.peers.auto_identity(self.OTHER)[0], detail)
         self.assertNotIn(self.UUID, detail)
         self.assertNotIn(self.OTHER, detail)
 
-    def test_one_live_unnamed_observation_preserves_the_legacy_single_peer_road(self):
+    def test_one_live_observation_replaces_the_legacy_guess_with_its_auto_peer(self):
         with tempfile.TemporaryDirectory() as project:
             antiphon.peers.write_observation(project, self.UUID)
             with patch.object(antiphon, "codex_thread_alive", return_value=True), \
@@ -12957,7 +13245,7 @@ class RoutingTest(unittest.TestCase):
                               return_value=self.UUID) as legacy:
                 target = antiphon.resolve_target(project, "codex")
         self.assertEqual(target, (self.UUID, ""))
-        legacy.assert_called_once_with(project)
+        legacy.assert_not_called()
 
     def test_unknown_observation_liveness_cannot_create_an_ambiguity(self):
         for state in (False, None):
@@ -14033,6 +14321,34 @@ class SenderIdentityTest(unittest.TestCase):
                 self.assertIn("return channel", words)
                 self.assertIn("restart", words)
 
+    def test_every_agent_facing_surface_states_the_automatic_identity_contract(self):
+        node = read_source("lib", "channel.mjs")
+        start = node.index("    instructions:")
+        end = node.index("\n  },\n);", start)
+        channel = re.sub(r'"\s*\+\s*\n\s*"', "", node[start:end])
+        surfaces = {
+            "AGENTS.md rule": antiphon.AGENTS_RULE,
+            "CLAUDE.md rule": antiphon.CLAUDE_RULE,
+            "channel instructions": channel,
+            "README": read_source("README.md"),
+        }
+        required = (
+            "automatic `auto-` peer alias",
+            "first hook",
+            "fixed claude probe",
+            "host display name is ignored",
+            "`antiphon_name` overrides automatic identity",
+            "one positively live automatic peer",
+            "two or more",
+            "never guessed",
+            "identity digest stay private",
+        )
+        for name, surface in surfaces.items():
+            with self.subTest(surface=name):
+                words = " ".join(surface.lower().split())
+                for phrase in required:
+                    self.assertIn(phrase, words)
+
     def test_every_agent_facing_surface_explains_the_refused_send_notice(self):
         """The diagnostic uses the existing channel event shape, so prose is
         what prevents the receiver from mistaking it for the sender's words or
@@ -14328,6 +14644,8 @@ class ClaimedAliasTest(unittest.TestCase):
     """
 
     UUID = "1d5a03e0-0548-4339-87c3-45c5dbf7e9d7"
+    OTHER = "2e6b14f1-1659-544a-98d4-56d6eca8fa48"
+    AUTO = "auto-yzmcrss6whnnsjxthq2pclz3l4"
     MINE, THEIRS = "300:mine", "301:theirs"
 
     @staticmethod
@@ -14469,6 +14787,30 @@ class ClaimedAliasTest(unittest.TestCase):
                  patch.object(antiphon.peers, "owner_key", return_value=self.MINE):
                 self.assertIsNone(self._stop_to_claude(project))
 
+    def test_a_codex_stop_publishes_its_live_automatic_observation(self):
+        with tempfile.TemporaryDirectory() as project:
+            antiphon.peers.write_observation(project, self.UUID)
+            with self._named(""), \
+                 patch.object(antiphon, "codex_thread_alive",
+                              return_value=True):
+                self.assertEqual(
+                    antiphon.claimed_alias(project, "codex", self.UUID),
+                    self.AUTO)
+
+    def test_an_unknown_or_different_observation_publishes_no_auto_alias(self):
+        with tempfile.TemporaryDirectory() as project:
+            antiphon.peers.write_observation(project, self.UUID)
+            with self._named(""), \
+                 patch.object(antiphon, "codex_thread_alive",
+                              return_value=None):
+                self.assertIsNone(
+                    antiphon.claimed_alias(project, "codex", self.UUID))
+            with self._named(""), \
+                 patch.object(antiphon, "codex_thread_alive",
+                              return_value=True):
+                self.assertIsNone(
+                    antiphon.claimed_alias(project, "codex", self.OTHER))
+
     def test_a_session_that_cannot_identify_itself_publishes_nothing(self):
         with tempfile.TemporaryDirectory() as project:
             self._codex_endpoint(project, self.MINE)
@@ -14582,6 +14924,7 @@ class StatusTest(unittest.TestCase):
 
     UUID = "1d5a03e0-0548-4339-87c3-45c5dbf7e9d7"
     OTHER = "2e6b14f1-1659-544a-98d4-56d6eca8fa48"
+    AUTO = "auto-yzmcrss6whnnsjxthq2pclz3l4"
 
     def _status(self, project, summary=("", None, 0)):
         out = io.StringIO()
@@ -14615,26 +14958,37 @@ class StatusTest(unittest.TestCase):
         self.assertIn("Claude ui — ready", text)
         self.assertIn("Codex build — waiting for first turn", text)
 
-    def test_status_lists_live_unnamed_observations_in_stable_full_id_order(self):
+    def test_status_lists_live_observations_as_stable_automatic_peers(self):
         with tempfile.TemporaryDirectory() as project:
             # Reverse write order: presentation is host-id order, never recency.
             antiphon.peers.write_observation(project, self.OTHER)
             antiphon.peers.write_observation(project, self.UUID)
             with patch.object(antiphon, "codex_thread_alive", return_value=True):
                 _, text = self._formatting_status(project)
+        aliases = sorted((self.AUTO, antiphon.peers.auto_identity(self.OTHER)[0]))
         rows = [line for line in text.splitlines()
-                if line.startswith("  Codex unnamed observation ")]
-        self.assertEqual(rows, [
-            f"  Codex unnamed observation {self.UUID} — live, not addressable",
-            f"  Codex unnamed observation {self.OTHER} — live, not addressable",
-        ])
+                if line.startswith("  Codex auto-")]
+        self.assertEqual(rows,
+                         [f"  Codex {alias} — ready" for alias in aliases])
         self.assertIn("Codex session census: at least 2 live observed", text)
         self.assertIn("additional sessions before their first hook may be invisible",
                       text)
-        self.assertIn("restart each intended terminal with a distinct "
-                      "ANTIPHON_NAME", text)
+        self.assertIn("a bare @codex line is refused", text)
         self.assertNotIn(f"@codex:{self.UUID}", text)
         self.assertNotIn(f"@codex:{self.OTHER}", text)
+        self.assertNotIn(self.UUID, text)
+        self.assertNotIn(self.OTHER, text)
+
+    def test_status_renders_a_live_observation_only_as_an_automatic_peer(self):
+        with tempfile.TemporaryDirectory() as project:
+            antiphon.peers.write_observation(project, self.UUID)
+            with patch.object(antiphon, "codex_thread_alive",
+                              return_value=True):
+                _, text = self._formatting_status(project)
+        self.assertIn(f"Codex {self.AUTO} — ready", text)
+        self.assertIn(f"@codex:{self.AUTO}", text)
+        self.assertNotIn(self.UUID, text)
+        self.assertNotIn("unnamed observation", text)
 
     def test_status_reports_unknown_observations_as_a_count_without_ids(self):
         with tempfile.TemporaryDirectory() as project:
@@ -14657,8 +15011,10 @@ class StatusTest(unittest.TestCase):
                               side_effect=lambda sid: sid == self.OTHER) as checked:
                 _, text = self._formatting_status(project)
         self.assertIn("Codex build — ready", text)
-        self.assertIn(f"Codex unnamed observation {self.OTHER}", text)
-        self.assertNotIn(f"Codex unnamed observation {self.UUID}", text)
+        other_alias = antiphon.peers.auto_identity(self.OTHER)[0]
+        self.assertIn(f"Codex {other_alias} — ready", text)
+        self.assertNotIn(self.UUID, text)
+        self.assertNotIn(self.OTHER, text)
         checked.assert_called_once_with(self.OTHER)
 
     def test_status_takes_one_observation_snapshot_for_one_report(self):
@@ -14700,17 +15056,14 @@ class StatusTest(unittest.TestCase):
         self.assertIn("1 source, at 42", text,
                       "the cursor's own progress is still shown, and singular")
 
-    def test_a_session_id_appears_only_on_its_labelled_observation_row(self):
+    def test_an_automatic_peers_internal_address_appears_on_no_status_row(self):
         with tempfile.TemporaryDirectory() as project:
             self._codex_peer(project, "build", "300:build", self.OTHER)
             antiphon.peers.write_observation(project, self.UUID)
             with patch.object(antiphon, "codex_thread_alive", return_value=True):
                 _, text = self._formatting_status(project)
-        carrying_observation = [line for line in text.splitlines()
-                                if self.UUID in line]
-        self.assertEqual(carrying_observation, [
-            f"  Codex unnamed observation {self.UUID} — live, not addressable",
-        ])
+        self.assertNotIn(self.UUID, text)
+        self.assertIn(f"Codex {self.AUTO} — ready", text)
         self.assertNotIn(self.OTHER, text,
                          "a named peer's address remains private everywhere")
 

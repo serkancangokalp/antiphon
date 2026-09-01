@@ -848,10 +848,9 @@ class ShippedContractTest(unittest.TestCase):
                             ("CLAUDE.md rule", antiphon.CLAUDE_RULE)):
             self.assertIn("ANTIPHON_NAME", text, where)
 
-    def test_every_agent_surface_teaches_unnamed_codex_observation_limits(self):
-        """Visibility is diagnostic identity, never an accidental third alias
-        grammar. Branch U also makes every count a lower bound; omitting that
-        qualifier turns an unmeasured pre-hook window into confident fiction."""
+    def test_every_agent_surface_teaches_automatic_identity_limits(self):
+        """Automatic identity is public only after host-specific positive proof;
+        every surface keeps the pre-hook window and privacy boundary honest."""
         channel = re.sub(r'"\s*\+\s*\n\s*"', "",
                          read("lib", "channel.mjs"))
         surfaces = {
@@ -861,11 +860,11 @@ class ShippedContractTest(unittest.TestCase):
             "channel instructions": channel,
         }
         for where, text in surfaces.items():
-            self.assertRegex(text, r"(?i)unnamed (Codex )?observation", where)
+            self.assertRegex(text, r"(?i)automatic `auto-` peer alias", where)
             self.assertRegex(text, r"(?i)at least[^.]*first hook", where)
-            self.assertRegex(text, r"(?i)session id[^.]*diagnostic", where)
-            self.assertRegex(text, r"(?i)not (a )?(recipient )?alias", where)
-            self.assertRegex(text, r"(?i)not addressable", where)
+            self.assertRegex(text, r"(?i)fixed Claude probe", where)
+            self.assertRegex(text, r"(?i)host display name is ignored", where)
+            self.assertRegex(text, r"(?i)identity digest stay private", where)
             self.assertIn("ANTIPHON_NAME", text, where)
             self.assertRegex(text, r"(?i)(two or more|multiple)[^.]*refus", where)
 

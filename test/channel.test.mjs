@@ -48,6 +48,11 @@ const queueLog = stub.log;
 mainEnv.PATH = `${stubDir}:${process.env.PATH}`;
 
 const CODEX_SESSION = "1d5a03e0-0548-4339-87c3-45c5dbf7e9d7";
+const AUTO_ALIAS = "auto-yzmcrss6whnnsjxthq2pclz3l4";
+const AUTO_DIGEST = "c65828ca5eb1dad926f33c34f12f3b5fb031dca2f2e33d83dd70aa072a959928";
+const UUID_V7 = "01890f3e-7b5a-7cc2-8f5d-123456789abc";
+const AUTO_V7_ALIAS = "auto-h7n54mu5tb4wpf3g72gggmq5om";
+const AUTO_V7_DIGEST = "3fdbde329d9879679766fe8c63321d733f8abaee51cf9dd450a4b5fc85471986";
 
 function liveCodexPeer(dir, alias, owner, session) {
   const peer = join(dir, ".antiphon", "peers", `codex-${alias}`);
@@ -206,6 +211,38 @@ os.execv(real_python, [real_python, *sys.argv[1:]])
   };
 }
 
+async function makeAutomaticIdentityPython(identity) {
+  const dir = await mkdtemp(join(tmpdir(), "antiphon-identity-python-"));
+  const calls = join(dir, "calls.txt");
+  const realPython = execFileSync("python3", [
+    "-c", "import sys; print(sys.executable)",
+  ], { encoding: "utf8" }).trim();
+  writeFileSync(join(dir, "python3"), `#!${realPython}
+import os
+import sys
+
+command = sys.argv[2] if len(sys.argv) > 2 else ""
+if command == "claude_identity":
+    with open(os.environ["ANTIPHON_TEST_IDENTITY_CALLS"], "a") as stream:
+        stream.write(command + "\\n")
+    print(os.environ["ANTIPHON_TEST_IDENTITY_RESULT"])
+    raise SystemExit(0)
+
+real_python = os.environ["ANTIPHON_TEST_REAL_PYTHON"]
+os.execv(real_python, [real_python, *sys.argv[1:]])
+`, { mode: 0o755 });
+  return {
+    dir,
+    calls,
+    env: {
+      PATH: `${dir}:${process.env.PATH}`,
+      ANTIPHON_TEST_IDENTITY_CALLS: calls,
+      ANTIPHON_TEST_IDENTITY_RESULT: JSON.stringify(identity),
+      ANTIPHON_TEST_REAL_PYTHON: realPython,
+    },
+  };
+}
+
 // Every test removes exactly the socket it created and nothing else. Killing
 // the child and deleting only the project directory leaves the socket in the
 // shared temp directory: 163 of them had piled up before this was noticed.
@@ -296,6 +333,158 @@ function registeredPeers(dir) {
 
 function endpointFor(dir, name) {
   return join(dir, ".antiphon", "peers", `claude-${name}`, "endpoint.json");
+}
+
+async function anAutomaticClaudeIdentityRequiresTheHookJoinBeforeSigning() {
+  const dir = await mkdtemp(join(tmpdir(), "antiphon-auto-claude-"));
+  const probe = await makeAutomaticIdentityPython({
+    alias: AUTO_ALIAS,
+    identity_digest: AUTO_DIGEST,
+  });
+  const stub = await makeCodexStub();
+  const socket = socketFor(dir, AUTO_ALIAS);
+  const env = { ...process.env, ...probe.env, ANTIPHON_CWD: dir };
+  env.PATH = `${probe.dir}:${stub.dir}:${process.env.PATH}`;
+  delete env.ANTIPHON_NAME;
+  const transport = new StdioClientTransport({
+    command: "node", args: ["lib/channel.mjs"], env, stderr: "pipe",
+  });
+  const client = new Client({ name: "antiphon-auto-identity", version: "1.0.0" });
+  try {
+    liveCodexPeer(dir, "build", "300:build", CODEX_SESSION);
+    await client.connect(transport);
+    assert.ok(await waitFor(() => existsSync(endpointFor(dir, AUTO_ALIAS))),
+      "the verified probe did not create the automatic Claude endpoint");
+    const endpoint = JSON.parse(readFileSync(endpointFor(dir, AUTO_ALIAS), "utf8"));
+    assert.ok(await waitFor(() => existsSync(socket)),
+      `the automatic alias must select its named socket; endpoint=${JSON.stringify(endpoint)}`);
+
+    assert.equal(endpoint.name, AUTO_ALIAS);
+    assert.equal(endpoint.automatic, true);
+    assert.equal(endpoint.identity_digest, AUTO_DIGEST);
+    assert.ok(!JSON.stringify(endpoint).includes(CODEX_SESSION),
+      "the public registry record must not contain the host session id");
+    assert.equal(readFileSync(probe.calls, "utf8").trim(), "claude_identity",
+      "an unnamed channel asks the fixed Python identity probe exactly once");
+
+    await client.callTool({
+      name: "reply_to_codex", arguments: { text: "before hook", to: "build" },
+    });
+    let queued = readFileSync(stub.log, "utf8");
+    assert.match(queued, /\[from=<unnamed> id=/,
+      "a probe alone cannot authenticate an outgoing automatic identity");
+    assert.ok(!queued.includes(AUTO_ALIAS),
+      "the automatic alias stays private until the hook joins the same endpoint");
+
+    writeFileSync(join(dir, ".antiphon", "peers", `claude-${AUTO_ALIAS}`, "session.json"),
+      JSON.stringify({
+        kind: "claude",
+        name: AUTO_ALIAS,
+        owner: endpoint.owner,
+        session_id: CODEX_SESSION,
+        automatic: true,
+        identity_digest: AUTO_DIGEST,
+      }));
+    await client.callTool({
+      name: "reply_to_codex", arguments: { text: "after hook", to: "build" },
+    });
+    queued = readFileSync(stub.log, "utf8");
+    assert.match(queued, new RegExp(`\\[from=${AUTO_ALIAS} id=`),
+      "the matching hook record authenticates the automatic sender alias");
+    const labels = queued.match(/\[from=[^\]]+ id=[^\]]+\]/g)?.join("\n") || "";
+    assert.ok(!labels.includes(CODEX_SESSION),
+      "the host session id never crosses in the message label");
+    assert.ok(!labels.includes(AUTO_DIGEST),
+      "the private digest never crosses in the message label");
+    console.log("automatic Claude identity waits for the hook join: ok");
+  } finally {
+    await client.close().catch(() => {});
+    await rm(socket, { force: true }).catch(() => {});
+    for (const path of [dir, probe.dir, stub.dir]) {
+      await rm(path, { recursive: true, force: true }).catch(() => {});
+    }
+  }
+}
+
+async function explicitAndUnverifiedClaudeIdentitiesStayConservative() {
+  const explicitDir = await mkdtemp(join(tmpdir(), "antiphon-explicit-claude-"));
+  const explicitProbe = await makeAutomaticIdentityPython({
+    alias: AUTO_ALIAS,
+    identity_digest: AUTO_DIGEST,
+  });
+  const explicit = spawnChannel(explicitDir, "ui", explicitProbe.env);
+  try {
+    assert.ok(await waitFor(() => existsSync(endpointFor(explicitDir, "ui"))),
+      `the explicit peer never registered: ${explicit.stderr()}`);
+    assert.ok(!existsSync(explicitProbe.calls),
+      "ANTIPHON_NAME is an override, so an explicit peer never runs the auto probe");
+  } finally {
+    await cleanUp(explicit, explicitDir);
+    await rm(explicitProbe.dir, { recursive: true, force: true });
+  }
+
+  const rejectedDir = await mkdtemp(join(tmpdir(), "antiphon-rejected-auto-"));
+  const rejectedProbe = await makeAutomaticIdentityPython({
+    alias: "auto-aaaaaaaaaaaaaaaaaaaaaaaaaa",
+    identity_digest: AUTO_DIGEST,
+  });
+  const rejected = spawnChannel(rejectedDir, "", rejectedProbe.env);
+  try {
+    assert.ok(await waitFor(() => registeredPeers(rejectedDir).length === 1),
+      `the conservative unnamed peer never registered: ${rejected.stderr()}`);
+    assert.deepEqual(registeredPeers(rejectedDir).map((peer) => peer.name), ["<unnamed>"],
+      "an alias that does not derive from its digest is never published");
+    assert.ok(await waitFor(() => existsSync(socketFor(rejectedDir, ""))),
+      "a rejected probe keeps the legacy unnamed socket");
+    assert.ok(!rejected.stderr().includes(AUTO_DIGEST),
+      "a rejected private digest is not echoed in diagnostics");
+  } finally {
+    await cleanUp(rejected, rejectedDir);
+    await rm(rejectedProbe.dir, { recursive: true, force: true });
+  }
+  console.log("explicit and unverified Claude identities stay conservative: ok");
+}
+
+async function automaticClaudeIdentityAcceptsTheCanonicalUuidGrammar() {
+  const dir = await mkdtemp(join(tmpdir(), "antiphon-auto-v7-"));
+  const probe = await makeAutomaticIdentityPython({
+    alias: AUTO_V7_ALIAS,
+    identity_digest: AUTO_V7_DIGEST,
+  });
+  const stub = await makeCodexStub();
+  const socket = socketFor(dir, AUTO_V7_ALIAS);
+  const env = { ...process.env, ...probe.env, ANTIPHON_CWD: dir };
+  env.PATH = `${probe.dir}:${stub.dir}:${process.env.PATH}`;
+  delete env.ANTIPHON_NAME;
+  const transport = new StdioClientTransport({
+    command: "node", args: ["lib/channel.mjs"], env, stderr: "pipe",
+  });
+  const client = new Client({ name: "antiphon-auto-v7", version: "1.0.0" });
+  try {
+    liveCodexPeer(dir, "build", "300:build", CODEX_SESSION);
+    await client.connect(transport);
+    assert.ok(await waitFor(() => existsSync(endpointFor(dir, AUTO_V7_ALIAS))),
+      "the canonical v7 identity did not create an endpoint");
+    const endpoint = JSON.parse(readFileSync(endpointFor(dir, AUTO_V7_ALIAS), "utf8"));
+    writeFileSync(join(dir, ".antiphon", "peers", `claude-${AUTO_V7_ALIAS}`, "session.json"),
+      JSON.stringify({
+        kind: "claude", name: AUTO_V7_ALIAS, owner: endpoint.owner,
+        session_id: UUID_V7, automatic: true, identity_digest: AUTO_V7_DIGEST,
+      }));
+    await client.callTool({
+      name: "reply_to_codex", arguments: { text: "from v7", to: "build" },
+    });
+    assert.match(readFileSync(stub.log, "utf8"),
+      new RegExp(`\\[from=${AUTO_V7_ALIAS} id=`),
+      "Node must accept every canonical UUID shape accepted by the registry");
+    console.log("automatic Claude identity accepts the canonical UUID grammar: ok");
+  } finally {
+    await client.close().catch(() => {});
+    await rm(socket, { force: true }).catch(() => {});
+    for (const path of [dir, probe.dir, stub.dir]) {
+      await rm(path, { recursive: true, force: true }).catch(() => {});
+    }
+  }
 }
 
 async function aLiveListenerReassertsItsOwnMissingEndpoint() {
@@ -1189,6 +1378,9 @@ await anArbitrarySocketBinderIsNotAdopted();
 await aReconnectRepairsTheLiveListenersMissingRecord();
 await everySessionSignsTheValidNameItWasGiven();
 await invalidConfiguredNamesAreNotEchoed();
+await anAutomaticClaudeIdentityRequiresTheHookJoinBeforeSigning();
+await explicitAndUnverifiedClaudeIdentitiesStayConservative();
+await automaticClaudeIdentityAcceptsTheCanonicalUuidGrammar();
 await fourLiveSessionsRouteByName();
 await onlyOneUnnamedSessionGetsTheChannel(false);   // a second terminal, later
 await onlyOneUnnamedSessionGetsTheChannel(true);    // both started together

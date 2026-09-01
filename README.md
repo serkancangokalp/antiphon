@@ -4,7 +4,7 @@
 
 Antiphon doesn't dispatch work. It only carries messages between the sides while preserving whether they came from the human user, from Claude, or from Codex.
 
-With one terminal per side there is nothing to configure beyond `antiphon setup`: peers go unnamed, messages have only one place to go, and the rest of this page is background. Naming becomes necessary the moment a second session opens on either side — see [Many peers](#many-peers).
+With one terminal per side there is nothing to configure beyond `antiphon setup`: Antiphon assigns an automatic alias when it can positively prove the host session, otherwise the peer stays honestly unnamed and the legacy single-peer road remains. With several sessions, address the automatic aliases shown by `status` or set explicit names — see [Many peers](#many-peers).
 
 ## How it works
 
@@ -62,9 +62,11 @@ line does not send it twice.
 
 A Claude → Codex message reaches Codex tagged either `[Antiphon bridge] Claude:` (pushed from Claude's Stop hook) or `[Antiphon channel] Claude:` (a direct reply sent through the channel, via the `reply_to_codex` tool) — either way, Codex sees these as Claude's words, not the human user's.
 
-The tag is followed by `[from=<alias> id=<uuid>]`, naming which Claude peer spoke. A session whose configured identity does not own its return channel instead carries `[from=<alias> reply_to=<unavailable> id=<uuid>]`; that exception is explained below. A session started without `ANTIPHON_NAME` shows `from=<unnamed>`: it has no name to be addressed by, and the angle brackets keep that apart from a peer actually called `unnamed`. The id names one delivery attempt — it is not a correlation id, and nothing routes replies by it.
+The tag is followed by `[from=<alias> id=<uuid>]`, naming which Claude peer spoke. A session whose configured identity does not own its return channel instead carries `[from=<alias> reply_to=<unavailable> id=<uuid>]`; that exception is explained below. A session that cannot establish either an explicit or automatic identity shows `from=<unnamed>`: it has no name to be addressed by, and the angle brackets keep that apart from a peer actually called `unnamed`. The id names one delivery attempt — it is not a correlation id, and nothing routes replies by it.
 
 A valid Claude `ANTIPHON_NAME` is the session's configured identity, not proof that its named return channel is reachable. If startup says the channel was not acquired, the name still identifies that session's outgoing words, but the label alone does not establish that a reply will reach the same process. The startup warning exposes a duplicate-name loss; `antiphon doctor` exposes a named listener whose endpoint registration is missing. Restart the Claude session after correcting either fault.
+
+Without `ANTIPHON_NAME`, Antiphon may derive an automatic `auto-` peer alias from a canonical host session UUID. Codex publishes one only after its first hook records that UUID and a writer lock positively proves the session live. Every census remains `at least N` because sessions before their first hook may be invisible. Claude accepts one only from a fixed Claude probe that finds exactly one interactive record with this session's CLI-root pid and exact project cwd; the host display name is ignored, and the Claude hook must join the same endpoint, owner and identity. Probe or hook failure stays `<unnamed>`. `ANTIPHON_NAME` overrides automatic identity. One positively live automatic peer can be addressed by alias and is the only automatic case a bare send may choose; two or more positively live candidates make a bare send refused. Older or mixed-version peers are never guessed into automatic identity. The full host session id and identity digest stay private; status, doctor, labels and refusals expose only the public alias.
 
 If a label carries `reply_to=<unavailable>`, do not reply to its `from` alias: that channel belongs to a different session. The sender remains identified, but there is deliberately no routable return alias until its Claude channel is restarted under a unique name.
 
@@ -76,9 +78,9 @@ A Codex → Claude message never pastes text into the terminal and never imperso
 <channel source="antiphon" sender="codex" sender_kind="agent" sender_alias="build" message_id="...">
 ```
 
-Claude Code's interface shows this as an incoming channel event, and Claude treats the message as the words of the Codex agent, not of the human user. It sends its reply back with the `reply_to_codex` MCP tool, passing `sender_alias` as `to` whenever it is a name rather than the literal `<unnamed>`. A bare reply is refused as soon as any named Codex peer is registered: an unnamed Codex session leaves no routable peer record, so one visible peer cannot be shown to be the only one running. It is also refused when two or more unnamed sessions are positively observed live. A `sender_alias` of `<unnamed>` is a peer with no name — it cannot be addressed by name, and a bare reply reaches it only in a project where nothing is registered; passing `<unnamed>` as `to` is the same as leaving it out.
+Claude Code's interface shows this as an incoming channel event, and Claude treats the message as the words of the Codex agent, not of the human user. It sends its reply back with the `reply_to_codex` MCP tool, passing `sender_alias` as `to` whenever it is a name rather than the literal `<unnamed>`. A bare reply works where no Codex peer is registered, or where one positively live automatic peer is the only candidate. It is refused when an explicit named peer or multiple positive candidates are live, because an unnamed Codex session before its first hook cannot be ruled out. A `sender_alias` of `<unnamed>` is a peer with no name — it cannot be addressed by name, and a bare reply reaches it only in the no-registered-peer case; passing `<unnamed>` as `to` is the same as leaving it out.
 
-Nothing pairs peers up. There is no automatic Claude↔Codex partnership, and no reply correlation: a message is routed only by the name written on it.
+Automatic aliases identify individual peers; they do not pair a Claude peer with a Codex peer. There is no automatic Claude↔Codex partnership and no reply correlation: a message is routed only by the alias written on it, except for the explicitly bounded bare-send cases above.
 
 ## Many peers
 
@@ -94,7 +96,7 @@ Names must be unique per side within a project. Two Claude sessions configured
 with the same name both identify their own outgoing words by that name, but
 only the one that owns the named channel can receive a reply there.
 
-Once named, a peer is addressed explicitly — by marker at the start of a line,
+Once an alias is visible, a peer is addressed explicitly — by marker at the start of a line,
 or by the `to` argument of the tool that sends without ending the turn:
 
 | From | Marker | Tool |
@@ -112,17 +114,16 @@ traces:
 
 - **To Claude.** A bare `@claude` works while exactly one Claude peer is live.
   From the second one on, it is refused and you must name one.
-- **To Codex.** A bare `@codex` is refused as soon as *any* named Codex peer is
-  registered — even if it is the only one you can see — or when two or more
-  unnamed sessions are positively observed live. A Codex session started
-  without a name leaves no routable peer record, so another unnamed one may
-  still be invisible and the bridge will not guess between a peer it can see
-  and one it cannot.
+- **To Codex.** A bare `@codex` works when no peer is registered (the legacy
+  single-peer road), or when exactly one positively live automatic peer is the
+  only candidate. It is refused when any explicit named Codex peer is live or
+  when two or more positive candidates exist. A session before its first hook
+  may still be invisible, so an explicit peer is never guessed to be alone.
 
-That asymmetry is why **every terminal in a multi-peer project must be named,
-Codex terminals above all**. Mixing named and unnamed sessions is the one
-configuration that can leave a message impossible to answer: the unnamed peer
-is live, it can send, and there is no name to send a reply back to.
+Automatic aliases make multi-peer addressing work without configuration after
+the host proofs arrive. Distinct `ANTIPHON_NAME` values remain the explicit
+override and avoid the first-hook/probe window; a peer whose proof fails stays
+unnamed and cannot be addressed while other candidates are live.
 
 ### Seeing who is live
 
@@ -140,25 +141,24 @@ Peers:
   Claude ui — ready
   Claude api — ready
   Codex build — ready
-  Codex unnamed observation 2e6b14f1-1659-544a-98d4-56d6eca8fa48 — live, not addressable
+  Codex auto-cwymp7bdr2do3ymgr5kxwv74tq — ready
   → a bare @claude line is refused; address one: @claude:ui, @claude:api
-  → a bare @codex line is refused; address a named peer: @codex:build
-  → the observed unnamed Codex session cannot be addressed; restart it with ANTIPHON_NAME set
+  → a bare @codex line is refused; address a named peer: @codex:auto-cwymp7bdr2do3ymgr5kxwv74tq, @codex:build
 ```
 
 A peer that is `waiting for first turn` is still a candidate: readiness never
 decides who a message goes to, so it cannot silently hand routing to whichever
-session happened to start first. An unnamed Codex observation is local
-diagnostic evidence, not a peer record. Every census says `at least N` because
-additional sessions before their first hook may be invisible. The full host
-session id is diagnostic identity, not a recipient alias, and the observation
-is not addressable. Two or more positively live candidates make a bare send
-refused; restart each intended terminal with a distinct `ANTIPHON_NAME` and
-address it by that name. With no peer or live observation, the `Peers:` block is
-empty while the census still says `at least 0`; zero observations never proves
-that zero sessions exist. Stored observations whose writer lock no longer gives
-positive liveness are retained and shown only as a count: a missing or unlocked
-lock is insufficient evidence that the host session is dead.
+session happened to start first. A positively live Codex observation is
+projected read-only as its stable automatic alias; the host UUID and full digest
+remain internal. Every census says `at least N` because additional sessions
+before their first hook may be invisible. One automatic peer is both explicitly
+addressable and reachable by a bare send while it is the only positive
+candidate. Two or more positive candidates make a bare send refused. With no
+peer or live observation, the `Peers:` block is empty while the census still
+says `at least 0`; zero observations never proves that zero sessions exist.
+Stored observations whose writer lock no longer gives positive liveness are
+retained and shown only as a count: a missing or unlocked lock is insufficient
+evidence that the host session is dead.
 
 ## Install
 

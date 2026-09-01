@@ -511,29 +511,54 @@ def sender_alias(candidate):
     return candidate if peers.valid_name(candidate) else None
 
 
-def claimed_alias(cwd, kind):
+def claimed_alias(cwd, kind, session_id=None):
     """The identity this side may publish on a Stop-hook message.
 
     A valid Claude `ANTIPHON_NAME` is its configured identity even when this
-    process did not win that name's return channel. That makes it unreachable,
-    not unnamed; startup and doctor expose the broken return path separately.
+    process did not win that name's return channel. Without that override, an
+    automatic alias is published only after the channel endpoint and hook
+    session join on owner and digest. A failed join remains unnamed. Channel
+    loss makes an explicit identity unreachable, not unnamed; startup and
+    doctor expose that broken return path separately.
 
-    Codex is different: its server is not the session and the environment is
-    only a request. It publishes an alias only when the live record belongs to
-    this session, matched on the owner key. Anything that cannot be shown yields
-    None; otherwise a reply could be routed to a Codex session that never spoke.
+    Codex is different: its server is not the session and an explicit
+    environment name is only a request. It publishes that alias only when the
+    live record belongs to this session, matched on the owner key. Without an
+    override, its hook-owned observation must have positive writer-lock proof
+    before the derived alias is published. Anything unproved yields None;
+    otherwise a reply could be routed to a Codex session that never spoke.
     """
-    alias = sender_alias(peers.explicit_name())
-    if not alias:
-        return None                   # nothing asked for; nothing to check
-    if kind == "claude":
-        return alias
-    owner = peers.owner_key()
-    if not owner:
+    requested = peers.explicit_name()
+    alias = sender_alias(requested)
+    if requested:
+        if not alias:
+            return None               # an invalid override never falls through
+        if kind == "claude":
+            return alias
+        owner = peers.owner_key()
+        if not owner:
+            return None
+        for peer in peers.read_peers(cwd, kind):
+            if peer.get("name") == alias:
+                return alias if peer.get("owner") == owner else None
         return None
-    for peer in peers.read_peers(cwd, kind):
-        if peer.get("name") == alias:
-            return alias if peer.get("owner") == owner else None
+    if kind == "codex" and peers.valid_session_id(session_id):
+        snapshot = _codex_identity_snapshot(
+            cwd, peers.read_peers(cwd, "codex"))
+        for peer in snapshot.automatic:
+            if peer.get("address") == session_id:
+                return peer.get("name")
+    if kind == "claude" and peers.valid_session_id(session_id):
+        name, digest = peers.auto_identity(session_id)
+        owner = peers.owner_key()
+        if not owner:
+            return None
+        for peer in peers.read_peers(cwd, "claude"):
+            if (peer.get("name") == name
+                    and peer.get("owner") == owner
+                    and peers._identity_digest_of(peer) == digest
+                    and peers._session_address(cwd, peer) == session_id):
+                return name
     return None
 
 
@@ -3487,7 +3512,7 @@ SessionJoin = collections.namedtuple(
 NO_SESSION_JOIN = SessionJoin({}, False, {})
 
 
-def _source_activity(cwd, kind):
+def _source_activity(cwd, kind, identities=None):
     """One read-only live/unknown/dead census for a source kind.
 
     Labels keep their rolling-compatible registry join. Scheduling is stricter:
@@ -3549,6 +3574,27 @@ def _source_activity(cwd, kind):
         session = peers._session_address(cwd, record)
         if session is not None:
             label_claims.setdefault(session, set()).add(name)
+    if kind == "codex":
+        # The hook-owned observation has no endpoint by design. Project it
+        # through the same positive-lock rule routing and diagnostics use, then
+        # feed only its public alias into page labels. The source UUID remains
+        # the internal map key because that is what transcript events carry.
+        registered = []
+        for record in endpoints:
+            if not peers._record_alive(record):
+                continue
+            projected = dict(record)
+            if peers._addressless(record):
+                projected["address"] = peers._session_address(cwd, record)
+            registered.append(projected)
+        identities = (identities
+                      if identities is not None
+                      else _codex_identity_snapshot(cwd, registered))
+        for source in identities.live_sessions:
+            states[source] = "live"
+        for record in identities.automatic:
+            label_claims.setdefault(record["address"], set()).add(
+                record["name"])
     aliases = {source: next(iter(names))
                for source, names in label_claims.items()
                if len(names) == 1}
@@ -4289,6 +4335,9 @@ def codex_thread_alive(session):
 CodexObservationSnapshot = collections.namedtuple(
     "CodexObservationSnapshot", "live unknown")
 
+CodexIdentitySnapshot = collections.namedtuple(
+    "CodexIdentitySnapshot", "automatic live_sessions unknown conflicts")
+
 
 def _codex_observation_snapshot(cwd, registered):
     """Unnamed host ids, classified only by positive writer-lock evidence.
@@ -4312,6 +4361,43 @@ def _codex_observation_snapshot(cwd, registered):
         target = live if codex_thread_alive(session_id) is True else unknown
         target.append(session_id)
     return CodexObservationSnapshot(tuple(live), tuple(unknown))
+
+
+def _codex_identity_snapshot(cwd, registered):
+    """Project positively live observations into public automatic peers.
+
+    The projection is read-only. Its route remains the host UUID internally;
+    every renderer below receives only the public alias. A complete digest is
+    carried beside each projected peer so a 128-bit alias collision or an
+    explicit record occupying the same name refuses instead of choosing.
+    """
+    observations = _codex_observation_snapshot(cwd, registered)
+    occupied = {record.get("name") for record in registered
+                if peers.valid_name(record.get("name"))}
+    by_name = {}
+    conflicts = set()
+    for session_id in observations.live:
+        identity = peers.auto_identity(session_id)
+        if not identity:
+            continue
+        name, digest = identity
+        if name in occupied:
+            conflicts.add(name)
+            continue
+        prior = by_name.get(name)
+        if prior is not None and prior.get("identity_digest") != digest:
+            conflicts.add(name)
+            continue
+        by_name[name] = {
+            "kind": "codex", "name": name, "address": session_id,
+            "automatic": True, "identity_digest": digest,
+            "started_at": 0.0,
+        }
+    automatic = tuple(by_name[name] for name in sorted(by_name)
+                      if name not in conflicts)
+    return CodexIdentitySnapshot(
+        automatic, observations.live, observations.unknown,
+        tuple(sorted(conflicts)))
 
 
 def codex_session_id(cwd):
@@ -4467,7 +4553,7 @@ def push(target="codex"):
     # Once for the turn, not once per recipient. Who is speaking cannot change
     # between two lines of one reply, and working it out again for each would
     # walk the process tree again for an answer that is already known.
-    who = claimed_alias(cwd, side)
+    who = claimed_alias(cwd, side, input_data.get("session_id"))
     can_reply = reply_available(cwd, side, who)
 
     def deliver(recipient, messages):
@@ -4767,8 +4853,9 @@ def _resolve_target(cwd, kind, alias=None):
             None, f"not delivered: unknown peer kind {kind!r} (claude | codex)",
             "refusal")
 
-    live = peers.read_peers(cwd, kind)
-    names = ", ".join(sorted(p.get("name") or "?" for p in live))
+    registered = peers.read_peers(cwd, kind)
+    registered_names = ", ".join(
+        sorted(p.get("name") or "?" for p in registered))
 
     if alias is not None:
         if not peers.valid_name(alias):
@@ -4781,8 +4868,38 @@ def _resolve_target(cwd, kind, alias=None):
             return ResolvedTarget(
                 None, ("not delivered: the supplied recipient is not a usable "
                        "peer name"
-                       + (f"; live {kind} peers: {names}" if names else "")),
+                       + (f"; live {kind} peers: {registered_names}"
+                          if registered_names else "")),
                 "refusal")
+        # Every generated name has this fixed prefix. A different valid alias
+        # can be decided entirely from the registry and never needs to inspect
+        # private observation state; this preserves the exact explicit-name
+        # road and keeps an invalid or unrelated recipient census-free.
+        if kind != "codex" or not alias.startswith(peers.AUTO_NAME_PREFIX):
+            match = [p for p in registered if p.get("name") == alias]
+            if not match:
+                return ResolvedTarget(
+                    None, (f"not delivered: no live {kind} peer named {alias!r}"
+                           + (f"; live peers: {registered_names}"
+                              if registered_names else "")),
+                    "refusal")
+            if match[0].get("address") is None:
+                return ResolvedTarget(
+                    None, (f"not delivered: {alias!r} is live but not yet "
+                           "routable — it has not run a turn yet"), "refusal")
+            return ResolvedTarget(match[0]["address"], "", "registered")
+
+    identities = (_codex_identity_snapshot(cwd, registered)
+                  if kind == "codex"
+                  else CodexIdentitySnapshot((), (), (), ()))
+    live = registered + list(identities.automatic)
+    names = ", ".join(sorted(p.get("name") or "?" for p in live))
+
+    if alias is not None:
+        if alias in identities.conflicts:
+            return ResolvedTarget(
+                None, (f"not delivered: automatic identity collision at "
+                       f"{alias!r}; no peer was chosen"), "refusal")
         # Exact, or not at all. A near miss is a different peer.
         match = [p for p in live if p.get("name") == alias]
         if not match:
@@ -4796,34 +4913,25 @@ def _resolve_target(cwd, kind, alias=None):
                        "— it has not run a turn yet"), "refusal")
         return ResolvedTarget(match[0]["address"], "", "registered")
 
-    # Preserve the established addressing-refusal class and byte-for-byte
-    # wording when the registry alone already proves ambiguity. The new
-    # observation road exists for candidates the peer registry cannot see; it
-    # must not reclassify an old refusal and accidentally add passive-page
-    # fallback guidance downstream.
-    if len(live) > 1:
-        return ResolvedTarget(
-            None, (f"not delivered: {len(live)} {kind} peers are live "
-                   f"({_peer_states(live)}); address one by name"), "refusal")
-
-    observations = (_codex_observation_snapshot(cwd, live)
-                    if kind == "codex"
-                    else CodexObservationSnapshot((), ()))
-    candidate_count = len(live) + len(observations.live)
-    if kind == "codex" and candidate_count > 1:
-        registered = len(live)
-        unnamed = len(observations.live)
-        states = f"; registered peers: {_peer_states(live)}" if live else ""
+    if identities.conflicts:
         return ResolvedTarget(
             None,
             _ClassifiedRefusal(
-                f"not delivered: at least {candidate_count} Codex sessions are "
-                f"live ({registered} registered, {unnamed} unnamed and not "
-                f"addressable{states}); additional sessions before their first "
-                "hook may be invisible — restart each intended terminal with "
-                "a distinct ANTIPHON_NAME, then address one by name",
-                "no-peer"),
+                "not delivered: automatic peer identity collision; no peer "
+                "was chosen", "no-peer"),
             "refusal")
+
+    # Preserve the established addressing-refusal class and byte-for-byte
+    # wording when the registry alone already proves ambiguity. Automatic
+    # observation peers keep the no-peer class so passive-page guidance still
+    # follows a refusal born before a registry endpoint exists.
+    if len(live) > 1:
+        detail = (f"not delivered: {len(live)} {kind} peers are live "
+                  f"({_peer_states(live)}); address one by name")
+        if kind == "codex" and identities.automatic:
+            detail = _ClassifiedRefusal(detail, "no-peer")
+        return ResolvedTarget(
+            None, detail, "refusal")
 
     if not live:
         # Nothing registered at all: the unnamed single pair, exactly as it was
@@ -4833,6 +4941,8 @@ def _resolve_target(cwd, kind, alias=None):
         address, detail = _legacy_target(cwd, kind)
         return ResolvedTarget(address, detail, "legacy")
     if kind == "codex":
+        if live[0].get("automatic") is True:
+            return ResolvedTarget(live[0]["address"], "", "automatic")
         # One named record is not proof of one session. An unnamed session has
         # no routable peer record, and one before its first hook may have no
         # observation either — delivering to the visible peer would be a guess
@@ -5768,7 +5878,8 @@ def register_peer(*_):
     # server, which is what a Stop hook in the same session computes too. It is
     # how that hook later shows the alias is genuinely this session's.
     ok, detail = peers.register(project_dir(), kind, name, address,
-                                pid=data.get("pid"), owner_key=peers.owner_key())
+                                pid=data.get("pid"), owner_key=peers.owner_key(),
+                                identity_digest=data.get("identity_digest"))
     if not ok:
         print(f"register_peer: {detail}", file=sys.stderr)
         return 1
@@ -5972,6 +6083,64 @@ def _retrieve_mcp_bridge(public_id=None):
     return 0
 
 
+CLAUDE_IDENTITY_TIMEOUT = 2.0
+CLAUDE_IDENTITY_MAX_OUTPUT = 1024 * 1024
+
+
+def _claude_auto_identity(cwd):
+    """The one Claude session independently proved to own this channel root.
+
+    The host command is a claim, not authority: its interactive record must
+    agree with the canonical CLI root found through the process tree and with
+    the exact project directory this server was configured for. Generated host
+    display metadata is deliberately unread. Every failure returns None and
+    leaves the existing unnamed channel behavior intact.
+    """
+    owner = peers.owner_key()
+    if not peers.valid_owner_key(owner):
+        return None
+    root_pid, _separator, _fingerprint = owner.partition(":")
+    if not root_pid.isdigit():
+        return None
+    try:
+        result = subprocess.run(
+            ["claude", "agents", "--json", "--cwd", cwd],
+            capture_output=True, text=True, timeout=CLAUDE_IDENTITY_TIMEOUT,
+            shell=False)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if result.returncode != 0 or len(result.stdout) > CLAUDE_IDENTITY_MAX_OUTPUT:
+        return None
+    try:
+        records = json.loads(result.stdout)
+    except (TypeError, ValueError):
+        return None
+    if not isinstance(records, list):
+        return None
+    matches = []
+    for record in records:
+        if not isinstance(record, dict):
+            continue
+        pid = record.get("pid")
+        session_id = record.get("sessionId")
+        if (type(pid) is int and pid == int(root_pid)
+                and record.get("kind") == "interactive"
+                and record.get("cwd") == cwd
+                and peers.valid_session_id(session_id)):
+            matches.append(session_id)
+    if len(matches) != 1:
+        return None
+    alias, digest = peers.auto_identity(matches[0])
+    return {"alias": alias, "identity_digest": digest}
+
+
+def _claude_identity_bridge():
+    """Private fixed-argv identity bridge used only by ``channel.mjs``."""
+    print(json.dumps(_claude_auto_identity(project_dir()),
+                     ensure_ascii=False, separators=(",", ":")))
+    return 0
+
+
 def register_codex_peer(cwd):
     """Registers this MCP server: alias, pid, owner key, and no address yet.
 
@@ -6020,14 +6189,16 @@ def register_codex_peer(cwd):
 
 
 def record_codex_session(cwd, session_id, transcript):
-    """Record the hook's named-session join or unnamed-session observation.
+    """Record the hook's explicit join or automatic-identity observation.
 
     A usable alias writes the hook's half of the peer record: which session is
-    behind that alias. Without one, a canonical host id writes only diagnostic
-    observation evidence — never an alias, address or transcript. Returns
-    whether either record was written. An unusable id is silent; an observation
-    write failure is reported without its id or path, while a named claim
-    refusal remains visible because somebody else holds the alias right now.
+    behind that alias. Without one, a canonical host id writes private
+    observation evidence — never a public alias, address or transcript. A
+    separate read-only projection exposes its derived automatic alias only
+    while a writer lock positively proves that session live. Returns whether
+    either record was written. An unusable id is silent; an observation write
+    failure is reported without its id or path, while a named claim refusal
+    remains visible because somebody else holds the alias right now.
     """
     alias = peers.explicit_name()
     if not peers.valid_name(alias):
@@ -6097,20 +6268,40 @@ def record_claude_session(cwd, session_id, transcript):
     of being somebody else, once per prompt, forever, would be worse than saying
     nothing; `doctor` says it once, where somebody is asking.
     """
-    alias = peers.explicit_name()
-    if not (peers.valid_name(alias) and session_id):
+    requested = peers.explicit_name()
+    automatic = not requested
+    if requested and not peers.valid_name(requested):
         return False
+    identity = peers.auto_identity(session_id) if automatic else None
+    if automatic:
+        if not identity:
+            return False
+        alias, identity_digest = identity
+    else:
+        alias, identity_digest = requested, None
+        if not session_id:
+            return False
     try:
         owner = peers.owner_key()
         if not owner:
             return False
         ok, detail = peers.write_session(cwd, "claude", alias, session_id,
-                                         transcript, owner)
+                                         transcript, owner,
+                                         identity_digest=identity_digest,
+                                         require_endpoint=automatic)
     except Exception as error:
         # Named routing is a layer over a bridge that already works without it.
-        print(f"antiphon: {alias!r} could not be recorded "
-              f"({type(error).__name__}: {error}); its session cannot be named "
-              "on the other side's pages this turn.", file=sys.stderr)
+        if automatic:
+            error_kind = type(error).__name__
+            error_number = getattr(error, "errno", None)
+            if isinstance(error_number, int):
+                error_kind += f" errno {error_number}"
+            print(f"antiphon: automatic Claude identity could not be joined "
+                  f"({error_kind}); this turn remains unnamed.", file=sys.stderr)
+        else:
+            print(f"antiphon: {alias!r} could not be recorded "
+                  f"({type(error).__name__}: {error}); its session cannot be named "
+                  "on the other side's pages this turn.", file=sys.stderr)
         return False
     if not ok and _endpoint_owner(cwd, "claude", alias) is not None:
         print(f"antiphon: {detail}", file=sys.stderr)
@@ -6427,14 +6618,22 @@ LONG_MARKER_RULE = (
     "parked as an attachment, while an oversized Stop-marker block is refused "
     "and not parked.")
 
-UNNAMED_CODEX_OBSERVATION_RULE = (
-    "An unnamed Codex hook may leave an unnamed Codex observation for local "
-    "diagnostics. Every census says `at least N` because additional sessions "
-    "before their first hook may be invisible. Its full host session id is "
-    "diagnostic identity, not a recipient alias, and is not addressable. Two or "
-    "more positively live candidates make a bare send refused; restart each "
-    "intended terminal with a distinct `ANTIPHON_NAME` and address it by that "
-    "name.")
+AUTOMATIC_PEER_IDENTITY_RULE = (
+    "Without `ANTIPHON_NAME`, Antiphon may derive an automatic `auto-` peer alias "
+    "from a canonical host session UUID. Codex publishes one only after its first "
+    "hook records that UUID and a writer lock positively proves the session live. "
+    "Every census remains `at least N` because sessions before their first hook "
+    "may be invisible. "
+    "Claude accepts one only from a fixed Claude probe that finds exactly one "
+    "interactive record with this session's CLI-root pid and exact project cwd; "
+    "the host display name is ignored, and the Claude hook must join the same "
+    "endpoint, owner and identity. Probe or hook failure stays `<unnamed>`. "
+    "`ANTIPHON_NAME` overrides automatic identity. One positively live automatic "
+    "peer can be addressed by alias and is the only automatic case a bare send may "
+    "choose; two or more positively live candidates make a bare send refused. "
+    "Older or mixed-version peers are never guessed into automatic identity. The "
+    "full host session id and identity digest stay private; status, doctor, labels "
+    "and refusals expose only the public alias.")
 
 AGENTS_RULE = ("\n## The Antiphon bridge\n\n"
                "You are working alongside Claude Code on this project. What happens on the "
@@ -6497,10 +6696,10 @@ AGENTS_RULE = ("\n## The Antiphon bridge\n\n"
                "A direct send reaches one peer and is never broadcast. Write `@claude:name`, "
                "or `antiphon_send(to=name)`, whenever more than one Claude peer is live: an "
                "unaddressed send is refused rather than delivered to a guess. For the same "
-               "reason every terminal in a project with more than one session per side has to "
-               "be started with `ANTIPHON_NAME` set — a session without a name is live but "
-               "unaddressable, and nothing can be sent back to it. "
-               + UNNAMED_CODEX_OBSERVATION_RULE + "\n\n"
+               "reason, use each peer's automatic alias or start every terminal with a "
+               "distinct `ANTIPHON_NAME`; a session whose identity proof failed remains "
+               "unaddressable. "
+               + AUTOMATIC_PEER_IDENTITY_RULE + "\n\n"
                "A message too large for the channel arrives as an envelope instead of the "
                "words: a line starting with `[Antiphon attachment]` naming an absolute path "
                "under `.antiphon/messages/`, the content's size and its SHA-256. Read that "
@@ -6541,10 +6740,12 @@ CLAUDE_RULE = ("\n## The Antiphon bridge\n\n"
                "sender_alias=\"...\">`; ordinary events "
                "are the words of the Codex agent, not of the human user. Use the "
                "`reply_to_codex` tool to answer them, passing `sender_alias` back "
-               "as `to` whenever it is a name rather than the literal `<unnamed>`: "
-               "a bare reply is refused as soon "
-               "as any named Codex peer is live, because unnamed sessions leave "
-               "no routable peer record and cannot be ruled out. A `sender_alias` of "
+               "as `to` whenever it is a name rather than the literal `<unnamed>`. "
+               "A bare reply works when no Codex peer is registered, or when one "
+               "positively live automatic peer is the only candidate. It is refused "
+               "when an explicit named peer or multiple positive candidates are live, "
+               "because unnamed sessions before their first hook cannot be ruled out. "
+               "A `sender_alias` of "
                "`<unnamed>` means that peer has no name: it cannot be answered by "
                "name, and a bare reply reaches it only where nothing is registered "
                "— passing `<unnamed>` as `to` is the same as leaving it out. Your "
@@ -6564,11 +6765,10 @@ CLAUDE_RULE = ("\n## The Antiphon bridge\n\n"
                "A reply reaches one peer and is never broadcast, and the same holds when you "
                "open the exchange: `@codex:name` at the start of a line addresses one peer, "
                "and an unaddressed line is refused rather than delivered to a guess. For the "
-               "same reason every terminal in a project with more than one session per side "
-               "has to be started with `ANTIPHON_NAME` set — Codex terminals above all, "
-               "because an unnamed Codex session leaves no routable peer record, and one that "
-               "exists unseen is why a bare message to Codex is refused. "
-               + UNNAMED_CODEX_OBSERVATION_RULE + " "
+               "same reason, use each peer's automatic alias or start every terminal with a "
+               "distinct `ANTIPHON_NAME`; a session before its first hook can still be unseen, "
+               "which is why ambiguous bare messages are refused. "
+               + AUTOMATIC_PEER_IDENTITY_RULE + " "
                + MULTILINE_MARKER_RULE + " "
                + LONG_MARKER_RULE.format(tool="reply_to_codex") + "\n\n"
                "A message too large for the transport arrives as an envelope instead of the "
@@ -7059,13 +7259,12 @@ def setup():
     print("\n— Start Claude with the channel enabled:")
     print("  claude --dangerously-load-development-channels server:antiphon")
     print("  In the research preview, the first launch needs both a development channel and an MCP approval.")
-    print("\n— More than one terminal on either side? Name every one of them:")
+    print("\n— More than one terminal? Explicit names are recommended:")
     print("  ANTIPHON_NAME=ui claude --dangerously-load-development-channels server:antiphon")
     print("  ANTIPHON_NAME=build codex")
-    print("  An unnamed session still runs, but it cannot be addressed by name. Name the")
-    print("  Codex terminals above all: an unnamed observation is diagnostic only,")
-    print("  so once any Codex peer is named, an unaddressed message to Codex is refused")
-    print("  rather than sent to a guess.")
+    print("  Antiphon may assign an automatic auto- alias after host identity is proved.")
+    print("  ANTIPHON_NAME overrides it and remains the clearest choice for several")
+    print("  terminals; a bare send is refused when more than one candidate is live.")
     if failures:
         listed = "\n  ".join(failures)
         print(f"\n✗ setup did not finish. {len(failures)} file(s) were left untouched "
@@ -7105,12 +7304,12 @@ def _live_by_kind(cwd):
             for kind, found in grouped.items()}
 
 
-def _codex_census_line(registered, observations):
+def _codex_census_line(registered, identities):
     """One honest lower-bound census; branch U can never print an exact zero."""
-    total = len(registered) + len(observations.live)
+    total = len(registered) + len(identities.live_sessions)
     line = (f"Codex session census: at least {total} live observed; additional "
             "sessions before their first hook may be invisible")
-    unknown = len(observations.unknown)
+    unknown = len(identities.unknown)
     if unknown:
         noun = "observation" if unknown == 1 else "observations"
         verb = "has" if unknown == 1 else "have"
@@ -7118,15 +7317,15 @@ def _codex_census_line(registered, observations):
     return line
 
 
-def _peer_report(live, observations=None):
+def _peer_report(live, identities=None):
     """The `Peers:` block and the addressing hints under it, as lines.
 
-    Empty when neither a registered peer nor a positively live unnamed
-    observation exists. The lower-bound census is printed separately even in
-    that case; zero observations never proves zero sessions.
+    Empty when neither a registered nor projected automatic peer exists. The
+    lower-bound census is printed separately even in that case; zero
+    observations never proves zero sessions.
     """
-    observations = observations or CodexObservationSnapshot((), ())
-    if not (live["claude"] or live["codex"] or observations.live):
+    identities = identities or CodexIdentitySnapshot((), (), (), ())
+    if not (live["claude"] or live["codex"] or identities.conflicts):
         return []
 
     lines = ["", "Peers:"]
@@ -7139,8 +7338,8 @@ def _peer_report(live, observations=None):
             state = ("ready" if peer.get("address") is not None
                      else "waiting for first turn")
             lines.append(f"  {kind.title()} {peer.get('name')} — {state}")
-    for session_id in observations.live:
-        lines.append(f"  Codex unnamed observation {session_id} — live, not "
+    for name in identities.conflicts:
+        lines.append(f"  Codex automatic identity collision at {name} — not "
                      "addressable")
 
     def addressable(kind):
@@ -7158,22 +7357,20 @@ def _peer_report(live, observations=None):
             lines.append("  → one Claude peer has no name and cannot be "
                          "addressed; restart it with ANTIPHON_NAME set to "
                          "reach it while others are live")
-    if live["codex"] or len(observations.live) > 1:
+    automatic = [peer for peer in live["codex"]
+                 if peer.get("automatic") is True]
+    if len(live["codex"]) == 1 and automatic:
+        name = automatic[0].get("name")
+        lines.append(f"  → automatic peer: @codex:{name}; a bare @codex line "
+                     "also reaches it while it is the only positive candidate")
+    elif live["codex"] or identities.conflicts:
         named = ", ".join(f"@codex:{name}" for name in addressable("codex"))
         if named:
             lines.append(f"  → a bare @codex line is refused; address a named "
                          f"peer: {named}")
         else:
-            lines.append("  → a bare @codex line is refused; no observed "
-                         "session has a name")
-    if observations.live:
-        if len(observations.live) == 1:
-            lines.append("  → the observed unnamed Codex session cannot be "
-                         "addressed; restart it with ANTIPHON_NAME set")
-        else:
-            lines.append("  → observed unnamed Codex sessions cannot be "
-                         "addressed; restart each intended terminal with a "
-                         "distinct ANTIPHON_NAME")
+            lines.append("  → a bare @codex line is refused until the automatic "
+                         "identity collision is resolved")
     return lines
 
 
@@ -7258,10 +7455,11 @@ def _catalog_status_line(side, discovery):
             f"{discovery.refusals} refused; {discovery.gone} gone")
 
 
-def _source_activity_line(cwd, side, discovery, positions=None):
+def _source_activity_line(cwd, side, discovery, positions=None,
+                          identities=None):
     """Aggregate scheduler evidence for readable sources, never identities."""
     kind = "codex" if side == "claude" else "claude"
-    join = _source_activity(cwd, kind)
+    join = _source_activity(cwd, kind, identities)
     counts = {"live": 0, "unknown": 0, "dead": 0}
     for path in discovery.sources:
         source = (path.candidate.expected_source
@@ -7299,13 +7497,15 @@ def status():
     # socket-file-shaped pathname. Registered peers get the same startup
     # patience doctor gives them; the ordinary idle-project path is tried once.
     live = _live_by_kind(cwd)
-    observations = _codex_observation_snapshot(cwd, live["codex"])
+    identities = _codex_identity_snapshot(cwd, live["codex"])
+    displayed = {"claude": live["claude"],
+                 "codex": live["codex"] + list(identities.automatic)}
     channel = ("live" if _channel_answering(cwd, live["claude"])
                else "down")
     print(f"Claude channel:     {channel}")
     print(attachment_report(cwd))
-    print(_codex_census_line(live["codex"], observations))
-    for line in _peer_report(live, observations):
+    print(_codex_census_line(live["codex"], identities))
+    for line in _peer_report(displayed, identities):
         print(line)
     snapshots = {}
     by_path = {}
@@ -7339,7 +7539,7 @@ def status():
         print(_catalog_status_line(side, discovery))
     for side in ("claude", "codex"):
         print(_source_activity_line(
-            cwd, side, discoveries[side], runtime_positions[side]))
+            cwd, side, discoveries[side], runtime_positions[side], identities))
     cleanup_pending = _catalog_cleanup_pending(cwd)
     if cleanup_pending is None:
         print("source manifests: cleanup pending unknown")
@@ -8067,15 +8267,18 @@ def _doctor_peers(report, cwd):
 
 
 def _doctor_codex_observations(report, cwd, registered):
-    """Report one read-only lower-bound snapshot and its live unnamed ids."""
+    """Report one read-only lower-bound automatic-identity snapshot."""
     codex = [record for record in registered
              if record.get("kind") == "codex"]
-    observations = _codex_observation_snapshot(cwd, codex)
-    report.note(_codex_census_line(codex, observations))
-    for session_id in observations.live:
-        report.note(f"Codex unnamed observation {session_id} — live, not "
-                    "addressable — restart it with ANTIPHON_NAME set")
-    return observations
+    identities = _codex_identity_snapshot(cwd, codex)
+    report.note(_codex_census_line(codex, identities))
+    for peer in identities.automatic:
+        report.ok(f"peer codex/{peer.get('name')}: live and addressed "
+                  "(automatic after first hook)")
+    for name in identities.conflicts:
+        report.bad(f"peer codex/{name}: automatic identity collision; no "
+                   "delivery can choose this alias")
+    return identities
 
 
 def _doctor_channel(report, cwd, live):
@@ -9332,6 +9535,7 @@ COMMANDS = {
     "hook": hook, "summary": print_summary,
     "push": push, "reply": reply, "mcp": mcp, "register_peer": register_peer,
     "unregister_peer": unregister_peer, "retrieve_mcp": _retrieve_mcp_bridge,
+    "claude_identity": _claude_identity_bridge,
     # Legacy aliases for old local installs, kept during the transition period.
     "kur": setup, "durum": status, "kanca": hook, "ozet": print_summary,
     "it": push, "yanit": reply,
