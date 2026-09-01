@@ -7893,8 +7893,9 @@ def _doctor_codex_tool_shapes(report, cwd):
                     "discovery or reading is incomplete")
     elif count:
         noun = "record" if count == 1 else "records"
+        verb = "is" if count == 1 else "are"
         report.bad(f"codex tool shapes: {count} unrecognized tool-call "
-                   f"{noun} are omitted from passive pages — Codex's host "
+                   f"{noun} {verb} omitted from passive pages — Codex's host "
                    "schema may have changed; update Antiphon")
     else:
         report.ok("codex tool shapes: 0 unrecognized tool-call records in "

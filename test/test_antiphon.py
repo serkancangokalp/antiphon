@@ -4218,11 +4218,8 @@ class DoctorTest(unittest.TestCase):
         self.assertEqual(code, 0, printed)
 
     def test_doctor_counts_rejected_codex_call_shapes_privately_and_read_only(self):
-        project = self.project()
         source = "17efb035-5650-4c4a-a363-026420ece317"
-        path = os.path.join(project,
-                            "rollout-2026-09-01T00-00-00-%s.jsonl" % source)
-        records = [
+        rejected = [
             {"type": "response_item", "payload": {
                 "type": "custom_tool_call", "name": "exec",
                 "call_id": "call_known", "input": "PRIVATE-KNOWN"}},
@@ -4240,19 +4237,59 @@ class DoctorTest(unittest.TestCase):
                 "type": "message", "role": "assistant",
                 "content": [{"type": "output_text", "text": "ordinary"}]}}
         ]
-        with open(path, "w", encoding="utf-8") as stream:
-            for record in records:
-                stream.write(json.dumps(record) + "\n")
-        self.set_up(project)
-        before = self.snapshot(project)
 
-        count = antiphon._codex_tool_shape_count(
-            project, source_paths=[path])
-        with patch.object(antiphon, "_codex_tool_shape_count",
-                          return_value=count):
-            code, printed = self.run_doctor(project)
+        def run_fixture(records, complete=True, degraded=False, fault=False):
+            project = self.project()
+            claude_root = self.project()
+            codex_root = self.project()
+            os.makedirs(os.path.join(
+                claude_root, antiphon._claude_slug(project)))
+            path = os.path.join(
+                codex_root, "2026", "09", "01",
+                "rollout-2026-09-01T00-00-00-%s.jsonl" % source)
+            os.makedirs(os.path.dirname(path))
+            with open(path, "w", encoding="utf-8") as stream:
+                stream.write(json.dumps({
+                    "type": "session_meta", "payload": {"cwd": project},
+                }) + "\n")
+                for record in records:
+                    stream.write(json.dumps(record) + "\n")
+            self.set_up(project)
 
-        self.assertEqual(count, 2)
+            def read_fault(_source):
+                raise OSError(errno.EIO, "injected diagnostic read fault")
+                yield
+
+            with patch.object(antiphon, "CLAUDE_PROJECTS", claude_root), \
+                 patch.object(antiphon, "CODEX_SESSIONS", codex_root):
+                if complete:
+                    with patch.object(antiphon, "project_dir",
+                                      return_value=project), \
+                         contextlib.redirect_stdout(io.StringIO()), \
+                         contextlib.redirect_stderr(io.StringIO()):
+                        self.assertEqual(antiphon.sources("scan"), 0)
+                    view = antiphon._catalog_view(project, "codex")
+                    self.assertEqual(view.state, "complete")
+                    if degraded:
+                        relative = os.path.relpath(path, codex_root)
+                        os.unlink(antiphon._catalog_record_path(
+                            project, "codex", relative))
+                before = self.snapshot(project)
+                with contextlib.ExitStack() as stack:
+                    stack.enter_context(patch.object(
+                        antiphon._PathSource, "read_retrieval_records",
+                        side_effect=AssertionError(
+                            "doctor bypassed descriptor-owned SafeSource")))
+                    if fault:
+                        stack.enter_context(patch.object(
+                            antiphon.SafeSource, "read_retrieval_records",
+                            new=read_fault))
+                    code, printed = self.run_doctor(project)
+                after = self.snapshot(project)
+            self.assertEqual(after, before)
+            return code, printed, path
+
+        code, printed, path = run_fixture(rejected)
         lines = [line for line in printed.splitlines()
                  if "codex tool shapes:" in line]
         self.assertEqual(len(lines), 1)
@@ -4263,43 +4300,42 @@ class DoctorTest(unittest.TestCase):
                        "PRIVATE-FUTURE", source, path, "future_tool_call"):
             self.assertNotIn(secret, lines[0])
         self.assertEqual(code, 1)
-        self.assertEqual(self.snapshot(project), before)
 
-        known_path = os.path.join(project, "known-" + source + ".jsonl")
-        with open(known_path, "w", encoding="utf-8") as stream:
-            for record in records[:2] + records[-1:]:
-                stream.write(json.dumps(record) + "\n")
-        self.assertEqual(antiphon._codex_tool_shape_count(
-            project, source_paths=[known_path]), 0)
+        code, printed, _path = run_fixture(
+            rejected[:2] + rejected[-1:])
+        green = self.line_for(printed, "codex tool shapes:")
+        self.assertTrue(green.startswith("✓"), green)
+        self.assertIn("0 unrecognized tool-call records", green)
+        self.assertEqual(code, 0, printed)
 
-        for value, prefix in ((0, "✓"), (None, "·")):
-            with self.subTest(value=value):
-                report, out = antiphon._Report(), io.StringIO()
-                with patch.object(antiphon, "_codex_tool_shape_count",
-                                  return_value=value), \
-                     contextlib.redirect_stdout(out):
-                    antiphon._doctor_codex_tool_shapes(report, project)
-                line = self.line_for(out.getvalue(), "codex tool shapes:")
-                self.assertTrue(line.startswith(prefix), line)
-                if value is None:
-                    self.assertIn("amount unknown", line)
-                else:
-                    self.assertIn("0 unrecognized tool-call records", line)
-                self.assertFalse(report.broken)
+        code, printed, _path = run_fixture(rejected, complete=False)
+        unknown = self.line_for(printed, "codex tool shapes:")
+        self.assertTrue(unknown.startswith("·"), unknown)
+        self.assertIn("amount unknown", unknown)
+        self.assertEqual(code, 0, printed)
 
-        building = antiphon.Discovery(
-            (path,), "building", 1, 0, 0, "catalog incomplete")
-        self.assertIsNone(antiphon._codex_tool_shape_count(
-            project, discovery=building))
+        code, printed, _path = run_fixture(rejected, degraded=True)
+        unknown = self.line_for(printed, "codex tool shapes:")
+        self.assertTrue(unknown.startswith("·"), unknown)
+        self.assertIn("amount unknown", unknown)
+        self.assertIn("source catalog claude_pages: degraded", printed)
+        self.assertEqual(code, 1, printed)
 
-        def read_fault(_source):
-            raise OSError(errno.EIO, "injected diagnostic read fault")
-            yield
+        code, printed, _path = run_fixture(rejected, fault=True)
+        unknown = self.line_for(printed, "codex tool shapes:")
+        self.assertTrue(unknown.startswith("·"), unknown)
+        self.assertIn("amount unknown", unknown)
+        self.assertEqual(code, 0, printed)
 
-        with patch.object(antiphon._PathSource, "read_retrieval_records",
-                          new=read_fault):
-            self.assertIsNone(antiphon._codex_tool_shape_count(
-                project, source_paths=[path]))
+        project = self.project()
+        report, out = antiphon._Report(), io.StringIO()
+        with patch.object(antiphon, "_codex_tool_shape_count", return_value=1), \
+             contextlib.redirect_stdout(out):
+            antiphon._doctor_codex_tool_shapes(report, project)
+        singular = self.line_for(out.getvalue(), "codex tool shapes:")
+        self.assertIn("1 unrecognized tool-call record is omitted", singular)
+        self.assertNotIn("record are omitted", singular)
+        self.assertTrue(report.broken)
 
     def test_a_healthy_idle_project_prints_no_x(self):
         """A set-up project with no session running is not broken. No socket,
