@@ -105,9 +105,23 @@ The first automatic endpoint may register with **no proof at all**, as an
 UNREADY candidate: at startup no hook has run yet, so no proof can exist. It is
 a candidate, never a ready peer.
 
-If a proof does exist, the registration must match it. Every automatic
-**reassert** requires the matching current proof, so a stale A can never
-republish after proof B lands — which is the whole point of putting the check
+The check belongs **inside the same Python registry lock that writes the
+endpoint**, never as a Node precheck. The real path is
+`channel.mjs` → `register_peer` → `peers.register`, so a proof validated in Node
+and a registration performed later in Python are two moments with a window
+between them, and the proof can move inside that window. Checking where the
+write happens closes it by construction.
+
+Initial registration and reassert also carry **different rules and must be
+distinguishable**, which today they are not: both send the same payload, so once
+an endpoint has been pruned Python cannot tell them apart. The bridge contract
+takes a strict allowlisted `mode`. `initial` opens an UNREADY candidate claim
+only when the classified read says the proof is genuinely `absent`; when a valid
+proof exists it must match exactly; `invalid` or `unreadable` refuses. `reassert`
+requires a valid exactly-matching proof in every case. An unknown mode fails
+closed.
+
+So a stale A can never republish after proof B lands — which is the whole point of putting the check
 on register and reassert rather than on delivery alone.
 
 The whole rotation is **one transaction under one lock acquisition**, exposed
