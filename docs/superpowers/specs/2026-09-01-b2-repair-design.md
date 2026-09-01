@@ -39,6 +39,24 @@ validation. With it the invariant holds even if cleanup never runs and the
 wakeup never arrives: a connection arriving after the proof moved is refused at
 the moment of delivery and emits no notification.
 
+That refusal is **classified**, not a transport error. The listener replies
+`ok:false` carrying a stable non-transport `refusal_class` and an actionable
+remedy, flushes that response, and only then self-retires. The delivery attempt
+is therefore its own wakeup, and cleanup stops depending on a control that may
+never arrive. Python preserves that class through `_ClassifiedRefusal` rather
+than recasting every negative reply as `transport`, so a sender learns the
+identity moved instead of that the socket failed.
+
+The retire control becomes an optimisation rather than a correctness mechanism:
+routing is already safe from the proof, and cleanup is already guaranteed by the
+first stale delivery attempt.
+
+RED test, the race named exactly: sender resolves A; hook B commits the proof;
+the wakeup is withheld; the sender connects to A's socket. Assert the listener
+refuses with the classified reason, that zero channel notifications are emitted,
+that the response is flushed before the socket closes, and that A has
+self-retired afterwards.
+
 ## 3. The proof record
 
 - One file per owner under the project's registry area, named from a digest of
@@ -92,11 +110,17 @@ subprocess per delivered message is both a cost and a new failure mode on the
 hot path.
 
 Node therefore reads the proof file directly with mirrored validation, and the
-two readers are bound by parity tests rather than by assertion. The parity suite
-drives both over identical fixtures and requires identical verdicts for: a valid
-current proof; a proof naming a different session; a missing file; a wrong
-version; a wrong kind; a malformed digest; a non-canonical session id; a torn
-record; and an empty file.
+two readers are bound by parity tests rather than by assertion. Parity is proved over the **whole readiness predicate** — endpoint, session
+half and owner-current proof together — not over proof parsing alone. Parsing
+agreement would still let the resolver and the listener disagree about a
+composite, and the composite is the thing that decides delivery.
+
+The parity suite drives both readers over identical fixtures and requires
+identical verdicts for: a valid current proof; a proof that is missing,
+wrong-version, wrong-kind, malformed-digest, non-canonical-id, torn, empty, or
+naming a different session; a missing or torn session half; a missing or torn
+endpoint; and owner, digest, pid and address mismatches between the three
+halves.
 
 ## 6. The accepted cost, named
 
@@ -114,7 +138,16 @@ or a route while saying it.
 
 Presence and usability are different facts. A normalized non-empty unusable
 value is a configured-invalid override: no observation, no automatic
-projection, no route, no status peer, and Node does not probe. Absence alone
+projection, no route, no status peer, and Node does not probe.
+
+Ignoring a legacy observation by predicate is impossible and the design does
+not pretend otherwise. An observation record carries version, kind, session id
+and time — nothing that says which environment wrote it — so a later resolver
+cannot tell a bug-created one from a legitimate one, and a stale record with a
+positively held writer lock would keep projecting. The configured-invalid hook
+therefore **withdraws durably**: it idempotently retires the observation for its
+own canonical session id, and only that id. It never touches another session's
+record, and it renders no path or id while doing it. Absence alone
 enables automatic identity.
 
 Empty and whitespace remain **absent**: `explicit_name()` documents "the name
@@ -125,11 +158,22 @@ defect.
 
 ## 8. The probe is bounded at the read
 
-Fixed argv; streaming reads under a 2s deadline; exact byte ceilings on stdout
-and on stderr, so total retained memory is bounded by their sum; strict decode;
-JSON parsed only after bounded completion. On timeout or either overflow:
-terminate, then kill and reap, and return unnamed. None of the captured bytes
-are emitted.
+Fixed argv; streaming reads; strict decode; JSON parsed only after bounded
+completion. The bounds are literal, not adjectival:
+
+| bound | value | why |
+| --- | --- | --- |
+| deadline | 2.0 s | the existing `CLAUDE_IDENTITY_TIMEOUT`, unchanged |
+| stdout ceiling | 32,768 bytes | the same number `channel.mjs` already uses as `maxBuffer` on this probe, so the two sides cannot disagree about what is too large |
+| stderr ceiling | 8,192 bytes | room for a real diagnostic and no more |
+| total retained | 40,960 bytes | their sum, and nothing else is held |
+| overflow boundary | the byte that would exceed a ceiling | a limit on what is retained triggers at the first byte past it, not after the read completes |
+| terminate to kill | 250 ms, then `SIGKILL` | bounded |
+| reap wait | 250 ms | a child that cannot be reaped is reported, never awaited forever |
+| retire control | 250 ms total, no reply awaited | connect, send, close; any error swallowed |
+
+On timeout or either overflow: terminate, then kill and reap, and return
+unnamed. None of the captured bytes are emitted.
 
 The child starts in its own session before any group-directed signal. If that
 isolation cannot be established, only the child pid is signalled — never widen a
