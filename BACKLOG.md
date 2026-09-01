@@ -160,7 +160,7 @@ the write-and-flush-before-advance transaction.
   incrementing the human-message count. Failed delivery persists neither their
   frontier nor scheduler lane, and no output can move the frontier past a first
   undelivered visible call.
-- A doctor diagnostic, released in 0.4.0, protects the same failure boundary
+- A doctor diagnostic, on `main` at 0.4.0, protects the same failure boundary
   that let roughly 6,400 real calls disappear while the old suite stayed green.
   On explicit `antiphon doctor` only, it scans the trusted complete Codex
   discovery set and counts aggregate call-like records the production
@@ -174,7 +174,7 @@ the write-and-flush-before-advance transaction.
   indexless scan over 243 MB cost about 579 ms, acceptable for an explicit
   diagnostic and not for every turn.
 
-### Completed by Wave 1D stable tool invocation retrieval (shipped in 0.4.0)
+### Completed by Wave 1D stable tool invocation retrieval (on `main` at 0.4.0)
 
 - Every recognized tool invocation now carries a 22-character opaque,
   content-bound `tc1.<kind>.<digest>` id on its compact page entry. The digest
@@ -1351,11 +1351,11 @@ inherited-locale `ps lstart` fingerprint defect reproduced above. The candidate
 branch beginning at `a4533d1` and completed for migration by `6902546`
 canonicalises new observations under `LC_ALL=C` and `TZ=UTC`, versions both
 endpoint births and owner keys, and treats an unversioned fingerprint as
-unverifiable rather than dead. Those commits ship in 0.4.0; published
-0.3.3 and earlier still carry the defect, which is what an operator on an
-older install is reading when they meet it.
+unverifiable rather than dead. Those commits are on `main` at 0.4.0 and are
+not published: 0.3.3 is what npm serves and it still carries the defect, which
+is what an operator on an installed copy is meeting.
 
-**What ships in 0.4.0.** A valid Claude `ANTIPHON_NAME` now
+**What is on `main` at 0.4.0.** A valid Claude `ANTIPHON_NAME` now
 signs both of its outgoing roads — the channel's `reply_to_codex` subprocess
 and the Stop-hook push —
 without treating ownership of the return socket as identity. Codex keeps the
@@ -1578,7 +1578,7 @@ terminal with a distinct `ANTIPHON_NAME`, then address it by name. This closes
 visibility and honest ambiguity, not automatic identity or unnamed
 addressability; those remain the next entry's work.
 
-## P2 — Automatic peer identity (shipped in 0.4.0)
+## P2 — Automatic peer identity (on `main` at 0.4.0)
 
 The design is approved after measuring both hosts on 2026-09-01. Claude Code
 2.1.251 returned exactly one interactive record from `claude agents --json
@@ -1631,7 +1631,7 @@ name is ignored, and `ANTIPHON_NAME` is the explicit override. Older peers that
 cannot supply the new proof remain on the existing unnamed/explicit paths; no
 mixed-version guess or automatic migration rewrites their records.
 
-**What ships in 0.4.0.** The registry derives the
+**What is on `main` at 0.4.0.** The registry derives the
 pinned 31-character alias, stores and validates the complete digest, rejects
 explicit/automatic and same-prefix/full-digest collisions, and refuses an
 automatic session whose digest does not belong to its canonical UUID. Codex
@@ -1652,11 +1652,13 @@ same canonical UUID grammar, including a pinned UUIDv7 regression case.
 README, setup guidance, both generated rules and live channel instructions now
 state the first-hook/probe windows, ignored Claude display name, explicit
 override, one-vs-many bare-send rule, mixed-version refusal and privacy
-boundary. This work ships in 0.4.0: merged to `main`, certified on an exact
-commit by `fresh-user.sh`, and reviewed independently before release. The test
-count moves with the suite and is not restated here — a number written into
-prose is stale the next time anyone adds a test, and this one was stale by a
-hundred.
+boundary. This work is merged to `main` and carries version 0.4.0, certified
+on an exact commit by `fresh-user.sh` and reviewed independently. **It is not
+published to npm**: `npm i -g antiphon` still installs 0.3.3, which does not
+contain it; installing from the repository does. See the release-gate note
+under P1 for why publication is held. The test count moves with the suite and
+is not restated here — a number written into prose is stale the next time
+anyone adds a test, and this one was stale by a hundred.
 
 ## P2 — Cross-vendor managed workers
 
@@ -1879,6 +1881,42 @@ The asymmetry that governs a doubtful case: a tag missing from a set lets one
 stray host line leak into a summary — visible, and cheap to fix by adding it.
 A tag wrongly present deletes a person's message — silently, with nothing left
 behind to notice it happened. When the evidence is thin, leave the tag out.
+
+## P1 — 0.4.0 is on `main` and held back from npm
+
+`main` carries version 0.4.0 with the automatic-identity repair merged, and
+npm still serves 0.3.3. The hold is deliberate and this is the reason.
+
+Eight independent review rounds ran against the exact release commit — some by
+the Codex peer, some by read-only agents — and **every one of them found
+something**. Several were destructive: a listener retiring itself on a record
+the other reader refuses outright, a process deleting a successor's socket, a
+delivery emitted from an endpoint that no longer described the emitter. None of
+those survive; each was reproduced, fixed red-first, and pinned.
+
+What stopped the release was the shape of the sequence rather than any single
+finding. Late rounds kept finding defects **introduced by the previous round's
+fix**: binding the endpoint's pid to the listener left the birth unbound;
+binding the birth took its authority from the very record it was judging, and
+made the check fail open when that read failed; adding the fail-closed put it
+on the inbound gate and left signing calling the raw verdict. Each fix was
+correct and each opened the next surface.
+
+The tests told the same story from the other side. Four fixtures written during
+these rounds passed for the wrong reason: one landed in an assertion group that
+cannot see what it was named for, two never reached the race they described,
+one was green because an unrelated precondition was missing. All four are
+fixed, and the parity suite now audits its own bucket membership — but a
+campaign that produces that many is a campaign whose remaining unknowns are not
+estimable from the outside.
+
+So: no open finding blocks 0.4.0, and that is not the same as ready. Publishing
+is a decision to stop looking, and the evidence does not yet support making it.
+Resuming means another exact-SHA round, not a fresh audit — the state is
+certified (full suite, statics, `fresh-user.sh`) at the commit `main` points to.
+
+What is worth doing before it: run a round that finds nothing in product
+behaviour, and treat *that* as the signal rather than fatigue.
 
 ## P1 — `reply_to_codex` can report success while the peer receives nothing
 
