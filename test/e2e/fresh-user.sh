@@ -193,6 +193,37 @@ DOCTOR="$(cd "$PROJECT" && antiphon doctor 2>&1)"; DOCTOR_CODE=$?
 check "doctor exit on a fresh project" "$DOCTOR_CODE" "0"
 lacks "doctor finds nothing broken" "$DOCTOR" "✗"
 
+# Break one project-local entry with a fixed Python program. No command read
+# from the configuration is executed, and no runtime state is involved.
+python3 - "$PROJECT/.mcp.json" <<'PY'
+import json, sys
+path = sys.argv[1]
+with open(path, encoding="utf-8") as source:
+    data = json.load(source)
+servers = data.get("mcpServers")
+if not isinstance(servers, dict) or "antiphon" not in servers:
+    raise SystemExit(1)
+del servers["antiphon"]
+with open(path, "w", encoding="utf-8") as target:
+    json.dump(data, target, indent=2)
+    target.write("\n")
+PY
+[ "$?" -eq 0 ] && pass "the fixture removed only the project MCP entry" \
+                 || fail "the fixture could not remove the project MCP entry"
+BROKEN_DOCTOR="$(cd "$PROJECT" && antiphon doctor 2>&1)"; BROKEN_DOCTOR_CODE=$?
+check "ordinary doctor rejects the broken project" "$BROKEN_DOCTOR_CODE" "1"
+contains "ordinary doctor names the missing MCP server" "$BROKEN_DOCTOR" ".mcp.json: missing"
+REPAIR="$(cd "$PROJECT" && antiphon doctor --fix 2>&1)"; REPAIR_CODE=$?
+check "doctor --fix repairs project configuration" "$REPAIR_CODE" "0"
+contains "the repair says what setup changed" "$REPAIR" "Claude MCP Channel registered"
+contains "the repair marks its read-only re-check" "$REPAIR" "doctor re-check (read-only)"
+AFTER_REPAIR="$(cd "$PROJECT" && antiphon doctor 2>&1)"; AFTER_REPAIR_CODE=$?
+check "ordinary doctor is clean after repair" "$AFTER_REPAIR_CODE" "0"
+lacks "the repaired project has no broken finding" "$AFTER_REPAIR" "✗"
+check "doctor --fix left global Codex config untouched" \
+  "$(shasum -a 256 "$HOME/.codex/config.toml" 2>/dev/null | cut -d' ' -f1)" \
+  "$CODEX_CONFIG_BEFORE"
+
 step "T2 — Claude writes to a Codex that does not exist yet"
 BEFORE_QUEUE="$(queued)"
 case "$BEFORE_QUEUE" in

@@ -7,6 +7,7 @@ Usage:
   antiphon setup               # installs the hook on both sides
   antiphon status              # shows what's happening on both sides (for humans)
   antiphon doctor              # read-only checkup: why is the bridge quiet?
+  antiphon doctor --fix        # writes project configuration only, then re-checks
   antiphon summary [side]      # the text that side would see (claude | codex)
   antiphon hook <side>         # prompt and session hook (reads JSON from stdin)
   antiphon push <target>       # Stop hook: pushes `@codex` / `@claude` lines
@@ -5500,7 +5501,7 @@ def _doctor_codex_queue(report, cwd):
                     "that thread is resumed")
 
 
-def doctor():
+def _doctor_readonly():
     """Explains a quiet bridge without touching it.
 
     Read-only by construction: nothing here opens a file for writing, takes the
@@ -5524,6 +5525,21 @@ def doctor():
     _doctor_codex(report, cwd)
     _doctor_replay(report, cwd)
     return 1 if report.broken else 0
+
+
+def doctor(mode=None):
+    """Diagnose by default; optionally repair project configuration, then check."""
+    if mode is None:
+        return _doctor_readonly()
+    if mode != "--fix":
+        print(f"antiphon: doctor accepts only --fix, got {mode}",
+              file=sys.stderr)
+        return 2
+    print("repair: project configuration only; runtime state is not changed")
+    setup_status = setup()
+    print("\n— doctor re-check (read-only) —")
+    doctor_status = _doctor_readonly()
+    return 1 if setup_status or doctor_status else 0
 
 
 def _doctor_replay(report, cwd):

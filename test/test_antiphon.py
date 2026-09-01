@@ -3137,6 +3137,57 @@ class DoctorTest(unittest.TestCase):
             code = antiphon.doctor()
         return code, out.getvalue()
 
+    # ---- the explicit configuration-only repair mode ----
+
+    def test_doctor_fix_runs_setup_then_a_read_only_recheck(self):
+        with patch.object(antiphon, "setup", return_value=0) as setup, \
+             patch.object(antiphon, "_doctor_readonly",
+                          return_value=0) as recheck:
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out):
+                code = antiphon.doctor("--fix")
+        self.assertEqual(code, 0)
+        setup.assert_called_once_with()
+        recheck.assert_called_once_with()
+        self.assertIn("configuration only", out.getvalue())
+        self.assertIn("read-only", out.getvalue())
+
+    def test_doctor_fix_keeps_setup_refusal_nonzero(self):
+        with patch.object(antiphon, "setup", return_value=1) as setup, \
+             patch.object(antiphon, "_doctor_readonly",
+                          return_value=0) as recheck, \
+             contextlib.redirect_stdout(io.StringIO()):
+            code = antiphon.doctor("--fix")
+        self.assertEqual(code, 1)
+        setup.assert_called_once_with()
+        recheck.assert_called_once_with()
+
+    def test_doctor_fix_keeps_remaining_runtime_fault_nonzero(self):
+        with patch.object(antiphon, "setup", return_value=0), \
+             patch.object(antiphon, "_doctor_readonly", return_value=1), \
+             contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(antiphon.doctor("--fix"), 1)
+
+    def test_doctor_rejects_unknown_mode_and_help_names_write_boundary(self):
+        error = io.StringIO()
+        with contextlib.redirect_stderr(error):
+            self.assertEqual(antiphon.doctor("nonsense"), 2)
+        self.assertIn("accepts only --fix", error.getvalue())
+
+        script = os.path.join(os.path.dirname(antiphon.__file__), "antiphon.py")
+        refused = subprocess.run(
+            [sys.executable, script, "doctor", "nonsense"],
+            capture_output=True, text=True, timeout=60,
+            stdin=subprocess.DEVNULL)
+        self.assertEqual(refused.returncode, 2, refused.stderr)
+        self.assertIn("accepts only --fix", refused.stderr)
+        helped = subprocess.run(
+            [sys.executable, script, "--help"], capture_output=True,
+            text=True, timeout=60, stdin=subprocess.DEVNULL)
+        self.assertEqual(helped.returncode, 0, helped.stderr)
+        self.assertIn("doctor --fix", helped.stdout)
+        self.assertIn("project configuration only", helped.stdout)
+
     @staticmethod
     def snapshot(*roots):
         """Every file under each root, by bytes, size and mtime.
