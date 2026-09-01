@@ -60,8 +60,12 @@ the write-and-flush-before-advance transaction.
   fixed number of writes and bytes independent of catalog size. Starting or
   refreshing a generation still publishes one full immutable manifest and is
   O(retained candidates); monotone retention makes that transition grow until
-  cursor-aware v4 retirement. Hooks record their current source first, then
-  inspect one bounded batch through finite base/reconcile/delta generations;
+  cursor-aware v4 retirement. Superseded manifests are also retained in 1A:
+  if each refresh adds one candidate, their worst-case on-disk total is
+  quadratic in the retained candidate count. Reclamation belongs to that same
+  v4 retirement rather than to a deletion rule this wave cannot yet prove.
+  Hooks record their current source first, then inspect one bounded batch
+  through finite base/reconcile/delta generations;
   `antiphon sources scan` completes or refreshes the same catalog without
   moving a page cursor. Status and doctor report aggregate complete/building/
   degraded truth separately for each reader, without paths or source ids.

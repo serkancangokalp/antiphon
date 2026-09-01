@@ -81,20 +81,21 @@ catalog. The measured corpus creates about 563 small JSON records; this inode
 and directory footprint is the current snapshot, not a steady-state bound.
 The catalog is structurally monotone through Wave 1A: it retains every proved
 candidate until cursor-aware v4 retirement, the accepted price of bounded
-normal-hook writes without silent narrowing.
+resumed-batch writes without silent narrowing.
 Starting or refreshing a generation publishes the full retained-candidate
 manifest and is therefore O(catalog size); only resumed batch turns have the
 size-independent write bound measured below.
 
 Every mutation holds `.antiphon/sources/.lock` and persists through an adjacent
-temporary file plus `os.replace`. A normal hook rewrites at most its current
-candidate record, the fixed batch of candidate records it inspects, and the
-small `state.json`; total bytes written are therefore bounded independently of
-catalog size. Manifests are immutable after publication. The lock is never held
-while a transcript is scanned or while a page, cursor, socket or queue operation
-runs. The operation is: read state and reserve a bounded work batch under the
-catalog lock, release; inspect source descriptors; reacquire and merge only
-observations whose bootstrap generation is still current.
+temporary file plus `os.replace`. A resumed batch turn that does not start or
+refresh a generation rewrites at most its current candidate record, the fixed
+batch of candidate records it inspects, and the small `state.json`; only that
+turn's total bytes are bounded independently of catalog size. Manifests are
+immutable after publication. The lock is never held while a transcript is
+scanned or while a page, cursor, socket or queue operation runs. The operation
+is: read state and reserve a bounded work batch under the catalog lock, release;
+inspect source descriptors; reacquire and merge only observations whose
+bootstrap generation is still current.
 
 Completeness is re-proved on every read rather than inferred from the word
 `complete` in `state.json`: the nested state shape, safe manifest basename,
@@ -336,6 +337,9 @@ catalog, because its Wave 0 contract is project configuration only.
   retirement needs cursor-aware evidence and belongs with the v4 design; until
   then the manifest/record candidate set is deliberately monotone across
   refreshes, including transcripts that disappeared months earlier.
+- Superseded immutable manifests are retained too. If each refresh adds one
+  candidate, their worst-case on-disk total is quadratic in the retained
+  candidate count; cursor-aware v4 retirement owns their reclamation.
 
 ## 8. Failure handling
 
@@ -376,9 +380,10 @@ Red-before-green tests must cover:
 - a reconciliation generation completing after exactly one delta even while
   later names keep appearing, with those later names entering a later finite
   refresh generation rather than recursively extending the first;
-- bounded catalog write amplification independent of corpus size, immutable
-  manifests, and deterministic proof that catalog and cursor locks are never
-  nested or acquired in the wrong order;
+- resumed-batch write amplification independent of corpus size, explicit
+  O(catalog-size) generation-start/refresh publication, immutable manifests,
+  and deterministic proof that catalog and cursor locks are never nested or
+  acquired in the wrong order;
 - catalog-lock timeout after bounded patience producing degraded fallback and
   hook exit 0, while the explicit scanner returns nonzero without mutation;
 - Claude admission through the selected host slug despite mixed root/worktree

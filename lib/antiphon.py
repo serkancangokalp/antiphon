@@ -20,7 +20,8 @@ Usage:
 
 Design: NO SHARED MESSAGE LOG IS KEPT. Both CLIs already write transcripts;
 Antiphon reads them as the content authority. Project-local metadata tracks
-page cursors, routable peers and a bounded catalog of transcript candidates;
+page cursors, routable peers and a catalog of transcript candidates that stays
+monotone until cursor-aware retirement;
 it never copies transcript content.
 
 Both sides are symmetric: Claude Code and Codex CLI speak the same hook
