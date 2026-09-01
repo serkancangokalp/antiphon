@@ -376,6 +376,9 @@ async function anAutomaticClaudeIdentityRequiresTheHookJoinBeforeSigning() {
     assert.ok(!queued.includes(AUTO_ALIAS),
       "the automatic alias stays private until the hook joins the same endpoint");
 
+    // The real hook writes both halves: the session record and the
+    // owner-current proof, in that one turn. A fixture that wrote only the
+    // session half would be simulating a hook that no longer exists.
     writeFileSync(join(dir, ".antiphon", "peers", `claude-${AUTO_ALIAS}`, "session.json"),
       JSON.stringify({
         kind: "claude",
@@ -383,6 +386,16 @@ async function anAutomaticClaudeIdentityRequiresTheHookJoinBeforeSigning() {
         owner: endpoint.owner,
         session_id: CODEX_SESSION,
         automatic: true,
+        identity_digest: AUTO_DIGEST,
+      }));
+    const currentOwnerDigest = createHash("sha256")
+      .update(endpoint.owner).digest("hex");
+    mkdirSync(join(dir, ".antiphon", "identity", "claude"), { recursive: true });
+    writeFileSync(
+      join(dir, ".antiphon", "identity", "claude", `${currentOwnerDigest}.json`),
+      JSON.stringify({
+        version: 1, kind: "claude", owner_key: endpoint.owner,
+        owner_digest: currentOwnerDigest, session_id: CODEX_SESSION,
         identity_digest: AUTO_DIGEST,
       }));
     await client.callTool({
@@ -394,6 +407,33 @@ async function anAutomaticClaudeIdentityRequiresTheHookJoinBeforeSigning() {
     const labels = queued.match(/\[from=[^\]]+ id=[^\]]+\]/g)?.join("\n") || "";
     assert.ok(!labels.includes(CODEX_SESSION),
       "the host session id never crosses in the message label");
+
+    // --- Task 6b: signing_identity ---------------------------------------
+    // Routing already refuses a rotated alias. Signing must refuse it too, or
+    // the old listener keeps announcing an identity that is no longer its own.
+    const ownerDigest = currentOwnerDigest;
+    const otherSession = "0199a1b2-2222-7000-8000-00000000000b";
+    const otherDigest = createHash("sha256")
+      .update(otherSession).digest("hex");
+    mkdirSync(join(dir, ".antiphon", "identity", "claude"), { recursive: true });
+    writeFileSync(
+      join(dir, ".antiphon", "identity", "claude", `${ownerDigest}.json`),
+      JSON.stringify({
+        version: 1, kind: "claude", owner_key: endpoint.owner,
+        owner_digest: ownerDigest, session_id: otherSession,
+        identity_digest: otherDigest,
+      }));
+    const before = readFileSync(stub.log, "utf8").length;
+    await client.callTool({
+      name: "reply_to_codex",
+      arguments: { text: "signing_identity after rotation", to: "build" },
+    });
+    const after = readFileSync(stub.log, "utf8").slice(before);
+    assert.ok(!after.includes(AUTO_ALIAS),
+      "signing_identity: a rotated proof must stop this listener signing as "
+      + "the alias it no longer owns");
+    assert.match(after, /\[from=<unnamed> id=/,
+      "signing_identity: unreachable and unnamed, not silently still itself");
     assert.ok(!labels.includes(AUTO_DIGEST),
       "the private digest never crosses in the message label");
     console.log("automatic Claude identity waits for the hook join: ok");
@@ -470,6 +510,17 @@ async function automaticClaudeIdentityAcceptsTheCanonicalUuidGrammar() {
       JSON.stringify({
         kind: "claude", name: AUTO_V7_ALIAS, owner: endpoint.owner,
         session_id: UUID_V7, automatic: true, identity_digest: AUTO_V7_DIGEST,
+      }));
+    // Both halves, as the real hook writes them in one turn.
+    const v7OwnerDigest = createHash("sha256")
+      .update(endpoint.owner).digest("hex");
+    mkdirSync(join(dir, ".antiphon", "identity", "claude"), { recursive: true });
+    writeFileSync(
+      join(dir, ".antiphon", "identity", "claude", `${v7OwnerDigest}.json`),
+      JSON.stringify({
+        version: 1, kind: "claude", owner_key: endpoint.owner,
+        owner_digest: v7OwnerDigest, session_id: UUID_V7,
+        identity_digest: AUTO_V7_DIGEST,
       }));
     await client.callTool({
       name: "reply_to_codex", arguments: { text: "from v7", to: "build" },
