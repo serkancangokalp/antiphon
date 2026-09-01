@@ -1520,6 +1520,23 @@ class CodexObservationTest(unittest.TestCase):
                                "observed_at": observed_at}, stream)
                 self.assertEqual(peers.read_observations(project), [])
 
+    def test_reader_rejects_non_integer_versions_and_overflow_sized_times(self):
+        with tempfile.TemporaryDirectory() as project:
+            root = self._root(project)
+            os.makedirs(root)
+            malformed = (
+                {"version": True, "observed_at": 1.0},
+                {"version": 1.0, "observed_at": 1.0},
+                {"version": 1, "observed_at": 10 ** 310},
+            )
+            for fields in malformed:
+                with self.subTest(fields=fields), \
+                     open(os.path.join(root, self.UUID + ".json"), "w",
+                          encoding="utf-8") as stream:
+                    json.dump({"kind": "codex", "session_id": self.UUID,
+                               **fields}, stream)
+                self.assertEqual(peers.read_observations(project), [])
+
 
 class UnnamedKeyTest(unittest.TestCase):
     """The registry key an unnamed peer occupies, which is not a name.

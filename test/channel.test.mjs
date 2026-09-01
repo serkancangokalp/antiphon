@@ -232,6 +232,22 @@ async function cleanUp(session, dir) {
   await rm(dir, { recursive: true, force: true });
 }
 
+async function aUuidShapedConfiguredNameIsNotEchoed() {
+  const dir = await mkdtemp(join(tmpdir(), "antiphon-uuid-name-"));
+  const supplied = CODEX_SESSION.toUpperCase();
+  const session = spawnChannel(dir, supplied);
+  try {
+    assert.ok(await waitFor(() => /not a usable peer name/.test(session.stderr())),
+      session.stderr());
+    assert.match(session.stderr(), /UUID-shaped/,
+      "the refusal names the private shape without reproducing it");
+    assert.ok(!session.stderr().toLowerCase().includes(CODEX_SESSION),
+      `the configured host id must stay private: ${session.stderr()}`);
+  } finally {
+    await cleanUp(session, dir);
+  }
+}
+
 async function waitFor(predicate, timeoutMs = 5_000) {
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
@@ -1163,6 +1179,7 @@ await aLiveListenerReassertsItsOwnMissingEndpoint();
 await anArbitrarySocketBinderIsNotAdopted();
 await aReconnectRepairsTheLiveListenersMissingRecord();
 await everySessionSignsTheValidNameItWasGiven();
+await aUuidShapedConfiguredNameIsNotEchoed();
 await fourLiveSessionsRouteByName();
 await onlyOneUnnamedSessionGetsTheChannel(false);   // a second terminal, later
 await onlyOneUnnamedSessionGetsTheChannel(true);    // both started together

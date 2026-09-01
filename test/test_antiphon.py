@@ -4579,6 +4579,27 @@ class DoctorTest(unittest.TestCase):
             self.run_doctor(project)
         snapshot.assert_called_once()
 
+    def test_doctor_joins_a_named_session_before_suppressing_its_observation(self):
+        project = self.project()
+        self.set_up(project)
+        owner = "300:build"
+        ok, detail = antiphon.peers.register(
+            project, "codex", "build", None, pid=os.getpid(), owner_key=owner)
+        self.assertTrue(ok, detail)
+        ok, detail = antiphon.peers.write_session(
+            project, "codex", "build", self.OBSERVED, "/t/build.jsonl", owner)
+        self.assertTrue(ok, detail)
+        antiphon.peers.write_observation(project, self.OBSERVED)
+        with patch.object(antiphon, "codex_thread_alive",
+                          side_effect=AssertionError(
+                              "a named join suppresses before a lock probe")):
+            code, printed = self.run_doctor(project)
+        self.assertEqual(code, 0, printed)
+        self.assertIn("peer codex/build: live and addressed", printed)
+        self.assertIn("Codex session census: at least 1 live observed", printed)
+        self.assertNotIn("Codex unnamed observation", printed)
+        self.assertNotIn(self.OBSERVED, printed)
+
     def test_doctor_counts_rejected_codex_call_shapes_privately_and_read_only(self):
         source = "17efb035-5650-4c4a-a363-026420ece317"
         rejected = [
@@ -4842,6 +4863,15 @@ class DoctorTest(unittest.TestCase):
         line = self.line_for(printed, "alias:")
         self.assertTrue(line.startswith("✗"), line)
         self.assertIn("lower-case", line, "the accepted shape is named")
+
+        uuid_name = self.OBSERVED.upper()
+        with patch.dict(os.environ, {"ANTIPHON_NAME": uuid_name}):
+            code, printed = self.run_doctor(project)
+        self.assertEqual(code, 1)
+        line = self.line_for(printed, "alias:")
+        self.assertIn("UUID-shaped", line)
+        self.assertNotIn(self.OBSERVED, line.lower(),
+                         "doctor describes the invalid shape without the id")
 
         with patch.dict(os.environ, {"ANTIPHON_NAME": "ui"}):
             code, printed = self.run_doctor(project)
@@ -11559,6 +11589,17 @@ class CodexPeerWiringTest(unittest.TestCase):
             walk.assert_not_called()
         self.assertIn("a-z0-9", err.getvalue())
 
+    def test_a_uuid_shaped_configured_alias_is_not_echoed(self):
+        supplied = self.UUID.upper()
+        with tempfile.TemporaryDirectory() as project:
+            with self._named(supplied), \
+                 patch.object(antiphon.peers, "owner_key") as walk, \
+                 contextlib.redirect_stderr(io.StringIO()) as err:
+                self.assertIsNone(antiphon.register_codex_peer(project))
+            walk.assert_not_called()
+        self.assertIn("UUID-shaped", err.getvalue())
+        self.assertNotIn(self.UUID, err.getvalue().lower())
+
     def test_an_alias_that_cannot_be_identified_says_so(self):
         with tempfile.TemporaryDirectory() as project:
             alias, err = self._register(project, owner=None)
@@ -11803,16 +11844,20 @@ class CodexPeerWiringTest(unittest.TestCase):
             self.assertEqual(antiphon.peers.read_observations(project), [])
 
     def test_an_observation_failure_never_costs_context_or_leaks_the_id(self):
-        with tempfile.TemporaryDirectory() as project, \
-             patch.object(antiphon.peers, "write_observation",
-                          side_effect=OSError("disk gone")):
-            _, out, err, _ = self._hook(
-                project, event="UserPromptSubmit", session_id=self.UUID, name="",
-                summary=("news", page_advance({
-                    "s1": {"gen": "g", "offset": 5}}), 1))
+        with tempfile.TemporaryDirectory() as project:
+            leaked = os.path.join(project, ".antiphon", "observations",
+                                  "codex", self.UUID + ".json.123.tmp")
+            failure = PermissionError(errno.EACCES, "permission denied", leaked)
+            with patch.object(antiphon.peers, "write_observation",
+                              side_effect=failure):
+                _, out, err, _ = self._hook(
+                    project, event="UserPromptSubmit", session_id=self.UUID,
+                    name="", summary=("news", page_advance({
+                        "s1": {"gen": "g", "offset": 5}}), 1))
         self.assertIn("news", out)
         self.assertIn("observation", err)
         self.assertIn("lower bound", err)
+        self.assertIn("PermissionError", err)
         self.assertNotIn(self.UUID, err)
         self.assertNotIn(project, err)
 
@@ -12858,17 +12903,19 @@ class RoutingTest(unittest.TestCase):
                                      ("legacy", ""))
 
     def test_a_host_session_id_is_diagnostic_identity_never_an_alias(self):
-        with tempfile.TemporaryDirectory() as project:
-            antiphon.peers.write_observation(project, self.UUID)
-            with patch.object(antiphon, "_codex_observation_snapshot",
-                              side_effect=AssertionError(
-                                  "an invalid alias refuses before census")):
-                address, detail = antiphon.resolve_target(
-                    project, "codex", self.UUID)
-        self.assertIsNone(address)
-        self.assertIn("not a usable peer name", detail)
-        self.assertNotIn(self.UUID, detail,
-                         "the invalid value is not echoed into an agent-facing refusal")
+        for supplied in (self.UUID, self.UUID.upper(), f" {self.UUID}\n"):
+            with self.subTest(supplied=supplied), \
+                 tempfile.TemporaryDirectory() as project:
+                antiphon.peers.write_observation(project, self.UUID)
+                with patch.object(antiphon, "_codex_observation_snapshot",
+                                  side_effect=AssertionError(
+                                      "an invalid alias refuses before census")):
+                    address, detail = antiphon.resolve_target(
+                        project, "codex", supplied)
+            self.assertIsNone(address)
+            self.assertIn("not a usable peer name", detail)
+            self.assertNotIn(self.UUID, detail.lower(),
+                             "UUID-shaped input is not echoed in a refusal")
 
     def test_several_peers_and_no_alias_is_refused_with_their_names(self):
         with tempfile.TemporaryDirectory() as project:

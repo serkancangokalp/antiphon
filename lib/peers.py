@@ -148,6 +148,17 @@ def valid_session_id(value):
     return isinstance(value, str) and bool(SESSION_ID_PATTERN.fullmatch(value))
 
 
+def looks_like_session_id(value):
+    """Whether a configured/routing value has the private host UUID shape.
+
+    Address validation stays canonical and lowercase in `valid_session_id`.
+    Secrecy is broader on purpose: case or surrounding whitespace must not turn
+    the same host identifier into text an error is allowed to echo.
+    """
+    return (isinstance(value, str)
+            and bool(SESSION_ID_PATTERN.fullmatch(value.strip().lower())))
+
+
 def socket_key(cwd, name=""):
     """Hashed, never appended: the path must not grow past the platform's limit.
 
@@ -234,12 +245,18 @@ def read_observations(cwd):
         if not record:
             continue
         observed_at = record.get("observed_at")
-        if (record.get("version") != OBSERVATION_VERSION
+        version = record.get("version")
+        try:
+            finite_time = math.isfinite(float(observed_at))
+        except (OverflowError, TypeError, ValueError):
+            finite_time = False
+        if (type(version) is not int
+                or version != OBSERVATION_VERSION
                 or record.get("kind") != "codex"
                 or record.get("session_id") != session_id
                 or isinstance(observed_at, bool)
                 or not isinstance(observed_at, (int, float))
-                or not math.isfinite(observed_at)
+                or not finite_time
                 or observed_at < 0):
             continue
         found.append(record)

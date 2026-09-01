@@ -4767,7 +4767,7 @@ def _resolve_target(cwd, kind, alias=None):
 
     if alias is not None:
         if not peers.valid_name(alias):
-            if peers.valid_session_id(alias):
+            if peers.looks_like_session_id(alias):
                 return ResolvedTarget(
                     None, ("not delivered: a host session id is diagnostic "
                            "identity, not a usable peer name; restart the "
@@ -5985,7 +5985,10 @@ def register_codex_peer(cwd):
     if not alias:
         return None
     if not peers.valid_name(alias):
-        print(f"antiphon: ANTIPHON_NAME={alias!r} is not a usable name "
+        shown = ("ANTIPHON_NAME is a UUID-shaped configured value"
+                 if peers.looks_like_session_id(alias)
+                 else f"ANTIPHON_NAME={alias!r}")
+        print(f"antiphon: {shown} is not a usable name "
               "([a-z0-9][a-z0-9_-]{0,31}); named routing is off for this session "
               "and the single unnamed peer still works.", file=sys.stderr)
         return None
@@ -6030,8 +6033,12 @@ def record_codex_session(cwd, session_id, transcript):
         try:
             return peers.write_observation(cwd, session_id)
         except Exception as error:
+            error_kind = type(error).__name__
+            error_number = getattr(error, "errno", None)
+            if isinstance(error_number, int):
+                error_kind += f" errno {error_number}"
             print("antiphon: unnamed Codex observation could not be recorded "
-                  f"({type(error).__name__}: {error}); live-session counts "
+                  f"({error_kind}); live-session counts "
                   "remain a lower bound.", file=sys.stderr)
             return False
     if not session_id:
@@ -7998,7 +8005,10 @@ def _doctor_alias(report):
     elif peers.valid_name(name):
         report.ok(f'alias: named "{name}"')
     else:
-        report.bad(f'alias: ANTIPHON_NAME resolves to "{name}", which cannot '
+        subject = ("ANTIPHON_NAME is a UUID-shaped configured value"
+                   if peers.looks_like_session_id(name)
+                   else f'ANTIPHON_NAME resolves to "{name}"')
+        report.bad(f'alias: {subject}, which cannot '
                    "be addressed — use lower-case letters, digits, `_` and "
                    "`-`, starting with a letter or digit, at most 32 characters")
 
@@ -8026,7 +8036,6 @@ def _doctor_peers(report, cwd):
             report.note(f"peer {who}: stale record; a live session cleans this "
                         "up on its next pass")
             continue
-        live.append(record)
         owner = peers._owner_of(record)
         session = peers.read_session(cwd, record.get("kind"), record.get("name"))
         session_owner = peers._owner_of(session) if session else None
@@ -8043,7 +8052,13 @@ def _doctor_peers(report, cwd):
             report.note(f"peer {who}: this endpoint has no owner key, so "
                         "sessions cannot be joined to it; restarting that "
                         "session usually records one")
-        if peers._address_of(record) is None:
+        diagnostic = dict(record)
+        if (peers._addressless(record) and session_owner == owner
+                and peers.valid_session_id(
+                    session.get("session_id") if session else None)):
+            diagnostic["address"] = session["session_id"]
+        live.append(diagnostic)
+        if peers._address_of(diagnostic) is None:
             if not mixed_owner_generation:
                 report.note(f"peer {who}: live, waiting for its first turn")
         else:
