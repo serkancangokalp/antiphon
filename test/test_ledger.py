@@ -415,6 +415,45 @@ class LedgerTest(unittest.TestCase):
                 project, UUID, sender="ui", to_kind="codex", to_alias=None,
                 transport="queue", proof="live", sha256="g" * 64, size=1))
 
+    def test_a_same_kind_delivery_is_read_only_by_its_named_receiver(self):
+        """Review 2026-09-03, critical: a same-kind sender verifying its own
+        parked file has the recipient's kind, so the kind guard alone let
+        its read collect the file before the recipient ever saw it."""
+        with tempfile.TemporaryDirectory() as project:
+            self._sent(project, UUID, sender="ui", sender_kind="claude", to_kind="claude",
+                       to_alias="api", attachment="a.txt")
+            self._sent(project, OTHER, sender="build", to_kind="claude", to_alias="ui",
+                       attachment="a.txt")
+            self.assertTrue(ledger.mark_read(project, "a.txt", 5.0, to_kind="claude"))
+            self.assertIsNone(ledger.read_entry(project, UUID)["read_at"],
+                              "a reader with no alias cannot be the named receiver")
+            self.assertEqual(ledger.read_entry(project, OTHER)["read_at"], 5.0,
+                             "a cross-kind delivery: the kind is the receiver")
+            ledger.mark_read(project, "a.txt", 6.0, to_kind="claude", reader_alias="ui")
+            self.assertIsNone(ledger.read_entry(project, UUID)["read_at"],
+                              "the sender's own verification")
+            ledger.mark_read(project, "a.txt", 7.0, to_kind="claude", reader_alias="api")
+            self.assertEqual(ledger.read_entry(project, UUID)["read_at"], 7.0, "the receiver")
+            ledger.record_receipts(project, [("read", "a.txt", 8.0)], read_by="claude",
+                                   reader_alias="api")
+
+    def test_reuse_matches_the_senders_kind(self):
+        with tempfile.TemporaryDirectory() as project:
+            store = os.path.join(project, ".antiphon", "messages")
+            os.makedirs(store, mode=0o700)
+            for name in ("a.txt", "b.txt"):
+                open(os.path.join(store, name), "w").write("[Antiphon attachment]\n\nz")
+            self._sent(project, UUID, sender="ui", sender_kind="claude", attachment="a.txt",
+                       at=100.0)
+            self._sent(project, OTHER, sender="ui", sender_kind="codex", attachment="b.txt",
+                       at=110.0)
+            self.assertEqual(ledger.reusable_attachment(project, SHA, "codex", "build", 200.0,
+                                                        sender="ui", sender_kind="claude"),
+                             "a.txt")
+            self.assertEqual(ledger.reusable_attachment(project, SHA, "codex", "build", 200.0,
+                                                        sender="ui", sender_kind="codex"),
+                             "b.txt")
+
     def test_prune_removes_only_what_is_older_than_the_ttl(self):
         with tempfile.TemporaryDirectory() as project:
             self._sent(project, UUID, at=100.0)

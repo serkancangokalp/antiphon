@@ -4548,15 +4548,6 @@ def hook(side="claude"):
         record_claude_session(cwd, input_data.get("session_id"),
                               input_data.get("transcript_path"))
 
-    # This session's own transcript, for what it proves about deliveries *to*
-    # this session: another session of the same kind writes here, and no
-    # reader of the other kind may ever walk this file (a Claude-only
-    # project has no Codex reader). One bounded read of the tail, receipts
-    # scoped to this side's kind, on every event.
-    _ledger_call("own receipts", lambda: ledger.record_receipts(
-        cwd, _own_transcript_receipts(side, input_data.get("transcript_path")),
-        read_by=side))
-
     if event != "UserPromptSubmit":
         # Only a prompt has something for context to attach to. Anything else —
         # `SessionStart`, or an event this version has never heard of — records
@@ -4564,6 +4555,21 @@ def hook(side="claude"):
         # event that did not happen. The cursor stays where it was too: a
         # summary nobody was shown has not been seen.
         return 0
+
+    # Who this session is, once: the notices are its, and so are the
+    # receipts read off its own transcript.
+    who = claimed_alias(cwd, side, input_data.get("session_id"))
+
+    # This session's own transcript, for what it proves about deliveries *to*
+    # this session: another session of the same kind writes here, and no
+    # reader of the other kind may ever walk this file (a Claude-only
+    # project has no Codex reader). One bounded read of the tail on each
+    # prompt, receipts scoped to this side's kind and — for a same-kind
+    # delivery — to this alias as the named receiver, so this session's own
+    # verification of a file it parked for another is never that other's read.
+    _ledger_call("own receipts", lambda: ledger.record_receipts(
+        cwd, _own_transcript_receipts(side, input_data.get("transcript_path")),
+        read_by=side, reader_alias=who))
 
     # Snapshot the catalog before the cursor transaction. The snapshot owns
     # ordinary Python values, so the shared catalog lock is already released
@@ -4599,7 +4605,7 @@ def hook(side="claude"):
         # left), and an attachment that expired unread was silent too.
         # Reported here, once, ahead of the page.
         notices = _ledger_call("pending notices", lambda: ledger.pending_notices(
-            cwd, side, claimed_alias(cwd, side, input_data.get("session_id")))) or []
+            cwd, side, who)) or []
         if not text and not notices:
             # Nothing to deliver this turn, so the write-then-advance order
             # below does not protect anything -- there is no page to lose.
@@ -4674,9 +4680,10 @@ def _own_transcript_receipts(side, transcript_path):
 
 def _ledger_call(what, action):
     """Run one ledger call on the hook's road; a fault there is the ledger's,
-    never the reader's. The calls sit inside the cursor lock, before the page
-    is written, and a raise would cost every page until somebody deleted a
-    file — measured with a validated entry whose time overflowed the platform."""
+    never the reader's. Most of the calls sit inside the cursor lock, before
+    the page is written, and a raise would cost every page until somebody
+    deleted a file — measured with a validated entry whose time overflowed
+    the platform."""
     try:
         return action()
     except Exception as error:      # noqa: BLE001 — the page must go out
@@ -5882,6 +5889,13 @@ def _notify_unregistered_claude(cwd, alias, sender_alias, message_id):
 
 
 LISTENER_REFUSAL_CLASSES = ("no-peer", "oversize")
+# `send_to_claude`'s success detail when the listener did not echo the
+# sender's kind: a channel server from before same-kind sends, which will
+# show a Claude sender's words as Codex's.
+OLD_LISTENER = "old-listener"
+OLD_LISTENER_WORDS = (" Note: that session's channel server predates same-kind sends "
+                      "and shows this as Codex's words; reconnect that session to fix "
+                      "it.")
 
 
 def send_to_claude(cwd, text, alias=None, sender_alias=None, message_id=None,
@@ -6020,6 +6034,11 @@ def send_to_claude(cwd, text, alias=None, sender_alias=None, message_id=None,
             redact_private(str(result.get("error")
                                or "channel delivery failed"), 200),
             supplied if supplied in LISTENER_REFUSAL_CLASSES else "transport")
+    # A listener that understood the sender's kind echoes it; one from before
+    # same-kind sends does not, and will show this Claude sender as Codex.
+    # Said to the caller, never a refusal: the words did arrive.
+    if sender_kind == "claude" and result.get("sender_kind") != "claude":
+        return True, OLD_LISTENER
     return True, ""
 
 
@@ -6705,14 +6724,14 @@ def reply(*_):
     if not isinstance(text, str) or not text.strip():
         print("reply: empty text", file=sys.stderr)
         return 1
-    to = input_data.get("to")
-    if to is not None and not isinstance(to, str):
-        print("reply: to must be a string naming one live Codex peer",
-              file=sys.stderr)
-        return 1
     kind = input_data.get("kind") or "codex"
     if kind not in ("codex", "claude"):
         print("reply: kind must be codex or claude", file=sys.stderr)
+        return 1
+    to = input_data.get("to")
+    if to is not None and not isinstance(to, str):
+        print(f"reply: to must be a string naming one live {kind.title()} peer",
+              file=sys.stderr)
         return 1
     cwd = project_dir()
     text = text.strip()
@@ -6802,6 +6821,7 @@ def _reply_to_claude(cwd, text, to, who):
         print(f"reply: {_guided(detail, 'only a tool-name line')}",
               file=sys.stderr)
         return 1
+    old_listener = detail == OLD_LISTENER
     _record_delivery(cwd, "claude", outgoing, to,
                      key=SAME_KIND_KEY.format(kind="claude"), side="claude")
     attachment = os.path.basename(parked.path) if parked is not None else None
@@ -6815,6 +6835,8 @@ def _reply_to_claude(cwd, text, to, who):
     if attachment:
         words += (" The message was too large for the channel, so its words "
                   "are parked as an attachment and the envelope names the file.")
+    if old_listener:
+        words += OLD_LISTENER_WORDS
     if not recorded:
         words += LEDGER_UNWRITTEN
     print(json.dumps({"queued": False, "delivered": True, "id": message_id,
@@ -7136,10 +7158,10 @@ def _send_tool(cwd, text, to=None, sender=None, kind="claude"):
     """
     if not isinstance(text, str) or not text.strip():
         return _tool_error("text must be a non-empty string")
-    if to is not None and not isinstance(to, str):
-        return _tool_error("to must be a string naming one live Claude peer")
     if kind not in ("claude", "codex"):
         return _tool_error("kind must be claude or codex")
+    if to is not None and not isinstance(to, str):
+        return _tool_error(f"to must be a string naming one live {kind.title()} peer")
     text = text.strip()
     who = sender_alias(sender)
     if kind == "codex":
@@ -8036,7 +8058,7 @@ AGENTS_RULE = ("\n## The Antiphon bridge\n\n"
                "reach you as `[Antiphon bridge] Codex:` (its Stop hook) or "
                "`[Antiphon channel] Codex:` (its direct send); reach one with "
                "`@codex:name` or `antiphon_send(kind=\"codex\", to=name)` — "
-               "always named, never on the passive page. "
+               "always named, not a lane of the passive page. "
                + RECOVERY_RULE + "\n\n"
                "To hand Claude a task, put `@claude` at the start of a line in "
                "your reply; only that line is sent. To reach Claude without "
@@ -8094,7 +8116,7 @@ CLAUDE_RULE = ("\n## The Antiphon bridge\n\n"
                "Codex reads its queue at its next turn — and `antiphon status` "
                "shows the receipt. An event with `sender=\"claude\"` is another "
                "Claude session's words; answer it with `reply_to_claude(to=…)` "
-               "or `@claude:name` — always named, never on the passive page. "
+               "or `@claude:name` — always named, not a lane of the passive page. "
                "`<unnamed>` means that peer has no name; "
                "passing it as `to` is the same as leaving it out. Your valid "
                "`ANTIPHON_NAME` is your configured identity on outgoing "
@@ -8747,7 +8769,8 @@ _STATUS_PAGE_KEYS = frozenset(("claude_pages", "codex_pages"))
 _STATUS_V4_PAGE_KEYS = frozenset(("claude_pages_v4", "codex_pages_v4"))
 _STATUS_CURSOR_KEYS = (_STATUS_SEEN_KEYS | _STATUS_PAGE_KEYS
                        | _STATUS_V4_PAGE_KEYS
-                       | {"last_pushed_claude", "last_pushed_codex"})
+                       | {"last_pushed_claude", "last_pushed_codex",
+                          "last_pushed_claude_same", "last_pushed_codex_same"})
 
 
 def _cursor_entry(key, value):

@@ -126,9 +126,13 @@ peer named on it, and to nobody else.
 session another Codex session, by the same machinery — always by name. A bare
 same-kind line (`@claude` from Claude, `@codex` from Codex) has no meaning and
 is refused, and so is a session's own alias; both refusals are reported on the
-sender's next page. The passive pull page does not carry same-kind activity: it
-stays the other kind's transcripts, so its size and its discovery window are
-unchanged. A same-kind receipt comes from the receiving session's own hook
+sender's next page. The passive pull page gains no same-kind lane: it stays
+the other kind's transcripts, so its size and its discovery window are
+unchanged. That is not confidentiality: a `@claude:name` line is part of the
+sender's own visible reply, which the other kind's page shows like any reply,
+and a same-kind tool call's arguments stay retrievable by their public id — a
+same-kind message is addressed, not confidential. A same-kind receipt comes
+from the receiving session's own hook
 reading the tail of its own transcript, which is why a Claude-only or
 Codex-only project gets receipts too. The bridge forwards nothing
 automatically, so no message ever comes back to its author through it.
@@ -309,7 +313,7 @@ turn ends.
 - The Codex hook asks for re-approval the first time it's used and whenever the hook file changes.
 - Matching is done on the same project's absolute directory.
 - Unix sockets only — there is no Windows support.
-- A same-vendor message (`@claude:name` from Claude, `@codex:name` from Codex, `reply_to_claude`, `antiphon_send(kind="codex")`) is always addressed and never on the passive page: two same-kind sessions need names or automatic aliases, and each hears from the other only what it is sent.
+- A same-vendor message (`@claude:name` from Claude, `@codex:name` from Codex, `reply_to_claude`, `antiphon_send(kind="codex")`) is always addressed, and the passive page gains no same-kind lane — two same-kind sessions need names or automatic aliases, and a session of one kind is told nothing of another's work unless it is sent. It is addressed, not confidential: a Stop-marker line is part of the sender's visible reply, which the other kind's page shows, and a same-kind tool call's arguments stay retrievable by their public id.
 - A tool result is a statement about the transport, never about the peer. `reply_to_codex` says queued and `antiphon_send` says delivered to the channel; a queued row in a thread that never takes a turn is not read, and only the peer's transcript proves receipt — `antiphon status` shows what still waits, `antiphon doctor` notes what has waited more than ten minutes. A bare reply refused among several peers names the last unanswered sender as advice; the bridge itself still never chooses.
 
 ### Passive pull pages, and what it still cannot promise
