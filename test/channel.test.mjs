@@ -1680,6 +1680,19 @@ try {
     message_id: "m-test",
   });
 
+  // Another Claude session's words arrive as `sender: "claude"` — only on the
+  // exact word; every other value, and the key's absence, is Codex.
+  for (const [kind, expected] of [["claude", "claude"], ["human", "codex"],
+                                  [undefined, "codex"]]) {
+    const pendingKind = nextNotification();
+    await sendToSocket({ content: `kind ${String(kind)}`, message_id: `m-kind-${String(kind)}`,
+                         sender_alias: "api", sender_kind: kind });
+    const seenKind = await pendingKind;
+    assert.equal(seenKind.params.meta.sender, expected,
+      `sender_kind ${JSON.stringify(kind)} must arrive as ${expected}`);
+    assert.equal(seenKind.params.meta.sender_alias, "api");
+  }
+
   // The alias crossed a socket, so it is a claim rather than a fact. Anything
   // that is not a name the registry would accept reaches the agent as the
   // reserved `<unnamed>` key — never as text it might read as a name to reply

@@ -4109,6 +4109,61 @@ class SameVendorTest(unittest.TestCase):
         self.assertEqual(antiphon.SIDE_LABELS["claude"],
                          (antiphon.PUSH_LABEL, antiphon.CHANNEL_LABEL))
 
+    # ---- Task 2: a Claude sender's kind travels to a Claude peer ----
+
+    class _Capture:
+        """A channel socket that records the request it was handed."""
+
+        def __init__(self):
+            self.sent = b""
+            self.answer = b'{"ok": true, "message_id": "m1"}'
+
+        def __call__(self, *_a, **_k):
+            return self
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_a):
+            return False
+
+        def settimeout(self, _):
+            pass
+
+        def close(self):
+            pass
+
+        def connect(self, _path):
+            pass
+
+        def sendall(self, data):
+            self.sent += data
+
+        def shutdown(self, _how):
+            pass
+
+        def recv(self, _n):
+            answer, self.answer = self.answer, b""
+            return answer
+
+    def test_send_to_claude_carries_the_senders_kind_only_when_it_is_claude(self):
+        with tempfile.TemporaryDirectory() as project:
+            antiphon.peers.register(project, "claude", "api", "/tmp/api.sock")
+            wire = self._Capture()
+            with patch.object(antiphon.socket, "socket", wire):
+                ok, _ = antiphon.send_to_claude(project, "hi", "api", sender_alias="ui",
+                                                message_id=self.MID, sender_kind="claude")
+            self.assertTrue(ok)
+            request = json.loads(wire.sent.decode())
+            self.assertEqual(request, {"content": "hi", "message_id": self.MID,
+                                       "sender_alias": "ui", "sender_kind": "claude"})
+            wire = self._Capture()
+            with patch.object(antiphon.socket, "socket", wire):
+                antiphon.send_to_claude(project, "hi", "api", sender_alias="build",
+                                        message_id=self.MID)
+            self.assertNotIn("sender_kind", json.loads(wire.sent.decode()),
+                             "a Codex sender is the shape every listener already reads")
+
     def test_a_codex_to_codex_message_is_a_receipt_on_the_page_never_speech(self):
         now = time.strftime("%Y-%m-%dT%H:%M:%S.000Z", time.gmtime())
         sid = "1d5a03e0-0548-4339-87c3-45c5dbf7e9d7"

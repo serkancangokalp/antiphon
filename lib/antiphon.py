@@ -5746,18 +5746,24 @@ def _notify_unregistered_claude(cwd, alias, sender_alias, message_id):
 LISTENER_REFUSAL_CLASSES = ("no-peer", "oversize")
 
 
-def send_to_claude(cwd, text, alias=None, sender_alias=None, message_id=None):
-    """Sends a Codex message to a Claude peer's MCP Channel socket.
+def send_to_claude(cwd, text, alias=None, sender_alias=None, message_id=None,
+                   sender_kind=None):
+    """Sends a message to a Claude peer's MCP Channel socket.
 
     `sender_alias` and `message_id` travel in the payload and become the
     notification's metadata, so the receiving agent can see who spoke and
-    address a reply deliberately.
+    address a reply deliberately. `sender_kind="claude"` says another Claude
+    session is speaking; it is written only then, so a Codex sender stays the
+    exact shape every listener already reads and an old listener, which knows
+    no such key, keeps reading the payload it always did.
     """
     request = {
         "content": text,
         "message_id": message_id or delivery_id(),
         "sender_alias": sender_alias,
     }
+    if sender_kind == "claude":
+        request["sender_kind"] = "claude"
     payload = json.dumps(request, ensure_ascii=False).encode()
     if len(payload) > MAX_CHANNEL_BYTES:
         # Refused before any socket is opened, so not a transport failure — but
