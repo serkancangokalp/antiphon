@@ -23,6 +23,15 @@ the page has a 24-hour horizon relative to the other side's newest record,
 the agent surfaces are a third smaller, and doctor sees a stale rule section
 — see *P1 — Token cost of the passive page and the static surfaces*.
 
+**Delivery truth** (2026-09-03): every direct send is on a ledger under
+`.antiphon/deliveries/`, `reply_to_codex` says queued and never delivered,
+receipts come from the peer's own transcript, a refused Stop marker and an
+attachment that expired unread are reported on the sender's next page, a
+bare-reply refusal names the last unanswered sender, and `status`/`doctor`
+read the ledger — see *P1 — `reply_to_codex` can report success while the
+peer receives nothing (fixed)*, the attachments entry's closing, and *P2 —
+Reply correlation*.
+
 **Picking the work up.** The open items are the P0/P1/P2 sections that follow,
 in that order. The two rules this project runs on, learned the expensive way
 and worth reading before touching anything:
@@ -1027,6 +1036,19 @@ Codex leaves no routable peer record. The later visibility fix records only a
 diagnostic observation; automatic addressability still belongs with the
 automatic-peer-identity entry.
 
+**2026-09-03, the third answer.** `codex_thread_alive` answers True, False
+or None: a held lock is proof of life, an unheld lock file is proof of death,
+and no lock file at all is *unknown* — measured, the Codex desktop app keeps no
+writer locks, so the refuse-unless-proved-running rule had silently closed the
+app road. A bare push now goes to a proved-live thread first, else to the
+newest thread not proved dead, and the delivery is recorded with that proof
+class (`live` or `unproven`) so the tool result and `status` say it; only when
+every recorded thread is proved gone is the push refused. Doctor's queue note
+counts threads *not proved running*. Measured after: a `codex queue` row to an
+open app-hosted thread sat unconsumed for over an hour — the unproven road
+delivers to a queue, not to a reader, which is exactly what the ledger and the
+word "queued" now say.
+
 ## Shipped — the channel never hands Claude Code a null sender
 
 Measured on Claude Code 2.1.251, in the host's own MCP log: every
@@ -1290,7 +1312,7 @@ read-only health probe. `ANTIPHON_NAME` forwarding is no longer an open
 question: a live `ANTIPHON_NAME=probe codex exec` measurement found the same
 value in the MCP child's environment, recorded under the unnamed-peer entry.
 
-## P2 — Reply correlation
+## P2 — Reply correlation (closed 2026-09-03: advice inside the refusal)
 
 Explicit `to` remains the safe default when several peers are live. Automatic
 reply routing needs a durable design before implementation:
@@ -1301,6 +1323,18 @@ reply routing needs a durable design before implementation:
 - let explicit `to` override correlation;
 - fail closed when several unanswered senders remain;
 - define expiry and cleanup without losing a late reply.
+
+**Decision, 2026-09-03.** Automatic routing is not built. The delivery
+ledger answers the first, second, fourth and sixth bullets — a correlation
+reads sent entries scoped to the receiving alias (or to nobody), an explicit
+`to` never consults it, and entries expire with the ledger's TTL — and the
+answer is *advice inside the refusal*: a bare reply refused among several
+peers ends `; the last unanswered sender was 'build' (5 min ago): pass
+to="build"`. The bridge still never chooses; when several senders are
+unanswered the newest is named as advice and the refusal stands, which is the
+fifth bullet's fail-closed. The third bullet (the same live session) is what
+the alias grammar and the registry already guarantee for a named peer, and an
+unnamed sender is never advised.
 
 ## P0 — A named Claude session can identify itself as `<unnamed>` (fixed)
 
@@ -2074,7 +2108,10 @@ certified (full suite, statics, `fresh-user.sh`) at the commit `main` points to.
 What is worth doing before it: run a round that finds nothing in product
 behaviour, and treat *that* as the signal rather than fatigue.
 
-## P1 — `reply_to_codex` can report success while the peer receives nothing
+## P1 — `reply_to_codex` can report success while the peer receives nothing (fixed)
+
+Fixed 2026-09-03 — see *What shipped* at the end of this entry. The record
+of the measurement and the ruled-out guesses stays as written.
 
 Measured 2026-09-01 across one long working session: the active channel tool
 returns `Channel reply delivered to Codex.` and the peer, asked directly,
@@ -2125,3 +2162,37 @@ accepting a write. Either the tool returns success only once the message is in
 the peer's readable position, or it stops saying "delivered" and says what it
 actually did — queued, to which peer, with what left to prove. A refusal that
 names its reason is worth more than a success that does not mean anything.
+
+### What shipped (2026-09-03)
+
+The second half of that sentence, then the first. `reply_to_codex` now says
+what it did — `Queued for Codex peer 'build' (id …): Codex reads its queue at
+its next turn; run antiphon status to see whether it was received` — with the
+proof class the address was chosen on (`registered`, `live`, or `unproven`
+with its caveat) and the parked file when there is one; it never says
+delivered. `antiphon_send` says delivered to the channel and names the id.
+Every direct send, and every Stop-marker attempt, is one small file on a
+delivery ledger (`lib/ledger.py`, `.antiphon/deliveries/<id>.json`): sender,
+peer, transport, proof, the words' SHA-256 and size, never the words. A
+refused Stop marker is on it with its reason and the sender's first sixty
+characters.
+
+The receipt is the peer's own transcript. The readers that already walk it
+report what those records prove — Codex's user record carrying our
+`[from=… id=…]` label (180 measured), Claude's channel injection carrying
+`message_id` (245 measured), a tool call naming an attachment file — and the
+hook and `antiphon_read` write them wherever the cursor advances, the empty
+turn included. The sender's next page carries, once, what it was never told:
+`Antiphon: your @codex line at 21:44 ("run the suite") was not delivered —
+no Codex session found` and `Antiphon: the attachment you sent to Codex at
+21:44 expired unread after 7 days`. `status` prints a Deliveries line;
+`doctor` notes a delivery without a receipt after ten minutes, read-only.
+
+Measured while building it: a `codex queue` row to an open app-hosted thread
+sat unconsumed for over an hour, which is why the word is "queued"; the
+Codex desktop app keeps no thread-writer locks, so liveness has three answers
+(see *Shipped — a bare push goes to a running Codex*); two rows queued on
+2026-08-31 to closed threads are still in Codex's queue, where only Codex can
+drain them. A queued-and-unread message is still a loss this bridge can name
+but not prevent: that is Codex's queue, and the receipt is the thing that
+says whether it was ever read.

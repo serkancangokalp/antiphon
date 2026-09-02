@@ -570,6 +570,35 @@ class ShippedContractTest(unittest.TestCase):
         self.assertNotRegex(limits, r"(?i)acknowledgement[^.]*not part of this",
                             "the old disclaimer is gone")
 
+    def test_every_surface_says_queued_and_names_the_receipt(self):
+        """Measured 2026-09-01: the tool said "delivered" and the peer had
+        received nothing. The rules, the channel instructions, the tool
+        description and the README say what a result means — queued for
+        Codex, delivered to Claude's channel — and where the receipt is."""
+        self.assertIn("Its result says queued, never delivered", antiphon.CLAUDE_RULE)
+        self.assertIn("`antiphon status` shows the receipt", antiphon.CLAUDE_RULE)
+        self.assertIn("names the delivery id", antiphon.AGENTS_RULE)
+        self.assertIn("`antiphon status` shows when Claude's transcript received it",
+                      antiphon.AGENTS_RULE)
+        node = read("lib", "channel.mjs")
+        collapsed = re.sub(r'"\s*\+\s*\n\s*"', "", node)
+        self.assertIn("Its result says queued, never delivered", collapsed)
+        self.assertIn("The result says queued, never delivered.", collapsed)
+        self.assertNotIn("Channel reply delivered", collapsed,
+                         "the old success sentence is gone from the server")
+        readme = read("README.md")
+        self.assertRegex(readme, r"`reply_to_codex` answers\s+\*queued\*")
+        self.assertIn(".antiphon/deliveries/<id>.json", readme)
+        self.assertRegex(section(readme, "Limits"),
+                         r"(?i)a tool result is a statement about the transport")
+        self.assertRegex(section(readme, "Limits"), r"(?i)last unanswered sender")
+        backlog = read("BACKLOG.md")
+        self.assertIn("## P1 — `reply_to_codex` can report success while the peer "
+                      "receives nothing (fixed)", backlog)
+        self.assertIn("## P2 — Reply correlation (closed 2026-09-03: advice inside "
+                      "the refusal)", backlog)
+        self.assertIn("### What shipped (2026-09-03)", backlog)
+
     def test_both_surfaces_teach_the_attachment_envelope(self):
         """An envelope naming a path an agent has never been told about is a
         pointer to nothing. Both surfaces name the label, the file's origin,

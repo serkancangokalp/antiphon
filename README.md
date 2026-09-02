@@ -8,7 +8,7 @@ With one terminal per side there is nothing to configure beyond `antiphon setup`
 
 ## How it works
 
-No shared log is kept. Both CLIs already write their own transcripts; Antiphon reads and derives from them, recording which messages each peer has already seen. An unnamed peer keeps its cursor at `.antiphon/cursor.json`; a named one owns `.antiphon/peers/<side>-<name>/cursor.json`, so two sessions on the same side never advance each other's place. An automatic Claude identity also records which session its owner runs now, one small file per owner under `.antiphon/identity/claude/`, named from a digest rather than from anything about the session. `doctor` reports that a proof could not be read or could not be trusted without naming the file; this is the directory it means, and removing the unreadable one costs nothing — the next turn writes it again.
+No shared log is kept. Both CLIs already write their own transcripts; Antiphon reads and derives from them, recording which messages each peer has already seen. An unnamed peer keeps its cursor at `.antiphon/cursor.json`; a named one owns `.antiphon/peers/<side>-<name>/cursor.json`, so two sessions on the same side never advance each other's place. Every direct send leaves one small file on a delivery ledger at `.antiphon/deliveries/<id>.json` — who sent, to whom, over what, the words' digest and never the words — kept for a week; receipts come from the peer's own transcript, read by the same reader that builds the pull page. An automatic Claude identity also records which session its owner runs now, one small file per owner under `.antiphon/identity/claude/`, named from a digest rather than from anything about the session. `doctor` reports that a proof could not be read or could not be trusted without naming the file; this is the directory it means, and removing the unreadable one costs nothing — the next turn writes it again.
 
 ### Pull — shared context, no wake
 
@@ -59,6 +59,15 @@ answer is collected later from the same turn with `antiphon_read` (Codex)
 or the channel event (Claude). Nothing blocks, and a message delivered by
 a tool is recorded, so ending the turn with the same `@claude` / `@codex`
 line does not send it twice.
+
+A tool result says what happened and no more. `reply_to_codex` answers
+*queued* — `codex queue` accepted a row, and Codex reads it at its next turn
+— and `antiphon_send` answers *delivered* to Claude's channel; neither is
+the peer reading the words. The receipt is the peer's own transcript showing
+the message, and `antiphon status` reports what is awaiting a receipt, what
+was received and what was refused. A `@codex` or `@claude` line the Stop hook
+could not deliver is reported on the sender's next page, with the reason,
+because the hook's own refusal reaches a debug log and not the agent.
 
 ### How identity is preserved
 
@@ -285,6 +294,7 @@ turn ends.
 - The Codex hook asks for re-approval the first time it's used and whenever the hook file changes.
 - Matching is done on the same project's absolute directory.
 - Unix sockets only — there is no Windows support.
+- A tool result is a statement about the transport, never about the peer. `reply_to_codex` says queued and `antiphon_send` says delivered to the channel; a queued row in a thread that never takes a turn is not read, and only the peer's transcript proves receipt — `antiphon status` shows what still waits, `antiphon doctor` notes what has waited more than ten minutes. A bare reply refused among several peers names the last unanswered sender as advice; the bridge itself still never chooses.
 
 ### Passive pull pages, and what it still cannot promise
 
