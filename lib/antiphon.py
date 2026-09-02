@@ -256,6 +256,13 @@ LEGACY_SLOT = "\0legacy"
 # against.
 MID_TURN_SLOT = "\0midturn"
 
+# Where a side's pushes to peers of its own kind are fingerprinted: a key of
+# its own in the sender's cursor. The unnamed default install shares one
+# cursor file between both sides, and a Claude session's `@claude:api` under
+# `last_pushed_claude` would sit in the slot Codex's `@claude:api` is compared
+# against.
+SAME_KIND_KEY = "last_pushed_{kind}_same"
+
 
 def parked_deliveries(record):
     """The mid-turn park inside one `last_pushed_*` value, as a plain copy.
@@ -5055,7 +5062,27 @@ def push(target="codex"):
     # can retire through the same compare-and-clear helper as a markerless Stop
     # without creating a second cursor mutation rule.
     side = sender_side(target)
-    key = f"last_pushed_{target}"
+    code = _push_batches(cwd, side, target, f"last_pushed_{target}", reply_text,
+                         turn_key, input_data)
+    # The same transcript, read once more for the same-kind marker —
+    # `@claude:name` in a Claude reply, `@codex:name` in a Codex one — under a
+    # key of its own. Its refusals are reported like every Stop refusal and
+    # never change the cross-kind outcome above.
+    same = _push_batches(cwd, side, side, SAME_KIND_KEY.format(kind=side),
+                         reply_text, turn_key, input_data)
+    return code or same
+
+
+def _push_batches(cwd, side, target, key, reply_text, turn_key, input_data):
+    """One marker family of one Stop: parse, refuse, deliver, record.
+
+    `target == side` is the same-kind pass. A bare same-kind marker and the
+    sender's own alias are refused before any transport is touched: a
+    same-kind line without a name has no meaning, and a session does not
+    write to itself. Both refusals go on the ledger, so the sender's next
+    page says them — the Stop hook's own stderr does not reach the agent.
+    """
+    same_kind = target == side
     try:
         grouped = group_by_recipient(target, reply_text)
     except MarkerSyntaxError as failure:
@@ -5099,17 +5126,40 @@ def push(target="codex"):
     who = claimed_alias(cwd, side, input_data.get("session_id"))
     can_reply = reply_available(cwd, side, who)
 
+    if same_kind:
+        for recipient in list(batches):
+            if recipient is None:
+                reason = (f"not delivered: a bare @{target} line from a "
+                          f"{target.title()} session has no meaning — name the "
+                          f"peer (@{target}:name)")
+            elif who and recipient == who:
+                reason = f"not delivered: {recipient!r} is this session's own alias"
+            else:
+                continue
+            outgoing = "\n".join(batches.pop(recipient))
+            print(f"antiphon: {reason}", file=sys.stderr)
+            ledger.record_refused(
+                cwd, delivery_id(), sender=who or NO_ALIAS, to_kind=target,
+                to_alias=recipient, reason=reason, preview=outgoing,
+                sender_kind=side)
+        if not batches:
+            return _retire_park(cwd, side, key,
+                                parked_deliveries(read_cursor(cwd, side).get(key)))
+
     def deliver(recipient, messages):
         outgoing = "\n".join(messages)
         attempt = delivery_id()       # but each attempt is its own attempt
         if target == "codex":
+            # The label names the sender's kind: a Codex peer reading another
+            # Codex session's words must not take them for Claude's.
             ok, detail = send_to_codex(
-                cwd, (f"{PUSH_LABEL} "
+                cwd, (f"{SIDE_LABELS[side][0]} "
                       f"{queue_label(who, attempt, can_reply)} {outgoing}"),
                 recipient, sender=who)
         else:
             ok, detail = send_to_claude(cwd, outgoing, recipient,
-                                        sender_alias=who, message_id=attempt)
+                                        sender_alias=who, message_id=attempt,
+                                        sender_kind=side)
         named = f":{recipient}" if recipient else ""
         if ok:
             print(f"antiphon: delivered to {target.title()}{named} "
@@ -5120,7 +5170,7 @@ def push(target="codex"):
                 transport="queue" if target == "codex" else "channel",
                 proof=(detail or "registered") if target == "codex" else "channel",
                 sha256=hashlib.sha256(outgoing.encode()).hexdigest(),
-                size=len(outgoing.encode()))
+                size=len(outgoing.encode()), sender_kind=side)
         else:
             # Returning False leaves this recipient's fingerprint where it was,
             # so the line is offered again next turn instead of being recorded
@@ -5137,7 +5187,7 @@ def push(target="codex"):
             ledger.record_refused(
                 cwd, attempt, sender=who or NO_ALIAS, to_kind=target,
                 to_alias=recipient, reason=redact_private(str(detail)),
-                preview=outgoing)
+                preview=outgoing, sender_kind=side)
         return ok
 
     # The send happens here, outside any lock — reversing an earlier ruling
@@ -5464,7 +5514,8 @@ def _correlation_advice(cwd, kind, sender):
     exact argument to pass — the bridge itself still never chooses. Empty
     when nobody is owed a reply, so the refusal stays byte-identical."""
     mine = "claude" if kind == "codex" else "codex"
-    found = ledger.last_unanswered_sender(cwd, mine, sender, time.time())
+    found = ledger.last_unanswered_sender(cwd, mine, sender, time.time(),
+                                          sender_kind=kind)
     if found is None:
         return ""
     who, age = found
@@ -6473,9 +6524,9 @@ _Attachment = collections.namedtuple("_Attachment", "envelope path size")
 def _spill(cwd, text, alias, message_id, recipient=None):
     """Parks `text`; returns `(attachment, refusal)` with exactly one filled.
 
-    `recipient` is `(kind, alias)`: with it, a resend of these exact words by
-    this same sender to this same peer, within the ledger's TTL, names the
-    file that already exists instead of parking a second one.
+    `recipient` is `(kind, alias, sender_kind)`: with it, a resend of these
+    exact words by this same sender to this same peer, within the ledger's
+    TTL, names the file that already exists instead of parking a second one.
 
     A refusal here is a plain string, never a `_ClassifiedRefusal`: an attached
     class means "the sender needs telling where its words still travel", and
@@ -6501,7 +6552,8 @@ def _spill_locked(cwd, text, alias, message_id, size, recipient=None):
     if recipient is not None:
         existing = ledger.reusable_attachment(
             cwd, digest, recipient[0], recipient[1], time.time(),
-            sender=alias or NO_ALIAS)
+            sender=alias or NO_ALIAS,
+            sender_kind=recipient[2] if len(recipient) > 2 else None)
         store = _sound_store(cwd) if existing else None
         if store is not None:
             # A retry is a retry of something: the same file, whose header
@@ -6573,7 +6625,7 @@ def reply(*_):
     composed = f"{CHANNEL_LABEL} {label} {text}"
     if _oversized_for_queue(composed) and _attachable(text):
         attachment, refusal = _spill(cwd, text, who, message_id,
-                                     recipient=("codex", to))
+                                     recipient=("codex", to, "claude"))
         if refusal is not None:
             print(f"reply: {refusal}", file=sys.stderr)
             return 1
@@ -6601,7 +6653,8 @@ def reply(*_):
     ledger.record_sent(cwd, message_id, sender=who or NO_ALIAS, to_kind="codex",
                        to_alias=to, transport="queue", proof=detail or "registered",
                        sha256=hashlib.sha256(text.encode()).hexdigest(),
-                       size=len(text.encode()), attachment=attachment)
+                       size=len(text.encode()), attachment=attachment,
+                       sender_kind="claude")
     print(json.dumps({"queued": True, "id": message_id, "proof": detail or "registered",
                       "to": to, "attachment": attachment,
                       "text": queued_words(to, message_id, detail or "registered",
@@ -6877,7 +6930,7 @@ def _send_tool(cwd, text, to=None, sender=None):
     outgoing, parked = text, None
     if _oversized_for_claude(text, who, message_id) and _attachable(text):
         attachment, refusal = _spill(cwd, text, who, message_id,
-                                     recipient=("claude", to))
+                                     recipient=("claude", to, "codex"))
         if refusal is not None:
             return _tool_error(f"Not delivered to Claude: {refusal}")
         outgoing, parked = attachment.envelope, attachment
@@ -6896,7 +6949,8 @@ def _send_tool(cwd, text, to=None, sender=None):
                        sha256=hashlib.sha256(text.encode()).hexdigest(),
                        size=len(text.encode()),
                        attachment=(os.path.basename(parked.path)
-                                   if parked is not None else None))
+                                   if parked is not None else None),
+                       sender_kind="codex")
     # Naming the peer back is what lets the sender notice it addressed the wrong
     # one. With a single peer there is nothing to distinguish, so the old
     # wording stands. "Delivered" is true here — the channel server accepted

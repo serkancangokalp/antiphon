@@ -53,6 +53,52 @@ class LedgerTest(unittest.TestCase):
             self.assertEqual(uuids, {UUID}, "the delivery id is the only uuid-shaped value")
             self.assertEqual([e["id"] for e in ledger.entries(project)], [UUID])
 
+    def test_the_senders_kind_is_recorded_and_inferred_for_older_entries(self):
+        with tempfile.TemporaryDirectory() as project:
+            self._sent(project, UUID)
+            self.assertEqual(ledger.read_entry(project, UUID)["sender_kind"], "claude",
+                             "a send to Codex was always Claude's before same-kind sends")
+            self._sent(project, OTHER, sender_kind="codex", to_kind="codex", to_alias="review")
+            self.assertEqual(ledger.sender_kind_of(ledger.read_entry(project, OTHER)), "codex")
+            path = os.path.join(ledger.ledger_dir(project), THIRD + ".json")
+            older = ledger.read_entry(project, UUID)
+            older["id"] = THIRD
+            del older["sender_kind"]
+            with open(path, "w") as f:
+                json.dump(older, f)
+            legacy = ledger.read_entry(project, THIRD)
+            self.assertIsNotNone(legacy, "an entry from before the field is still read")
+            self.assertEqual(ledger.sender_kind_of(legacy), "claude")
+            self.assertEqual(len(ledger.entries(project)), 3)
+            bad = dict(older, id=THIRD, sender_kind="human")
+            with open(path, "w") as f:
+                json.dump(bad, f)
+            self.assertIsNone(ledger.read_entry(project, THIRD), "a kind that is not one")
+
+    def test_a_same_kind_refusal_is_reported_to_its_own_side(self):
+        with tempfile.TemporaryDirectory() as project:
+            ledger.record_refused(project, UUID, sender="ui", to_kind="claude", to_alias=None,
+                                  reason="not delivered: a bare @claude line", preview="x",
+                                  sender_kind="claude", at=1_000.0)
+            self.assertEqual([i for i, _ in ledger.pending_notices(project, "claude", "ui")],
+                             [UUID], "a Claude session's own refusal, whatever the kind sent to")
+            self.assertEqual(ledger.pending_notices(project, "codex", "ui"), [],
+                             "a Codex session named ui is a different session")
+
+    def test_advice_never_names_a_peer_of_the_other_kind(self):
+        with tempfile.TemporaryDirectory() as project:
+            self._sent(project, UUID, sender="api", sender_kind="claude", to_kind="claude",
+                       to_alias="ui", at=100.0)
+            self._sent(project, OTHER, sender="build", to_kind="claude", to_alias="ui", at=50.0)
+            self.assertEqual(ledger.last_unanswered_sender(project, "claude", "ui", 200.0,
+                                                           sender_kind="codex"),
+                             ("build", 150.0), "advice for a Codex reply names Codex peers")
+            self.assertEqual(ledger.last_unanswered_sender(project, "claude", "ui", 200.0,
+                                                           sender_kind="claude"),
+                             ("api", 100.0))
+            self.assertEqual(ledger.last_unanswered_sender(project, "claude", "ui", 200.0),
+                             ("api", 100.0), "unfiltered, the newest of any kind")
+
     def test_a_malformed_entry_is_skipped_never_raised(self):
         with tempfile.TemporaryDirectory() as project:
             self._sent(project)
