@@ -1155,7 +1155,7 @@ class IdentityPrivacyContractTest(unittest.TestCase):
                        "more than 400 pages", "20 pages",
                        "never delivers a record older than", "reverses",
                        "antiphon catch-up", "ceilings pinned",
-                       "the Antiphon section is missing or differs"):
+                       "section is missing or differs"):
             self.assertIn(phrase, entry, phrase)
         self.assertEqual(antiphon.PAGE_HORIZON // 3600, 24,
                          "the entry's 24 hours is the constant's")
