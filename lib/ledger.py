@@ -1,0 +1,405 @@
+"""The delivery ledger: what was sent, refused, received and read.
+
+One directory, `.antiphon/deliveries/`, one file per delivery attempt. Every
+direct send writes its entry before the transport is touched; the page
+readers, which already walk the peer's transcript and already recognise the
+bridge's own injected messages, add a receipt when they meet one; the
+attachment sweep and the hook consult it. `status` and `doctor` only read.
+
+It exists because the tools said "delivered" when a queue had merely accepted
+a row nobody drained — measured, a message queued to an open ChatGPT-app
+thread stayed in the queue for over an hour — and because a refused Stop-hook
+line printed on exit-0 stderr, which reaches a debug log and never the agent
+that wrote it.
+
+An entry holds no message content, no route, no session id and no socket
+path: public aliases, kinds, a transport, a proof class, times, a content
+digest and size, an attachment file name, a state, a redacted reason and a
+short preview of the sender's own marker line (their own words, in their own
+project).
+"""
+
+import contextlib
+import hashlib
+import json
+import os
+import re
+import stat
+import time
+
+LEDGER_VERSION = 1
+LEDGER_TTL = 7 * 24 * 3600            # seconds an entry is kept
+RECORD_CEILING = 64 * 1024
+INTEGER_TOKEN_CEILING = 20
+STATES = ("sent", "refused")
+TRANSPORTS = ("queue", "channel")
+PROOFS = ("live", "unproven", "registered", "automatic", "legacy", "channel")
+KINDS = ("claude", "codex")
+PREVIEW_LENGTH = 60
+LABEL = {"claude": "Claude", "codex": "Codex"}
+
+DELIVERY_ID = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}")
+ATTACHMENT_BASENAME = re.compile(
+    r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\.txt|[A-Za-z0-9_.-]{1,80}")
+
+OPTIONAL_TIMES = ("received_at", "read_at", "reported_at", "expired_unread_at")
+KEYS = frozenset({
+    "version", "id", "sender", "to_kind", "to_alias", "transport", "proof",
+    "state", "sent_at", "sha256", "size", "attachment", "reason", "preview",
+    *OPTIONAL_TIMES})
+
+
+def ledger_dir(cwd):
+    return os.path.join(cwd, ".antiphon", "deliveries")
+
+
+def _sound_dir(cwd, create=False):
+    """The ledger directory when it is a directory this code owns, else None.
+
+    Never through a symlink: a link at somebody else's directory would have
+    this bridge writing its bookkeeping there and counting it as here.
+    """
+    directory = ledger_dir(cwd)
+    try:
+        info = os.lstat(directory)
+    except FileNotFoundError:
+        if not create:
+            return None
+        try:
+            os.makedirs(os.path.dirname(directory), exist_ok=True)
+            os.mkdir(directory, 0o700)
+        except FileExistsError:
+            return _sound_dir(cwd, create=False)
+        except OSError:
+            return None
+        return directory
+    except OSError:
+        return None
+    if stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode):
+        return None
+    if info.st_mode & 0o077:
+        with contextlib.suppress(OSError):
+            os.chmod(directory, 0o700)
+    return directory
+
+
+def _bounded_int(token):
+    if len(token.lstrip("-")) > INTEGER_TOKEN_CEILING:
+        raise ValueError("integer token too long")
+    return int(token)
+
+
+def _no_duplicate_keys(pairs):
+    seen = {}
+    for key, value in pairs:
+        if key in seen:
+            raise ValueError("duplicate key")
+        seen[key] = value
+    return seen
+
+
+def _time_or_none(value):
+    if value is None:
+        return True
+    return (isinstance(value, (int, float)) and not isinstance(value, bool)
+            and value == value and value not in (float("inf"), float("-inf"))
+            and value >= 0)
+
+
+def _valid(entry, expected_id):
+    if not isinstance(entry, dict) or set(entry) != KEYS:
+        return False
+    if entry["version"] != LEDGER_VERSION or type(entry["version"]) is not int:
+        return False
+    if entry["id"] != expected_id or not DELIVERY_ID.fullmatch(expected_id):
+        return False
+    if not isinstance(entry["sender"], str) or not entry["sender"]:
+        return False
+    if entry["to_kind"] not in KINDS:
+        return False
+    if entry["to_alias"] is not None and (not isinstance(entry["to_alias"], str)
+                                          or not entry["to_alias"]):
+        return False
+    if entry["transport"] not in TRANSPORTS or entry["proof"] not in PROOFS:
+        return False
+    if entry["state"] not in STATES:
+        return False
+    if not _time_or_none(entry["sent_at"]) or entry["sent_at"] is None:
+        return False
+    if entry["sha256"] is not None and not (
+            isinstance(entry["sha256"], str) and len(entry["sha256"]) == 64):
+        return False
+    if entry["size"] is not None and (
+            type(entry["size"]) is not int or entry["size"] < 0):
+        return False
+    if entry["attachment"] is not None and not (
+            isinstance(entry["attachment"], str)
+            and ATTACHMENT_BASENAME.fullmatch(entry["attachment"])
+            and "/" not in entry["attachment"]):
+        return False
+    for key in ("reason", "preview"):
+        if entry[key] is not None and not isinstance(entry[key], str):
+            return False
+    return all(_time_or_none(entry[key]) for key in OPTIONAL_TIMES)
+
+
+def _path(cwd, delivery_id):
+    return os.path.join(ledger_dir(cwd), delivery_id + ".json")
+
+
+def read_entry(cwd, delivery_id):
+    """One validated entry, or None."""
+    if not isinstance(delivery_id, str) or not DELIVERY_ID.fullmatch(delivery_id):
+        return None
+    if _sound_dir(cwd) is None:
+        return None
+    try:
+        with open(_path(cwd, delivery_id), "rb") as stream:
+            raw = stream.read(RECORD_CEILING + 1)
+        if len(raw) > RECORD_CEILING:
+            return None
+        entry = json.loads(raw.decode("utf-8"),
+                           object_pairs_hook=_no_duplicate_keys,
+                           parse_int=_bounded_int)
+    except (OSError, ValueError, UnicodeDecodeError):
+        return None
+    return entry if _valid(entry, delivery_id) else None
+
+
+def entries(cwd):
+    """Every validated entry, oldest first (then by id)."""
+    directory = _sound_dir(cwd)
+    if directory is None:
+        return []
+    try:
+        names = sorted(os.listdir(directory))
+    except OSError:
+        return []
+    found = []
+    for name in names:
+        if not name.endswith(".json"):
+            continue
+        entry = read_entry(cwd, name[:-5])
+        if entry is not None:
+            found.append(entry)
+    found.sort(key=lambda e: (e["sent_at"], e["id"]))
+    return found
+
+
+def _write(cwd, entry):
+    directory = _sound_dir(cwd, create=True)
+    if directory is None:
+        return False
+    path = _path(cwd, entry["id"])
+    tmp = f"{path}.{os.getpid()}.tmp"
+    try:
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as stream:
+            json.dump(entry, stream, ensure_ascii=False)
+        os.replace(tmp, path)
+    except OSError:
+        with contextlib.suppress(OSError):
+            os.unlink(tmp)
+        return False
+    return True
+
+
+def _new(delivery_id, sender, to_kind, to_alias, transport, proof, state, at):
+    return {
+        "version": LEDGER_VERSION, "id": delivery_id, "sender": sender,
+        "to_kind": to_kind, "to_alias": to_alias, "transport": transport,
+        "proof": proof, "state": state, "sent_at": float(at),
+        "sha256": None, "size": None, "attachment": None, "reason": None,
+        "preview": None, "received_at": None, "read_at": None,
+        "reported_at": None, "expired_unread_at": None,
+    }
+
+
+def record_sent(cwd, delivery_id, *, sender, to_kind, to_alias, transport,
+                proof, sha256, size, attachment=None, at=None):
+    """An attempt the transport accepted. Returns whether it is on the ledger."""
+    entry = _new(delivery_id, sender, to_kind, to_alias, transport, proof,
+                 "sent", time.time() if at is None else at)
+    entry["sha256"] = sha256
+    entry["size"] = size
+    entry["attachment"] = attachment
+    if not _valid(entry, delivery_id):
+        return False
+    return _write(cwd, entry)
+
+
+def record_refused(cwd, delivery_id, *, sender, to_kind, to_alias, reason,
+                   preview, at=None):
+    """An attempt that never left: the reason, and enough of the sender's own
+    line to recognise it. Returns whether it is on the ledger."""
+    entry = _new(delivery_id, sender, to_kind, to_alias, "queue"
+                 if to_kind == "codex" else "channel", "unproven", "refused",
+                 time.time() if at is None else at)
+    entry["reason"] = str(reason)
+    entry["preview"] = " ".join(str(preview).split())[:PREVIEW_LENGTH]
+    if not _valid(entry, delivery_id):
+        return False
+    return _write(cwd, entry)
+
+
+def _update(cwd, delivery_id, mutate):
+    entry = read_entry(cwd, delivery_id)
+    if entry is None:
+        return False
+    changed = dict(entry)
+    mutate(changed)
+    if changed == entry:
+        return True
+    return _write(cwd, changed)
+
+
+def mark_received(cwd, delivery_id, at):
+    """The peer's transcript shows the delivery; the earliest sighting wins."""
+    def mutate(entry):
+        if entry["received_at"] is None or at < entry["received_at"]:
+            entry["received_at"] = float(at)
+    return _update(cwd, delivery_id, mutate)
+
+
+def _entries_naming(cwd, attachment):
+    return [e for e in entries(cwd) if e["attachment"] == attachment]
+
+
+def mark_read(cwd, attachment, at):
+    """The peer's transcript shows the attachment file being read."""
+    found = False
+    for entry in _entries_naming(cwd, attachment):
+        found = True
+
+        def mutate(changed):
+            if changed["read_at"] is None or at < changed["read_at"]:
+                changed["read_at"] = float(at)
+        _update(cwd, entry["id"], mutate)
+    return found
+
+
+def mark_expired_unread(cwd, attachment, at):
+    """The sweep removed the file and no receipt ever said it was read."""
+    for entry in _entries_naming(cwd, attachment):
+        if entry["read_at"] is not None or entry["expired_unread_at"] is not None:
+            continue
+
+        def mutate(changed):
+            changed["expired_unread_at"] = float(at)
+        _update(cwd, entry["id"], mutate)
+
+
+def mark_reported(cwd, delivery_ids, at):
+    """The sender's own page carried the notice; never again."""
+    for delivery_id in delivery_ids:
+        def mutate(changed):
+            if changed["reported_at"] is None:
+                changed["reported_at"] = float(at)
+        _update(cwd, delivery_id, mutate)
+
+
+def record_receipts(cwd, receipts):
+    """Apply `("received", id, at)` / `("read", basename, at)` triples."""
+    for kind, key, at in receipts:
+        if kind == "received":
+            mark_received(cwd, key, at)
+        elif kind == "read":
+            mark_read(cwd, key, at)
+
+
+def _clock(stamp):
+    return time.strftime("%H:%M", time.localtime(stamp))
+
+
+def pending_notices(cwd, side, alias):
+    """`[(id, text)]` the sender on `side` has not been told yet.
+
+    A refusal is reported to the session that wrote the line: the entry's
+    sender is this alias, or `<unnamed>` when this session has no name. An
+    attachment that expired unread is reported to its sender the same way.
+    """
+    mine = {alias} if alias else set()
+    if not alias or alias == "<unnamed>":
+        mine.add("<unnamed>")
+    notices = []
+    for entry in entries(cwd):
+        if entry["sender"] not in mine or entry["reported_at"] is not None:
+            continue
+        if entry["to_kind"] == side:
+            continue                       # a delivery this side received, not sent
+        target = LABEL[entry["to_kind"]]
+        if entry["state"] == "refused":
+            named = f":{entry['to_alias']}" if entry["to_alias"] else ""
+            notices.append((entry["id"], (
+                f"Antiphon: your @{entry['to_kind']}{named} line at "
+                f"{_clock(entry['sent_at'])} (\"{entry['preview'] or ''}\") "
+                f"was not delivered — {entry['reason'] or 'no reason recorded'}")))
+        elif entry["expired_unread_at"] is not None:
+            notices.append((entry["id"], (
+                f"Antiphon: the attachment you sent to {target} at "
+                f"{_clock(entry['sent_at'])} expired unread after "
+                f"{LEDGER_TTL // 86400} days")))
+    return notices
+
+
+def awaiting_receipt(cwd, now):
+    """`[(entry, age)]` for what was sent and never seen in the peer's transcript."""
+    waiting = []
+    for entry in entries(cwd):
+        if entry["state"] == "sent" and entry["received_at"] is None:
+            waiting.append((entry, max(0.0, now - entry["sent_at"])))
+    return waiting
+
+
+def last_unanswered_sender(cwd, to_kind, to_alias, now):
+    """`(alias, age)` of the newest peer that wrote to this session — by its
+    alias, or to nobody in particular — and has not been written back to
+    since; None when nobody is owed a reply. Advice for a refusal, never a
+    route: the bridge does not choose."""
+    latest = {}
+    answered = {}
+    for entry in entries(cwd):
+        if entry["state"] != "sent":
+            continue
+        sender = entry["sender"]
+        if (entry["to_kind"] == to_kind
+                and entry["to_alias"] in (to_alias, None)
+                and sender != "<unnamed>" and sender != to_alias):
+            latest[sender] = max(latest.get(sender, 0.0), entry["sent_at"])
+        if sender == to_alias and entry["to_alias"]:
+            answered[entry["to_alias"]] = max(
+                answered.get(entry["to_alias"], 0.0), entry["sent_at"])
+    open_senders = [(when, sender) for sender, when in latest.items()
+                    if answered.get(sender, -1.0) < when]
+    if not open_senders:
+        return None
+    when, sender = max(open_senders)
+    return sender, max(0.0, now - when)
+
+
+def reusable_attachment(cwd, sha256, to_kind, to_alias, now):
+    """The parked file an earlier, unexpired send of these exact words to this
+    recipient left behind, when it is still there; else None."""
+    for entry in reversed(entries(cwd)):
+        if (entry["state"] == "sent" and entry["attachment"]
+                and entry["sha256"] == sha256 and entry["to_kind"] == to_kind
+                and entry["to_alias"] == to_alias
+                and now - entry["sent_at"] <= LEDGER_TTL):
+            path = os.path.join(cwd, ".antiphon", "messages", entry["attachment"])
+            try:
+                if stat.S_ISREG(os.lstat(path).st_mode):
+                    return entry["attachment"]
+            except OSError:
+                continue
+    return None
+
+
+def prune(cwd, now):
+    """Drop entries older than the ledger's own TTL. Best effort, never raises."""
+    directory = _sound_dir(cwd)
+    if directory is None:
+        return
+    for entry in entries(cwd):
+        if now - entry["sent_at"] > LEDGER_TTL:
+            with contextlib.suppress(OSError):
+                os.unlink(_path(cwd, entry["id"]))
