@@ -2910,6 +2910,40 @@ async function aCurrentListenerOverADowngradedPythonWithdrawsItsOwnEndpoint() {
   }
 }
 
+// New Node in memory, old Python on disk, and a reply that succeeds: the old
+// bridge prints nothing on stdout, so the server's own words stand in for
+// the sentence Python would have composed — queued, never delivered.
+async function aNewListenerOverAnOldPythonSaysQueuedInItsOwnWords() {
+  const mixed = await materialiseLib({ node: "worktree", python: "f0c529f" });
+  if (!mixed) { console.log("new listener over old python: skipped (no git)"); return; }
+  const dir = await mkdtemp(join(tmpdir(), "antiphon-new-node-words-"));
+  liveCodexPeer(dir, "review", "301:review", CODEX_SESSION);
+  // Its own `codex` stub: the module's was removed with the main client's
+  // project, and a missing stub would let the real binary answer.
+  const codexStub = await makeCodexStub();
+  const env = { ...mainEnv, ANTIPHON_CWD: dir, HOME: dir,
+                PATH: `${codexStub.dir}:${process.env.PATH}` };
+  const oldTransport = new StdioClientTransport({
+    command: "node", args: [join(mixed.lib, "channel.mjs")], env, stderr: "pipe",
+  });
+  const oldClient = new Client({ name: "antiphon-test", version: "1.0.0" });
+  try {
+    await oldClient.connect(oldTransport);
+    const answer = await oldClient.callTool({
+      name: "reply_to_codex", arguments: { text: "ship it", to: "review" },
+    });
+    assert.equal(answer.isError, undefined, JSON.stringify(answer));
+    assert.equal(answer.content[0].text,
+      "Queued for Codex peer 'review'; run antiphon status to see whether it was received.",
+      "the fallback wording, byte for byte");
+    assert.match(readFileSync(codexStub.log, "utf8"), /ship it/, "and the old bridge did queue it");
+    console.log("a new listener over an old python says queued in its own words: ok");
+  } finally {
+    await oldClient.close().catch(() => {});
+    for (const p of [dir, mixed.dir, codexStub.dir]) await rm(p, { recursive: true, force: true }).catch(() => {});
+  }
+}
+
 // The four answers, on real files, without a listener.
 async function anEndpointIsClassifiedNotCollapsed() {
   const { classifyEndpoint } = await import("../lib/identity.mjs");
@@ -3103,3 +3137,4 @@ await aMidLifeDowngradeIsRefusedOnceNotChurned();
 await aCurrentListenerOverADowngradedPythonWithdrawsItsOwnEndpoint();
 await anEndpointIsClassifiedNotCollapsed();
 await aWithdrawalThatDidNotHappenIsNotAnnounced();
+await aNewListenerOverAnOldPythonSaysQueuedInItsOwnWords();
