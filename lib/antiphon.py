@@ -80,14 +80,14 @@ EVENT_LIMIT = 40          # completed source records per page
 PAGE_BUDGET = 8_000       # UTF-8 bytes in an ordinary complete page envelope
 RECENT_FILES = 3          # bounded fallback/current-window discovery per side
 LOOKBACK = 6 * 3600       # a new reader starts this far back
-# A positioned reader never lags a source by more than this much of the
-# source's own clock: undelivered records older than the source's newest
-# complete record minus this are skipped, counted and announced. Relative to
-# the source, not to the wall: an overnight run is still there in the
-# morning, and a source that stopped days ago yields its last day. Measured
-# before this existed: a reader more than 400 pages behind, every page a
-# day old, 2,000 tokens per turn spent on history nobody asked for; bounded
-# to a day, 21 pages.
+# A reader never delivers a record older than this much before the other
+# side's newest complete record, across every source it reads: what is older
+# is skipped, counted and announced. Relative to the other side's own clock,
+# not to the wall: an overnight run is still there in the morning, and a
+# side that stopped days ago yields its last day. Measured before this
+# existed: a reader more than 400 pages behind, every page a day old, 2,000
+# tokens per turn spent on history nobody asked for; bounded to a day, 21
+# pages.
 PAGE_HORIZON = 24 * 3600
 HORIZON_BISECT_ABOVE = 1024 * 1024     # bytes of unread span before bisecting
 HORIZON_BISECT_STEP = 4096             # the bisection converges to this span
@@ -3070,15 +3070,33 @@ def _first_offset_at_or_after(source, timestamp, start):
     return size
 
 
-def _apply_horizon(source, start):
+def _reader_horizon(cwd, kind, paths):
+    """The moment before which this reader delivers nothing: PAGE_HORIZON
+    before the newest complete record across every source it can read, or
+    None when no source has a readable newest time.
+
+    Across sources, not per source. Measured per source on the live project,
+    every one of thirty old rollouts still yielded its own last day — a
+    hundred pages of days-old tool lines; against the other side's newest
+    record, a rollout that stopped days ago is entirely behind the horizon."""
+    newest = None
+    for path in paths:
+        opened = _open_discovered_source(path, cwd, kind, report=False)
+        if isinstance(opened, SourceRefusal):
+            continue
+        with opened as source:
+            when = _source_newest_time(source)
+        if when is not None and (newest is None or when > newest):
+            newest = when
+    return None if newest is None else newest - PAGE_HORIZON
+
+
+def _apply_horizon(source, start, horizon):
     """`(start, skipped)`: a trusted start moved forward to the first record
-    within PAGE_HORIZON of the source's newest complete record, and how many
-    raw bytes that left behind. Nothing moves when the source has no readable
-    newest time or the next record is already inside the window."""
-    newest = _source_newest_time(source)
-    if newest is None:
+    at or after `horizon`, and how many raw bytes that left behind. Nothing
+    moves without a horizon or when the next record is already inside it."""
+    if horizon is None:
         return start, 0
-    horizon = newest - PAGE_HORIZON
     first = source.first_record_at(start)
     if first is None:
         return start, 0
@@ -3345,7 +3363,7 @@ def claude_transcripts(cwd):
 
 
 def claude_events(cwd, positions=None, since=None, visible_record_limit=None,
-                  source_paths=None, skipped=None):
+                  source_paths=None, skipped=None, horizon=None):
     """Return visible events and the safe scanned position for each source.
 
     A completed JSONL record consumes at most one visible lookahead slot even
@@ -3368,7 +3386,7 @@ def claude_events(cwd, positions=None, since=None, visible_record_limit=None,
             # The horizon, after every start rule: a reader never lags this
             # source by more than PAGE_HORIZON of its own clock, and what it
             # leaves behind is counted for the page to say so.
-            offset, cut = _apply_horizon(source, offset)
+            offset, cut = _apply_horizon(source, offset, horizon)
             if cut and skipped is not None:
                 skipped[sid] = skipped.get(sid, 0) + cut
             previous_anchor = source.anchor_at(offset) if offset else None
@@ -3526,11 +3544,10 @@ def _codex_tool_fields(payload):
 # The ChatGPT app records an external agent's tool traffic — Claude Code's
 # own Bash and Read calls, when Claude runs inside the app — as assistant
 # messages in the Codex rollout. Measured 2026-09-02: 8,936 records, 11 MB,
-# rendered as Codex speech with the commands and their output in full. A call
-# is one name-only tool line, as every Codex tool call is; a result is a tool
-# output and stays filtered. Exact at the first line: the bracket, the fixed
-# prefix, one tool-name token, nothing leading. Nothing retrievable backs a
-# relay, so it carries no id.
+# rendered as Codex speech with the commands and their output in full. Both
+# shapes are that agent's own activity, already in its own transcript, and
+# are filtered whole. Exact at the first line: the bracket, the fixed prefix,
+# one tool-name token, nothing leading.
 EXTERNAL_AGENT_CALL = re.compile(
     r"\[external_agent_tool_call: (" + TOOL_COMPONENT.pattern + r")\](?:\n|$)")
 EXTERNAL_AGENT_RESULT_HEAD = "[external_agent_tool_result]"
@@ -3638,7 +3655,7 @@ def _codex_tool_shape_count(cwd, discovery=None, source_paths=None):
 
 
 def codex_events(cwd, positions=None, since=None, visible_record_limit=None,
-                 source_paths=None, skipped=None):
+                 source_paths=None, skipped=None, horizon=None):
     """Return visible events and the safe scanned position for each rollout."""
     events = []
     reached = {}
@@ -3656,7 +3673,7 @@ def codex_events(cwd, positions=None, since=None, visible_record_limit=None,
             # The horizon, after every start rule: a reader never lags this
             # source by more than PAGE_HORIZON of its own clock, and what it
             # leaves behind is counted for the page to say so.
-            offset, cut = _apply_horizon(source, offset)
+            offset, cut = _apply_horizon(source, offset, horizon)
             if cut and skipped is not None:
                 skipped[sid] = skipped.get(sid, 0) + cut
             previous_anchor = source.anchor_at(offset) if offset else None
@@ -3693,20 +3710,19 @@ def codex_events(cwd, positions=None, since=None, visible_record_limit=None,
                                                         start, end, previous_anchor,
                                                         anchor)))
                             elif role == "assistant":
-                                relay = _external_agent_relay(text)
-                                if relay is None:
+                                # A relayed external-agent call or result is
+                                # the other agent's own activity, already in
+                                # that agent's transcript: filtered whole,
+                                # while the safe scanned frontier advances.
+                                # Measured as tool lines instead: 1,022 of
+                                # them inside one day's horizon on the live
+                                # project, every one a mirror of Claude's own
+                                # commands.
+                                if _external_agent_relay(text) is None:
                                     events.append((ts, path, next(position),
                                                   Event(ts, "codex", text, sid, gen,
                                                         start, end, previous_anchor,
                                                         anchor)))
-                                elif relay[0] == "call":
-                                    events.append((ts, path, next(position),
-                                                  Event(ts, "tool",
-                                                        f"external agent: {relay[1]}",
-                                                        sid, gen, start, end,
-                                                        previous_anchor, anchor)))
-                                # a relayed result is a tool output: filtered,
-                                # while the safe scanned frontier still advances
                     elif kind == "response_item":
                         invocation = _codex_invocation(payload, sid, start)
                         if invocation is not None:
@@ -4302,14 +4318,15 @@ def build_summary(cwd, side, positions=None, since=None, replay_reason=None,
             state="degraded", refusals=max(1, discovery.refusals),
             reason="some project sources could not be proved")
     skipped = {}
+    horizon = _reader_horizon(cwd, kind, discovery.sources)
     if side == "claude":
         events, reached = codex_events(
             cwd, positions, since, visible_record_limit=EVENT_LIMIT + 1,
-            source_paths=discovery.sources, skipped=skipped)
+            source_paths=discovery.sources, skipped=skipped, horizon=horizon)
     else:
         events, reached = claude_events(
             cwd, positions, since, visible_record_limit=EVENT_LIMIT + 1,
-            source_paths=discovery.sources, skipped=skipped)
+            source_paths=discovery.sources, skipped=skipped, horizon=horizon)
     expected = {
         (path.candidate.expected_source
          if isinstance(path, DiscoveredSourcePath) else source_id(path))
@@ -9400,6 +9417,7 @@ def reader_backlog(cwd, side, cursor, cursor_state="valid"):
     kind = CATCH_UP_SOURCES[side]
     discovery = _discover_sources(cwd, kind, side, positions, since)
     unread, positioned, unpositioned, skipped = 0, 0, 0, 0
+    horizon = _reader_horizon(cwd, kind, discovery.sources)
     for path in discovery.sources:
         opened = _open_discovered_source(path, cwd, kind)
         if isinstance(opened, SourceRefusal):
@@ -9409,7 +9427,7 @@ def reader_backlog(cwd, side, cursor, cursor_state="valid"):
             if size is None:
                 continue
             start, reason = _resolve_source_start(source, positions, since)
-            start, cut = _apply_horizon(source, start)
+            start, cut = _apply_horizon(source, start, horizon)
             skipped += cut
             unread += max(0, size - start)
             if reason == "positioned":

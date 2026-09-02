@@ -2445,9 +2445,10 @@ class AntiphonTest(unittest.TestCase):
         """The ChatGPT app records an external agent's tool traffic — Claude
         Code's own Bash and Read calls, when Claude runs inside the app — as
         assistant messages in the Codex rollout. Measured 2026-09-02: 8,936
-        records, 11 MB, rendered as Codex speech. A call is one name-only tool
-        line, as every Codex tool call is; a result is a tool output and stays
-        filtered."""
+        records, 11 MB, rendered as Codex speech. Rendered as tool lines instead,
+        1,022 of them sat inside one day's horizon on the live project. Both
+        shapes are that agent's own activity, already in its own transcript:
+        filtered whole."""
         rendered = self._codex_events_for([
             self._codex_line("assistant",
                              "[external_agent_tool_call: Bash]\ndescription: list\n"
@@ -2461,12 +2462,11 @@ class AntiphonTest(unittest.TestCase):
             self._codex_line("user", "a person typed this", 5),
         ])
         self.assertEqual(rendered, [
-            ("tool", "external agent: Bash", None),
             ("codex", "Plain words from Codex.", None),
             ("you", "a person typed this", None),
-        ])
+        ], "a relay is the other agent's own activity: filtered whole")
         joined = "\n".join(text for _kind, text, _id in rendered)
-        for secret in ("ls -la", "SECRET-OUTPUT", "GOAL-SECRET"):
+        for secret in ("ls -la", "SECRET-OUTPUT", "GOAL-SECRET", "external agent"):
             self.assertNotIn(secret, joined)
 
     def test_the_relay_predicate_is_exact_about_its_shape(self):
@@ -4107,14 +4107,17 @@ class PageHorizonTest(unittest.TestCase):
     def test_the_skip_lands_on_a_record_boundary_the_anchor_can_prove(self):
         path = self._rollout(self._hourly(72))
         with antiphon._PathSource(path, "codex") as source:
-            start, skipped = antiphon._apply_horizon(source, 0)
+            horizon = antiphon._source_newest_time(source) - antiphon.PAGE_HORIZON
+            start, skipped = antiphon._apply_horizon(source, 0, horizon)
             self.assertGreater(skipped, 0)
             record = source.first_record_at(start)
             self.assertEqual(record[0], start, "a boundary")
             self.assertIn("message 47", record[2])
             self.assertIsNotNone(source.anchor_at(start))
-            self.assertEqual(antiphon._apply_horizon(source, start), (start, 0),
+            self.assertEqual(antiphon._apply_horizon(source, start, horizon), (start, 0),
                              "idempotent")
+            self.assertEqual(antiphon._apply_horizon(source, 0, None), (0, 0),
+                             "no horizon, nothing moves")
 
     def test_first_record_at_reads_boundaries_and_mid_lines_alike(self):
         path = self._rollout(self._hourly(3))
@@ -4155,10 +4158,40 @@ class PageHorizonTest(unittest.TestCase):
             stream.write('{"type": "event_msg", "payload": {}}\n')
         with antiphon._PathSource(path, "codex") as source:
             self.assertIsNone(antiphon._source_newest_time(source))
-            self.assertEqual(antiphon._apply_horizon(source, 0), (0, 0))
+            self.assertIsNone(antiphon._reader_horizon("/tmp/project", "codex", [path]))
+            self.assertEqual(antiphon._apply_horizon(source, 0, None), (0, 0))
         self.assertIsNone(antiphon._record_time("not json"))
         self.assertIsNone(antiphon._record_time('{"timestamp": ""}'))
         self.assertIsNone(antiphon._record_time("[1, 2]"))
+
+    def test_the_horizon_is_the_other_sides_newest_record_across_sources(self):
+        """Per source, thirty old rollouts on the live project each yielded
+        their own last day — a hundred pages of days-old tool lines. The
+        horizon is one moment for the whole reader: a day before the newest
+        record the other side wrote anywhere, so a source that stopped days
+        ago is entirely behind it."""
+        old = self._hourly(24)                                   # 08-28
+        new = [f"2026-09-01T{hour:02d}:00:00.000Z" for hour in range(6)]
+        live_sid = "2e6b14f1-1659-544a-98d4-56d6eca8fa48"
+        with tempfile.TemporaryDirectory() as project:
+            stale = self._rollout(old, project)
+            live = self._rollout(new, project)
+            renamed = live.replace(self.SID, live_sid)
+            os.rename(live, renamed)
+            positions = antiphon.RuntimePositions({
+                self.SID: {"gen": antiphon.source_generation(stale),
+                           "offset": 0, "anchor": None},
+                live_sid: {"gen": antiphon.source_generation(renamed),
+                           "offset": 0, "anchor": None}})
+            with patch.object(antiphon, "codex_rollout_files",
+                              return_value=[stale, renamed]):
+                text, _advance, _ = antiphon.build_summary(
+                    project, "claude", positions, None, None)
+        self.assertIn("skipped:", text)
+        self.assertIn("in 1 source(s)", text, "the stale source, whole; the live one untouched")
+        self.assertNotIn("message 23\n", text + "\n", "nothing of the stale source")
+        self.assertIn("message 0\n", text + "\n", "all of the live source")
+        self.assertIn("message 5\n", text + "\n")
 
     def test_status_counts_what_the_horizon_will_skip(self):
         with tempfile.TemporaryDirectory() as project:
