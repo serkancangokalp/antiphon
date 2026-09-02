@@ -2441,7 +2441,7 @@ class AntiphonTest(unittest.TestCase):
         self.assertFalse(antiphon._is_codex_host_block(None))
         self.assertEqual(self._codex_events_for([self._codex_line("user", block)]), [])
 
-    def test_codex_external_agent_relays_are_tool_lines_not_speech(self):
+    def test_codex_external_agent_relays_are_filtered_whole(self):
         """The ChatGPT app records an external agent's tool traffic — Claude
         Code's own Bash and Read calls, when Claude runs inside the app — as
         assistant messages in the Codex rollout. Measured 2026-09-02: 8,936
@@ -4208,10 +4208,86 @@ class PageHorizonTest(unittest.TestCase):
         self.assertEqual(positioned, 1)
         line = antiphon._backlog_line(
             "claude_pages", (unread, positioned, unpositioned, replay, skipped))
-        self.assertIn(f"{skipped:,} raw bytes older than the 24-hour horizon "
-                      "will be skipped", line)
+        # The headline counts the skip too: "0 raw bytes" beside megabytes
+        # about to be dropped is the zero the replay line never claims.
+        self.assertIn(f"unread claude_pages: {unread + skipped:,} raw bytes across "
+                      f"1 source, of which {skipped:,} older than the 24-hour "
+                      "horizon will be skipped", line)
         self.assertNotIn("horizon", antiphon._backlog_line(
             "claude_pages", (unread, positioned, unpositioned, replay, 0)))
+
+    def test_a_future_stamped_record_cannot_move_the_horizon_past_now(self):
+        """One record stamped in the future — a clock set forward and put
+        back, an edited transcript — would otherwise put the horizon past
+        everything real on that side, for every source, permanently. The
+        source's clock moves the horizon backwards only."""
+        now = time.time()
+        times = [time.strftime("%Y-%m-%dT%H:%M:%S.000Z", time.gmtime(now - 7200 + 600 * i))
+                 for i in range(6)]
+        times.append("2030-01-01T00:00:00.000Z")
+        with tempfile.TemporaryDirectory() as project:
+            path = self._rollout(times, project)
+            horizon = antiphon._reader_horizon(project, "codex", [path])
+            self.assertGreaterEqual(horizon, now - antiphon.PAGE_HORIZON)
+            self.assertLessEqual(horizon, now + 60 - antiphon.PAGE_HORIZON,
+                                 "bounded by the wall clock, not by 2030")
+            pages = self._drain(project, path, self._at_byte_zero(path))
+        joined = "\n".join(pages)
+        self.assertIn("message 0\n", joined + "\n", "two hours old is inside the horizon")
+        self.assertIn("message 6\n", joined + "\n")
+        self.assertNotIn("skipped:", joined)
+
+    def test_a_page_that_only_skipped_still_says_so_and_moves_the_cursor(self):
+        """An old backlog whose whole in-horizon tail is host bookkeeping:
+        nothing visible to deliver, yet the cursor moves past days of
+        records. The page says so — never a silent advance — and the
+        position it leaves is anchored and provable."""
+        with tempfile.TemporaryDirectory() as project:
+            path = self._rollout(self._hourly(30), project)
+            with open(path, "a", encoding="utf-8") as stream:
+                for hour in range(6):
+                    stream.write(json.dumps({
+                        "timestamp": f"2026-09-01T{hour:02d}:00:00.000Z",
+                        "type": "response_item",
+                        "payload": {"type": "message", "role": "developer",
+                                    "content": [{"type": "input_text",
+                                                 "text": "host bookkeeping"}]}})
+                        + "\n")
+            with patch.object(antiphon, "codex_rollout_files", return_value=[path]):
+                text, advance, count = antiphon.build_summary(
+                    project, "claude", self._at_byte_zero(path), None, None)
+            self.assertIn("skipped:", text)
+            self.assertNotIn("message ", text)
+            self.assertNotIn("host bookkeeping", text)
+            self.assertEqual(count, 0)
+            self.assertFalse(advance.has_more)
+            position = advance.sources[self.SID]
+            self.assertTrue(antiphon._valid_anchored_position(position), position)
+            with antiphon._PathSource(path, "codex") as source:
+                self.assertEqual(position["offset"], source.complete_prefix_end())
+
+    def test_a_first_record_without_a_timestamp_does_not_switch_the_horizon_off(self):
+        """Measured: 101 of 526 Claude transcripts end on a bookkeeping record
+        with no timestamp, and a reader whose frontier lands on one used to
+        get one unbounded page."""
+        path = self._rollout(self._hourly(72))
+        with open(path, encoding="utf-8") as stream:
+            body = stream.read()
+        with open(path, "w", encoding="utf-8") as stream:
+            stream.write('{"type": "event_msg", "payload": {}}\n' + body)
+        with antiphon._PathSource(path, "codex") as source:
+            horizon = antiphon._source_newest_time(source) - antiphon.PAGE_HORIZON
+            start, skipped = antiphon._apply_horizon(source, 0, horizon)
+            self.assertGreater(skipped, 0)
+            self.assertIn("message 47", source.first_record_at(start)[2])
+
+    def test_a_degraded_page_without_records_still_announces_the_skip(self):
+        degraded = antiphon.Discovery((), "degraded", 0, 1, 0,
+                                      "some project sources could not be proved")
+        text, _advance, _count = antiphon._build_page(
+            [], {}, "claude", discovery=degraded, skipped={self.SID: 4096})
+        self.assertIn("discovery: degraded", text)
+        self.assertRegex(text, r"skipped: 4,096 raw bytes of Codex activity")
 
 
 class LiveCodexTargetTest(unittest.TestCase):
@@ -4802,6 +4878,77 @@ class DoctorTest(unittest.TestCase):
         line = self.line_for(printed, "AGENTS.md")
         self.assertTrue(line.startswith("✗ AGENTS.md: the Antiphon section is missing"), line)
         self.assertIn("run `antiphon setup`", line)
+
+    def test_doctor_names_an_unreadable_rules_file(self):
+        project = self.project()
+        self.set_up(project)
+        with open(os.path.join(project, "AGENTS.md"), "wb") as f:
+            f.write(b"## The Antiphon bridge\n\xff\xfe\n")
+        code, printed = self.run_doctor(project)
+        self.assertEqual(code, 1)
+        line = self.line_for(printed, "AGENTS.md")
+        self.assertTrue(line.startswith("✗ AGENTS.md: unreadable: not valid UTF-8"), line)
+        self.assertIn("fix or delete it, then run `antiphon setup`", line)
+
+    def test_setup_refuses_an_unreadable_rules_file_and_finishes_the_rest(self):
+        """Doctor's advice is "fix or delete it, then run `antiphon setup`";
+        setup read the same file with a bare `open` and died on it with a
+        traceback after the hooks were already written."""
+        project = self.project()
+        with open(os.path.join(project, "AGENTS.md"), "wb") as f:
+            f.write(b"\xff\xfe")
+        err = io.StringIO()
+        with patch.object(antiphon, "project_dir", return_value=project), \
+             contextlib.redirect_stdout(io.StringIO()), \
+             contextlib.redirect_stderr(err):
+            code = antiphon.setup()
+        self.assertEqual(code, 1)
+        self.assertIn("✗ AGENTS.md: not valid UTF-8", err.getvalue())
+        self.assertIn("run `antiphon setup` again", err.getvalue())
+        self.assertNotIn("Traceback", err.getvalue())
+        with open(os.path.join(project, "AGENTS.md"), "rb") as f:
+            self.assertEqual(f.read(), b"\xff\xfe", "left untouched")
+        with open(os.path.join(project, "CLAUDE.md"), encoding="utf-8") as f:
+            self.assertIn(antiphon.SECTION_HEADING, f.read(),
+                          "the rest of setup still ran")
+
+    def test_setup_keeps_a_persons_notes_after_the_marked_section(self):
+        """The section ends at its own marker now. Before, it ran to the
+        next `## ` heading or the end of the file, and a rewrite took the
+        notes a person had appended after it along with the stale words."""
+        stale = antiphon.AGENTS_RULE.replace("You work alongside",
+                                             "You used to work alongside")
+        current = "# Mine\n" + stale + "\nMy own notes, no heading.\n"
+        new_text, word = antiphon._update_instructions(current, antiphon.AGENTS_RULE)
+        self.assertEqual(word, "updated")
+        self.assertTrue(new_text.startswith("# Mine\n"))
+        self.assertTrue(new_text.endswith(antiphon.AGENTS_RULE
+                                          + "\nMy own notes, no heading.\n"),
+                        new_text[-200:])
+        self.assertNotIn("used to work", new_text)
+        # A person's own `## ` heading inside the section still ends it
+        # there, marker or not: the earlier boundary wins.
+        headed = ("## The Antiphon bridge\n\nold words\n\n## Mine\n\nkept\n"
+                  + antiphon.SECTION_END + "\n")
+        self.assertEqual(antiphon._rule_section(headed)[2],
+                         "## The Antiphon bridge\n\nold words\n")
+
+    def test_doctor_says_what_a_rewrite_of_an_unmarked_section_replaces(self):
+        project = self.project()
+        self.set_up(project)
+        with open(os.path.join(project, "CLAUDE.md"), "w", encoding="utf-8") as f:
+            f.write("## The Antiphon bridge\n\nold words\n\nmy notes, no heading\n")
+        _code, printed = self.run_doctor(project)
+        line = self.line_for(printed, "CLAUDE.md")
+        self.assertTrue(line.startswith("✗ CLAUDE.md: the Antiphon section is stale"), line)
+        self.assertIn("no end marker", line)
+        self.assertIn("up to the next `## ` heading", line)
+        with open(os.path.join(project, "CLAUDE.md"), "w", encoding="utf-8") as f:
+            f.write(antiphon.CLAUDE_RULE.replace("You work", "You used to work"))
+        _code, printed = self.run_doctor(project)
+        line = self.line_for(printed, "CLAUDE.md")
+        self.assertTrue(line.startswith("✗ CLAUDE.md: the Antiphon section is stale"), line)
+        self.assertNotIn("no end marker", line, "a marked section is rewritten exactly")
 
     def test_doctor_fix_repairs_a_stale_rule_section(self):
         project = self.project()
@@ -6218,13 +6365,20 @@ class PagedSummaryModelTest(unittest.TestCase):
             self.event("small first record", offset=0, end=100),
             self.event(multibyte, offset=100, end=200, when=11),
         ]
+        # The widest envelope there is: a five-source skip line with a
+        # nine-digit count (measured: 126 bytes) rides on every page of a
+        # reader far behind, so the pinned overhead includes it.
+        widest_skip = {f"source-{i}": 30_000_000 for i in range(5)}
         complete = antiphon._render_page(
-            "claude", antiphon._ordered_records(events), False, None)
+            "claude", antiphon._ordered_records(events), False, None,
+            None, None, widest_skip)
         self.assertLessEqual(len(complete), antiphon.PAGE_BUDGET)
         self.assertGreater(len(complete.encode("utf-8")), antiphon.PAGE_BUDGET)
-        text, advance, count = self.page(
-            events, self.scanned(("source", "generation", 200)))
+        text, advance, count = antiphon._build_page(
+            events, self.scanned(("source", "generation", 200)), "claude",
+            skipped=widest_skip)
         self.assertLessEqual(len(text.encode("utf-8")), antiphon.PAGE_BUDGET)
+        self.assertIn("skipped: 150,000,000 raw bytes", text)
         self.assertIn("small first record", text)
         self.assertNotIn(multibyte, text)
         self.assertTrue(advance.has_more)

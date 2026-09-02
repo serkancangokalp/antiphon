@@ -442,6 +442,22 @@ class ShippedContractTest(unittest.TestCase):
             self.assertTrue(answers, f"no handshake answer; stderr: {done.stderr}")
             self.assertEqual(answers[0]["result"]["serverInfo"]["version"], version)
 
+    def test_the_horizon_is_one_moment_for_the_reader_and_named_on_both_rules(self):
+        """The shipped horizon is cross-source and wall-clock bounded. The
+        README once described the abandoned per-source design, and the pin on
+        'older than 24 hours' passed on the wrong sentence."""
+        limits = section(read("README.md"), "Limits")
+        self.assertRegex(limits, r"newest complete\s+record the other side wrote in\s+any of its sources")
+        self.assertRegex(limits, r"skipped\s+whole")
+        self.assertRegex(limits, r"never later than the\s+wall clock")
+        for rule in (antiphon.AGENTS_RULE, antiphon.CLAUDE_RULE):
+            self.assertIn("`skipped:`", rule,
+                          "the page's own word, so an agent seeing it knows what it is")
+            self.assertRegex(rule, r"older than 24 hours before the newest record "
+                                   r"in (Claude|Codex)'s transcripts")
+            self.assertTrue(rule.rstrip("\n").endswith(antiphon.SECTION_END),
+                            "the generated section closes itself")
+
     def test_paged_context_limits_match_code(self):
         """Every number the README states about the pull path is read back off
         the constant that enforces it, and the retired cuts are gone from both

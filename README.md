@@ -336,11 +336,14 @@ only when it has no `discovery: building` or `discovery: degraded` line. Either
 marker makes the incomplete discovery boundary explicit instead of allowing a
 newest-file fallback to masquerade as project completeness.
 
-A page never carries a record older than 24 hours of its source's newest
-complete record. A reader that fell further behind skips to that point: the
-page says `skipped: N raw bytes of … activity older than 24 hours …` once,
-where it happened, `status` counts what the next page will skip, and the
-transcripts keep what was skipped. Measured before the horizon existed, a
+A page never carries a record older than 24 hours before the newest complete
+record the other side wrote in any of its sources — one moment for the whole
+reader, never later than the wall clock, so a source that stopped more than a
+day before that newest record is skipped whole and a record stamped in the
+future cannot move the horizon. A reader that fell further behind skips to
+that point: the page says `skipped: N raw bytes of … activity older than 24
+hours …` once, where it happened, `status` counts what the next page will
+skip, and the transcripts keep what was skipped. Measured before the horizon existed, a
 reader more than 400 pages behind delivered a day-old page on every turn;
 bounded to a day it delivers 21. A brand-new reader still starts 6 hours
 back, and `antiphon catch-up` remains the way to skip to the live edge at

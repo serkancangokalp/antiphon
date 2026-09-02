@@ -1945,9 +1945,11 @@ and said once on the page where it happened (`skipped: N raw bytes of Codex
 activity older than 24 hours in K source(s) — not delivered; the transcripts
 keep it`), also when nothing newer is left, never as a silent advance.
 `status` counts what the next page will skip. The horizon is relative to the
-other side's clock, not the wall: an overnight run is still there in the
-morning, a side that stopped days ago yields its last day, and the suite's
-fixed-date fixtures stand. Measured per source first, every one of thirty old
+other side's clock, never later than the wall clock: an overnight run is
+still there in the morning, a side that stopped days ago yields nothing
+older than a day before its newest record, the suite's fixed-date fixtures
+stand, and one record stamped in the future cannot move the horizon past
+everything real (0 such records in 203,890 live ones; bounded anyway). Measured per source first, every one of thirty old
 rollouts still yielded its own last day — a hundred pages — which is why it is
 one moment for the whole reader. Measured after: the Claude reader is 20 pages
 behind (88 KB) and the Codex reader 5, with the first page naming 150,137,892
@@ -1956,6 +1958,18 @@ the sentence above that "skipping is the error this bridge does not accept":
 inside the horizon every untrusted start still repeats; beyond it the twenty
 deaf hours recorded in this file are the measured cost of never skipping.
 `antiphon catch-up` remains the way to skip to the live edge at once.
+
+Reviewed 2026-09-03 by an independent read-only pass (unit runs, targeted
+mutations, a 240-case fuzz of the bisection, a census of the live host roots):
+the README described the abandoned per-source horizon and now describes the
+shipped one; the horizon is bounded by the wall clock; a first record without a
+timestamp (101 of 526 Claude transcripts end on one) no longer switches it off;
+the skip-only page, the degraded page and the widest envelope are pinned by
+named tests; `setup` refuses a rules file that is not UTF-8 the way `doctor`
+names it, instead of dying on it after the hooks were written; the generated
+section now closes with `SECTION_END`, so a rewrite keeps the notes a person
+appended after it, and `doctor` says what a rewrite of an older, unmarked
+section replaces.
 
 **The surfaces shrank by a third.** `CLAUDE_RULE`, `AGENTS_RULE` and the
 channel instructions keep every fact the contract tests pin and lose the

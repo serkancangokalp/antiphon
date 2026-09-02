@@ -477,7 +477,8 @@ CLAUDE_HOST_WRAPPERS = (
 # Two host literals, exact. Claude Code writes them as the user record that
 # ends an interrupted turn; nobody typed them. Equality, never a prefix: a
 # person's line that begins the same way stays a person's line. Measured
-# 2026-09-02: seven such records reaching Codex's page as `To Claude:`.
+# 2026-09-02: seven such records had reached Codex's page as `To Claude:`;
+# the 2026-09-03 census counts 14 across all 525 Claude transcripts.
 CLAUDE_HOST_LITERALS = ("[Request interrupted by user]",
                         "[Request interrupted by user for tool use]")
 
@@ -3044,8 +3045,11 @@ def _first_offset_at_or_after(source, timestamp, start):
     Bisects over record boundaries when the span is large — a reader can be
     a hundred megabytes behind — then scans the last slack linearly, so a
     local misorder of timestamps costs a few repeated records rather than
-    skipped ones. Both hosts append records in time order; a misorder wider
-    than the slack is the stated residual."""
+    skipped ones. Measured 2026-09-03: Codex appends in time order (0
+    inversions in 108,801 records); Claude has sub-second reorderings (2,751
+    in 95,089 records, 2 of them beyond the slack and both 0 s wide). A
+    misorder wider than the slack that also straddles the horizon is the
+    stated residual, unobserved."""
     size = source.complete_prefix_end()
     lo, hi = start, size
     if hi - lo > HORIZON_BISECT_ABOVE:
@@ -3088,20 +3092,38 @@ def _reader_horizon(cwd, kind, paths):
             when = _source_newest_time(source)
         if when is not None and (newest is None or when > newest):
             newest = when
-    return None if newest is None else newest - PAGE_HORIZON
+    if newest is None:
+        return None
+    # Bounded above by the wall clock: a single record stamped in the future
+    # — a clock set forward and corrected, an edited transcript — would
+    # otherwise put the horizon past everything real on that side, for every
+    # source, permanently. The source's own clock only ever needs to move the
+    # horizon backwards (an overnight run is still there in the morning), and
+    # that direction is kept. Measured 2026-09-03: 0 future-stamped records
+    # in 203,890 live ones, so this is the unobserved case, bounded anyway.
+    return min(newest, time.time()) - PAGE_HORIZON
 
 
 def _apply_horizon(source, start, horizon):
-    """`(start, skipped)`: a trusted start moved forward to the first record
-    at or after `horizon`, and how many raw bytes that left behind. Nothing
-    moves without a horizon or when the next record is already inside it."""
+    """`(start, skipped)`: the start every start rule agreed on — a cursor,
+    a recovery at byte zero, the `since` road — moved forward to the first
+    record at or after `horizon`, and how many raw bytes that left behind.
+    Nothing moves without a horizon or when the next record is already
+    inside it.
+
+    A first record without a timestamp does not switch the horizon off.
+    Measured 2026-09-03: 11,077 of 95,089 Claude records carry none (host
+    bookkeeping — `last-prompt`, `file-history-snapshot`, …) and 101 of 526
+    transcripts end on one; none of those shapes is visible to a reader, so
+    the landing is the first timestamped record inside the horizon and the
+    bookkeeping before it goes with the rest."""
     if horizon is None:
         return start, 0
     first = source.first_record_at(start)
     if first is None:
         return start, 0
     when = _record_time(first[2])
-    if when is None or when >= horizon:
+    if when is not None and when >= horizon:
         return start, 0
     landing = _first_offset_at_or_after(source, horizon, start)
     return landing, max(0, landing - start)
@@ -3563,6 +3585,9 @@ def _external_agent_relay(text):
     if text == EXTERNAL_AGENT_RESULT_HEAD or text.startswith(
             EXTERNAL_AGENT_RESULT_HEAD + "\n"):
         return "result", None
+    # The whole record goes when it starts with a relay: measured, a relay
+    # record carries nothing else (1,022 of 1,022). A record that put Codex's
+    # own words after a relay would lose them — unobserved, stated.
     return None
 
 
@@ -4239,7 +4264,7 @@ def _build_page(events, scanned, side, replay_reason=None, join=None,
         if not scanned:
             if discovery is not None and discovery.state == "degraded":
                 text = _render_page(side, [], False, replay_reason,
-                                    NO_SESSION_JOIN, discovery)
+                                    NO_SESSION_JOIN, discovery, skipped)
                 return text, None, 0
             return "", None, 0
         if replay_reason is None:
@@ -7313,6 +7338,10 @@ def hook_installed(data, shape):
 
 
 SECTION_HEADING = "## The Antiphon bridge"
+# Closes the generated section. Without it the section runs to the next `## `
+# heading or the end of the file, and a rewrite takes whatever a person
+# appended after it — their own notes — along with the stale words.
+SECTION_END = "<!-- antiphon: end of the generated section -->"
 
 TOOL_RETRIEVAL_RULE = (
     "Every compact tool-call line carries a content-bound `tc1` id: the "
@@ -7374,8 +7403,9 @@ AGENTS_RULE = ("\n## The Antiphon bridge\n\n"
                "sources` covers the durable catalog only when no `discovery: "
                "building` or `discovery: degraded` line says the boundary is "
                "incomplete. A page never carries a record older than 24 hours "
-               "before the newest thing Claude wrote; a skip is announced on "
-               "the page. A page with a replay notice re-delivers history after "
+               "before the newest record in Claude's transcripts; what that "
+               "left behind is announced on the page as `skipped:`. A page with "
+               "a replay notice re-delivers history after "
                "an upgrade or cursor recovery and can carry duplicates until the "
                "notice disappears. If the single next record is larger than a "
                "page, `antiphon_read` refuses it rather than truncating "
@@ -7418,7 +7448,8 @@ AGENTS_RULE = ("\n## The Antiphon bridge\n\n"
                "timer. Your own oversized `antiphon_send` is parked the same "
                "way and its result names the file; an oversized `@claude` line "
                "is not parked — it is refused and its words travel with "
-               "your visible reply through the passive pages.\n")
+               "your visible reply through the passive pages.\n"
+               + SECTION_END + "\n")
 
 CLAUDE_RULE = ("\n## The Antiphon bridge\n\n"
                "You work alongside a Codex agent here. Its side is injected "
@@ -7430,8 +7461,9 @@ CLAUDE_RULE = ("\n## The Antiphon bridge\n\n"
                "`has_more_scope: catalogued project sources` covers the durable "
                "catalog only when no `discovery: building` or `discovery: "
                "degraded` line says the boundary is incomplete. A page never "
-               "carries a record older than 24 hours before the newest thing "
-               "Codex wrote; a skip is announced on the page. "
+               "carries a record older than 24 hours before the newest record "
+               "in Codex's transcripts; what that left behind is announced on "
+               "the page as `skipped:`. "
                + TOOL_RETRIEVAL_RULE + "\n\n"
                "Events straight from that agent are marked "
                "`<channel source=\"antiphon\" sender=\"codex\" "
@@ -7467,7 +7499,8 @@ CLAUDE_RULE = ("\n## The Antiphon bridge\n\n"
                "timer. An oversized `reply_to_codex` is parked the same way; an "
                "oversized `@codex` line is not parked — it is refused and "
                "its words travel with your visible reply through the passive "
-               "pages.\n")
+               "pages.\n"
+               + SECTION_END + "\n")
 
 
 class ConfigFileError(Exception):
@@ -7711,7 +7744,15 @@ def _rule_section(current):
     start = current.find(heading)
     if start == -1:
         return None
-    end = current.find("\n## ", start + len(heading))
+    ends = []
+    marker = current.find(SECTION_END, start + len(heading))
+    if marker != -1:
+        after = marker + len(SECTION_END)
+        ends.append(after + 1 if current[after:after + 1] == "\n" else after)
+    next_heading = current.find("\n## ", start + len(heading))
+    if next_heading != -1:
+        ends.append(next_heading)
+    end = min(ends) if ends else -1
     section = current[start:] if end == -1 else current[start:end]
     return start, end, section
 
@@ -7925,29 +7966,37 @@ def setup():
             "Claude MCP local permission updated",
             "Claude MCP local permission already up to date")
 
-    # --- AGENTS.md rule ---
-    agents = os.path.join(cwd, "AGENTS.md")
-    current = ""
-    if os.path.exists(agents):
-        with open(agents, encoding="utf-8") as f:
-            current = f.read()
-    new_text, status_word = _update_instructions(current, AGENTS_RULE)
-    if new_text != current:
-        with open(agents, "w", encoding="utf-8") as f:
-            f.write(new_text)
-    print(f"{'✓' if new_text != current else '·'} AGENTS.md rule {status_word}: {agents}")
+    def rules_text(path):
+        """The rules file as it is: '' when absent, None — and a recorded
+        failure — when it exists but cannot be read. The same three answers
+        `_config_state` gives doctor, so `setup` refuses the file doctor
+        names rather than aborting on it with a traceback after the hooks
+        were already written."""
+        try:
+            with open(path, encoding="utf-8") as f:
+                return f.read()
+        except FileNotFoundError:
+            return ""
+        except UnicodeDecodeError:
+            failures.append(path)
+            print(f"✗ {os.path.basename(path)}: not valid UTF-8 — fix or "
+                  "delete it, then run `antiphon setup` again", file=sys.stderr)
+        except OSError as error:
+            failures.append(path)
+            print(f"✗ {os.path.basename(path)}: could not be read "
+                  f"({error.strerror or type(error).__name__})", file=sys.stderr)
+        return None
 
-    # --- CLAUDE.md rule ---
-    claude_md = os.path.join(cwd, "CLAUDE.md")
-    current = ""
-    if os.path.exists(claude_md):
-        with open(claude_md, encoding="utf-8") as f:
-            current = f.read()
-    new_text, status_word = _update_instructions(current, CLAUDE_RULE)
-    if new_text != current:
-        with open(claude_md, "w", encoding="utf-8") as f:
-            f.write(new_text)
-    print(f"{'✓' if new_text != current else '·'} CLAUDE.md rule {status_word}: {claude_md}")
+    for name, rule in (("AGENTS.md", AGENTS_RULE), ("CLAUDE.md", CLAUDE_RULE)):
+        target = os.path.join(cwd, name)
+        current = rules_text(target)
+        if current is None:
+            continue
+        new_text, status_word = _update_instructions(current, rule)
+        if new_text != current:
+            with open(target, "w", encoding="utf-8") as f:
+                f.write(new_text)
+        print(f"{'✓' if new_text != current else '·'} {name} rule {status_word}: {target}")
 
     print("\n— One last step: Codex hooks need a one-time security approval.")
     print("  Open `codex` in this directory; approve the hook at the 'New hook - review required' prompt.")
@@ -8127,13 +8176,16 @@ def _backlog_line(key, backlog):
         return (f"unread {key}: unknown (the cursor could not be trusted; "
                 "the next turn replays)")
     unread, positioned, unpositioned, replay, skipped = backlog
-    line = (f"unread {key}: {unread:,} raw bytes across "
+    # The headline counts everything not yet delivered, the skip included:
+    # "0 raw bytes" beside 150 MB about to be dropped would be the zero the
+    # replay line was written never to claim.
+    line = (f"unread {key}: {unread + skipped:,} raw bytes across "
             f"{positioned + unpositioned} "
             f"source{'' if positioned + unpositioned == 1 else 's'}")
     if unpositioned:
         line += f"; {unpositioned} not yet positioned"
     if skipped:
-        line += (f"; {skipped:,} raw bytes older than the "
+        line += (f", of which {skipped:,} older than the "
                  f"{PAGE_HORIZON // 3600}-hour horizon will be skipped")
     if replay:
         line += " — replaying history; `antiphon catch-up` skips it"
@@ -8409,7 +8461,7 @@ def _config_state(cwd):
     # The TOML file has no `_read_json_object` to raise for it — the writer
     # reads it with a bare `open` — so the pre-pass supplies its own bound and
     # its own reason, and the promise "every file, once, or a stated reason"
-    # covers all five.
+    # covers all seven.
     # The two rules files are text too, read the same way: absent is an
     # empty text (setup adds the section), unreadable is a stated reason.
     for name in (CODEX_CONFIG_FILE, AGENTS_FILE, CLAUDE_MD_FILE):
@@ -8926,8 +8978,14 @@ def _doctor_config(report, cwd, states):
             report.bad(f"{name}: the Antiphon section is missing — run "
                        "`antiphon setup`")
         elif found[2].strip() != rule.strip():
+            # A section from before the end marker is rewritten through the
+            # next `## ` heading, notes appended to it included; said once,
+            # here, where the person decides.
+            legacy = ("" if SECTION_END in found[2] else
+                      " (a section this old has no end marker, so the rewrite "
+                      "replaces everything up to the next `## ` heading)")
             report.bad(f"{name}: the Antiphon section is stale — run "
-                       "`antiphon setup`")
+                       f"`antiphon setup`{legacy}")
         else:
             report.ok(f"{name}: the Antiphon section is current")
 
@@ -9285,9 +9343,12 @@ def _doctor_replay(report, cwd):
             continue
         if not backlog[3]:
             continue
-        unread = backlog[0]
+        unread, skipped = backlog[0] + backlog[4], backlog[4]
+        behind = (f", {skipped:,} of them behind the {PAGE_HORIZON // 3600}-hour "
+                  "horizon" if skipped else "")
         report.note(f"replay: the {side} reader is re-delivering history "
-                    f"({unread:,} raw bytes unread); `antiphon catch-up` skips it")
+                    f"({unread:,} raw bytes unread{behind}); `antiphon catch-up` "
+                    "skips it")
 
 
 def _doctor_sources(report, cwd):
