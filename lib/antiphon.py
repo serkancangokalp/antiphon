@@ -8743,6 +8743,34 @@ def _doctor_peers(report, cwd):
             report.note(f"peer {who}: this endpoint has no owner key, so "
                         "sessions cannot be joined to it; restarting that "
                         "session usually records one")
+        fingerprint = peers._fingerprint_of(record)
+        if fingerprint is not None and "process_birth" not in record:
+            # The 0.4.0 migration spelling: `birth` beside `birth_version`,
+            # which a 0.3.x reader still running compares against its own
+            # timezone and prunes. Risk, not diagnosis — doctor cannot see
+            # whether such a reader is running. A Claude record in this
+            # spelling was written by an old Node whose reassert the new
+            # registry refuses without writing; only a reconnect rewrites
+            # it. A Codex MCP rewrites on restart.
+            remedy = ("this Claude session reconnects"
+                      if record.get("kind") == "claude"
+                      else "that Codex session restarts")
+            report.note(f"peer {who}: fingerprint in the 0.4.0 spelling; a "
+                        f"0.3.x reader, if one is still running, prunes it "
+                        f"until {remedy}")
+        # UNREADY has a bootstrap meaning — waiting for its first turn — and
+        # a governed record without a current fingerprint is not that: no
+        # current listener can be serving it as its own. The cause replaces
+        # the bootstrap sentence below rather than sitting beside it. Claude
+        # only: the verdict does not govern a Codex record, and a Claude
+        # remedy on one would send the operator to the wrong terminal.
+        no_current_fingerprint = (
+            record.get("kind") == "claude" and record.get("automatic") is True
+            and (fingerprint is None or fingerprint[0] != "current"))
+        if no_current_fingerprint:
+            report.note(f"peer {who}: endpoint carries no current fingerprint, "
+                        "so no current listener can be serving it as its own; "
+                        "reconnect the Claude session")
         diagnostic = dict(record)
         if (peers._addressless(record) and session_owner == owner
                 and peers.valid_session_id(
@@ -8770,11 +8798,12 @@ def _doctor_peers(report, cwd):
         elif verdict == "UNREADY":
             # Same suppression the untyped path has always had: an endpoint and
             # session whose owner-key generations differ already got their own
-            # note above, and two lines about one peer read as two faults.
-            if not mixed_owner_generation:
+            # note above, and two lines about one peer read as two faults. The
+            # fingerprint cause above replaces this line for the same reason.
+            if not mixed_owner_generation and not no_current_fingerprint:
                 report.note(f"peer {who}: live, waiting for its first turn")
         elif peers._address_of(diagnostic) is None:
-            if not mixed_owner_generation:
+            if not mixed_owner_generation and not no_current_fingerprint:
                 report.note(f"peer {who}: live, waiting for its first turn")
         else:
             report.ok(f"peer {who}: live and addressed")

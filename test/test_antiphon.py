@@ -18718,6 +18718,108 @@ class DoctorRemedyMatchesTheVerdictTest(unittest.TestCase):
         self.assertIn(antiphon.RECONNECT_REMEDY, line, line)
 
 
+class DoctorFingerprintNotesTest(unittest.TestCase):
+    """Two records doctor has to name, read-only, with the remedy by kind.
+
+    A record still in the 0.4.0 migration spelling stays prunable by a 0.3.x
+    reader until its owner rewrites it — a Claude session by reconnecting (an
+    old listener's reassert is refused without writing), a Codex session by
+    restarting. And an automatic Claude record without a current fingerprint
+    is UNREADY for a reason that is not the bootstrap one: no current
+    listener can be serving it as its own, and the operator must be told
+    that rather than "waiting for its first turn".
+    """
+
+    A = "8261c119-2c20-4bf4-87ab-f152ac87dbda"
+
+    def _doctor(self, project):
+        out = io.StringIO()
+        report = antiphon._Report()
+        with contextlib.redirect_stdout(out):
+            antiphon._doctor_peers(report, project)
+        return out.getvalue()
+
+    @staticmethod
+    def _rewrite_endpoint(project, kind, name, mutate):
+        path = antiphon.peers._peer_file(project, kind, name)
+        with open(path, encoding="utf-8") as stream:
+            record = json.load(stream)
+        mutate(record)
+        with open(path, "w", encoding="utf-8") as stream:
+            json.dump(record, stream)
+
+    def _register_migration_spelling(self, project, kind, name):
+        """What 0.4.0-on-main wrote: `birth` under the canon beside the
+        integer `birth_version: 1`, and no sibling."""
+        owner = antiphon.peers.owner_key()
+        address = None if kind == "codex" else os.path.join(project, name + ".sock")
+        ok, detail = antiphon.peers.register(project, kind, name, address,
+                                             pid=os.getpid(), owner_key=owner)
+        self.assertTrue(ok, detail)
+        birth = antiphon.peers._process_birth(os.getpid())
+        if not birth:
+            self.skipTest("no readable process table")
+
+        def to_migration(record):
+            record.pop("process_birth", None)
+            record["birth"] = birth
+            record["birth_version"] = 1
+        self._rewrite_endpoint(project, kind, name, to_migration)
+
+    def _register_automatic(self, project, kind="claude"):
+        alias, digest = antiphon.peers.auto_identity(self.A)
+        owner = antiphon.peers.owner_key()
+        address = None if kind == "codex" else os.path.join(project, alias + ".sock")
+        ok, detail = antiphon.peers.register(
+            project, kind, alias, address, pid=os.getpid(), owner_key=owner,
+            identity_digest=digest, mode="initial" if kind == "claude" else None)
+        self.assertTrue(ok, detail)
+        if kind == "claude":
+            antiphon.peers.write_identity_proof(project, owner, self.A, digest)
+        return alias
+
+    def test_doctor_names_a_record_an_old_reader_may_still_prune(self):
+        """Risk, not diagnosis: doctor cannot see whether such a reader is
+        running. The remedy is by kind."""
+        with tempfile.TemporaryDirectory() as project:
+            self._register_migration_spelling(project, "claude", "ui")
+            self._register_migration_spelling(project, "codex", "x")
+            report = self._doctor(project)
+        self.assertIn("peer claude/ui: fingerprint in the 0.4.0 spelling; a 0.3.x "
+                      "reader, if one is still running, prunes it until this "
+                      "Claude session reconnects", report)
+        self.assertIn("peer codex/x: fingerprint in the 0.4.0 spelling; a 0.3.x "
+                      "reader, if one is still running, prunes it until that "
+                      "Codex session restarts", report)
+
+    def test_doctor_names_an_unready_record_that_carries_no_current_fingerprint(self):
+        """UNREADY has a bootstrap meaning — waiting for its first turn — and
+        this record is not that. Say what it is, and say only that: the
+        bootstrap line must not appear beside it."""
+        with tempfile.TemporaryDirectory() as project:
+            alias = self._register_automatic(project)
+            self._rewrite_endpoint(project, "claude", alias,
+                                   lambda r: r.update(process_birth="v1:garbage"))
+            report = self._doctor(project)
+        self.assertIn(f"peer claude/{alias}: endpoint carries no current fingerprint, "
+                      "so no current listener can be serving it as its own; "
+                      "reconnect the Claude session", report)
+        self.assertNotIn(f"peer claude/{alias}: live, waiting for its first turn", report)
+
+    def test_doctor_gives_no_claude_remedy_to_an_automatic_codex_record(self):
+        """Codex records carry `automatic` too, and the verdict does not
+        govern them. A fingerprint-less automatic Codex record gets the
+        migration-risk note at most, never 'reconnect the Claude session'."""
+        with tempfile.TemporaryDirectory() as project:
+            alias = self._register_automatic(project, kind="codex")
+            self._rewrite_endpoint(project, "codex", alias,
+                                   lambda r: r.update(process_birth="v1:garbage"))
+            report = self._doctor(project)
+        self.assertIn(f"codex/{alias}", report, "the record is listed at all")
+        self.assertNotIn("reconnect the Claude session", report)
+        self.assertNotIn("no current listener can be serving it", report)
+
+
 class DoctorAutomaticIsStructuralTest(unittest.TestCase):
     """`auto-` is a public prefix, not a fact about a record.
 
