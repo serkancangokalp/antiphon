@@ -4701,14 +4701,21 @@ def last_codex_reply(transcript_path, turn_id=None):
 def codex_thread_alive(session):
     """Whether a Codex thread is running, read off its writer lock.
 
-    True or False when this Codex keeps per-thread locks; None when it keeps
-    none, so a caller can fall back rather than treat every thread as dead.
-    Measured on Codex 0.151.0: `thread-writer-locks/<id>.lock` is created and
-    held under an exclusive flock when the thread opens and removed when it
-    closes — while the rollout file, which discovery reads, appears only on
-    the user's first turn (7,832 s later in the measured case). A shared
-    non-blocking probe is refused exactly while the writer holds it; the probe
-    takes nothing when it succeeds and releases at once.
+    Three answers. True: the lock is held — proven live. False: a lock file
+    exists that nobody holds — the host closed the thread without removing
+    it, proven gone. None: no lock file at all, unknown. Measured on Codex
+    0.151.0 and 0.152.1: the CLI creates `thread-writer-locks/<id>.lock`
+    under an exclusive flock when a thread opens and removes it when the
+    thread closes — while the rollout file, which discovery reads, appears
+    only on the user's first turn (7,832 s later in the measured case). But
+    a thread hosted by the ChatGPT app's app-server keeps no lock at all
+    while open (measured 2026-09-03, two open sessions, an empty directory),
+    and its rollout is indistinguishable from a closed CLI thread's. Reading
+    "no file" as dead therefore refused every bare send on that machine;
+    it is unknown, and the ledger says afterwards whether the words were
+    read. A shared non-blocking probe is refused exactly while the writer
+    holds the lock; the probe takes nothing when it succeeds and releases at
+    once.
     """
     if not os.path.isdir(CODEX_THREAD_LOCKS):
         return None
@@ -4716,7 +4723,7 @@ def codex_thread_alive(session):
         fd = os.open(os.path.join(CODEX_THREAD_LOCKS, session + ".lock"),
                      os.O_RDONLY)
     except OSError:
-        return False
+        return None
     try:
         try:
             fcntl.flock(fd, fcntl.LOCK_SH | fcntl.LOCK_NB)
@@ -4797,14 +4804,19 @@ def _codex_identity_snapshot(cwd, registered):
 
 
 def codex_session_id(cwd):
-    """The Codex session a bare message goes to.
+    """`(session, proof)` for the Codex session a bare message goes to.
 
-    The newest *running* session whose rollout records this directory. The
-    newest file alone chose wrong, measured: a session opened at 13:03 had no
-    rollout until 15:13, so a push at 15:04 was queued into the newest file's
-    thread — an empty session from 12:55 that nothing would ever drain.
-    Where this Codex keeps no thread locks, the old newest-file rule stands.
-    None when nothing can be chosen; `_legacy_target` says why.
+    The newest *proven-live* session whose rollout records this directory,
+    with proof `live`; else the newest session whose liveness is unknown —
+    no lock file, which is what an open app-hosted thread and a closed CLI
+    thread both look like — with proof `unproven`; else `(None, None)`, when
+    every candidate is proved gone or there is none. The newest file alone
+    chose wrong, measured: a session opened at 13:03 had no rollout until
+    15:13, so a push at 15:04 was queued into the newest file's thread — an
+    empty session from 12:55 that nothing would ever drain. Refusing every
+    unproven thread was measured too: it closed the road for good on a
+    machine whose Codex keeps no locks. The ledger carries the proof class,
+    and the receipt that follows says whether the words were read.
     """
     candidates = []
     for path in codex_rollout_files(cwd):
@@ -4812,14 +4824,15 @@ def codex_session_id(cwd):
         if m:
             candidates.append(m.group(1))
     if not candidates:
-        return None
+        return None, None
     alive = {sid: codex_thread_alive(sid) for sid in candidates}
-    if all(state is None for state in alive.values()):
-        return candidates[0]
     for sid in candidates:
-        if alive[sid]:
-            return sid
-    return None
+        if alive[sid] is True:
+            return sid, "live"
+    for sid in candidates:
+        if alive[sid] is None:
+            return sid, "unproven"
+    return None, None
 
 
 def _retire_park(cwd, side, key, observed):
@@ -5240,8 +5253,8 @@ def _legacy_target(cwd, kind):
     still the one Codex session in it; upgrading must not cut either off.
     """
     if kind == "claude":
-        return claude_socket_path(cwd), ""
-    session = codex_session_id(cwd)
+        return claude_socket_path(cwd), "", "legacy"
+    session, proof = codex_session_id(cwd)
     if not session:
         # Classified where it is born, so nothing downstream has to read the
         # prose to tell it apart from an addressing refusal. It says discovery
@@ -5249,17 +5262,19 @@ def _legacy_target(cwd, kind):
         # peer's ability to read: the Codex-side page is built from Claude's
         # transcripts and carries these words either way, measured.
         if codex_rollout_files(cwd):
-            # Rollouts exist and none belongs to a running thread. The one
-            # that is running may simply not have a rollout yet: Codex writes
-            # it on the first user turn, so until then it cannot be found from
-            # here, and queueing into a closed thread would strand the words.
+            # Rollouts exist and every one belongs to a thread proved gone
+            # (a lock file nobody holds). A running one may simply not have
+            # a rollout yet: Codex writes it on the first user turn, so until
+            # then it cannot be found from here.
             return None, _ClassifiedRefusal(
-                "not delivered: the Codex sessions recorded in this directory "
-                "are not running, and a running one gets a transcript only on "
-                "its first turn — until then it cannot be addressed", "no-peer")
+                "not delivered: every Codex session recorded in this "
+                "directory is proved gone (its writer lock is unheld), and a "
+                "running one gets a transcript only on its first turn — until "
+                "then it cannot be addressed", "no-peer"), None
         return None, _ClassifiedRefusal(
-            "not delivered: no Codex session found in this directory", "no-peer")
-    return session, ""
+            "not delivered: no Codex session found in this directory",
+            "no-peer"), None
+    return session, "", proof
 
 
 def _peer_states(live):
@@ -5275,8 +5290,13 @@ def _peer_states(live):
         for peer in live))
 
 
+# `proof` is how the address was shown to be a session somebody is reading:
+# `registered`/`automatic` from the registry, `live` from a held writer lock,
+# `unproven` from a rollout the host keeps no lock for. The ledger records it
+# and the tool result says it.
 ResolvedTarget = collections.namedtuple("ResolvedTarget",
-                                        "address detail origin")
+                                        "address detail origin proof",
+                                        defaults=(None,))
 
 
 def _resolve_target(cwd, kind, alias=None):
@@ -5340,7 +5360,7 @@ def _resolve_target(cwd, kind, alias=None):
                 return ResolvedTarget(
                     None, (f"not delivered: {alias!r} is live but not yet "
                            "routable — it has not run a turn yet"), "refusal")
-            return ResolvedTarget(match[0]["address"], "", "registered")
+            return ResolvedTarget(match[0]["address"], "", "registered", "registered")
 
     identities = (_codex_identity_snapshot(cwd, registered)
                   if kind == "codex"
@@ -5391,11 +5411,11 @@ def _resolve_target(cwd, kind, alias=None):
         # before any of this. Not provably unique either, but it is the shipped
         # behaviour of every existing install and breaking it would cost far
         # more than the guess it makes.
-        address, detail = _legacy_target(cwd, kind)
-        return ResolvedTarget(address, detail, "legacy")
+        address, detail, proof = _legacy_target(cwd, kind)
+        return ResolvedTarget(address, detail, "legacy", proof)
     if kind == "codex":
         if live[0].get("automatic") is True:
-            return ResolvedTarget(live[0]["address"], "", "automatic")
+            return ResolvedTarget(live[0]["address"], "", "automatic", "automatic")
         # One named record is not proof of one session. An unnamed session has
         # no routable peer record, and one before its first hook may have no
         # observation either — delivering to the visible peer would be a guess
@@ -5410,7 +5430,7 @@ def _resolve_target(cwd, kind, alias=None):
     # Reached only for Claude, whose live records always carry a usable address:
     # the addressless shape is Codex-only and `read_peers` skips every other
     # unusable one.
-    return ResolvedTarget(live[0]["address"], "", "registered")
+    return ResolvedTarget(live[0]["address"], "", "registered", "registered")
 
 
 def resolve_target(cwd, kind, alias=None):
@@ -5422,13 +5442,19 @@ def resolve_target(cwd, kind, alias=None):
 def send_to_codex(cwd, message, alias=None):
     """Sends a message to a Codex peer, chosen by `alias` or by there being one.
 
-    Returns (ok, detail). Nothing is started when the recipient cannot be
-    decided: the refusal happens before the transport is touched.
+    Returns (ok, detail): on success `detail` is the proof class the address
+    was chosen on (`registered`, `automatic`, `live`, `unproven`), which the
+    ledger records and the tool result says; on refusal it is the reason.
+    Nothing is started when the recipient cannot be decided: the refusal
+    happens before the transport is touched.
     """
-    address, detail = resolve_target(cwd, "codex", alias)
-    if address is None:
+    target = _resolve_target(cwd, "codex", alias)
+    if target.address is None:
+        return False, target.detail
+    ok, detail = _queue_codex(target.address, message)
+    if not ok:
         return False, detail
-    return _queue_codex(address, message)
+    return True, target.proof or "registered"
 
 
 # The channel server refuses anything larger. Checking here too means a sender
@@ -9206,20 +9232,22 @@ def _doctor_codex_queue(report, cwd):
             con.close()
     except (sqlite3.Error, OSError):
         return
+    # Not proved running: a lock nobody holds (proved gone) or no lock at all
+    # (unknown — an open app-hosted thread and a closed CLI thread look the
+    # same on disk). Either way the words wait until that thread takes a turn.
     stranded = [(tid, n) for tid, n in rows
                 if isinstance(tid, str) and tid in ours
-                and codex_thread_alive(tid) is False]
+                and codex_thread_alive(tid) is not True]
     if stranded:
         # Aggregate, never a thread-id prefix. A truncated prefix is still
-        # session identity, and it was never actionable anyway: nobody can
-        # address a thread that is not running. The counts are what a person
-        # can act on.
+        # session identity, and it was never actionable anyway. The counts
+        # are what a person can act on.
         waiting = sum(count for _tid, count in stranded)
         threads = len(stranded)
         noun = "thread" if threads == 1 else "threads"
         report.note(f"codex queue: {waiting} message(s) wait across {threads} "
-                    f"non-running project {noun} — they are read only if those "
-                    "threads are resumed")
+                    f"project {noun} not proved running — they are read only "
+                    "when those threads take a turn")
 
 
 def _doctor_readonly():

@@ -1514,7 +1514,7 @@ class AntiphonTest(unittest.TestCase):
         # on a real developer's machine.
         with tempfile.TemporaryDirectory() as project, \
              patch.object(antiphon, "project_dir", return_value=project), \
-             patch.object(antiphon, "codex_session_id", return_value="sess"), \
+             patch.object(antiphon, "codex_session_id", return_value=("sess", "live")), \
              patch.object(antiphon, "send_to_codex", return_value=(True, "")), \
              patch.object(antiphon, "read_cursor", return_value={}), \
              patch.object(antiphon, "write_cursor",
@@ -3029,7 +3029,7 @@ class AntiphonTest(unittest.TestCase):
             os.makedirs(day)
             self._write_rollout(day, self.SIBLING_UUID, "/Users/x/api-v2")
             with patch.object(antiphon, "CODEX_SESSIONS", sessions):
-                self.assertIsNone(antiphon.codex_session_id("/Users/x/api"))
+                self.assertEqual(antiphon.codex_session_id("/Users/x/api"), (None, None))
 
     def test_codex_rollout_files_refuse_a_head_without_session_metadata(self):
         """Free text containing a cwd is not project authority."""
@@ -4263,7 +4263,12 @@ class LiveCodexTargetTest(unittest.TestCase):
             open(os.path.join(directory, self.DEAD + ".lock"), "w").close()
             self.assertIs(antiphon.codex_thread_alive(self.DEAD), False,
                           "a lock file nobody holds is a thread that is gone")
-            self.assertIs(antiphon.codex_thread_alive("no-such-thread"), False)
+            # Measured 2026-09-03: two sessions hosted by the ChatGPT app's
+            # app-server had no lock file at all while open, and their
+            # rollouts said `originator: codex-tui` like a closed CLI
+            # thread's. No file is unknown, never dead.
+            self.assertIsNone(antiphon.codex_thread_alive("no-such-thread"),
+                              "the host may keep no lock for an open thread")
         with patch.object(antiphon, "CODEX_THREAD_LOCKS",
                           os.path.join(directory, "absent")):
             self.assertIsNone(antiphon.codex_thread_alive(self.LIVE),
@@ -4276,23 +4281,49 @@ class LiveCodexTargetTest(unittest.TestCase):
             with patch.object(antiphon, "CODEX_SESSIONS", sessions):
                 with patch.object(antiphon, "CODEX_THREAD_LOCKS", directory):
                     self.hold(directory, self.LIVE)
-                    self.assertEqual(antiphon.codex_session_id(self.CWD), self.LIVE)
+                    self.assertEqual(antiphon.codex_session_id(self.CWD),
+                                     (self.LIVE, "live"),
+                                     "a proven-live thread beats a newer unknown one")
                 with patch.object(antiphon, "CODEX_THREAD_LOCKS",
                                   os.path.join(directory, "absent")):
-                    self.assertEqual(antiphon.codex_session_id(self.CWD), self.DEAD,
-                                     "without locks the old newest-file rule stands")
+                    self.assertEqual(antiphon.codex_session_id(self.CWD),
+                                     (self.DEAD, "unproven"),
+                                     "without locks the newest file is the candidate, unproven")
 
-    def test_no_running_session_is_refused_rather_than_queued_into_a_dead_one(self):
+    def test_a_bare_send_reaches_the_newest_unknown_thread_as_unproven(self):
+        """The app case: locks exist for nothing, the thread is open. Refusing
+        it as dead killed the whole Claude → Codex road on this machine;
+        queueing it unproven lets the ledger tell the truth afterwards."""
         directory = self.locks()
         with tempfile.TemporaryDirectory() as sessions, \
-             tempfile.TemporaryDirectory() as project, \
+             patch.object(antiphon, "CODEX_SESSIONS", sessions), \
+             patch.object(antiphon, "CODEX_THREAD_LOCKS", directory):
+            self.rollouts(sessions, self.LIVE, self.DEAD)
+            self.assertEqual(antiphon.codex_session_id(self.CWD), (self.DEAD, "unproven"))
+            target = antiphon._resolve_target(self.CWD, "codex")
+            self.assertEqual((target.address, target.origin, target.proof),
+                             (self.DEAD, "legacy", "unproven"))
+            with patch.object(antiphon, "_queue_codex", return_value=(True, "")):
+                self.assertEqual(antiphon.send_to_codex(self.CWD, "hi"), (True, "unproven"))
+            self.hold(directory, self.LIVE)
+            self.assertEqual(antiphon.codex_session_id(self.CWD), (self.LIVE, "live"))
+            with patch.object(antiphon, "_queue_codex", return_value=(True, "")):
+                self.assertEqual(antiphon.send_to_codex(self.CWD, "hi"), (True, "live"))
+
+    def test_no_running_session_is_refused_rather_than_queued_into_a_dead_one(self):
+        """Only positive proof of death refuses: a lock file nobody holds is a
+        thread the host closed without removing its lock."""
+        directory = self.locks()
+        with tempfile.TemporaryDirectory() as sessions, \
              patch.object(antiphon, "CODEX_SESSIONS", sessions), \
              patch.object(antiphon, "CODEX_THREAD_LOCKS", directory):
             self.rollouts(sessions, self.DEAD)
-            address, detail = antiphon.resolve_target(project if False else self.CWD, "codex")
+            open(os.path.join(directory, self.DEAD + ".lock"), "w").close()
+            self.assertEqual(antiphon.codex_session_id(self.CWD), (None, None))
+            address, detail = antiphon.resolve_target(self.CWD, "codex")
             self.assertIsNone(address)
             self.assertEqual(detail.refusal_class, "no-peer")
-            self.assertIn("not running", detail)
+            self.assertIn("proved gone", detail)
             self.assertIn("first turn", detail,
                           "the reader learns why a session it can see is not addressable")
 
@@ -5417,7 +5448,7 @@ class DoctorTest(unittest.TestCase):
         # thread that is not running. The counts are what a person acts on.
         self.assertNotIn(dead[:8], line, "no thread-id prefix survives")
         self.assertNotIn(live[:8], line, "the running thread's queue is normal")
-        self.assertIn("1 non-running project thread", line)
+        self.assertIn("1 project thread not proved running", line)
         self.assertNotIn(project, line)
         with patch.object(antiphon, "CODEX_THREAD_LOCKS", locks), \
              patch.object(antiphon, "CODEX_QUEUE_DBS", os.path.join(home, "nothing_*.sqlite")), \
@@ -5673,7 +5704,7 @@ class DoctorTest(unittest.TestCase):
         self.assertEqual(len(queue_lines), 1, queue_lines)
         self.assertIn("1 message(s)", queue_lines[0],
                       "this project's own stranded message is counted")
-        self.assertIn("1 non-running project thread", queue_lines[0],
+        self.assertIn("1 project thread not proved running", queue_lines[0],
                       "and exactly one thread, so the scoping still holds")
         self.assertNotIn(ours[:8], queue_lines[0], "no id prefix, even ours")
         self.assertNotIn(theirs[:8], printed,
@@ -13513,7 +13544,7 @@ class RoutingTest(unittest.TestCase):
         touched = AssertionError("a refused recipient must touch no transport")
         with tempfile.TemporaryDirectory() as project, \
              patch.object(antiphon, "codex_session_id",
-                          return_value="sess-legacy") as rollout, \
+                          return_value=("sess-legacy", "live")) as rollout, \
              patch.object(antiphon.socket, "socket", side_effect=touched) as sock, \
              patch.object(antiphon, "_request_claude_reassert",
                           return_value=False) as recover, \
@@ -13540,7 +13571,7 @@ class RoutingTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as project:
             self._codex_peer(project, "build", "300:build", self.UUID)
             with patch.object(antiphon, "codex_session_id",
-                              return_value="sess-newest") as rollout:
+                              return_value=("sess-newest", "live")) as rollout:
                 self.assertEqual(antiphon.resolve_target(project, "codex",
                                                          "build"),
                                  (self.UUID, ""))
@@ -13656,7 +13687,7 @@ class RoutingTest(unittest.TestCase):
             antiphon.peers.write_observation(project, self.UUID)
             with patch.object(antiphon, "codex_thread_alive", return_value=True), \
                  patch.object(antiphon, "codex_session_id",
-                              return_value=self.UUID) as legacy:
+                              return_value=(self.UUID, "live")) as legacy:
                 target = antiphon.resolve_target(project, "codex")
         self.assertEqual(target, (self.UUID, ""))
         legacy.assert_not_called()
@@ -13668,7 +13699,7 @@ class RoutingTest(unittest.TestCase):
                 with patch.object(antiphon, "codex_thread_alive",
                                   return_value=state), \
                      patch.object(antiphon, "codex_session_id",
-                                  return_value="legacy"):
+                                  return_value=("legacy", "live")):
                     self.assertEqual(antiphon.resolve_target(project, "codex"),
                                      ("legacy", ""))
 
@@ -13709,7 +13740,7 @@ class RoutingTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as project:
             self._codex_peer(project, "build", "300:build")
             with patch.object(antiphon, "codex_session_id",
-                              return_value="9999") as legacy:
+                              return_value=("9999", "live")) as legacy:
                 address, detail = antiphon.resolve_target(project, "codex")
                 self.assertIsNone(antiphon.resolve_target(project, "codex",
                                                           "build")[0])
@@ -13781,7 +13812,7 @@ class RoutingTest(unittest.TestCase):
             with patch.object(antiphon.subprocess, "run",
                               side_effect=only_the_process_table(touched)), \
                  patch.object(antiphon, "codex_session_id",
-                              return_value="sess-legacy") as legacy:
+                              return_value=("sess-legacy", "live")) as legacy:
                 address, detail = antiphon.resolve_target(project, "codex")
                 self.assertFalse(antiphon.send_to_codex(project, "hi")[0])
             legacy.assert_not_called()
@@ -13860,13 +13891,13 @@ class RoutingTest(unittest.TestCase):
 
     def test_nothing_registered_falls_back_to_the_newest_codex_rollout(self):
         with tempfile.TemporaryDirectory() as project, \
-             patch.object(antiphon, "codex_session_id", return_value="sess-1"):
+             patch.object(antiphon, "codex_session_id", return_value=("sess-1", "live")):
             self.assertEqual(antiphon.resolve_target(project, "codex"),
                              ("sess-1", ""))
 
     def test_no_codex_session_and_nothing_registered_is_refused(self):
         with tempfile.TemporaryDirectory() as project, \
-             patch.object(antiphon, "codex_session_id", return_value=None):
+             patch.object(antiphon, "codex_session_id", return_value=(None, None)):
             address, detail = antiphon.resolve_target(project, "codex")
         self.assertIsNone(address)
         self.assertIn("no Codex session", detail)
@@ -15983,7 +16014,7 @@ class RefusedSendHonestyTest(unittest.TestCase):
         transcripts and carries these words regardless — measured in the same
         fixture that produces this refusal."""
         with tempfile.TemporaryDirectory() as project, \
-             patch.object(antiphon, "codex_session_id", return_value=None):
+             patch.object(antiphon, "codex_session_id", return_value=(None, None)):
             code, _, err = self._reply(project, {"text": "hi"})
         self.assertEqual(code, 1)
         self.assertEqual(err, "reply: {} — {}\n".format(
@@ -16081,7 +16112,7 @@ class RefusedSendHonestyTest(unittest.TestCase):
              self.HOST_ERROR, replied),
             ("_legacy_target: discovery found no Codex rollout",
              lambda: bare_reply(patch.object(antiphon, "codex_session_id",
-                                             return_value=None)),
+                                             return_value=(None, None))),
              self.NO_SESSION, replied),
             ("send_to_claude: over the channel's byte cap",
              lambda: send(text=self._oversized()),
@@ -16212,7 +16243,7 @@ class RefusedSendHonestyTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as project:
             no_peer = self._push(
                 project, "codex", "@codex ship it",
-                [patch.object(antiphon, "codex_session_id", return_value=None)])
+                [patch.object(antiphon, "codex_session_id", return_value=(None, None))])
         self.assertEqual(no_peer, (0, "antiphon: delivery failed — {}\n".format(
             self.NO_SESSION)))
 
@@ -18798,7 +18829,7 @@ class IdentityPrivacyTest(unittest.TestCase):
         words = printed.getvalue()
         self.assertNotIn(self.UUID[:8], words, words)
         self.assertNotIn(second[:8], words, words)
-        self.assertRegex(words, r"3 message\(s\).*2 non-running")
+        self.assertRegex(words, r"3 message\(s\).*2 project threads not proved running")
 
 
 class ReconnectNoticeTest(unittest.TestCase):
