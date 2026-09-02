@@ -258,3 +258,157 @@ def prune(cwd, now):
         if now - record["created_at"] > TASK_TTL:
             with contextlib.suppress(OSError):
                 os.unlink(_path(cwd, record["id"]))
+
+
+# ---------- the worker: one subprocess of the other kind ----------
+
+class Refused(Exception):
+    """A task this store will not start, with the reason a caller relays."""
+
+
+WORKER_LABEL = "[Antiphon worker {kind}:{task_id}]"
+HOP_BUDGET_DEFAULT = 1
+# The permission-widening flags no worker is ever started with; named here
+# so a test can pin their absence rather than trust the adapter's author.
+FORBIDDEN_FLAGS = ("--dangerously-skip-permissions", "--full-auto",
+                   "--dangerously-bypass-approvals-and-sandbox")
+
+
+def worker_dir(cwd, task_id):
+    return os.path.join(workers_dir(cwd), task_id)
+
+
+def log_path(cwd, task_id):
+    return os.path.join(worker_dir(cwd, task_id), "log")
+
+
+def hop_budget(env):
+    try:
+        value = int(str(env.get("ANTIPHON_HOP_BUDGET", "")).strip())
+    except ValueError:
+        return HOP_BUDGET_DEFAULT
+    return value if value >= 1 else HOP_BUDGET_DEFAULT
+
+
+def current_hop(env):
+    try:
+        value = int(str(env.get("ANTIPHON_HOP", "")).strip())
+    except ValueError:
+        return 0
+    return max(0, value)
+
+
+def check_hop(env):
+    """Refuse a delegation from a session already at the hop budget: the
+    bridge forwards nothing on its own, so this is the only recursion there
+    can be, and it is bounded here."""
+    budget, hop = hop_budget(env), current_hop(env)
+    if hop >= budget:
+        raise Refused(f"not delegated: hop budget {budget} reached (this session is "
+                      f"hop {hop}); set ANTIPHON_HOP_BUDGET to allow a bounded "
+                      "deeper chain")
+
+
+def running(cwd):
+    return [record for record in tasks(cwd) if record["state"] == "running"]
+
+
+def admit(cwd):
+    """Refuse a fifth worker, naming the four that run."""
+    live = running(cwd)
+    if len(live) >= MAX_WORKERS:
+        raise Refused(f"not delegated: {MAX_WORKERS} workers already run in this "
+                      f"project ({', '.join(record['id'] for record in live)}); "
+                      "wait for one, or cancel it")
+
+
+def prompt_for(kind, task_id, text):
+    """The task text behind one line that names the worker — the label the
+    worker's words carry, which it is told not to remove."""
+    label = WORKER_LABEL.format(kind=kind, task_id=task_id)
+    return (f"{label} You are a managed worker started by Antiphon for one task; "
+            "keep this label at the start of your final message and do not "
+            "delegate further. The task:\n\n" + text)
+
+
+def adapter(kind, task_class, text, task_id):
+    """The argv for one worker: the host's own CLI, its default permission
+    class, never a flag that widens it."""
+    prompt = prompt_for(kind, task_id, text)
+    if kind == "claude":
+        argv = ["claude", "-p", prompt]
+    else:
+        sandbox = "read-only" if task_class == "read" else "workspace-write"
+        argv = ["codex", "exec", "-s", sandbox, "--color", "never", prompt]
+    assert not any(flag in argv for flag in FORBIDDEN_FLAGS)
+    return argv
+
+
+def _git_checkout(cwd):
+    import subprocess
+    try:
+        done = subprocess.run(["git", "-C", cwd, "rev-parse", "--is-inside-work-tree"],
+                              capture_output=True, text=True, timeout=10)
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return done.returncode == 0 and done.stdout.strip() == "true"
+
+
+def _fail(cwd, task_id, reason):
+    def mutate(changed):
+        changed["state"] = "failed"
+        changed["finished_at"] = time.time()
+    update_task(cwd, task_id, mutate)
+    raise Refused(reason)
+
+
+def start(cwd, record, text, env=None):
+    """Start the worker for an accepted record; returns the running record.
+
+    A write task gets a fresh git worktree at `.antiphon/workers/<id>` (refused
+    without a checkout); a read task gets a plain directory there and runs in
+    the project. The worker is its own session leader, its output goes to the
+    task's log, and its environment carries the hop, its name and its
+    directory — never a widened permission class."""
+    import subprocess
+    env = dict(os.environ if env is None else env)
+    task_id = record["id"]
+    if _sound_dir(workers_dir(cwd), create=True) is None:
+        _fail(cwd, task_id, f"not delegated: {workers_dir(cwd)} cannot be used")
+    directory = worker_dir(cwd, task_id)
+    if record["task_class"] == "write":
+        if not _git_checkout(cwd):
+            _fail(cwd, task_id, "not delegated: a write task needs a git checkout "
+                                "to give its worker a worktree of its own")
+        done = subprocess.run(["git", "-C", cwd, "worktree", "add", "--detach", "-q",
+                               directory, "HEAD"], capture_output=True, text=True)
+        if done.returncode != 0:
+            _fail(cwd, task_id, "not delegated: the worker's worktree could not be "
+                                f"created: {done.stderr.strip()[:200]}")
+        run_in = directory
+    else:
+        os.makedirs(directory, mode=0o700, exist_ok=True)
+        run_in = cwd
+    # The record's hop is the worker's: `delegate` computed it as the parent's
+    # plus one, so a worker at the budget refuses to delegate further.
+    env["ANTIPHON_HOP"] = str(record["hop"])
+    env["ANTIPHON_NAME"] = f"worker-{task_id[:8]}"
+    env["ANTIPHON_CWD"] = run_in
+    argv = adapter(record["kind"], record["task_class"], text, task_id)
+    log = open(log_path(cwd, task_id), "ab")
+    try:
+        child = subprocess.Popen(argv, cwd=run_in, env=env, stdin=subprocess.DEVNULL,
+                                 stdout=log, stderr=subprocess.STDOUT,
+                                 start_new_session=True)
+    except OSError as error:
+        log.close()
+        _fail(cwd, task_id, f"not delegated: the {record['kind']} CLI could not be "
+                            f"started: {error}")
+    log.close()
+
+    def mutate(changed):
+        changed["state"] = "running"
+        changed["pid"] = child.pid
+        changed["started_at"] = time.time()
+    update_task(cwd, task_id, mutate)
+    return read_task(cwd, task_id)

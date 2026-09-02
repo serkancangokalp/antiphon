@@ -125,5 +125,117 @@ class TaskStoreTest(unittest.TestCase):
             self.assertEqual(workers.tasks(project), [])
 
 
+
+class AdapterTest(unittest.TestCase):
+    """One subprocess per kind, with the host's own default permission class
+    and never a flag that widens it; a write task in its own worktree."""
+
+    def _stub(self, root, kind, body="exit 0"):
+        """A `claude` or `codex` on PATH that records its argv and does as told."""
+        path = os.path.join(root, kind)
+        with open(path, "w") as f:
+            f.write("#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$0.argv\"\n"
+                    "printf 'HOP=%s CWD=%s NAME=%s\\n' \"$ANTIPHON_HOP\" \"$ANTIPHON_CWD\" "
+                    "\"$ANTIPHON_NAME\" >> \"$0.env\"\n" + body + "\n")
+        os.chmod(path, 0o755)
+        return path
+
+    def _env(self, bin_dir):
+        return dict(os.environ, PATH=bin_dir + os.pathsep + os.environ.get("PATH", ""))
+
+    def test_the_argv_per_kind_and_class_never_widens_the_permission_class(self):
+        claude_read = workers.adapter("claude", "read", "do it", "t1")
+        codex_read = workers.adapter("codex", "read", "do it", "t1")
+        codex_write = workers.adapter("codex", "write", "do it", "t1")
+        self.assertEqual(claude_read[:2], ["claude", "-p"])
+        self.assertEqual(codex_read[:5], ["codex", "exec", "-s", "read-only", "--color"])
+        self.assertEqual(codex_write[:4], ["codex", "exec", "-s", "workspace-write"])
+        for argv in (claude_read, codex_read, codex_write,
+                     workers.adapter("claude", "write", "do it", "t1")):
+            joined = " ".join(argv)
+            self.assertNotIn("--dangerously-skip-permissions", joined)
+            self.assertNotIn("--full-auto", joined)
+            self.assertNotIn("bypass", joined)
+            self.assertIn("[Antiphon worker", argv[-1], "the prompt names the label")
+            self.assertIn("do it", argv[-1])
+            self.assertIn("t1", argv[-1])
+
+    def test_start_runs_the_stub_in_its_own_directory_with_the_hop_and_a_name(self):
+        with tempfile.TemporaryDirectory() as project, tempfile.TemporaryDirectory() as bin_dir:
+            stub = self._stub(bin_dir, "codex")
+            record = workers.new_task(project, kind="codex", task_class="read",
+                                      sha256=SHA, size=15, hop=2)
+            started = workers.start(project, record, "review the diff", env=self._env(bin_dir))
+            self.assertEqual(started["state"], "running")
+            self.assertIsInstance(started["pid"], int)
+            deadline = time.time() + 5
+            while time.time() < deadline and not os.path.exists(stub + ".env"):
+                time.sleep(0.05)
+            argv = open(stub + ".argv").read()
+            self.assertIn("exec -s read-only", argv)
+            self.assertIn("review the diff", argv)
+            seen = open(stub + ".env").read()
+            self.assertIn("HOP=2", seen, "the record's hop, one deeper than the parent")
+            self.assertIn(f"NAME=worker-{record['id'][:8]}", seen)
+            self.assertIn(f"CWD={project}", seen, "a read task runs in the project")
+            self.assertTrue(os.path.isdir(workers.worker_dir(project, record["id"])))
+            self.assertTrue(os.path.exists(workers.log_path(project, record["id"])))
+
+    def test_a_write_task_needs_a_git_checkout_and_gets_its_own_worktree(self):
+        import subprocess
+        with tempfile.TemporaryDirectory() as project, tempfile.TemporaryDirectory() as bin_dir:
+            self._stub(bin_dir, "codex")
+            record = workers.new_task(project, kind="codex", task_class="write",
+                                      sha256=SHA, size=15)
+            with self.assertRaises(workers.Refused) as refused:
+                workers.start(project, record, "edit it", env=self._env(bin_dir))
+            self.assertIn("a write task needs a git checkout", str(refused.exception))
+            self.assertEqual(workers.read_task(project, record["id"])["state"], "failed")
+        with tempfile.TemporaryDirectory() as project, tempfile.TemporaryDirectory() as bin_dir:
+            subprocess.run(["git", "init", "-q", project], check=True)
+            subprocess.run(["git", "-C", project, "-c", "user.email=a@b", "-c", "user.name=a",
+                            "commit", "-q", "--allow-empty", "-m", "root"], check=True)
+            self._stub(bin_dir, "claude")
+            record = workers.new_task(project, kind="claude", task_class="write",
+                                      sha256=SHA, size=15)
+            started = workers.start(project, record, "edit it", env=self._env(bin_dir))
+            worktree = workers.worker_dir(project, record["id"])
+            self.assertTrue(os.path.exists(os.path.join(worktree, ".git")), "a worktree")
+            listed = subprocess.run(["git", "-C", project, "worktree", "list", "--porcelain"],
+                                    capture_output=True, text=True).stdout
+            self.assertIn(record["id"], listed)
+            self.assertEqual(started["state"], "running")
+
+    def test_a_fifth_worker_is_refused_with_the_four(self):
+        with tempfile.TemporaryDirectory() as project:
+            ids = []
+            for _ in range(4):
+                record = workers.new_task(project, kind="codex", task_class="read",
+                                          sha256=SHA, size=1)
+                workers.update_task(project, record["id"],
+                                    lambda c: c.update(state="running", pid=1, started_at=1.0))
+                ids.append(record["id"])
+            with self.assertRaises(workers.Refused) as refused:
+                workers.admit(project)
+            for task_id in ids:
+                self.assertIn(task_id, str(refused.exception))
+            workers.update_task(project, ids[0],
+                                lambda c: c.update(state="completed", finished_at=2.0))
+            workers.admit(project)
+
+    def test_the_hop_budget_refuses_at_the_budget(self):
+        self.assertEqual(workers.hop_budget({}), 1)
+        self.assertEqual(workers.hop_budget({"ANTIPHON_HOP_BUDGET": "3"}), 3)
+        self.assertEqual(workers.hop_budget({"ANTIPHON_HOP_BUDGET": "nonsense"}), 1)
+        self.assertEqual(workers.current_hop({}), 0)
+        self.assertEqual(workers.current_hop({"ANTIPHON_HOP": "1"}), 1)
+        with self.assertRaises(workers.Refused) as refused:
+            workers.check_hop({"ANTIPHON_HOP": "1"})
+        self.assertIn("hop budget 1 reached", str(refused.exception))
+        self.assertIn("ANTIPHON_HOP_BUDGET", str(refused.exception))
+        workers.check_hop({})
+        workers.check_hop({"ANTIPHON_HOP": "1", "ANTIPHON_HOP_BUDGET": "2"})
+
+
 if __name__ == "__main__":
     unittest.main()
