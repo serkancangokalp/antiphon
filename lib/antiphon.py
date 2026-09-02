@@ -425,6 +425,73 @@ def _is_self_injected(text):
     return text.lstrip().lower().startswith(_SELF_INJECTION_PREFIXES)
 
 
+# What a peer's own transcript proves about a delivery. Measured 2026-09-03
+# on the live transcripts: 180 Codex user records carry this bridge's
+# `[from=… id=…]` label; 245 Claude channel injections carry
+# `message_id="…"` in the tag (`isMeta`, `origin.kind` "channel", string
+# content); 4 Claude transcripts and 78 Codex rollouts name an attachment
+# under `.antiphon/messages/` in a tool call. Each is a receipt — received,
+# or read — for the ledger; none is an event for the page.
+UUID_TEXT = r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}"
+SELF_INJECTED_ID = re.compile(r"\[from=[^\]\n]*?\bid=(" + UUID_TEXT + r")\]")
+CHANNEL_MESSAGE_ID = re.compile(
+    r'<channel source="antiphon"[^>]*\bmessage_id="(' + UUID_TEXT + r')"')
+ATTACHMENT_REFERENCE = re.compile(
+    r"\.antiphon/messages/(" + UUID_TEXT + r"\.txt)(?![A-Za-z0-9_.-])")
+
+
+def _receipt_time(record):
+    stamp = iso_epoch(record.get("timestamp"))
+    return float(stamp) if stamp is not None else time.time()
+
+
+def _collect_claude_receipts(record, receipts):
+    """Append what one Claude record proves: a channel injection carrying
+    `message_id` was received; a tool call naming an attachment read it.
+
+    `isMeta` is required for the injection: a person typing the tag into a
+    prompt is not `isMeta` and proves nothing. `origin` may be absent — the
+    older measured shape — but when present it has to say `channel`."""
+    kind = record.get("type")
+    if kind == "user" and record.get("isMeta"):
+        origin = record.get("origin")
+        if isinstance(origin, dict) and origin.get("kind") != "channel":
+            return
+        message = record.get("message")
+        content = message.get("content") if isinstance(message, dict) else None
+        if isinstance(content, str):
+            found = CHANNEL_MESSAGE_ID.search(content)
+            if found:
+                receipts.append(("received", found.group(1), _receipt_time(record)))
+    elif kind == "assistant" and not record.get("isMeta"):
+        message = record.get("message")
+        content = message.get("content") if isinstance(message, dict) else None
+        for block in content if isinstance(content, list) else []:
+            if (isinstance(block, dict) and block.get("type") == "tool_use"
+                    and isinstance(block.get("input"), dict)):
+                for name in ATTACHMENT_REFERENCE.findall(
+                        json.dumps(block["input"], ensure_ascii=False)):
+                    receipts.append(("read", name, _receipt_time(record)))
+
+
+def _collect_codex_receipts(record, payload, receipts):
+    """Append what one Codex `response_item` proves: our own label, received;
+    an attachment named in a call's arguments, read."""
+    if payload.get("type") == "message" and payload.get("role") == "user":
+        text = _join_text_blocks(
+            (c.get("text") or c.get("input_text") or "")
+            for c in payload.get("content") or [] if isinstance(c, dict))
+        if _is_self_injected(text):
+            found = SELF_INJECTED_ID.search(text)
+            if found:
+                receipts.append(("received", found.group(1), _receipt_time(record)))
+        return
+    fields = _codex_tool_fields(payload)
+    if fields is not None:
+        for name in ATTACHMENT_REFERENCE.findall(fields[3]):
+            receipts.append(("read", name, _receipt_time(record)))
+
+
 def _join_text_blocks(blocks):
     """Join present text blocks without treating whitespace as absence."""
     return "\n\n".join(block for block in blocks
@@ -3386,12 +3453,14 @@ def claude_transcripts(cwd):
 
 
 def claude_events(cwd, positions=None, since=None, visible_record_limit=None,
-                  source_paths=None, skipped=None, horizon=None):
+                  source_paths=None, skipped=None, horizon=None, receipts=None):
     """Return visible events and the safe scanned position for each source.
 
     A completed JSONL record consumes at most one visible lookahead slot even
     when it contains several text and tool blocks. Filtered records consume no
     slot, so the scanner can pass them to EOF or to the next visible record.
+    `receipts`, when given, collects what the scanned records prove about
+    deliveries (`_collect_claude_receipts`); the page never shows them.
     """
     events = []
     reached = {}
@@ -3426,6 +3495,8 @@ def claude_events(cwd, positions=None, since=None, visible_record_limit=None,
                     d = json.loads(line)
                 except json.JSONDecodeError:
                     d = None
+                if receipts is not None and isinstance(d, dict):
+                    _collect_claude_receipts(d, receipts)
                 if isinstance(d, dict) and not d.get("isMeta"):
                     ts = iso_epoch(d.get("timestamp"))
                     kind = d.get("type")
@@ -3681,8 +3752,10 @@ def _codex_tool_shape_count(cwd, discovery=None, source_paths=None):
 
 
 def codex_events(cwd, positions=None, since=None, visible_record_limit=None,
-                 source_paths=None, skipped=None, horizon=None):
-    """Return visible events and the safe scanned position for each rollout."""
+                 source_paths=None, skipped=None, horizon=None, receipts=None):
+    """Return visible events and the safe scanned position for each rollout.
+    `receipts`, when given, collects what the scanned records prove about
+    deliveries (`_collect_codex_receipts`); the page never shows them."""
     events = []
     reached = {}
     position = itertools.count()
@@ -3720,6 +3793,8 @@ def codex_events(cwd, positions=None, since=None, visible_record_limit=None,
                     ts = iso_epoch(d.get("timestamp"))
                     kind, payload = d.get("type"), d.get("payload") or {}
                     payload = payload if isinstance(payload, dict) else {}
+                    if receipts is not None and kind == "response_item":
+                        _collect_codex_receipts(d, payload, receipts)
                     if kind == "response_item" and payload.get("type") == "message":
                         role = payload.get("role")
                         text = _join_text_blocks(
@@ -4328,7 +4403,7 @@ def _build_page(events, scanned, side, replay_reason=None, join=None,
 
 
 def build_summary(cwd, side, positions=None, since=None, replay_reason=None,
-                  catalog_degraded=False, catalog_snapshot=None):
+                  catalog_degraded=False, catalog_snapshot=None, receipts=None):
     """`side` is the side that will READ the summary ('claude' | 'codex').
     Turns what happened on the other side, and what the user said, into
     compact text.
@@ -4348,11 +4423,13 @@ def build_summary(cwd, side, positions=None, since=None, replay_reason=None,
     if side == "claude":
         events, reached = codex_events(
             cwd, positions, since, visible_record_limit=EVENT_LIMIT + 1,
-            source_paths=discovery.sources, skipped=skipped, horizon=horizon)
+            source_paths=discovery.sources, skipped=skipped, horizon=horizon,
+            receipts=receipts)
     else:
         events, reached = claude_events(
             cwd, positions, since, visible_record_limit=EVENT_LIMIT + 1,
-            source_paths=discovery.sources, skipped=skipped, horizon=horizon)
+            source_paths=discovery.sources, skipped=skipped, horizon=horizon,
+            receipts=receipts)
     expected = {
         (path.candidate.expected_source
          if isinstance(path, DiscoveredSourcePath) else source_id(path))
@@ -4425,6 +4502,9 @@ def hook(side="claude"):
         except OSError as error:
             print(f"antiphon: the attachment sweep failed: {error}",
                   file=sys.stderr)
+        # The ledger's own sweep, on the same trust: entries older than its
+        # TTL go, and nothing here raises.
+        ledger.prune(cwd, time.time())
 
     # Every reserve and merge inside this bounded update releases the catalog
     # lock before transcript inspection. The whole update returns before any
@@ -4470,11 +4550,23 @@ def hook(side="claude"):
         cursor, cursor_state = _read_cursor_state(cwd, side)
         positions, since, replay_reason = positions_for(
             cursor, side, cursor_state)
+        # Receipts ride in the records the page scans — our own label in the
+        # peer's transcript, an attachment named in its tool call — and the
+        # cursor moves past them whether or not the page has words, so they
+        # are written wherever the cursor advances, the empty turn included.
+        receipts = []
         text, advance, _ = build_summary(
             cwd, side, positions, since, replay_reason,
             catalog_degraded=not catalog_ok,
-            catalog_snapshot=catalog_snapshot)
-        if not text:
+            catalog_snapshot=catalog_snapshot, receipts=receipts)
+        # What this session's own sends came to, if it was never told: a
+        # Stop-hook refusal reaches a debug log and not the agent (exit-0
+        # stderr, measured — the peer said "sent" for a marker that never
+        # left), and an attachment that expired unread was silent too.
+        # Reported here, once, ahead of the page.
+        notices = ledger.pending_notices(
+            cwd, side, claimed_alias(cwd, side, input_data.get("session_id")))
+        if not text and not notices:
             # Nothing to deliver this turn, so the write-then-advance order
             # below does not protect anything -- there is no page to lose.
             # The parser's own high-water mark still has to move, or a
@@ -4484,8 +4576,12 @@ def hook(side="claude"):
                     cwd, side, cursor, side, positions, advance):
                 print("antiphon: nothing to show, but could not record cursor "
                       "progress", file=sys.stderr)
+            ledger.record_receipts(cwd, receipts)
             return 0
 
+        context = "\n".join(words for _id, words in notices)
+        if text:
+            context = f"{context}\n\n{text}" if context else text
         # The hook prints nothing to the terminal. The counter used to say
         # "message" but it was counting the other side's transcript events;
         # incoming channel messages already show up via their own notices.
@@ -4493,13 +4589,17 @@ def hook(side="claude"):
         if not _deliver(json.dumps({
             "hookSpecificOutput": {
                 "hookEventName": "UserPromptSubmit",
-                "additionalContext": text,
+                "additionalContext": context,
             }
         }, ensure_ascii=False)):
             # The page never left this process, so it has not been delivered
-            # and the cursor stays where it was. The next turn offers it again.
+            # and the cursor stays where it was — and a notice not delivered
+            # is not reported. The next turn offers both again.
             print("antiphon: could not write this turn's context", file=sys.stderr)
             return 1
+        ledger.mark_reported(cwd, [delivery for delivery, _words in notices],
+                             time.time())
+        ledger.record_receipts(cwd, receipts)
         if not _advance_page_cursor(
                 cwd, side, cursor, side, positions, advance):
             # The page WAS delivered, so the exit code stays 0: a non-zero
@@ -7207,9 +7307,11 @@ def _mcp_serve(cwd, alias=None):
                         cursor, cursor_state = _read_cursor_state(cwd, "codex")
                         positions, since, replay_reason = positions_for(
                             cursor, "codex", cursor_state)
+                        receipts = []
                         text, advance, _ = build_summary(
                             cwd, "codex", positions, since, replay_reason,
-                            catalog_snapshot=catalog_snapshot)
+                            catalog_snapshot=catalog_snapshot,
+                            receipts=receipts)
                         oversized = (text
                                      and len(text.encode("utf-8")) > PAGE_BUDGET)
                         if oversized:
@@ -7235,6 +7337,10 @@ def _mcp_serve(cwd, alias=None):
                         delivered = _mcp_result(mid, output)
                         if oversized:
                             continue
+                        if delivered:
+                            # The same rule as the hook: the cursor is about
+                            # to move past the records that carried these.
+                            ledger.record_receipts(cwd, receipts)
                         if not text and delivered:
                             if not _advance_page_cursor(
                                     cwd, "codex", cursor, "codex", positions,
