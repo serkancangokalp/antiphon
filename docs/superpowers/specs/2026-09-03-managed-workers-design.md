@@ -1,0 +1,104 @@
+# Cross-vendor managed workers — design
+
+Campaign phase 5 (`2026-09-02-final-campaign-design.md` §5). The BACKLOG entry
+*P2 — Cross-vendor managed workers* states the shape and lists five open
+decisions. This document takes them and specifies the lifecycle. Whether it is
+built in this campaign is decided at the end of phase 4; if it is not, the
+BACKLOG entry says "designed, not built" and points here.
+
+## The five decisions
+
+1. **`delegate` exposes both modes, explicitly, and never guesses.**
+   `delegate(text, to=<alias>)` hands a task to an already-running named peer of
+   the other kind over the addressed send that exists today, and records the
+   task on the ledger under a task id. `delegate(text, kind=<claude|codex>)`
+   without `to` creates a fresh managed worker: a subprocess of that kind's CLI
+   in its own worktree. Neither `to` nor `kind` → refused ("name a peer or a
+   kind; a task to nobody in particular has no meaning"). Both → refused
+   ("one or the other").
+2. **Managed workers are one-task, ephemeral sessions.** A worker runs one task
+   and exits. There is no resume: a follow-up is a new task that names the
+   previous task id as `parent`, and the new worker starts from the previous
+   worker's worktree if it is still there. A task record lives at
+   `.antiphon/tasks/<task-id>.json` for seven days (the ledger's own TTL, one
+   sweep); a worker's worktree under `.antiphon/workers/<task-id>/` is removed
+   when its result is collected or the task is cancelled, kept for inspection
+   after `failed` until the record expires, and never removed while the worker
+   runs. At most four workers run at once per project; a fifth `delegate` is
+   refused with the four task ids.
+3. **CLI subprocess adapters only, first.** `claude -p` and `codex exec` are the
+   two adapters, the same two `fresh-user.sh` proves on every release. Neither
+   host's native cross-vendor worker API is depended on (Claude Code subagents
+   and Codex `multi_agent`/`spawnAgent` are same-vendor stories, one of them
+   experimental); when one becomes a stable cross-vendor contract, it is a
+   second adapter behind version detection, with the subprocess adapter as the
+   documented fallback.
+4. **Read-only tasks run without another confirmation; a write task never
+   merges itself.** A task is `read` (review, explain, search) or `write`
+   (edit, generate). A read task runs the worker with its host's default
+   permission class and no write access outside its worktree. A write task
+   runs in its own worktree with the host's default sandbox (`claude -p` with
+   the default permission mode; `codex exec --sandbox workspace-write` bound to
+   the worktree) and returns a patch and its test output as evidence; the
+   bridge never applies a patch. The parent agent, or the human, applies it
+   with `git apply --check` first. A worker never receives a broader permission
+   class than the delegating session (`--dangerously-skip-permissions` and
+   `--full-auto` are never passed), never approves the parent's requests, and
+   never widens its sandbox.
+5. **No synchronous `delegate`; a bounded wait on `result`.** `delegate` returns
+   at once with the task id. `result(id, wait=<seconds>)` blocks up to
+   `wait` (at most 300 s, default 0) and returns whatever state the task is in
+   when it returns. The parent's turn stays free; the bound is explicit and
+   the caller's.
+
+## Lifecycle
+
+States: `accepted → running → completed | failed | cancelled | timed_out |
+blocked`. `blocked` is a worker that asked for a permission its class denies;
+it is reported, never granted from here.
+
+Commands and tools:
+
+| Surface | Claude side | Codex side |
+|---|---|---|
+| CLI | `antiphon task delegate\|status\|result\|cancel` | same |
+| MCP | `antiphon_delegate`, `antiphon_task` on the channel server | `antiphon_delegate`, `antiphon_task` on the `mcp` server |
+
+`antiphon_delegate(text, kind?, to?, task=read|write)` → `{task_id, worker: {kind, session, worktree?}, state: accepted}`.
+`antiphon_task(id, action=status|result|cancel, wait?)` → the record; `result` on a completed write task carries `diff` (bounded to 256 KiB, then a path), `tests` (the worker's own report) and `log_path`.
+
+Every event and artifact names the worker: the passive page and the ledger
+label it `[Antiphon worker codex:<task-id>]` / `[Antiphon worker
+claude:<task-id>]`, never as the parent's own words or work. The worker's own
+transcript is discovered by the ordinary readers (it runs in this project's
+directory or its worktree, which is catalogued as a worker source and labelled).
+
+Hop budget: `ANTIPHON_HOP_BUDGET` (default 1). A worker is started with
+`ANTIPHON_HOP=<parent hop + 1>`; a session whose hop is at the budget has its
+`antiphon_delegate` refused ("hop budget 1 reached; set ANTIPHON_HOP_BUDGET to
+allow a bounded deeper chain"). The bridge never forwards a task automatically,
+so the budget is the only recursion there can be, and it is stated.
+
+Timeouts: a task has a `timeout` (default 900 s, at most 3600 s); past it the
+worker is sent SIGTERM, then SIGKILL after 10 s, and the task is `timed_out`
+with whatever output exists.
+
+Storage: `.antiphon/tasks/` and `.antiphon/workers/` are swept on the hook like
+the attachments and the ledger; a task record never carries the task text
+(its SHA-256 and size), and the worker's log is the worker's own file under
+its worktree.
+
+## What this does not claim
+
+No worker appears in either host's native subagent UI. The portable contract is
+Antiphon's task id, lifecycle, labels and evidence trail.
+
+## Implementation gate
+
+Built in this campaign only if, at the end of phase 4, both suites, the E2E run
+and the independent reviews are green on `main` and a bounded MVP — `delegate`
+by `kind` with the subprocess adapters, `status`, `result`, `cancel`, the hop
+budget, the labels and the sweep — can be delivered with the same test
+discipline (every behaviour under a named test with a mutation gate, the two
+CLIs stubbed in the suite, and one real run in `fresh-user.sh`). Otherwise the
+BACKLOG says "designed, not built" and why.
