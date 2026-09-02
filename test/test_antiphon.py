@@ -1458,7 +1458,8 @@ class AntiphonTest(unittest.TestCase):
 
     def test_mcp_offers_codex_read_send_and_retrieve_tools(self):
         self.assertEqual(sorted(t["name"] for t in antiphon.TOOLS),
-                         ["antiphon_read", "antiphon_retrieve", "antiphon_send"])
+                         ["antiphon_delegate", "antiphon_read", "antiphon_retrieve",
+                          "antiphon_send", "antiphon_task"])
 
     def test_antiphon_send_delivers_the_text_to_the_claude_channel(self):
         sent = []
@@ -4240,6 +4241,25 @@ class ManagedWorkerToolTest(unittest.TestCase):
              contextlib.redirect_stdout(io.StringIO()):
             antiphon._mcp_serve("/tmp/project", "build")
         called.assert_called_once_with("/tmp/project", {"id": "t", "action": "result", "wait": 3})
+
+    def test_a_workers_words_carry_its_name_on_the_page(self):
+        """A worker registers as `worker-<id8>` through its own hooks, and
+        the page joins its source to that alias like any named peer's: the
+        words name the session that produced them, never the parent."""
+        worker = "1d5a03e0-0548-4339-87c3-45c5dbf7e9d7"
+        parent = "2e6b14f1-1659-544a-98d4-56d6eca8fa48"
+        events = [
+            antiphon.Event(10.0, "codex", "reviewed: fine", worker, "g1", 0, 100, None,
+                           {"start": 0, "sha256": "b" * 64}),
+            antiphon.Event(11.0, "codex", "carrying on", parent, "g2", 0, 100, None,
+                           {"start": 0, "sha256": "c" * 64}),
+        ]
+        join = antiphon.SessionJoin({worker: "worker-1d5a03e0", parent: "build"}, False)
+        text = antiphon._render_page("claude", antiphon._ordered_records(events),
+                                     False, None, join)
+        self.assertIn("worker-1d5a03e0", text)
+        self.assertLess(text.index("worker-1d5a03e0"), text.index("reviewed: fine"))
+        self.assertIn("build", text)
 
     def test_the_delegate_tool_defaults_the_kind_to_the_other_side(self):
         with tempfile.TemporaryDirectory() as project, tempfile.TemporaryDirectory() as bin_dir:

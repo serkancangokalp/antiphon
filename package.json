@@ -14,6 +14,7 @@
     "lib/identity.mjs",
     "lib/peers.py",
     "lib/ledger.py",
+    "lib/workers.py",
     "README.md",
     "BACKLOG.md",
     "LICENSE"

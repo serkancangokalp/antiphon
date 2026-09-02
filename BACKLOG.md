@@ -1792,7 +1792,7 @@ under P1 for why publication is held. The test count moves with the suite and
 is not restated here — a number written into prose is stale the next time
 anyone adds a test, and this one was stale by a hundred.
 
-## P2 — Cross-vendor managed workers
+## P2 — Cross-vendor managed workers (shipped 2026-09-03, MVP)
 
 A user should be able to tell a live Claude session “have Codex do this”, or a
 live Codex session “have Claude review this”, without manually opening another
@@ -1836,18 +1836,40 @@ this feature must not depend on one without version detection and a tested
 fallback. The bounded-depth precedent is worth copying rather than reinventing:
 a documented, configurable limit is exactly the shape the hop budget above takes.
 
-### Decisions still required
+### Decisions taken (2026-09-03) — `docs/superpowers/specs/2026-09-03-managed-workers-design.md`
 
-- Whether `delegate` may target an already-running named peer, always creates a
-  fresh managed worker, or exposes both modes explicitly.
-- Whether managed workers are one-task ephemeral sessions or can be resumed,
-  and what expiry, cleanup and storage quotas apply.
-- Which host adapters are supported first, and whether an unavailable native
-  worker API may fall back to a documented CLI/SDK subprocess.
-- Which task classes may run without another user confirmation, and who may
-  accept a worker's patch or merge it after deterministic checks pass.
-- Whether a synchronous wait mode is worth exposing in addition to the safer
-  asynchronous default.
+- **Both modes, explicitly.** `kind` names the worker's kind (the other side by
+  default); with `to` the task is handed to that running named peer of `kind`
+  over the ordinary addressed send, marked `[Antiphon task <id>]` and on the
+  ledger; without it a fresh worker starts. Neither a kind nor a peer is ever
+  guessed.
+- **One task, ephemeral.** A worker runs one task and exits; no resume — a
+  follow-up is a new task. Records live a week under `.antiphon/tasks/`,
+  worker directories under `.antiphon/workers/<id>/` go when the result was
+  collected or the task cancelled, stay for inspection after a failure until
+  the record expires, and are never touched while the worker runs. At most
+  four workers per project.
+- **CLI subprocess adapters only**: `claude -p` and `codex exec`, the two the
+  release's own E2E proves. No host-native cross-vendor API is depended on.
+- **Read tasks run without another confirmation; a write task never merges
+  itself.** Read: the host's default class, read-only. Write: its own worktree
+  and the host's default sandbox, a diff as evidence, applied only by the parent
+  or the human after `git apply --check`. Never
+  `--dangerously-skip-permissions`, never `--full-auto`.
+- **No synchronous delegate; a bounded wait on result** (`wait` ≤ 300 s).
+
+### What shipped (MVP)
+
+`lib/workers.py` (the store, the adapters, start/status/result/cancel/sweep,
+the hop budget), `antiphon task`, `antiphon_delegate` and `antiphon_task` on
+both servers, the label `[Antiphon worker <kind>:<id>]` in every worker's prompt
+and its registry name `worker-<id8>` on the page, the sweep on the hook. Exit
+codes come from the worker's own exit file (a shell wrapper writes it; the
+asking process never started the worker), liveness from the pid and its start
+time, timeouts by SIGTERM then SIGKILL on the worker's session. Measured on
+macOS: a zombie session leader makes `killpg(pgid, 0)` answer EPERM, read as
+gone. Not in the MVP: native subagent UI on either host, resume, native worker
+APIs — the portable contract is the task id, the lifecycle and the evidence.
 
 No claim is made yet that a Claude worker can appear in Codex's native agent UI,
 or that a Codex worker can appear in Claude Code's native subagent UI. That UX

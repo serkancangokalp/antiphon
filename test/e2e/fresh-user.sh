@@ -385,6 +385,19 @@ else
   check "this run stranded nothing of its own" "$STRANDED" "0"
 fi
 
+step "T3a — a managed worker: delegate one read task to a fresh codex exec, collect it by id"
+DELEGATED="$(cd "$PROJECT" && printf '%s' '{"text":"Reply with exactly: WORKER-OK","kind":"codex","timeout":300}' | antiphon task delegate 2>&1)" \
+  && pass "antiphon task delegate exits 0" || fail "antiphon task delegate failed: $DELEGATED"
+contains "the answer names a fresh codex worker" "$DELEGATED" "to a fresh codex worker"
+TASK_ID="$(printf '%s' "$DELEGATED" | python3 -c 'import sys, json; print(json.load(sys.stdin)["task_id"])' 2>/dev/null)"
+RESULT="$(cd "$PROJECT" && antiphon task result "$TASK_ID" 240 2>&1)"
+contains "the worker completed within the wait" "$RESULT" '"state": "completed"'
+contains "the result names the worker" "$RESULT" "worker-"
+WORKER_LOG="$PROJECT/.antiphon/workers/$TASK_ID/log"
+if [ -s "$WORKER_LOG" ]; then pass "the worker's log exists and is not empty"; else fail "no worker log at $WORKER_LOG"; fi
+contains "the worker answered in its own log" "$(cat "$WORKER_LOG" 2>/dev/null)" "WORKER-OK"
+SWEPT="$(cd "$PROJECT" && ANTIPHON_NAME= antiphon status 2>&1)"; contains "status still runs with a task on file" "$SWEPT" "Deliveries:"
+
 step "T3 — Codex's first turn reads what the refused push could not carry"
 BEFORE_ROLLOUTS="$(mktemp)"; find "$HOME/.codex/sessions" -name 'rollout-*.jsonl' 2>/dev/null | sort > "$BEFORE_ROLLOUTS"
 CODEX_OUT="$(cd "$PROJECT" && codex exec -s read-only --color never 'Reply with exactly: E2E-OK' 2>&1)" \

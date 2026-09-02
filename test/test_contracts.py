@@ -576,6 +576,34 @@ class ShippedContractTest(unittest.TestCase):
         self.assertNotRegex(limits, r"(?i)acknowledgement[^.]*not part of this",
                             "the old disclaimer is gone")
 
+    def test_every_surface_teaches_managed_workers(self):
+        """One task, one worker of the other kind, never merged: the README,
+        both rules, both servers' tool descriptions, the BACKLOG and the
+        spec agree on the tools, the bound and the rule."""
+        readme = read("README.md")
+        for words in ("### Managed workers", "`antiphon_delegate(", "`antiphon_task(",
+                      "never\napplies", "ANTIPHON_HOP_BUDGET", "antiphon task delegate",
+                      "[Antiphon worker <kind>:<id>]", "never a host-native subagent"):
+            self.assertIn(words, readme, words)
+        for rule in (antiphon.AGENTS_RULE, antiphon.CLAUDE_RULE):
+            self.assertIn("`antiphon_delegate`", rule)
+            self.assertIn("`antiphon_task`", rule)
+            self.assertIn("the bridge never merges its work", rule)
+        self.assertIn("never merges its work", antiphon.DELEGATE_DESCRIPTION)
+        node = read("lib", "channel.mjs")
+        collapsed = re.sub(r'"\s*\+\s*\n\s*"', "", node)
+        self.assertIn("never merges its work", collapsed)
+        self.assertIn('name: "antiphon_delegate"', collapsed)
+        self.assertIn('name: "antiphon_task"', collapsed)
+        self.assertIn("## P2 — Cross-vendor managed workers (shipped 2026-09-03, MVP)",
+                      read("BACKLOG.md"))
+        self.assertTrue(os.path.exists(os.path.join(
+            ROOT, "docs", "superpowers", "specs", "2026-09-03-managed-workers-design.md")))
+        for flag in antiphon.workers.FORBIDDEN_FLAGS:
+            self.assertNotIn(flag, "\n".join(
+                " ".join(antiphon.workers.adapter(kind, task_class, "x", "t"))
+                for kind in ("claude", "codex") for task_class in ("read", "write")))
+
     def test_every_surface_teaches_same_vendor_bridging(self):
         """A Claude session reaches another Claude session and a Codex
         session another Codex session, always by name; every surface says the
@@ -1233,9 +1261,10 @@ class IdentityPrivacyContractTest(unittest.TestCase):
         # for ("or 1 hour after the bridge sees it read"): the recipient is the
         # party whose read starts that clock, and it was being told 7 days.
         # +200 each on 2026-09-03 for the same-vendor sentence: the one road
-        # the rules did not know existed.
-        for where, text, ceiling in (("CLAUDE_RULE", antiphon.CLAUDE_RULE, 5_300),
-                                     ("AGENTS_RULE", antiphon.AGENTS_RULE, 5_800),
+        # the rules did not know existed; +150 each for the managed-worker
+        # sentence, because the rule must name every tool the server offers.
+        for where, text, ceiling in (("CLAUDE_RULE", antiphon.CLAUDE_RULE, 5_450),
+                                     ("AGENTS_RULE", antiphon.AGENTS_RULE, 5_950),
                                      ("channel instructions", channel, 3_500)):
             self.assertLessEqual(len(text.encode("utf-8")), ceiling,
                                  f"{where}: {len(text.encode('utf-8'))} bytes")
