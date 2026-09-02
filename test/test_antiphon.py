@@ -14652,28 +14652,36 @@ class SenderIdentityTest(unittest.TestCase):
                 self.assertIn("invocation only", words)
                 self.assertIn("never the tool result", words)
 
-    def test_every_agent_facing_surface_states_the_v4_retention_contract(self):
+    def test_the_v4_retention_contract_lives_in_the_documents_not_the_rules(self):
+        """The retention contract — cursor key names, the v3 sibling, lanes,
+        compaction — is an operator's and a maintainer's fact, and it was
+        costing every agent turn a paragraph it never acts on. README and
+        BACKLOG carry it in full; the three agent surfaces carry none of it,
+        deliberately, so the narrative cannot creep back into the per-turn
+        bill."""
         node = read_source("lib", "channel.mjs")
         start = node.index("    instructions:")
         end = node.index("\n  },\n);", start)
         channel = re.sub(r'"\s*\+\s*\n\s*"', "", node[start:end])
-        surfaces = {
-            "AGENTS.md rule": antiphon.AGENTS_RULE,
-            "CLAUDE.md rule": antiphon.CLAUDE_RULE,
-            "channel instructions": channel,
-            "README": read_source("README.md"),
-            "BACKLOG": read_source("BACKLOG.md"),
-        }
         required = (
             "<side>_pages_v4", "v3 sibling", "last record repeats",
             "current process fingerprint", "alternates whole pages",
             "antiphon sources compact", "hooks never retire",
         )
-        for name, surface in surfaces.items():
+        for name, surface in (("README", read_source("README.md")),
+                              ("BACKLOG", read_source("BACKLOG.md"))):
             with self.subTest(surface=name):
                 words = surface.lower()
                 for phrase in required:
                     self.assertIn(phrase, words)
+        for name, surface in (("AGENTS.md rule", antiphon.AGENTS_RULE),
+                              ("CLAUDE.md rule", antiphon.CLAUDE_RULE),
+                              ("channel instructions", channel)):
+            with self.subTest(surface=name):
+                words = surface.lower()
+                for phrase in ("<side>_pages_v4", "v3 sibling",
+                               "alternates whole pages", "hooks never retire"):
+                    self.assertNotIn(phrase, words)
 
     def test_every_agent_facing_surface_separates_claude_identity_from_reachability(self):
         """A labelled message must not make either agent infer that its reply

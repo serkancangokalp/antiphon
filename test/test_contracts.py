@@ -1122,6 +1122,26 @@ class IdentityPrivacyContractTest(unittest.TestCase):
         register = register[:register.index("\ndef ")]
         self.assertIn('"fingerprint_field": "process_birth"', register)
 
+    def test_the_agent_surfaces_stay_small(self):
+        """Every byte here is paid on every turn (the rules) or every session
+        (the instructions), and the host truncates a long instructions
+        string. Measured before the rewrite: 7,354 / 8,120 / ~6,000 bytes;
+        after it 4,740 / 5,338 / 3,183. The contract facts the tests around
+        this one pin fill roughly 4.5 KB on their own, so the ceilings sit
+        just above the rewrite rather than at the 3,000 the campaign aimed
+        for; they exist so the surfaces cannot regrow unnoticed. The
+        instructions are measured as the collapsed source slice, a few bytes
+        over the string itself (quotes and escapes)."""
+        node = read("lib", "channel.mjs")
+        start = node.index("    instructions:")
+        end = node.index("\n  },\n);", start)
+        channel = re.sub(r'"\s*\+\s*\n\s*"', "", node[start:end])
+        for where, text, ceiling in (("CLAUDE_RULE", antiphon.CLAUDE_RULE, 5_000),
+                                     ("AGENTS_RULE", antiphon.AGENTS_RULE, 5_500),
+                                     ("channel instructions", channel, 3_500)):
+            self.assertLessEqual(len(text.encode("utf-8")), ceiling,
+                                 f"{where}: {len(text.encode('utf-8'))} bytes")
+
     def test_the_socket_path_is_never_unlinked_after_a_close(self):
         """`close()` removes the socket file the server bound. An explicit
         unlink after it is a second removal with an await in front of it, and
