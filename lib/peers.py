@@ -70,6 +70,47 @@ PROCESS_FINGERPRINT_VERSION = 1
 OWNER_KEY_VERSION = f"v{PROCESS_FINGERPRINT_VERSION}"
 OBSERVATION_VERSION = 1
 IDENTITY_PROOF_VERSION = 1
+# The exact shape `_process_info` renders under LC_ALL=C and TZ=UTC: C-locale
+# weekday and month, an unpadded day, a 24-hour clock, a four-digit year,
+# single spaces. Spelled identically in identity.mjs and compared at runtime
+# by a contract test. Only this shape, with every field in range, may
+# authorise "dead": anything wider lets a reader's own notion of blank or word
+# take part, and the two runtimes disagree on U+0085 and U+FEFF.
+CANONICAL_START = (r"([A-Z][a-z]{2}) ([A-Z][a-z]{2}) ([0-9]{1,2}) "
+                   r"([0-9]{2}):([0-9]{2}):([0-9]{2}) ([0-9]{4})")
+WEEKDAYS = ("Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat")
+MONTHS = ("Jan", "Feb", "Mar", "Apr", "May", "Jun",
+          "Jul", "Aug", "Sep", "Oct", "Nov", "Dec")
+_CANONICAL_START = re.compile(CANONICAL_START)
+# Some generation, captured lexically and bounded: a reader that names v1
+# must neither convert nor choke on a long digit run, only tell whether the
+# token is its own. A generation is a positive integer with no leading zero,
+# like a pid in an owner key; `v0:` and `v01:` are malformed, not "other".
+# Spelled once as a string so the contract test can compare it with the
+# Node mirror at runtime, like the grammar above.
+GENERATION_TOKEN = r"v([1-9][0-9]{0,8}):"
+_GENERATION = re.compile(GENERATION_TOKEN)
+INTEGER_TOKEN_CEILING = 20      # digits; a pid, a version, a clock all fit
+
+
+def canonical_start(text):
+    """`text` when it is a start the writer could have produced, else None.
+
+    Shape and range, not calendar: `Feb 31` passes, and a value that is shaped
+    and in range but not this process's birth is indistinguishable from a
+    recycled pid — the same residual an in-range wrong owner key carries.
+    """
+    if not isinstance(text, str):
+        return None
+    matched = _CANONICAL_START.fullmatch(text)
+    if not matched:
+        return None
+    weekday, month, day, hour, minute, second, year = matched.groups()
+    if (weekday in WEEKDAYS and month in MONTHS and 1 <= int(day) <= 31
+            and int(hour) <= 23 and int(minute) <= 59 and int(second) <= 59
+            and 1970 <= int(year) <= 9999):
+        return text
+    return None
 # The canonical UUID a Codex session is named by, lowercase as the CLI writes it
 # and as `antiphon.SESSION_ID` reads it back off a rollout file name. A contract
 # test keeps the two spellings from drifting apart.
@@ -461,7 +502,8 @@ def _read_identity_proof_file(path, owner_digest):
         return "invalid", None
     try:
         record = json.loads(raw.decode("utf-8"),
-                            object_pairs_hook=_no_duplicate_keys)
+                            object_pairs_hook=_no_duplicate_keys,
+                            parse_int=_bounded_int)
     except (ValueError, UnicodeDecodeError):
         return "invalid", None
     if not _valid_identity_proof(record, owner_digest):
@@ -1022,6 +1064,19 @@ def _no_duplicate_keys(pairs):
     return seen
 
 
+def _bounded_int(token):
+    """`int(token)` for a token of at most INTEGER_TOKEN_CEILING digits.
+
+    `json.loads` converts an integer before any reader sees it; a 65,000-digit
+    token fits under RECORD_CEILING, converts slowly on 3.9, raises on later
+    Pythons, and rounds to a double in Node. Refusing it here makes the record
+    invalid on every Python, before any conversion. Integers only: floats and
+    exponents go to `parse_float` and never reach this."""
+    if len(token.lstrip("-")) > INTEGER_TOKEN_CEILING:
+        raise ValueError("integer token too long")
+    return int(token)
+
+
 def _read_record(path):
     """The record as a dict, or None. Valid JSON of the wrong shape is not a
     record: a bare array used to raise out of `read_peers` on `.get`."""
@@ -1031,7 +1086,8 @@ def _read_record(path):
         if len(raw) > RECORD_CEILING:
             return None
         record = json.loads(raw.decode("utf-8"),
-                            object_pairs_hook=_no_duplicate_keys)
+                            object_pairs_hook=_no_duplicate_keys,
+                            parse_int=_bounded_int)
     except (OSError, ValueError, UnicodeDecodeError):
         return None
     return record if isinstance(record, dict) else None
@@ -1136,29 +1192,38 @@ def _pid_of(record):
     return pid if 0 < pid <= PID_CEILING else None
 
 
-def _birth_of(record):
-    """The start time of the process the record was written for, or None.
+def _fingerprint_of(record):
+    """`("current", start)`, `("other", None)` or None for a record.
 
-    None is two different histories with one correct reading. The record may
-    predate this field, or `ps` may have had nothing to say when the claim was
-    made. Neither is evidence that the pid has been recycled, so both fall back
-    to the liveness the registry has always used.
+    Precedence is by key presence. A present `process_birth` is the only
+    thing consulted, however it is spelled: the 0.3.x reader interpreted
+    `birth` against its own timezone and pruned live listeners while
+    `birth_version` sat unread beside it, so the canonical value lives where
+    that reader never looks, and nothing here falls back past it. A generation
+    token that is not this reader's is unverifiable; this reader's token with
+    anything but the writer's shape after it is malformed, not "other". The
+    0.4.0 pair — canonical `birth` beside a lexical integer `birth_version`
+    1 — is migration input, read strictly. Everything else is evidence of
+    nothing.
     """
-    birth = record.get("birth") if hasattr(record, "get") else None
-    if not isinstance(birth, str) or not birth.strip():
+    if not hasattr(record, "get"):
         return None
-    return birth
-
-
-def _birth_is_current(record):
-    """Whether `birth` was rendered by the canonical process reader.
-
-    Records written before this marker carry a local-time, local-locale string.
-    A mismatch with today's UTC/C rendering says nothing about their process,
-    so only a current marker makes strict comparison safe.
-    """
-    return (hasattr(record, "get")
-            and record.get("birth_version") == PROCESS_FINGERPRINT_VERSION)
+    if "process_birth" in record:
+        sibling = record.get("process_birth")
+        if not isinstance(sibling, str):
+            return None
+        head = _GENERATION.match(sibling)
+        if head is None:
+            return None
+        if int(head.group(1)) != PROCESS_FINGERPRINT_VERSION:
+            return ("other", None)
+        start = canonical_start(sibling[head.end():])
+        return ("current", start) if start is not None else None
+    version = record.get("birth_version")
+    start = canonical_start(record.get("birth"))
+    if start is not None and type(version) is int and version == 1:
+        return ("current", start)
+    return None
 
 
 def alive(pid):
@@ -1219,11 +1284,11 @@ def _record_alive(record):
     pid = _pid_of(record)
     if pid is None or not alive(pid):
         return False
-    recorded = _birth_of(record)
-    if recorded is None or not _birth_is_current(record):
+    fingerprint = _fingerprint_of(record)
+    if fingerprint is None or fingerprint[0] != "current":
         return True
     observed = _process_birth(pid)
-    return observed is None or observed == recorded
+    return observed is None or observed == fingerprint[1]
 
 
 def _record_liveness(record, cache=None):
@@ -1235,21 +1300,18 @@ def _record_liveness(record, cache=None):
     failed process read are ``unknown`` rather than guessed live or dead.
     """
     pid = _pid_of(record)
-    birth = _birth_of(record)
-    version = (record.get("birth_version")
-               if hasattr(record, "get") else None)
-    key = (pid, version, birth)
+    fingerprint = _fingerprint_of(record)
+    key = (pid, fingerprint)
     if cache is not None and key in cache:
         return cache[key]
     result = "unknown"
-    if (pid is not None and version == PROCESS_FINGERPRINT_VERSION
-            and birth is not None):
+    if pid is not None and fingerprint is not None and fingerprint[0] == "current":
         if not alive(pid):
             result = "dead"
         else:
             observed = _process_birth(pid)
             if observed is not None:
-                result = "live" if observed == birth else "dead"
+                result = "live" if observed == fingerprint[1] else "dead"
     if cache is not None:
         cache[key] = result
     return result
@@ -1410,9 +1472,15 @@ def _automatic_claim_refusal(cwd, kind, owner_key, identity_digest, mode):
     return f"the owner's identity proof is {state}; no claim was changed"
 
 
-def register(cwd, kind, name, address, pid=None, owner_key=None,
-             identity_digest=None, mode=None):
-    """Claims `name` for `pid`. Returns (ok, detail).
+def register_claim(cwd, kind, name, address, pid=None, owner_key=None,
+                   identity_digest=None, mode=None):
+    """Claims `name` for `pid`. Returns (ok, detail, fingerprint).
+
+    `fingerprint` is the exact `process_birth` string the record was written
+    with, or None when the process could not be fingerprinted — the answer a
+    listener compares its own record against. It comes from this operation's
+    one observation: a second `ps` can answer differently (measured by fault
+    injection), and a read-back of the file would let anyone's bytes answer.
 
     `pid` is the process whose life the peer's life follows, and it is often not
     the caller. `channel.mjs` registers by shelling out to a short-lived Python
@@ -1444,30 +1512,30 @@ def register(cwd, kind, name, address, pid=None, owner_key=None,
     exactly the cross-writer overwrite the split exists to prevent.
     """
     if not valid_kind(kind):
-        return False, f"invalid peer kind {kind!r}: expected 'claude' or 'codex'"
+        return False, f"invalid peer kind {kind!r}: expected 'claude' or 'codex'", None
     if not valid_key(kind, name):
         return False, (f"invalid peer name {name!r} for a {kind} peer: "
-                       "expected [a-z0-9][a-z0-9_-]{0,31}")
+                       "expected [a-z0-9][a-z0-9_-]{0,31}"), None
     automatic = identity_digest is not None
     if automatic and (not valid_identity_digest(identity_digest)
                       or auto_name_from_digest(identity_digest) != name):
         return False, ("invalid automatic identity: the full digest does not "
-                       "derive the requested peer name")
+                       "derive the requested peer name"), None
     if address is None:
         if kind != "codex":
             return False, (f"invalid peer address {address!r}: only a Codex peer "
-                           "may register before it has one")
+                           "may register before it has one"), None
         if not valid_owner_key(owner_key):
             return False, (f"invalid peer address {address!r}: omitting it takes a "
-                           f"valid owner key, got {owner_key!r}")
+                           f"valid owner key, got {owner_key!r}"), None
     elif _address_of({"address": address}) is None:
-        return False, f"invalid peer address {address!r}: expected a non-empty string"
+        return False, f"invalid peer address {address!r}: expected a non-empty string", None
     if owner_key is not None and not valid_owner_key(owner_key):
         return False, (f"invalid owner key {owner_key!r}: expected a pid and the "
-                       "start time that tells it from a recycled one")
+                       "start time that tells it from a recycled one"), None
     owner_pid = _pid_of({"pid": pid}) if pid is not None else os.getpid()
     if owner_pid is None:
-        return False, f"invalid owner pid {pid!r}: expected a positive integer"
+        return False, f"invalid owner pid {pid!r}: expected a positive integer", None
     # Observed here and taken from nowhere else. There is no parameter for it
     # and no field of the payload reaches it: a fingerprint a caller could hand
     # in is a stale record vouching for itself, which is the one claim the
@@ -1486,7 +1554,7 @@ def register(cwd, kind, name, address, pid=None, owner_key=None,
                 if ((automatic and other_digest != identity_digest)
                         or (not automatic and other_digest is not None)):
                     return False, (f"automatic identity collision at peer name "
-                                   f"{name!r}; no claim was changed")
+                                   f"{name!r}; no claim was changed"), None
                 if other_pid == owner_pid:
                     continue              # this process refreshing its own record
                 if kind == "codex" and owner_key and _owner_of(other) == owner_key:
@@ -1505,7 +1573,7 @@ def register(cwd, kind, name, address, pid=None, owner_key=None,
                     # answering — the registry would then describe a server
                     # nobody reaches. A rollout id is not owned that way.
                     continue
-                return False, f"peer name {name!r} is already held by pid {other_pid}"
+                return False, f"peer name {name!r} is already held by pid {other_pid}", None
             if address is not None and _address_of(other) == address:
                 # The contended resource is the address, not the name, and the
                 # two races are different. Two sessions under one alias are
@@ -1515,7 +1583,7 @@ def register(cwd, kind, name, address, pid=None, owner_key=None,
                 # registry would show two peers while a message addressed to
                 # either reached whichever actually held it.
                 return False, (f"address {address!r} is already served by peer "
-                               f"{other.get('name')!r} (pid {other_pid})")
+                               f"{other.get('name')!r} (pid {other_pid})"), None
         if mode is not None:
             # Inside the lock that writes the endpoint, never one hop earlier:
             # a proof validated in Node and a registration performed here are
@@ -1523,7 +1591,7 @@ def register(cwd, kind, name, address, pid=None, owner_key=None,
             refusal = _automatic_claim_refusal(cwd, kind, owner_key,
                                                identity_digest, mode)
             if refusal:
-                return False, refusal
+                return False, refusal, None
         path = _peer_file(cwd, kind, name)
         os.makedirs(os.path.dirname(path), exist_ok=True)
         record = {"kind": kind, "name": name, "pid": owner_pid,
@@ -1534,16 +1602,30 @@ def register(cwd, kind, name, address, pid=None, owner_key=None,
             record["automatic"] = True
             record["identity_digest"] = identity_digest
         if birth:
-            # Kept apart from `started_at`, which is when the claim was made and
-            # is what the listing sorts on. This is when the process was born,
-            # and it is the half of its identity the number does not carry.
-            record["birth"] = birth
-            record["birth_version"] = PROCESS_FINGERPRINT_VERSION
+            # When the process was born, the half of its identity the number
+            # does not carry — kept apart from `started_at`, which is when the
+            # claim was made and is what the listing sorts on. Written where
+            # the 0.3.x reader never looks, so a server still running that
+            # reader keeps this record on its pid rather than pruning it
+            # against its own timezone. Nothing writes `birth` for that
+            # reader's benefit: it compares against a timezone the writer
+            # cannot know.
+            record["process_birth"] = _render_fingerprint(birth)
         tmp = f"{path}.{os.getpid()}.tmp"
         with open(tmp, "w", encoding="utf-8") as f:
             json.dump(record, f, ensure_ascii=False)
         os.replace(tmp, path)
-    return True, ""
+    return True, "", record.get("process_birth")
+
+
+def register(cwd, kind, name, address, pid=None, owner_key=None,
+             identity_digest=None, mode=None):
+    """`register_claim` without the fingerprint, for callers that do not
+    answer a listener."""
+    ok, detail, _fingerprint = register_claim(
+        cwd, kind, name, address, pid=pid, owner_key=owner_key,
+        identity_digest=identity_digest, mode=mode)
+    return ok, detail
 
 
 def unregister(cwd, kind, name, pid=None):
@@ -1707,7 +1789,28 @@ def _process_birth(pid):
     trusts for the same purpose.
     """
     info = _process_info(pid)
-    return (info[1] or None) if info else None
+    # Through the same grammar the readers select on, so writer and reader
+    # agree by construction. `_process_info` checks three of the seven fields
+    # it renders; a `ps` that leaked a locale name or a five-digit year would
+    # otherwise be written as a sibling neither reader can select — UNREADY
+    # forever, with a reconnect remedy that reproduces it. Off the canon the
+    # process simply has no fingerprint, the documented evidence-of-nothing
+    # road, and the same answer on both sides.
+    return canonical_start(info[1]) if info else None
+
+
+def _render_fingerprint(start):
+    """The spelling `register` writes: the process generation in the value,
+    the way an owner key already carries its own."""
+    return f"v{PROCESS_FINGERPRINT_VERSION}:{start}"
+
+
+def process_fingerprint(pid):
+    """The spelling `register` writes, from a fresh observation. For a harness
+    that needs its own listener's spelling; the bridge's claim response never
+    uses it — that value comes back from `register_claim` itself."""
+    birth = _process_birth(pid)
+    return _render_fingerprint(birth) if birth else None
 
 
 def _owner_liveness(key, cache=None):

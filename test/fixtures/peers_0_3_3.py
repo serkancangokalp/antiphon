@@ -1,0 +1,706 @@
+"""Peer identity: naming, the socket key, and the registry both sides read.
+
+A peer is one agent session working in one project directory. Antiphon assumed
+exactly one per side and never said so; this module is the part that lets
+several coexist without taking each other's sockets and cursors.
+
+An explicit name is what buys isolation, and it is the only thing that does. A
+session started without one occupies the reserved `UNNAMED` key below: it is
+counted, it is served, and it cannot be addressed by name — which is exactly
+what having no name means. There is one such peer per side per project, and a
+second session that wants one finds the key taken. Nothing is ever invented on
+a session's behalf; a name it did not choose is a name the other side could
+address without the session having agreed to answer to it.
+
+A Codex peer is written by two processes that never meet. The MCP server owns
+`endpoint.json` and knows the pid; the hook owns `session.json` and knows the
+session id, which is the address. Each writes its own file, so neither can lose
+the other's fields, and `read_peers` joins the two on the owner key when it is
+read. Anything that cannot be joined is listed as live and unroutable rather
+than guessed at.
+"""
+
+import contextlib
+import fcntl
+import hashlib
+import json
+import os
+import re
+import subprocess
+import time
+
+NAME_PATTERN = re.compile(r"[a-z0-9][a-z0-9_-]{0,31}")
+# Both sides are matched with `fullmatch`, never `match`: `$` also matches just
+# before a trailing newline, so `re.match` accepted "ui\n" as a peer name and it
+# would have gone straight into a file name and a socket seed.
+KIND_PATTERN = re.compile(r"claude|codex")
+# A pid and the start time that tells it from a recycled one, as `owner_key`
+# below produces it. A bare pid is refused deliberately: it is the recycled
+# number the start time exists to rule out.
+OWNER_PATTERN = re.compile(r"[1-9][0-9]*:\S(?:.*\S)?")
+# The canonical UUID a Codex session is named by, lowercase as the CLI writes it
+# and as `antiphon.SESSION_ID` reads it back off a rollout file name. A contract
+# test keeps the two spellings from drifting apart.
+SESSION_ID_PATTERN = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-"
+                                r"[0-9a-f]{4}-[0-9a-f]{12}")
+
+
+def explicit_name():
+    """The name set for this session, or "" when none was set."""
+    return (os.environ.get("ANTIPHON_NAME") or "").strip().lower()
+
+
+# The registry key a peer with no name occupies. It is not a name: the angle
+# brackets are outside the alias grammar, so nothing anyone can type or write in
+# an `@claude:` marker can ever be it, and the two can never collide. It is the
+# same spelling the visible label uses, because it is the same idea — one word
+# for "this peer has no name", wherever that has to be said.
+#
+# The check against it is exact, never a prefix or a shape: `claude-abc` is a
+# name somebody may deliberately choose, and inferring from the look of a name
+# would take their alias away over a resemblance. An earlier version generated
+# `claude-<3hex>` for an unnamed session, which was a real name in the registry
+# for a peer that told the other side it had none — and a message addressed to
+# that key resolved.
+UNNAMED = "<unnamed>"
+
+
+def valid_name(name):
+    """Whether `name` is a public alias: what a person may type, what an
+    `@claude:` marker may carry, what a reply may be addressed to.
+
+    Both this and `valid_kind` are handed values that came out of JSON — a
+    tool argument, a marker, a record read off disk — so a non-string is
+    refused rather than passed to `fullmatch`, which raises on one."""
+    return isinstance(name, str) and bool(NAME_PATTERN.fullmatch(name))
+
+
+def valid_key(kind, name):
+    """Whether `name` may be this kind of peer's place in the registry.
+
+    Every public alias may, on either side. The reserved key may only on the
+    Claude side, because that is the only thing it represents: an unnamed
+    channel server, which registers because it serves a socket somebody has to
+    be able to find. An unnamed Codex session deliberately has no record at all
+    — that is exactly why one visible Codex peer cannot be shown to be the only
+    one running — so a record under this key there would be a live peer nobody
+    could ever name, and it would make every bare message ambiguous while being
+    unreachable itself.
+
+    Directory names and record fields are checked with this; addressing is
+    checked with `valid_name`, which is narrower still.
+    """
+    return valid_name(name) or (kind == "claude" and name == UNNAMED)
+
+
+def valid_kind(kind):
+    """`kind` is concatenated into a directory name; unvalidated, `../..` walks
+    out of the project."""
+    return isinstance(kind, str) and bool(KIND_PATTERN.fullmatch(kind))
+
+
+def valid_owner_key(key):
+    """A key the registry is willing to record as an identity.
+
+    Anything else is refused rather than stored and ignored: a malformed key
+    would register cleanly and then join nothing, which looks like a peer that
+    simply never came back.
+    """
+    return isinstance(key, str) and bool(OWNER_PATTERN.fullmatch(key))
+
+
+def valid_session_id(value):
+    """A canonical UUID and nothing else.
+
+    This becomes an address. An id that is not one routes a message at nothing
+    and does it silently, which is the whole failure this registry exists to
+    end. `fullmatch`, like every other pattern here: `$` also matches before a
+    trailing newline.
+    """
+    return isinstance(value, str) and bool(SESSION_ID_PATTERN.fullmatch(value))
+
+
+def socket_key(cwd, name=""):
+    """Hashed, never appended: the path must not grow past the platform's limit.
+
+    An empty name reproduces the pre-multi-peer key byte for byte, so an unnamed
+    session keeps the socket it already has.
+    """
+    base = os.path.abspath(cwd)
+    seed = base if not name else f"{base}\0{name}"
+    return hashlib.sha256(seed.encode()).hexdigest()[:20]
+
+
+def peers_dir(cwd):
+    return os.path.join(cwd, ".antiphon", "peers")
+
+
+def peer_dir(cwd, kind, name):
+    """One directory per peer: its records and its cursor live together."""
+    return os.path.join(peers_dir(cwd), f"{kind}-{name}")
+
+
+def _peer_file(cwd, kind, name):
+    """The record written only by the process that owns the peer.
+
+    One file per writer: the hook writes `session.json` beside it, so the two
+    never read-modify-write the same document and cannot lose each other's
+    fields.
+    """
+    return os.path.join(peer_dir(cwd, kind, name), "endpoint.json")
+
+
+def _session_file(cwd, kind, name):
+    """The hook's record, beside the server's.
+
+    The server knows the pid and never the session id; the hook knows the
+    session id and must never claim a pid, having usually exited by the time
+    anyone reads it. Two files, one writer each.
+    """
+    return os.path.join(peer_dir(cwd, kind, name), "session.json")
+
+
+@contextlib.contextmanager
+def _registry_lock(cwd):
+    """Serializes every claim, refresh, prune and release in this project.
+
+    One lock for the whole registry rather than one per name: a claim has to
+    check the name *and* the address, and two claims holding different per-name
+    locks would not be serialized against each other at all. Contention is a
+    handful of sessions, so a single lock costs nothing and removes the ordering
+    problem entirely. It is not reentrant, so nothing called while it is held may
+    take it again.
+    """
+    directory = peers_dir(cwd)
+    os.makedirs(directory, exist_ok=True)
+    fd = os.open(os.path.join(directory, ".lock"), os.O_CREAT | os.O_RDWR, 0o600)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        yield
+    finally:
+        fcntl.flock(fd, fcntl.LOCK_UN)
+        os.close(fd)
+
+
+def _read_record(path):
+    """The record as a dict, or None. Valid JSON of the wrong shape is not a
+    record: a bare array used to raise out of `read_peers` on `.get`."""
+    try:
+        with open(path, encoding="utf-8") as f:
+            record = json.load(f)
+    except (OSError, ValueError):
+        return None
+    return record if isinstance(record, dict) else None
+
+
+def _address_of(record):
+    """A usable address, or None. An empty address is not a peer: stored, it made
+    the single-peer resolver fall back to the legacy socket without saying so."""
+    address = record.get("address") if hasattr(record, "get") else None
+    if not isinstance(address, str) or not address.strip():
+        return None
+    return address
+
+
+def _owner_of(record):
+    """The record's owner key, or None. Never its pid: they are two different
+    identities, and a reader that takes one for the other joins nothing."""
+    owner = record.get("owner") if hasattr(record, "get") else None
+    return owner if valid_owner_key(owner) else None
+
+
+def _addressless(record):
+    """True for the one shape that is live without being reachable.
+
+    A Codex server is handed a project directory and nothing else; the rollout
+    id it answers to arrives with the first message. Between those two moments
+    the peer exists and can be named, which is what an ambiguity refusal needs,
+    and it is stored with its address explicitly `None`.
+
+    Every other unusable address stays skipped — empty, blank, wrong type, or
+    absent altogether. Those say nothing about being on their way, and reading
+    silence as a claim is the guess this registry exists to refuse.
+    """
+    return (record.get("kind") == "codex"
+            and record.get("address", "") is None
+            and _owner_of(record) is not None)
+
+
+def _session_address(cwd, peer):
+    """The session id this endpoint's own hook has claimed for it, or None.
+
+    Kind-neutral, and used both ways. For a Codex endpoint the id is also the
+    address: a Codex peer registers before it has one and this is what it comes
+    to answer to. For a Claude endpoint it is not an address at all — the
+    socket is — and the id says only which transcript that peer is writing,
+    which is what a pull page joins a session label on. Same halves, same
+    owner, same refusal either way.
+
+    The two halves are joined on the owner key and nothing else. A missing
+    session record, one with no owner, one from a different owner, and one whose
+    id is not a canonical UUID all read the same way: live, not routable. There
+    is no rule that reaches for the likeliest session, because reaching for the
+    likeliest is what the silent misrouting was.
+
+    `.get`, never `[...]`: a half-written record must not raise out of every
+    read of the registry. `name` is validated before it becomes a path — it
+    comes off disk, and `../..` would read a record from outside the project.
+    """
+    kind, name = peer.get("kind"), peer.get("name")
+    if not (valid_kind(kind) and valid_key(kind, name)):
+        return None
+    owner = _owner_of(peer)
+    session = _read_record(_session_file(cwd, kind, name))
+    if not (owner and session and session.get("owner") == owner):
+        return None
+    claimed = session.get("session_id")
+    return claimed if valid_session_id(claimed) else None
+
+
+def _started_at(record):
+    """The record's timestamp as a float, or 0. Sorting a float against a string
+    raises, and it would raise inside every read of the registry."""
+    try:
+        return float(record.get("started_at"))
+    except (AttributeError, TypeError, ValueError):
+        return 0.0
+
+
+def _pid_of(record):
+    """A usable owner pid, or None when the record identifies nobody.
+
+    Anything that is not a positive integer names no process, so it cannot be
+    checked for liveness and must not hold a name hostage either.
+    """
+    try:
+        pid = int(record.get("pid"))
+    except (AttributeError, TypeError, ValueError):
+        return None
+    return pid if pid > 0 else None
+
+
+def _birth_of(record):
+    """The start time of the process the record was written for, or None.
+
+    None is two different histories with one correct reading. The record may
+    predate this field, or `ps` may have had nothing to say when the claim was
+    made. Neither is evidence that the pid has been recycled, so both fall back
+    to the liveness the registry has always used.
+    """
+    birth = record.get("birth") if hasattr(record, "get") else None
+    if not isinstance(birth, str) or not birth.strip():
+        return None
+    return birth
+
+
+def alive(pid):
+    """True if the process still exists. Signal 0 checks without delivering.
+
+    A process that has exited but not yet been reaped is a zombie and still
+    answers this, so a peer can read as live for the window before its parent
+    reaps it. The cost is a delivery attempt that fails loudly against a socket
+    nobody serves, never a silent misroute.
+
+    This answers "somebody holds that number", which is weaker than what any
+    caller here wants to know. `_record_alive` is what they ask; this is one
+    half of its answer.
+    """
+    try:
+        os.kill(int(pid), 0)
+    except (OSError, TypeError, ValueError):
+        return False
+    return True
+
+
+def _record_alive(record):
+    """Whether the process this record was written for is the one still running.
+
+    Every liveness decision in the registry goes through here, because they are
+    all the same decision and one of them getting it wrong is enough. A pid is a
+    number the kernel hands out again; `owner_key` has always said so by pairing
+    a pid with a start time, and liveness used to contradict it by asking only
+    whether the number was in use. An endpoint that crashed without releasing
+    its claim therefore came back to life the moment its number was reassigned
+    to an unrelated process — holding an alias, holding an address, and standing
+    between a Codex session and the address it was entitled to.
+
+    Three readings, and only the last one is a corpse:
+
+    - no fingerprint in the record: it predates the field or its owner could not
+      be fingerprinted at registration. The pid alone, exactly as before.
+    - a fingerprint, and none readable now: `ps` failed, which is evidence of
+      nothing. Releasing a peer that may well be live over a lookup that could
+      not be made would trade a rare bug for a common one.
+    - a fingerprint, and a different one: the process this record names is gone
+      and its number belongs to somebody else. Dead, and prunable.
+    """
+    pid = _pid_of(record)
+    if pid is None or not alive(pid):
+        return False
+    recorded = _birth_of(record)
+    if recorded is None:
+        return True
+    observed = _process_birth(pid)
+    return observed is None or observed == recorded
+
+
+def _prune(cwd, kind, name, dead_pid):
+    """Removes a dead peer's record, but only if it is still that peer's.
+
+    Re-read under the lock: between the unlocked read that spotted the corpse
+    and this call, a new owner may have claimed the name, and deleting its fresh
+    record would leave a live peer invisible. The directory stays, so a peer
+    returning under the same name finds its cursor where it left it.
+    """
+    if not (valid_kind(kind) and valid_key(kind, name)):
+        return
+    with _registry_lock(cwd):
+        held = _read_record(_peer_file(cwd, kind, name))
+        held_pid = _pid_of(held) if held else None
+        if held_pid is None or held_pid != dead_pid:
+            return
+        if _record_alive(held):
+            return
+        path = _peer_file(cwd, kind, name)
+        try:
+            os.unlink(path)
+        except OSError:
+            pass
+
+
+def _scan(cwd):
+    """Every readable record that agrees with the directory holding it.
+
+    Unlocked and unpruned; safe to call under the lock.
+
+    The directory is a peer's real identity — it is where every writer for that
+    peer puts its files. The `kind` and `name` inside a record are what the rest
+    of this module builds paths and decisions from, so a record claiming a name
+    other than its own directory's would send the session join looking inside
+    another peer, and report an address for an endpoint that does not exist. A
+    record that disagrees with where it lives is not read at all.
+
+    Split at the first hyphen only: neither kind contains one, so everything
+    after it belongs to the alias and `codex-my-build` keeps its name.
+    """
+    try:
+        entries = sorted(os.listdir(peers_dir(cwd)))
+    except OSError:
+        return []
+    records = []
+    for entry in entries:
+        kind, _, name = entry.partition("-")
+        if not (valid_kind(kind) and valid_key(kind, name)):
+            continue
+        record = _read_record(os.path.join(peers_dir(cwd), entry, "endpoint.json"))
+        if record is None:
+            continue
+        if record.get("kind") != kind or record.get("name") != name:
+            continue
+        records.append(record)
+    return records
+
+
+def read_peers(cwd, kind=None):
+    """Live peers, newest first. Records left by dead processes are removed.
+
+    Live is `_record_alive`, not a signal to a pid: a record whose process is
+    gone is still removed when its number has been handed to somebody else.
+
+    Live is not the same as reachable. A Codex peer that has not been given its
+    address yet is listed with `address` set to `None`, because a peer nobody
+    can name is a peer an ambiguity refusal cannot mention. This is the single
+    public reading of the registry, so every caller that intends to *deliver*
+    something has to check the address it got rather than assume one.
+
+    It is also where the two halves of a Codex peer are joined: an addressless
+    endpoint takes the session id its own hook recorded, and only its own. The
+    join happens on the way out rather than at either write, so neither writer
+    ever has to read the other's file.
+
+    A record that cannot be parsed is skipped rather than raised: a half-written
+    entry must never take the bridge down with it.
+    """
+    found = []
+    for peer in _scan(cwd):
+        peer_pid = _pid_of(peer)
+        if peer_pid is None:
+            continue                  # identifies nobody; not a peer, not prunable
+        if _address_of(peer) is None and not _addressless(peer):
+            continue                  # reaches nobody, and is not on its way
+        if not _record_alive(peer):
+            _prune(cwd, peer.get("kind"), peer.get("name"), peer_pid)
+            continue
+        if kind is None or peer.get("kind") == kind:
+            if _addressless(peer):
+                peer["address"] = _session_address(cwd, peer)
+            found.append(peer)
+    found.sort(key=_started_at, reverse=True)
+    return found
+
+
+def register(cwd, kind, name, address, pid=None, owner_key=None):
+    """Claims `name` for `pid`. Returns (ok, detail).
+
+    `pid` is the process whose life the peer's life follows, and it is often not
+    the caller. `channel.mjs` registers by shelling out to a short-lived Python
+    subprocess; recording that subprocess's pid would mark the peer dead the
+    instant the call returned.
+
+    The whole read-check-write runs under an exclusive `flock`. An `O_EXCL`
+    create is not enough on its own: it makes an *empty* file visible before the
+    record is written, so a second claimant reads nothing, concludes the record
+    is unowned, and takes it. Measured — two racing claimants both won every
+    time with `O_EXCL` and exactly one wins under the lock. The bridge is
+    Unix-only already, so a lock file costs nothing in portability.
+
+    `owner_key` is the session two writers share, and it is kept strictly apart
+    from `pid`, which is the process whose life the record follows. The
+    parameter is not called `owner` because that was already the local holding
+    the resolved pid; the two would have shadowed each other and written a
+    number where the join expects a key. The local is `owner_pid` now, and the
+    field the record stores the key under is `owner`.
+
+    A `None` address is accepted from a Codex peer that has a valid owner key,
+    and from nothing else. It is stored as `None` rather than as a sentinel: a
+    `"pending"` string would be an address as far as the collision check is
+    concerned, and the second Codex server would be refused for one the first
+    does not really serve.
+
+    There is deliberately no `transcript` parameter. That field belongs to
+    `session.json`, whose only writer is the hook; accepting it here would invite
+    exactly the cross-writer overwrite the split exists to prevent.
+    """
+    if not valid_kind(kind):
+        return False, f"invalid peer kind {kind!r}: expected 'claude' or 'codex'"
+    if not valid_key(kind, name):
+        return False, (f"invalid peer name {name!r} for a {kind} peer: "
+                       "expected [a-z0-9][a-z0-9_-]{0,31}")
+    if address is None:
+        if kind != "codex":
+            return False, (f"invalid peer address {address!r}: only a Codex peer "
+                           "may register before it has one")
+        if not valid_owner_key(owner_key):
+            return False, (f"invalid peer address {address!r}: omitting it takes a "
+                           f"valid owner key, got {owner_key!r}")
+    elif _address_of({"address": address}) is None:
+        return False, f"invalid peer address {address!r}: expected a non-empty string"
+    if owner_key is not None and not valid_owner_key(owner_key):
+        return False, (f"invalid owner key {owner_key!r}: expected a pid and the "
+                       "start time that tells it from a recycled one")
+    owner_pid = _pid_of({"pid": pid}) if pid is not None else os.getpid()
+    if owner_pid is None:
+        return False, f"invalid owner pid {pid!r}: expected a positive integer"
+    # Observed here and taken from nowhere else. There is no parameter for it
+    # and no field of the payload reaches it: a fingerprint a caller could hand
+    # in is a stale record vouching for itself, which is the one claim the
+    # comparison exists to disbelieve. Read before the lock — `ps` is a
+    # subprocess, and nothing about it needs the registry held still.
+    birth = _process_birth(owner_pid)
+    with _registry_lock(cwd):
+        for other in _scan(cwd):
+            other_pid = _pid_of(other)
+            if other_pid is None or not _record_alive(other):
+                continue
+            if other.get("kind") != kind:
+                continue                  # a rollout id and a socket path never collide
+            if other.get("name") == name:
+                if other_pid == owner_pid:
+                    continue              # this process refreshing its own record
+                if kind == "codex" and owner_key and _owner_of(other) == owner_key:
+                    # Codex can bring up a second MCP server for one CLI session
+                    # before the first has exited. Judged by pid alone the
+                    # newcomer looks like an intruder, and the session locks
+                    # itself out of its own name until its predecessor is
+                    # reaped. A shared key excuses a differing pid; a dead owner
+                    # is already gone above, so it never excuses a missing
+                    # process.
+                    #
+                    # Codex only, on purpose. A Claude endpoint is a socket
+                    # this process is serving, and two channel servers under one
+                    # CLI root would otherwise let the second overwrite the
+                    # first's record while the first's socket is still the one
+                    # answering — the registry would then describe a server
+                    # nobody reaches. A rollout id is not owned that way.
+                    continue
+                return False, f"peer name {name!r} is already held by pid {other_pid}"
+            if address is not None and _address_of(other) == address:
+                # The contended resource is the address, not the name, and the
+                # two races are different. Two sessions under one alias are
+                # caught above; this catches two *different* aliases carrying
+                # one address — a Codex session registering a second name
+                # against its own rollout, or a hand-written record — where the
+                # registry would show two peers while a message addressed to
+                # either reached whichever actually held it.
+                return False, (f"address {address!r} is already served by peer "
+                               f"{other.get('name')!r} (pid {other_pid})")
+        path = _peer_file(cwd, kind, name)
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        record = {"kind": kind, "name": name, "pid": owner_pid,
+                  "address": address, "started_at": time.time()}
+        if owner_key:
+            record["owner"] = owner_key
+        if birth:
+            # Kept apart from `started_at`, which is when the claim was made and
+            # is what the listing sorts on. This is when the process was born,
+            # and it is the half of its identity the number does not carry.
+            record["birth"] = birth
+        tmp = f"{path}.{os.getpid()}.tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(record, f, ensure_ascii=False)
+        os.replace(tmp, path)
+    return True, ""
+
+
+def unregister(cwd, kind, name, pid=None):
+    """Releases a name, but only if this owner still holds it."""
+    if not (valid_kind(kind) and valid_key(kind, name)):
+        return
+    owner = _pid_of({"pid": pid}) if pid is not None else os.getpid()
+    if owner is None:
+        return
+    with _registry_lock(cwd):
+        path = _peer_file(cwd, kind, name)
+        held = _read_record(path)
+        held_pid = _pid_of(held) if held else None
+        if held_pid is not None and held_pid != owner:
+            return
+        try:
+            os.unlink(path)
+        except OSError:
+            pass
+
+
+def read_session(cwd, kind, name):
+    """The hook's record for an alias as a dict, or None."""
+    if not (valid_kind(kind) and valid_key(kind, name)):
+        return None
+    return _read_record(_session_file(cwd, kind, name))
+
+
+def write_session(cwd, kind, name, session_id, transcript, owner):
+    """Records which session is behind an alias. Returns (ok, detail).
+
+    Refuses when a live endpoint holds the alias for a different owner, and
+    touches nothing at all in that case: the session that got there first keeps
+    working and this one is told. The guard is on the **endpoint**, not on any
+    session record already present. A guard that compared session owners could
+    only refuse a second owner once the first one's hook had run, and a server
+    that has registered without an id yet is precisely the peer that is live and
+    about to become routable.
+
+    An alias no endpoint holds is writable: the hook can fire before the server
+    registers, and the record simply waits. It is not a peer until an endpoint
+    appears — the registry is listed from `endpoint.json`, so a session record
+    on its own describes nobody.
+
+    No pid is written. The hook has usually exited by the time anyone reads
+    this, and a pid it left behind would mark the peer dead on the next read.
+    """
+    if not (valid_kind(kind) and valid_key(kind, name)):
+        return False, f"invalid peer {kind!r}/{name!r}"
+    if not valid_session_id(session_id):
+        return False, (f"invalid session id {session_id!r}: expected a canonical "
+                       "UUID")
+    if not valid_owner_key(owner):
+        return False, (f"invalid owner key {owner!r}: expected a pid and the "
+                       "start time that tells it from a recycled one")
+    with _registry_lock(cwd):
+        endpoint = _read_record(_peer_file(cwd, kind, name))
+        if endpoint and _owner_of(endpoint) != owner and _record_alive(endpoint):
+            if _owner_of(endpoint) is None:
+                # An unreadable owner is not a different owner. The write is
+                # still refused — an endpoint that names nobody cannot be shown
+                # to be this session's — but the endpoint is most often the
+                # caller's own, from before the field existed or from a tree
+                # `owner_key` could not walk, and calling it another live
+                # session names the reader's own pid as somebody else.
+                return False, (f"alias {name!r} is held by a live {kind} endpoint "
+                               f"that records no owner (pid {_pid_of(endpoint)}); "
+                               "its record was not touched")
+            return False, (f"alias {name!r} is held by another live {kind} session "
+                           f"(pid {_pid_of(endpoint)}); its record was not touched")
+        record = {"kind": kind, "name": name, "owner": owner,
+                  "session_id": session_id}
+        if isinstance(transcript, str) and transcript.strip():
+            # Nothing is ever delivered to a transcript path. Refusing the whole
+            # record over a missing one would cost the session its address for a
+            # field no message travels through.
+            record["transcript"] = transcript
+        path = _session_file(cwd, kind, name)
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        tmp = f"{path}.{os.getpid()}.tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(record, f, ensure_ascii=False)
+        os.replace(tmp, path)
+    return True, ""
+
+
+# ---------- owner key: pairing two writers on one session ----------
+
+CLI_ROOTS = ("claude", "codex")
+MAX_ANCESTRY = 8
+
+
+def _process_info(pid):
+    """(ppid, start time, command) for a live pid, or None.
+
+    Separated from the walk so tests can drive it without building real process
+    trees. The start time is `ps`'s `lstart`, a fixed 24 characters wide.
+    """
+    try:
+        out = subprocess.run(["ps", "-o", "ppid=,lstart=,command=", "-p", str(pid)],
+                             capture_output=True, text=True, timeout=5).stdout.strip()
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if not out:
+        return None
+    try:
+        ppid, rest = out.split(None, 1)
+    except ValueError:
+        return None
+    return ppid, rest[:24].strip(), rest[24:].strip()
+
+
+def _process_birth(pid):
+    """The start time `ps` reports for `pid` itself, or None when it has none.
+
+    The same reading `owner_key` builds its key from, asked about one process
+    instead of a walk: two processes that hold one number in turn were born at
+    different moments, and that difference is all the registry needs to tell
+    them apart. Seconds of resolution is the resolution `owner_key` already
+    trusts for the same purpose.
+    """
+    info = _process_info(pid)
+    return (info[1] or None) if info else None
+
+
+def owner_key(pid=None):
+    """`"<root pid>:<start time>"` for the CLI session above `pid`, or None.
+
+    On the Codex side no single process knows which session it belongs to: the
+    hook is handed a session id and exits, and the long-lived server is handed
+    only a project directory. They pair up by walking to the same CLI process.
+
+    The start time is part of the key because a pid alone is recycled, and a
+    recycled pid matching the wrong session is exactly the silent
+    misidentification this refuses to make. For the same reason there is no
+    environment override: a key anyone could set would let one session claim
+    another's identity.
+
+    None means no key, which means fall back to what the bridge does today. It
+    never returns a best guess.
+    """
+    current = str(pid or os.getpid())
+    for _ in range(MAX_ANCESTRY):
+        info = _process_info(current)
+        if not info:
+            return None
+        parent, start, command = info
+        head = os.path.basename((command.split() or [""])[0])
+        if head in CLI_ROOTS:
+            return f"{current}:{start}"
+        if parent in ("0", "1", current):
+            return None
+        current = parent
+    return None

@@ -1066,8 +1066,55 @@ class IdentityPrivacyContractTest(unittest.TestCase):
         python = read("lib", "antiphon.py")
         register = python[python.index("def register_peer("):]
         register = register[:register.index("\ndef ")]
-        self.assertIn('json.dumps({"birth"', register,
-                      "and the operation returns it")
+        self.assertIn("register_claim(", register,
+                      "the claim is the operation that returns it")
+        self.assertIn('json.dumps({"birth": fingerprint', register,
+                      "and the operation's own return is what is answered")
+        self.assertNotIn("_process_birth(", register,
+                         "never a second observation")
+
+    def test_the_two_readers_select_the_fingerprint_the_same_way(self):
+        """One selector per language, one grammar compared at runtime — never
+        grepped from source, where Python's constant spans two adjacent
+        literals — precedence by key presence, and the Node form sees the
+        lexical scan."""
+        node = read("lib", "identity.mjs")
+        self.assertIn("export function fingerprintOf(wrapper)", node)
+        self.assertIn('Object.hasOwn(record, "process_birth")', node)
+        self.assertIn('spelledFractional(wrapper, "birth_version")', node)
+        python = read("lib", "peers.py")
+        self.assertIn("def _fingerprint_of(record)", python)
+        self.assertIn('"process_birth" in record', python)
+        self.assertNotIn("def _birth_of(", python)
+        exported = json.loads(subprocess.run(
+            ["node", "--input-type=module", "-e",
+             'import * as m from "./lib/identity.mjs";'
+             'process.stdout.write(JSON.stringify({'
+             'grammar: m.CANONICAL_START, weekdays: m.WEEKDAYS, months: m.MONTHS,'
+             'version: m.PROCESS_FINGERPRINT_VERSION,'
+             'generation: m.GENERATION_TOKEN,'
+             'ceiling: m.INTEGER_TOKEN_CEILING}));'],
+            capture_output=True, text=True, cwd=ROOT, check=True).stdout)
+        self.assertEqual(exported["grammar"], antiphon.peers.CANONICAL_START)
+        self.assertEqual(exported["weekdays"], list(antiphon.peers.WEEKDAYS))
+        self.assertEqual(exported["months"], list(antiphon.peers.MONTHS))
+        self.assertEqual(exported["version"],
+                         antiphon.peers.PROCESS_FINGERPRINT_VERSION)
+        self.assertEqual(exported["ceiling"],
+                         antiphon.peers.INTEGER_TOKEN_CEILING)
+        # The generation token too: a positive integer with no leading zero,
+        # anchored at the start on both sides. It was the one selector
+        # constant not compared here, so `v0:` could have parted the readers.
+        self.assertEqual(exported["generation"], antiphon.peers.GENERATION_TOKEN)
+        self.assertEqual(antiphon.peers._GENERATION.pattern,
+                         antiphon.peers.GENERATION_TOKEN)
+        channel = read("lib", "channel.mjs")
+        self.assertIn('fingerprint_field: "process_birth"', channel)
+        self.assertIn('answer?.fingerprint_field !== "process_birth"', channel)
+        register = read("lib", "antiphon.py")
+        register = register[register.index("def register_peer("):]
+        register = register[:register.index("\ndef ")]
+        self.assertIn('"fingerprint_field": "process_birth"', register)
 
     def test_the_socket_path_is_never_unlinked_after_a_close(self):
         """`close()` removes the socket file the server bound. An explicit

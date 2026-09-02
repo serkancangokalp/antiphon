@@ -11,6 +11,7 @@ import pathlib
 import multiprocessing
 import subprocess
 import tempfile
+import time
 import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -597,8 +598,7 @@ class RecycledPidTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as project:
             self._register(project, self.LIVE)
             record = self._read(project)
-        self.assertEqual(record["birth"], self.LIVE)
-        self.assertEqual(record["birth_version"], 1)
+        self.assertEqual(record["process_birth"], f"v1:{self.LIVE}")
         self.assertIsInstance(record["started_at"], float,
                               "when the claim was made is a different fact from "
                               "when the process was born, and stays its own field")
@@ -744,8 +744,8 @@ class RecycledPidTest(unittest.TestCase):
             ok, detail = peers.register(project, "claude", "ui", "/tmp/ui.sock",
                                         pid=os.getpid())
             self.assertTrue(ok, detail)
-            self.assertEqual(self._read(project)["birth"],
-                             peers._process_info(os.getpid())[1])
+            self.assertEqual(self._read(project)["process_birth"],
+                             "v1:" + peers._process_info(os.getpid())[1])
             self.assertEqual([p["name"] for p in peers.read_peers(project)], ["ui"])
 
     def test_a_real_live_pid_with_a_foreign_fingerprint_is_not_the_peer(self):
@@ -758,12 +758,247 @@ class RecycledPidTest(unittest.TestCase):
             peers.register(project, "claude", "ui", "/tmp/ui.sock",
                            pid=os.getpid())
             record = self._read(project)
-            record["birth"] = "Thu Jan  1 00:00:00 1970"
+            record["process_birth"] = "v1:Thu Jan 1 00:00:00 1970"
             with open(self._endpoint(project), "w", encoding="utf-8") as f:
                 json.dump(record, f)
             self.assertTrue(peers.alive(os.getpid()))
             self.assertEqual(peers.read_peers(project), [])
             self.assertFalse(os.path.exists(self._endpoint(project)))
+
+    # ---- a reader from the published 0.3.x line is still running ----
+
+    LIVE_LOCAL = "Sat Aug 30 04:00:00 2026"   # LIVE rendered three hours east
+
+    @staticmethod
+    def _old_ps(old, start):
+        return patch.object(old, "_process_info",
+                            return_value=("1", start, "node server.js"))
+
+    def _rewrite(self, project, mutate):
+        path = peers._peer_file(project, "claude", "ui")
+        with open(path, encoding="utf-8") as stream:
+            record = json.load(stream)
+        mutate(record)
+        with open(path, "w", encoding="utf-8") as stream:
+            json.dump(record, stream)
+
+    def _raw(self, project, text):
+        with open(peers._peer_file(project, "claude", "ui"), "w",
+                  encoding="utf-8") as stream:
+            stream.write(text)
+
+    def _listed(self, project, start):
+        with self._ps(start):
+            return [p["name"] for p in peers.read_peers(project, "claude")]
+
+    def test_the_published_reader_leaves_a_current_record_alone(self):
+        """The reproduced P0. A 0.3.x MCP server that started before the
+        upgrade keeps reading the registry with the reader it loaded, which
+        compares `birth` against its own timezone's `ps`. It must find nothing
+        to compare — and so keep the record on its pid alone — rather than
+        prune a live listener every time it enumerates."""
+        old = _old_reader()
+        with tempfile.TemporaryDirectory() as project:
+            self._register(project, self.LIVE)
+            with self._old_ps(old, self.LIVE_LOCAL):
+                listed = old.read_peers(project, "claude")
+            self.assertEqual([p["name"] for p in listed], ["ui"])
+            self.assertTrue(os.path.exists(
+                peers._peer_file(project, "claude", "ui")),
+                "the old reader must not prune what it cannot judge")
+
+    def test_a_record_carries_its_fingerprint_where_the_old_reader_never_looks(self):
+        with tempfile.TemporaryDirectory() as project:
+            self._register(project, self.LIVE)
+            record = self._read(project)
+        self.assertEqual(record["process_birth"], f"v1:{self.LIVE}")
+        self.assertNotIn("birth", record)
+        self.assertNotIn("birth_version", record)
+
+    def test_the_published_reader_validates_a_versioned_owner_and_joins_on_it(self):
+        """The join field already carried its generation in the value. Pin
+        both halves of that on the old reader directly: the validator accepts
+        the spelling, and an addressless Codex endpoint joins its session on
+        it. (`read_peers` never consults the validator for an addressed Claude
+        endpoint, so listing one proves nothing about owners.)"""
+        old = _old_reader()
+        owner = f"300:v1:{self.LIVE}"
+        self.assertTrue(old.valid_owner_key(owner))
+        with tempfile.TemporaryDirectory() as project:
+            with self._ps(self.LIVE):
+                ok, detail = peers.register(project, "codex", "x", None,
+                                            pid=os.getpid(), owner_key=owner)
+            self.assertTrue(ok, detail)
+            peers.write_session(project, "codex", "x", self.UUID,
+                                "/t/x.jsonl", owner)
+            with open(peers._peer_file(project, "codex", "x"),
+                      encoding="utf-8") as stream:
+                endpoint = json.load(stream)
+            self.assertEqual(old._session_address(project, endpoint), self.UUID)
+
+    # ---- the current reader keeps the strict check ----
+
+    def test_the_current_reader_still_prunes_a_recycled_pid(self):
+        with tempfile.TemporaryDirectory() as project:
+            self._register(project, self.LIVE)
+            self.assertEqual(self._listed(project, self.RECYCLED), [])
+            self.assertFalse(os.path.exists(
+                peers._peer_file(project, "claude", "ui")))
+
+    def test_a_migration_spelling_is_read_strictly_and_never_as_absent(self):
+        """What 0.4.0-on-main wrote: `birth` under the UTC canon beside the
+        integer `birth_version: 1`, no sibling. Migration input: a matching
+        birth is live, a different one is dead, and the missing sibling is
+        evidence of nothing."""
+        def to_migration(record):
+            del record["process_birth"]
+            record["birth"] = self.LIVE
+            record["birth_version"] = 1
+        with tempfile.TemporaryDirectory() as project:
+            self._register(project, self.LIVE)
+            self._rewrite(project, to_migration)
+            self.assertEqual(self._listed(project, self.LIVE), ["ui"])
+            self.assertEqual(self._listed(project, self.RECYCLED), [])
+
+    def test_a_present_sibling_is_the_only_thing_consulted(self):
+        """Precedence is by key presence, not by type. A malformed sibling —
+        including a malformed *current* one — beside a valid, conflicting
+        migration pair yields no fingerprint at all: pid only, and the pair is
+        never read."""
+        for bad in ("", "v1:", "v1:garbage", "1:Sat Aug 30 01:00:00 2026",
+                    "v0:x", 7, None, [], {},
+                    "v1:" + self.LIVE + "\u0085", "\ufeffv1:" + self.LIVE):
+            def conflict(record, bad=bad):
+                record["process_birth"] = bad
+                record["birth"] = self.LIVE          # valid pair, would be strict
+                record["birth_version"] = 1
+            with self.subTest(bad=bad), tempfile.TemporaryDirectory() as project:
+                self._register(project, self.LIVE)
+                self._rewrite(project, conflict)
+                self.assertEqual(self._listed(project, self.RECYCLED), ["ui"])
+                self.assertIsNone(peers._fingerprint_of(self._read(project)))
+
+    def test_a_future_generation_is_unverifiable_not_dead(self):
+        for sibling in ("v2:2026-08-30T01:00:00Z", "v999999999:" + self.LIVE):
+            with self.subTest(sibling=sibling), \
+                    tempfile.TemporaryDirectory() as project:
+                self._register(project, self.LIVE)
+                self._rewrite(project, lambda r: r.update(process_birth=sibling))
+                self.assertEqual(self._listed(project, self.RECYCLED), ["ui"])
+                self.assertEqual(peers._fingerprint_of(self._read(project)),
+                                 ("other", None))
+
+    def test_a_long_integer_token_never_reaches_a_conversion(self):
+        """A near-ceiling digit run in the raw record: the bounded parser
+        refuses it before `int()` sees it, on 3.9 as on any later Python, and
+        the record is not one. Timed, because 3.9.6 would otherwise convert
+        it — slowly, and to a value the selector must then refuse."""
+        digits = "9" * (peers.RECORD_CEILING - 200)
+        with tempfile.TemporaryDirectory() as project:
+            self._register(project, self.LIVE)
+            self._raw(project, '{"kind": "claude", "name": "ui", "pid": %d, '
+                      '"address": "/tmp/ui.sock", "started_at": 1.0, '
+                      '"birth": "%s", "birth_version": %s}'
+                      % (os.getpid(), self.LIVE, digits))
+            # Not timed: the refusal is asserted on the value, and a clock
+            # would only add a flake on a loaded machine.
+            record = peers._read_record(peers._peer_file(project, "claude", "ui"))
+            self.assertIsNone(record, "a record with an unbounded integer is not a record")
+            self.assertEqual(self._listed(project, self.RECYCLED), [])
+        self.assertEqual(peers._bounded_int("1"), 1)
+        self.assertEqual(peers._bounded_int("9" * 20), 10 ** 20 - 1)
+        with self.assertRaises(ValueError):
+            peers._bounded_int("9" * 21)
+        # Integers only: json hands floats and exponents to parse_float, so a
+        # 21-digit `…9.0` is a valid record here and has to stay one in Node.
+        with tempfile.TemporaryDirectory() as project:
+            self._register(project, self.LIVE)
+            for spelled in ("9" * 21 + ".0", "9" * 21 + "e0"):
+                with self.subTest(spelled=spelled):
+                    self._raw(project, '{"kind": "claude", "name": "ui", "pid": %d, '
+                              '"address": "/tmp/ui.sock", "started_at": 1.0, '
+                              '"extra": {"n": %s}}' % (os.getpid(), spelled))
+                    self.assertIsNotNone(
+                        peers._read_record(peers._peer_file(project, "claude", "ui")))
+
+    def test_the_grammar_is_the_writers_own_shape_and_in_range(self):
+        for start in (self.LIVE, "Wed Sep 2 16:13:13 2026", "Thu Jan 1 00:00:00 1970"):
+            with self.subTest(start=start):
+                self.assertEqual(peers.canonical_start(start), start)
+                self.assertEqual(peers._fingerprint_of({"process_birth": "v1:" + start}),
+                                 ("current", start))
+                self.assertEqual(peers._fingerprint_of(
+                    {"birth": start, "birth_version": 1}), ("current", start))
+        for start in ("Wed Sep  2 16:13:13 2026",       # padded day: the old 24-column slice
+                      "Çar Eyl 2 16:13:13 2026",        # a locale
+                      "Mon Jan 99 99:99:99 2026",       # shaped, out of range
+                      "Abc Xxx 0 00:00:00 0000",        # shaped, no such names
+                      "Sat Aug 30 01:00:00 1969",       # before the epoch
+                      "Sat Aug 30 24:00:00 2026", "Sat Aug 30 01:60:00 2026",
+                      "Sat Aug 30 01:00:60 2026", "Sat Aug 0 01:00:00 2026",
+                      "Sat Aug 32 01:00:00 2026",
+                      self.LIVE + " ", " " + self.LIVE,
+                      self.LIVE + "\u0085", "\ufeff" + self.LIVE, ""):
+            with self.subTest(start=start):
+                self.assertIsNone(peers.canonical_start(start))
+                self.assertIsNone(peers._fingerprint_of({"process_birth": "v1:" + start}))
+                self.assertIsNone(peers._fingerprint_of(
+                    {"birth": start, "birth_version": 1}))
+        for version in (True, 1.0, "1", 2, None):
+            with self.subTest(version=version):
+                self.assertIsNone(peers._fingerprint_of(
+                    {"birth": self.LIVE, "birth_version": version}))
+
+    def test_a_start_the_readers_cannot_read_is_no_fingerprint(self):
+        """Writer and reader agree by construction. `_process_info` checks
+        three of the seven fields it renders; a `ps` that leaks a locale name
+        or a five-digit year would otherwise be written as a sibling neither
+        reader selects — UNREADY forever, with a reconnect remedy that
+        reproduces it. Off the canon, the process has no fingerprint, which
+        is the documented evidence-of-nothing road on both sides."""
+        for start in ("Sat Aug 30 01:00:00 12026", "Çar Eyl 2 16:13:13 2026",
+                      "Sat Aug 30 01:00:00 2026 "):
+            with self.subTest(start=start), \
+                    tempfile.TemporaryDirectory() as project, \
+                    patch.object(peers, "_process_info",
+                                 return_value=("1", start, "node server.js")):
+                self.assertIsNone(peers._process_birth(os.getpid()))
+                ok, detail, fingerprint = peers.register_claim(
+                    project, "claude", "ui", "/tmp/ui.sock", pid=os.getpid())
+                self.assertTrue(ok, detail)
+                self.assertIsNone(fingerprint)
+                self.assertNotIn("process_birth", self._read(project))
+                self.assertEqual([p["name"] for p in peers.read_peers(project)],
+                                 ["ui"], "pid-only liveness, as before the field")
+
+    def test_the_response_spelling_is_the_records_spelling(self):
+        with self._ps(self.LIVE):
+            self.assertEqual(peers.process_fingerprint(os.getpid()),
+                             f"v1:{self.LIVE}")
+        with patch.object(peers, "_process_info", return_value=None):
+            self.assertIsNone(peers.process_fingerprint(os.getpid()))
+
+    def test_the_claim_answers_with_the_fingerprint_it_wrote(self):
+        """One observation. `ps` answering once and then not — measured by
+        fault injection — must not leave a record with a fingerprint and an
+        answer without one: that pairs a Python READY with a Node UNGOVERNED."""
+        with tempfile.TemporaryDirectory() as project, \
+                patch.object(peers, "_process_birth",
+                             side_effect=[self.LIVE, None]) as observed:
+            ok, detail, fingerprint = peers.register_claim(
+                project, "claude", "ui", "/tmp/ui.sock", pid=os.getpid())
+            self.assertTrue(ok, detail)
+            self.assertEqual(fingerprint, f"v1:{self.LIVE}")
+            self.assertEqual(self._read(project)["process_birth"], fingerprint)
+            self.assertEqual(observed.call_count, 1,
+                             "one observation: a second call is the defect")
+        with tempfile.TemporaryDirectory() as project, \
+                patch.object(peers, "_process_birth", return_value=None):
+            ok, _detail, fingerprint = peers.register_claim(
+                project, "claude", "ui", "/tmp/ui.sock", pid=os.getpid())
+            self.assertTrue(ok)
+            self.assertIsNone(fingerprint)
+            self.assertNotIn("process_birth", self._read(project))
 
 
 class AddresslessEndpointTest(unittest.TestCase):
@@ -2971,3 +3206,58 @@ class PidCeilingHalvesAreSeparateTest(unittest.TestCase):
         self.assertFalse(peers.alive(self.HUGE))
         self.assertFalse(peers.alive(-1))
         self.assertFalse(peers.alive("not a pid"))
+
+
+OLD_READER_SHA256 = "4bb3ea14ab9415f84a734b16472638c09d0acfd56eba83ee96d11d3ea29a060b"
+OLD_READER_COMMITS = ("943da8a", "a076723")   # 0.3.3 as published; the same bytes one release earlier
+
+
+def _old_reader():
+    """The 0.3.3 registry reader, loaded from the byte-exact fixture by path.
+
+    By path, not as a `test.fixtures` package: Anaconda's Python ships the
+    stdlib `test` package, and a regular package shadows a local namespace
+    package however `sys.path` is ordered — measured, three tests errored
+    under `python3` 3.14 while `/usr/bin/python3` 3.9 (no stdlib `test`)
+    passed them. `FrozenReaderFixtureTest` pins the bytes this loads."""
+    import importlib.util
+    fixture = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                           "fixtures", "peers_0_3_3.py")
+    spec = importlib.util.spec_from_file_location("peers_0_3_3", fixture)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+class FrozenReaderFixtureTest(unittest.TestCase):
+    """The cross-version tests drive the reader 0.3.3 actually shipped, not a
+    model of it. The fixture is byte-exact, and when git history is at hand the
+    blobs are compared too, so a hand edit to the fixture cannot quietly turn
+    the old reader into a kinder one."""
+
+    FIXTURE = os.path.join(os.path.dirname(__file__), "fixtures", "peers_0_3_3.py")
+    REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+    def test_the_fixture_is_the_shipped_reader(self):
+        with open(self.FIXTURE, "rb") as stream:
+            self.assertEqual(hashlib.sha256(stream.read()).hexdigest(),
+                             OLD_READER_SHA256)
+
+    def test_the_fixture_matches_both_pinned_blobs(self):
+        for commit in OLD_READER_COMMITS:
+            with self.subTest(commit=commit):
+                try:
+                    blob = subprocess.run(
+                        ["git", "show", f"{commit}:lib/peers.py"],
+                        capture_output=True, check=True, timeout=10,
+                        cwd=self.REPO).stdout
+                except (OSError, subprocess.SubprocessError):
+                    self.skipTest("no git history in this checkout")
+                self.assertEqual(hashlib.sha256(blob).hexdigest(),
+                                 OLD_READER_SHA256)
+
+    def test_the_fixture_imports_and_is_the_old_reader(self):
+        old = _old_reader()
+        self.assertFalse(hasattr(old, "PROCESS_FINGERPRINT_VERSION"),
+                         "0.3.3 had no fingerprint generation at all")
+        self.assertTrue(callable(old._record_alive))

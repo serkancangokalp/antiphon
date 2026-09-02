@@ -536,6 +536,14 @@ def automatic_verdict(cwd, kind, peer, proof):
     digest = peers._identity_digest_of(peer)
     if digest is None or peer.get("automatic") is not True:
         return None
+    fingerprint = peers._fingerprint_of(peer)
+    if fingerprint is None or fingerprint[0] != "current":
+        # A current listener writes a current sibling whenever `ps` answers,
+        # and fails closed on its own side when it does not. A governed
+        # record without one is not a record any current listener is serving
+        # as its own; routing to it is "recovered, then refused". Non-
+        # destructive: nothing is pruned or retired over it.
+        return "UNREADY"
     state, record = proof
     if state == "absent":
         return "UNREADY"
@@ -6099,6 +6107,18 @@ def register_peer(*_):
     # how that hook later shows the alias is genuinely this session's.
     mode = data.get("mode")
     if data.get("identity_digest") is not None and kind == "claude" \
+            and data.get("fingerprint_field") != "process_birth":
+        # The claim is a two-way capability. A listener declares which
+        # fingerprint field its in-memory verdict reads; one that declares
+        # nothing is an older Node over this Python, and registering it would
+        # publish an endpoint that verdict cannot govern — a sender would be
+        # told it recovered and then refused. Both modes, before any claim.
+        print("register_peer: this listener predates the registry's "
+              "fingerprint field and cannot govern the endpoint it would "
+              "publish; reconnect the Claude session (`/mcp` → reconnect "
+              "antiphon) so a current listener claims it", file=sys.stderr)
+        return 1
+    if data.get("identity_digest") is not None and kind == "claude" \
             and mode not in peers.AUTOMATIC_REGISTRATION_MODES:
         # The bridge always knows which kind of claim it is making, so it must
         # always say. The direct API stays usable without a mode; this caller
@@ -6106,19 +6126,20 @@ def register_peer(*_):
         print("register_peer: an automatic claim needs initial or reassert",
               file=sys.stderr)
         return 1
-    ok, detail = peers.register(project_dir(), kind, name, address,
-                                mode=mode,
-                                pid=data.get("pid"), owner_key=peers.owner_key(),
-                                identity_digest=data.get("identity_digest"))
+    ok, detail, fingerprint = peers.register_claim(
+        project_dir(), kind, name, address, mode=mode,
+        pid=data.get("pid"), owner_key=peers.owner_key(),
+        identity_digest=data.get("identity_digest"))
     if not ok:
         print(f"register_peer: {detail}", file=sys.stderr)
         return 1
     # The fingerprint of the process this endpoint names, returned by the
-    # operation rather than read back out of the file it wrote. A caller that
-    # re-reads the record to learn what it published has no authority at all:
-    # the same bytes anyone could have changed would answer both questions, and
-    # the comparison that follows would always agree with itself.
-    print(json.dumps({"birth": peers._process_birth(data.get("pid"))}))
+    # operation that wrote it — one observation, the same string. Not a
+    # second `ps` (which can answer differently, measured) and not a
+    # read-back of the file (which would let anyone's bytes answer). The
+    # field name travels back with it: the acknowledgement half of the
+    # capability, which a listener over an older registry never receives.
+    print(json.dumps({"birth": fingerprint, "fingerprint_field": "process_birth"}))
     return 0
 
 
@@ -8722,6 +8743,34 @@ def _doctor_peers(report, cwd):
             report.note(f"peer {who}: this endpoint has no owner key, so "
                         "sessions cannot be joined to it; restarting that "
                         "session usually records one")
+        fingerprint = peers._fingerprint_of(record)
+        if fingerprint is not None and "process_birth" not in record:
+            # The 0.4.0 migration spelling: `birth` beside `birth_version`,
+            # which a 0.3.x reader still running compares against its own
+            # timezone and prunes. Risk, not diagnosis — doctor cannot see
+            # whether such a reader is running. A Claude record in this
+            # spelling was written by an old Node whose reassert the new
+            # registry refuses without writing; only a reconnect rewrites
+            # it. A Codex MCP rewrites on restart.
+            remedy = ("this Claude session reconnects"
+                      if record.get("kind") == "claude"
+                      else "that Codex session restarts")
+            report.note(f"peer {who}: fingerprint in the 0.4.0 spelling; a "
+                        f"0.3.x reader, if one is still running, prunes it "
+                        f"until {remedy}")
+        # UNREADY has a bootstrap meaning — waiting for its first turn — and
+        # a governed record without a current fingerprint is not that: no
+        # current listener can be serving it as its own. The cause replaces
+        # the bootstrap sentence below rather than sitting beside it. Claude
+        # only: the verdict does not govern a Codex record, and a Claude
+        # remedy on one would send the operator to the wrong terminal.
+        no_current_fingerprint = (
+            record.get("kind") == "claude" and record.get("automatic") is True
+            and (fingerprint is None or fingerprint[0] != "current"))
+        if no_current_fingerprint:
+            report.note(f"peer {who}: endpoint carries no current fingerprint, "
+                        "so no current listener can be serving it as its own; "
+                        "reconnect the Claude session")
         diagnostic = dict(record)
         if (peers._addressless(record) and session_owner == owner
                 and peers.valid_session_id(
@@ -8749,11 +8798,12 @@ def _doctor_peers(report, cwd):
         elif verdict == "UNREADY":
             # Same suppression the untyped path has always had: an endpoint and
             # session whose owner-key generations differ already got their own
-            # note above, and two lines about one peer read as two faults.
-            if not mixed_owner_generation:
+            # note above, and two lines about one peer read as two faults. The
+            # fingerprint cause above replaces this line for the same reason.
+            if not mixed_owner_generation and not no_current_fingerprint:
                 report.note(f"peer {who}: live, waiting for its first turn")
         elif peers._address_of(diagnostic) is None:
-            if not mixed_owner_generation:
+            if not mixed_owner_generation and not no_current_fingerprint:
                 report.note(f"peer {who}: live, waiting for its first turn")
         else:
             report.ok(f"peer {who}: live and addressed")
