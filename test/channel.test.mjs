@@ -1544,7 +1544,27 @@ try {
 
   const tools = await client.listTools();
   assert.deepEqual(tools.tools.map((tool) => tool.name),
-    ["reply_to_codex", "antiphon_retrieve"]);
+    ["reply_to_codex", "reply_to_claude", "antiphon_retrieve"]);
+  const claudeTool = tools.tools.find((tool) => tool.name === "reply_to_claude");
+  assert.deepEqual(claudeTool.inputSchema.required, ["text", "to"],
+    "a same-kind message is always named");
+  assert.match(claudeTool.description, /another Claude Code session/);
+  assert.match(claudeTool.description, /antiphon status/);
+  // Refused by this server, before any process starts: the Python bridge
+  // would refuse too, but through "Failed to deliver reply to Claude: …".
+  const refusedHere = (error) =>
+    /to is required/.test(error.message) && !/Failed to deliver/.test(error.message);
+  await assert.rejects(
+    () => client.callTool({ name: "reply_to_claude", arguments: { text: "hi" } }),
+    refusedHere, "refused before any process is started");
+  await assert.rejects(
+    () => client.callTool({ name: "reply_to_claude", arguments: { text: "hi", to: "<unnamed>" } }),
+    refusedHere, "the sentinel is not a name");
+  await assert.rejects(
+    () => client.callTool({ name: "reply_to_claude",
+                            arguments: { text: "hi", to: "nobody-here" } }),
+    /no live claude peer named 'nobody-here'/,
+    "the kind reaches the Python resolver: it looked for a Claude peer");
   const replyTool = tools.tools.find((tool) => tool.name === "reply_to_codex");
   const retrieveTool = tools.tools.find((tool) => tool.name === "antiphon_retrieve");
   assert.doesNotMatch(replyTool.description, /you can leave it out/,

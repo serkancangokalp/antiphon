@@ -4225,6 +4225,86 @@ class SameVendorTest(unittest.TestCase):
             self.assertEqual(sorted(e["to_kind"] for e in ledger.entries(project)),
                              ["claude", "codex"])
 
+    # ---- Task 4: reply_to_claude on the channel, reply(kind="claude") in Python ----
+
+    def _reply(self, project, payload, sends=None):
+        sends = [] if sends is None else sends
+
+        def to_claude(*args, **kwargs):
+            sends.append((args, kwargs))
+            return True, ""
+
+        out, err = io.StringIO(), io.StringIO()
+        with patch.object(antiphon, "project_dir", return_value=project), \
+             patch.object(antiphon, "send_to_claude", side_effect=to_claude), \
+             patch.object(antiphon.sys, "stdin", io.StringIO(json.dumps(payload))), \
+             contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            code = antiphon.reply()
+        return code, out.getvalue(), err.getvalue(), sends
+
+    def test_reply_to_claude_delivers_to_a_named_claude_peer(self):
+        with tempfile.TemporaryDirectory() as project:
+            antiphon.peers.register(project, "claude", "api", "/tmp/api.sock")
+            code, out, err, sends = self._reply(
+                project, {"text": "look", "to": "api", "kind": "claude", "sender_alias": "ui"})
+            self.assertEqual(code, 0, err)
+            self.assertEqual(len(sends), 1)
+            args, kwargs = sends[0]
+            self.assertEqual((args[1], args[2]), ("look", "api"))
+            self.assertEqual((kwargs["sender_alias"], kwargs["sender_kind"]), ("ui", "claude"))
+            answer = json.loads(out.strip().splitlines()[-1])
+            self.assertEqual((answer["queued"], answer["delivered"], answer["to"],
+                              answer["attachment"], answer["proof"]),
+                             (False, True, "api", None, "channel"))
+            self.assertEqual(answer["id"], kwargs["message_id"])
+            self.assertEqual(answer["text"],
+                             f"Delivered to the Claude Code peer 'api' (id {answer['id']}); "
+                             "antiphon status shows when its transcript received it.")
+            entry = ledger.read_entry(project, answer["id"])
+            self.assertEqual((entry["sender"], entry["sender_kind"], entry["to_kind"],
+                              entry["to_alias"], entry["transport"]),
+                             ("ui", "claude", "claude", "api", "channel"))
+            park = antiphon.parked_deliveries(
+                antiphon.read_cursor(project, "claude")["last_pushed_claude_same"])
+            self.assertEqual(park["@api"], antiphon.batch_fingerprint(["look"]),
+                             "parked where the same-kind Stop looks, so the turn's "
+                             "closing @claude:api line does not send it twice")
+
+    def test_a_same_kind_tool_delivery_is_not_resent_by_the_stop_hook(self):
+        with tempfile.TemporaryDirectory() as project:
+            antiphon.peers.register(project, "claude", "api", "/tmp/api.sock")
+            self._reply(project, {"text": "look", "to": "api", "kind": "claude",
+                                  "sender_alias": "ui"})
+            code, _err, sends = self._stop(project, "claude", "@claude:api look", turn_key="t1")
+            self.assertEqual(code, 0)
+            self.assertEqual(sends, [], "delivered by the tool already")
+            _code, _err, sends = self._stop(project, "claude", "@claude:api look again",
+                                            turn_key="t1")
+            self.assertEqual(len(sends), 1, "different words are a new message")
+
+    def test_reply_to_claude_requires_a_name_and_refuses_the_senders_own(self):
+        with tempfile.TemporaryDirectory() as project:
+            antiphon.peers.register(project, "claude", "ui", "/tmp/ui.sock")
+            code, _out, err, sends = self._reply(
+                project, {"text": "hi", "kind": "claude", "sender_alias": "ui"})
+            self.assertEqual((code, sends), (1, []))
+            self.assertIn("reply: to is required — a reply to another Claude session "
+                          "names its peer", err)
+            code, _out, err, sends = self._reply(
+                project, {"text": "hi", "kind": "claude", "to": "<unnamed>",
+                          "sender_alias": "ui"})
+            self.assertEqual((code, sends), (1, []), "the sentinel is not a name")
+            code, _out, err, sends = self._reply(
+                project, {"text": "hi", "kind": "claude", "to": "ui", "sender_alias": "ui"})
+            self.assertEqual((code, sends), (1, []))
+            self.assertIn("'ui' is this session's own alias", err)
+            code, _out, err, sends = self._reply(
+                project, {"text": "hi", "kind": "human", "to": "ui", "sender_alias": "ui"})
+            self.assertEqual((code, sends), (1, []))
+            self.assertIn("reply: kind must be codex or claude", err)
+            self.assertEqual(ledger.entries(project), [],
+                             "a tool refusal is reported to the caller in full")
+
     # ---- Task 2: a Claude sender's kind travels to a Claude peer ----
 
     class _Capture:

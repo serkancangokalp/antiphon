@@ -6432,7 +6432,7 @@ def attachment_report(cwd, now=None):
     return line
 
 
-def _oversized_for_claude(text, alias=None, message_id=None):
+def _oversized_for_claude(text, alias=None, message_id=None, sender_kind=None):
     """Whether `send_to_claude`'s cap would refuse `text`.
 
     The cap's own arithmetic over the cap's own dict. `len(text.encode())` and
@@ -6448,6 +6448,8 @@ def _oversized_for_claude(text, alias=None, message_id=None):
     """
     request = {"content": text, "message_id": message_id or delivery_id(),
                "sender_alias": alias}
+    if sender_kind == "claude":
+        request["sender_kind"] = "claude"
     payload = json.dumps(request, ensure_ascii=False).encode()
     return len(payload) > MAX_CHANNEL_BYTES
 
@@ -6608,10 +6610,16 @@ def reply(*_):
         print("reply: to must be a string naming one live Codex peer",
               file=sys.stderr)
         return 1
+    kind = input_data.get("kind") or "codex"
+    if kind not in ("codex", "claude"):
+        print("reply: kind must be codex or claude", file=sys.stderr)
+        return 1
     cwd = project_dir()
     text = text.strip()
     # `channel.mjs` passes the peer name it validated for itself.
     who = sender_alias(input_data.get("sender_alias"))
+    if kind == "claude":
+        return _reply_to_claude(cwd, text, to, who)
     can_reply = input_data.get("sender_reachable") is not False
     message_id = delivery_id()
     label = queue_label(who, message_id, can_reply)
@@ -6662,6 +6670,54 @@ def reply(*_):
     return 0
 
 
+def _reply_to_claude(cwd, text, to, who):
+    """The channel tool's same-kind road: this Claude session to another,
+    always named, over the channel socket the other one listens on."""
+    if not to or to == NO_ALIAS:
+        print("reply: to is required — a reply to another Claude session names "
+              "its peer", file=sys.stderr)
+        return 1
+    if who and to == who:
+        print(f"reply: not delivered: {to!r} is this session's own alias",
+              file=sys.stderr)
+        return 1
+    message_id = delivery_id()
+    outgoing, parked = text, None
+    if (_oversized_for_claude(text, who, message_id, sender_kind="claude")
+            and _attachable(text)):
+        attachment, refusal = _spill(cwd, text, who, message_id,
+                                     recipient=("claude", to, "claude"))
+        if refusal is not None:
+            print(f"reply: {refusal}", file=sys.stderr)
+            return 1
+        outgoing, parked = attachment.envelope, attachment
+    ok, detail = send_to_claude(cwd, outgoing, to, sender_alias=who,
+                                message_id=message_id, sender_kind="claude")
+    if not ok:
+        if parked is not None:
+            drop_attachment(cwd, parked.path)
+        print(f"reply: {_guided(detail, 'only a tool-name line')}",
+              file=sys.stderr)
+        return 1
+    _record_delivery(cwd, "claude", outgoing, to,
+                     key=SAME_KIND_KEY.format(kind="claude"), side="claude")
+    attachment = os.path.basename(parked.path) if parked is not None else None
+    ledger.record_sent(cwd, message_id, sender=who or NO_ALIAS, to_kind="claude",
+                       to_alias=to, transport="channel", proof="channel",
+                       sha256=hashlib.sha256(text.encode()).hexdigest(),
+                       size=len(text.encode()), attachment=attachment,
+                       sender_kind="claude")
+    words = (f"Delivered to the Claude Code peer {to!r} (id {message_id}); "
+             "antiphon status shows when its transcript received it.")
+    if attachment:
+        words += (" The message was too large for the channel, so its words "
+                  "are parked as an attachment and the envelope names the file.")
+    print(json.dumps({"queued": False, "delivered": True, "id": message_id,
+                      "proof": "channel", "to": to, "attachment": attachment,
+                      "text": words}))
+    return 0
+
+
 def queued_words(to, message_id, proof, attachment=None):
     """The `reply_to_codex` result, composed here so one spelling is tested.
 
@@ -6679,7 +6735,7 @@ def queued_words(to, message_id, proof, attachment=None):
     return text
 
 
-def _record_delivery(cwd, target, text, alias=None):
+def _record_delivery(cwd, target, text, alias=None, key=None, side=None):
     """Remembers what was just delivered, in the shape `push` dedupes on.
 
     Without it a message sent mid-turn through a channel tool arrives twice:
@@ -6702,8 +6758,10 @@ def _record_delivery(cwd, target, text, alias=None):
     and it is kept in its own form for `migrate_pushed` to compare. Dropping it
     would resend the last unaddressed message once.
     """
-    side = sender_side(target)
-    key = f"last_pushed_{target}"
+    # A same-kind tool delivery parks under the same-kind key of the sender's
+    # own side, which is where the same-kind Stop pass compares.
+    side = side or sender_side(target)
+    key = key or f"last_pushed_{target}"
     slot = "" if alias is None else f"@{alias}"
 
     def mutate(cursor):
