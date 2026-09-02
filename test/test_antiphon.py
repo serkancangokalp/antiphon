@@ -4307,6 +4307,102 @@ class SameVendorTest(unittest.TestCase):
             self.assertEqual(ledger.entries(project), [],
                              "a tool refusal is reported to the caller in full")
 
+    # ---- Task 5: antiphon_send(kind="codex") ----
+
+    def test_antiphon_send_reaches_a_named_codex_peer(self):
+        with tempfile.TemporaryDirectory() as project:
+            sends = []
+
+            def to_codex(cwd, message, to=None, sender=None):
+                sends.append((message, to, sender))
+                return True, "live"
+            with patch.object(antiphon, "send_to_codex", side_effect=to_codex):
+                result = antiphon._send_tool(project, "ship it", "review", sender="build",
+                                             kind="codex")
+            self.assertIsNot(result.get("isError"), True, result)
+            text = result["content"][0]["text"]
+            self.assertRegex(text, r"^Queued for Codex peer 'review' \(id [0-9a-f-]{36}\): "
+                                   r"Codex reads its queue at its next turn; run antiphon "
+                                   r"status to see whether it was received\.$")
+            message, to, sender = sends[0]
+            self.assertRegex(message, r"^\[Antiphon channel\] Codex: \[from=build "
+                                      r"id=[0-9a-f-]{36}\] ship it$")
+            self.assertEqual((to, sender), ("review", "build"))
+            entry = ledger.entries(project)[0]
+            self.assertEqual((entry["sender"], entry["sender_kind"], entry["to_kind"],
+                              entry["to_alias"], entry["transport"], entry["proof"]),
+                             ("build", "codex", "codex", "review", "queue", "live"))
+            park = antiphon.parked_deliveries(
+                antiphon.read_cursor(project, "codex")["last_pushed_codex_same"])
+            self.assertEqual(park["@review"], antiphon.batch_fingerprint(["ship it"]),
+                             "parked where the same-kind Stop looks")
+
+    def test_antiphon_send_to_codex_parks_an_oversized_message(self):
+        text = "y" * 4_000
+        with tempfile.TemporaryDirectory() as project:
+            sends = []
+            with patch.object(antiphon, "send_to_codex",
+                              side_effect=lambda cwd, m, to=None, sender=None:
+                                  sends.append(m) or (True, "live")), \
+                 patch.object(antiphon, "_oversized_for_queue",
+                              side_effect=lambda message: len(message) > 500):
+                result = antiphon._send_tool(project, text, "review", sender="build",
+                                             kind="codex")
+            self.assertIsNot(result.get("isError"), True, result)
+            self.assertIn("parked as an attachment", result["content"][0]["text"])
+            self.assertIn(antiphon.ATTACHMENT_LABEL, sends[0])
+            self.assertTrue(sends[0].startswith(antiphon.CHANNEL_LABEL_CODEX))
+            entry = ledger.entries(project)[0]
+            self.assertRegex(entry["attachment"], r"^[0-9a-f-]{36}\.txt$")
+            with open(os.path.join(project, ".antiphon", "messages", entry["attachment"]),
+                      encoding="utf-8") as f:
+                self.assertTrue(f.read().startswith("[Antiphon attachment from=build "))
+
+    def test_antiphon_send_to_codex_requires_a_name_and_refuses_the_senders_own(self):
+        with tempfile.TemporaryDirectory() as project, \
+             patch.object(antiphon, "send_to_codex") as send:
+            for to in (None, "<unnamed>"):
+                result = antiphon._send_tool(project, "hi", to, sender="build", kind="codex")
+                self.assertTrue(result.get("isError"), result)
+                self.assertIn("to is required: a message to another Codex session names "
+                              "its peer", result["content"][0]["text"])
+            result = antiphon._send_tool(project, "hi", "build", sender="build", kind="codex")
+            self.assertTrue(result.get("isError"))
+            self.assertIn("'build' is this session's own alias", result["content"][0]["text"])
+            result = antiphon._send_tool(project, "hi", "review", sender="build", kind="human")
+            self.assertTrue(result.get("isError"))
+            self.assertIn("kind must be claude or codex", result["content"][0]["text"])
+            send.assert_not_called()
+            self.assertEqual(ledger.entries(project), [])
+
+    def test_a_refused_same_kind_send_gets_no_passive_page_guidance(self):
+        """The guidance sentence says the words travel with the passive
+        pages; a same-kind message does not, so it would be untrue here."""
+        with tempfile.TemporaryDirectory() as project, \
+             patch.object(antiphon, "send_to_codex", return_value=(
+                 False, antiphon._ClassifiedRefusal("not delivered: nobody", "no-peer"))):
+            result = antiphon._send_tool(project, "hi", "review", sender="build", kind="codex")
+        self.assertTrue(result.get("isError"))
+        self.assertEqual(result["content"][0]["text"],
+                         "Not delivered to Codex: not delivered: nobody")
+
+    def test_the_send_tool_schema_offers_the_kind_and_the_server_passes_it(self):
+        tool = next(t for t in antiphon.TOOLS if t["name"] == "antiphon_send")
+        kind = tool["inputSchema"]["properties"]["kind"]
+        self.assertEqual(kind["enum"], ["claude", "codex"])
+        self.assertIn("another Codex session", kind["description"])
+        self.assertIn("`to` is required", kind["description"])
+        self.assertEqual(tool["inputSchema"]["required"], ["text"])
+        request = {"jsonrpc": "2.0", "id": 3, "method": "tools/call",
+                   "params": {"name": "antiphon_send",
+                              "arguments": {"text": "hi", "to": "review", "kind": "codex"}}}
+        answer = {"content": [{"type": "text", "text": "queued"}]}
+        with patch.object(antiphon.sys, "stdin", io.StringIO(json.dumps(request) + "\n")), \
+             patch.object(antiphon, "_send_tool", return_value=answer) as called, \
+             contextlib.redirect_stdout(io.StringIO()):
+            antiphon._mcp_serve("/tmp/project", "build")
+        called.assert_called_once_with("/tmp/project", "hi", "review", "build", kind="codex")
+
     # ---- Task 2: a Claude sender's kind travels to a Claude peer ----
 
     class _Capture:

@@ -6816,6 +6816,48 @@ def queued_words(to, message_id, proof, attachment=None):
     return text
 
 
+def _send_tool_to_codex(cwd, text, to, who):
+    """`antiphon_send(kind="codex")`: this Codex session to another, always
+    named, through the queue the other one reads at its next turn.
+
+    No passive-page guidance on a refusal: a same-kind message does not
+    travel with the pull pages, so the sentence that says so for a Claude
+    refusal would be untrue here."""
+    if not to or to == NO_ALIAS:
+        return _tool_error("to is required: a message to another Codex session "
+                           "names its peer")
+    if who and to == who:
+        return _tool_error(f"Not delivered to Codex: {to!r} is this session's own "
+                           "alias")
+    message_id = delivery_id()
+    label = queue_label(who, message_id, True)
+    outgoing, parked = text, None
+    composed = f"{CHANNEL_LABEL_CODEX} {label} {text}"
+    if _oversized_for_queue(composed) and _attachable(text):
+        attachment, refusal = _spill(cwd, text, who, message_id,
+                                     recipient=("codex", to, "codex"))
+        if refusal is not None:
+            return _tool_error(f"Not delivered to Codex: {refusal}")
+        outgoing, parked = attachment.envelope, attachment
+        composed = f"{CHANNEL_LABEL_CODEX} {label} {outgoing}"
+    ok, detail = send_to_codex(cwd, composed, to, sender=who)
+    if not ok:
+        if parked is not None and not parked.reused:
+            drop_attachment(cwd, parked.path)
+        return _tool_error(f"Not delivered to Codex: {detail}")
+    _record_delivery(cwd, "codex", outgoing, to,
+                     key=SAME_KIND_KEY.format(kind="codex"), side="codex")
+    attachment = os.path.basename(parked.path) if parked is not None else None
+    recorded = ledger.record_sent(
+        cwd, message_id, sender=who or NO_ALIAS, to_kind="codex", to_alias=to,
+        transport="queue", proof=detail or "registered",
+        sha256=hashlib.sha256(text.encode()).hexdigest(),
+        size=len(text.encode()), attachment=attachment, sender_kind="codex")
+    return {"content": [{"type": "text", "text": (
+        queued_words(to, message_id, detail or "registered", attachment)
+        + (LEDGER_UNWRITTEN if not recorded else ""))}]}
+
+
 def _record_delivery(cwd, target, text, alias=None, key=None, side=None):
     """Remembers what was just delivered, in the shape `push` dedupes on.
 
@@ -6994,6 +7036,12 @@ TOOLS = [{
         "properties": {
             "text": {"type": "string", "description": "Message for Claude"},
             "to": {"type": "string", "description": TO_DESCRIPTION},
+            "kind": {"type": "string", "enum": ["claude", "codex"],
+                     "description": ("Which kind of peer: claude (default), or codex "
+                                     "for another Codex session in this project — "
+                                     "then `to` is required, the message reaches "
+                                     "that session's queue, and the result says "
+                                     "queued.")},
         },
         "required": ["text"],
     },
@@ -7038,7 +7086,7 @@ def _mcp_result(mid, result):
                                ensure_ascii=False))
 
 
-def _send_tool(cwd, text, to=None, sender=None):
+def _send_tool(cwd, text, to=None, sender=None, kind="claude"):
     """Delivers `text` to a Claude peer now, and reports honestly if it can't.
 
     A silent success would be the worst outcome: Codex would believe Claude had
@@ -7059,8 +7107,12 @@ def _send_tool(cwd, text, to=None, sender=None):
         return _tool_error("text must be a non-empty string")
     if to is not None and not isinstance(to, str):
         return _tool_error("to must be a string naming one live Claude peer")
+    if kind not in ("claude", "codex"):
+        return _tool_error("kind must be claude or codex")
     text = text.strip()
     who = sender_alias(sender)
+    if kind == "codex":
+        return _send_tool_to_codex(cwd, text, to, who)
     # Decided here rather than inside the transport, so the predicate can
     # mirror the cap over the very bytes the cap will measure. There is no
     # prefix on this road: the composition the cap sees is its own JSON
@@ -7703,7 +7755,8 @@ def _mcp_serve(cwd, alias=None):
                 arguments = p.get("arguments")
                 arguments = arguments if isinstance(arguments, dict) else {}
                 _mcp_result(mid, _send_tool(cwd, arguments.get("text"),
-                                            arguments.get("to"), alias))
+                                            arguments.get("to"), alias,
+                                            kind=arguments.get("kind") or "claude"))
             elif name == "antiphon_retrieve":
                 arguments = p.get("arguments")
                 arguments = arguments if isinstance(arguments, dict) else {}
