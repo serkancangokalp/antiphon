@@ -1,6 +1,34 @@
 # Antiphon product backlog
 
-Last reviewed: 2026-09-01
+Last reviewed: 2026-09-02
+
+## Start here
+
+**Where this stands.** `main` carries **0.4.0** with the automatic-identity
+repair merged and certified — full suite, statics and `fresh-user.sh` all green
+on the commit `main` points at. **npm still serves 0.3.3**, and the hold is
+deliberate: see *P1 — 0.4.0 is on `main` and held back from npm* below for the
+reason and for what resuming would take. Nothing is half-applied and nothing is
+waiting on a decision inside the code.
+
+**Picking the work up.** The open items are the P0/P1/P2 sections that follow,
+in that order. The two rules this project runs on, learned the expensive way
+and worth reading before touching anything:
+
+- A test that is green is not a test that is protecting something. Mutate the
+  guard, watch the named test fail, put the guard back. Several fixtures in
+  this repository have passed for the wrong reason — landing in an assertion
+  group that could not see them, short-circuited by a guard added beside them,
+  or asserting a tautology.
+- The registry is read by two languages, and a rule added to one reader is a
+  divergence until it is added to the other. `test_readiness_parity_holds_across_every_fixture`
+  drives both over the same state; a change to either reader belongs there.
+
+**One thing about the working tree.** The tracked tree is clean, and about
+forty `docs/superpowers/{plans,specs}/2026-08-*` files are untracked — historical
+design documents, visible since the `.gitignore` negation, left alone
+deliberately. `fresh-user.sh` requires a clean tree, so run it from a temporary
+`git worktree` at the commit under test rather than moving those files aside.
 
 Priorities here describe product risk, not release promises. The bridge keeps
 two invariants across every item: it preserves who said something, and it
