@@ -279,14 +279,30 @@ def mark_read(cwd, attachment, at):
 
 
 def mark_expired_unread(cwd, attachment, at):
-    """The sweep removed the file and no receipt ever said it was read."""
+    """The sweep removed the file and no receipt ever said it was read.
+    Returns how many entries were marked — zero when nothing on the ledger
+    names the file, which is a file from before the ledger."""
+    marked = 0
     for entry in _entries_naming(cwd, attachment):
         if entry["read_at"] is not None or entry["expired_unread_at"] is not None:
             continue
 
         def mutate(changed):
             changed["expired_unread_at"] = float(at)
-        _update(cwd, entry["id"], mutate)
+        if _update(cwd, entry["id"], mutate):
+            marked += 1
+    return marked
+
+
+def read_times(cwd):
+    """`{attachment basename: earliest read_at}` over every entry with a read
+    receipt — one pass, for a sweep or a report that looks at many files."""
+    times = {}
+    for entry in entries(cwd):
+        name, at = entry["attachment"], entry["read_at"]
+        if name and at is not None and (name not in times or at < times[name]):
+            times[name] = at
+    return times
 
 
 def mark_reported(cwd, delivery_ids, at):
@@ -381,13 +397,17 @@ def last_unanswered_sender(cwd, to_kind, to_alias, now):
     return sender, max(0.0, now - when)
 
 
-def reusable_attachment(cwd, sha256, to_kind, to_alias, now):
+def reusable_attachment(cwd, sha256, to_kind, to_alias, now, sender=None):
     """The parked file an earlier, unexpired send of these exact words to this
-    recipient left behind, when it is still there; else None."""
+    recipient left behind, when it is still there; else None. With `sender`,
+    only a send by that same sender counts: the file's header names whose
+    words they are, and a reuse must not put one session's words under
+    another's name."""
     for entry in reversed(entries(cwd)):
         if (entry["state"] == "sent" and entry["attachment"]
                 and entry["sha256"] == sha256 and entry["to_kind"] == to_kind
                 and entry["to_alias"] == to_alias
+                and (sender is None or entry["sender"] == sender)
                 and now - entry["sent_at"] <= LEDGER_TTL):
             path = os.path.join(cwd, ".antiphon", "messages", entry["attachment"])
             try:
@@ -399,11 +419,22 @@ def reusable_attachment(cwd, sha256, to_kind, to_alias, now):
 
 
 def prune(cwd, now):
-    """Drop entries older than the ledger's own TTL. Best effort, never raises."""
+    """Drop entries older than the ledger's own TTL. Best effort, never raises.
+
+    An entry with something still to tell its sender — a refusal or an
+    unread expiry not yet reported — is kept for a second TTL: the
+    attachment TTL and this one are the same week, so the expiry a sweep
+    marks on day seven would otherwise be pruned in the same hook, unheard."""
     directory = _sound_dir(cwd)
     if directory is None:
         return
     for entry in entries(cwd):
-        if now - entry["sent_at"] > LEDGER_TTL:
-            with contextlib.suppress(OSError):
-                os.unlink(_path(cwd, entry["id"]))
+        age = now - entry["sent_at"]
+        if age <= LEDGER_TTL:
+            continue
+        unheard = entry["reported_at"] is None and (
+            entry["state"] == "refused" or entry["expired_unread_at"] is not None)
+        if unheard and age <= 2 * LEDGER_TTL:
+            continue
+        with contextlib.suppress(OSError):
+            os.unlink(_path(cwd, entry["id"]))

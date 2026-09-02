@@ -5847,6 +5847,10 @@ def send_to_claude(cwd, text, alias=None, sender_alias=None, message_id=None):
 ATTACHMENT_MAX = 8 * 1024 * 1024          # bytes one parked message may hold
 ATTACHMENT_QUOTA = 64 * 1024 * 1024       # bytes the whole store may hold
 ATTACHMENT_TTL = 7 * 24 * 3600            # seconds a parked message survives
+# Seconds a parked message stays after the peer's own transcript showed it
+# being read: long enough for the reader to come back to it in the same
+# turn, short enough that a read file is not a week of store.
+ATTACHMENT_READ_GRACE = 3600
 
 # The envelope's opening words. Deliberately not part of the self-injection
 # family: `_SELF_INJECTION_PREFIXES` exists so `PUSH_LABEL` and `CHANNEL_LABEL`
@@ -6191,8 +6195,28 @@ def sweep_attachments(cwd, now=None):
     now = time.time() if now is None else now
     store = _sound_store(cwd)
     attachments, foreign = _attachment_entries(cwd)
+    # The ledger's read receipts, once: a file the peer's own transcript
+    # showed being read is collected ATTACHMENT_READ_GRACE after that, not a
+    # week later; a file nobody read waits out the TTL as before, and when it
+    # goes its sender is told on its next page, which is the party the old
+    # stderr line never reached.
+    reads = ledger.read_times(cwd) if attachments else {}
     for path, info in attachments:
+        name = os.path.basename(path)
         age = now - info.st_mtime
+        read_at = reads.get(name)
+        if read_at is not None:
+            since_read = now - read_at
+            if since_read <= ATTACHMENT_READ_GRACE:
+                continue
+            removed, error = _unlink_attachment(store, path)
+            if error is not None:
+                print(f"antiphon: a read attachment could not be collected: "
+                      f"{path}: {error}", file=sys.stderr)
+            elif removed:
+                print(f"antiphon: attachment read {int(since_read // 60)} "
+                      f"minutes ago and collected: {path}", file=sys.stderr)
+            continue
         if age <= ATTACHMENT_TTL:
             continue
         removed, error = _unlink_attachment(store, path)
@@ -6200,8 +6224,14 @@ def sweep_attachments(cwd, now=None):
             print(f"antiphon: an expired attachment could not be deleted: "
                   f"{path}: {error}", file=sys.stderr)
         elif removed:
-            print(f"antiphon: attachment expired after {int(age // 86400)} "
-                  f"days and was deleted: {path}", file=sys.stderr)
+            days = int(age // 86400)
+            if ledger.mark_expired_unread(cwd, name, now):
+                print(f"antiphon: attachment expired unread after {days} days "
+                      f"and was deleted: {path} — its sender will be told",
+                      file=sys.stderr)
+            else:
+                print(f"antiphon: attachment expired after {days} days and "
+                      f"was deleted: {path}", file=sys.stderr)
     if foreign:
         # Reported and left. This directory is not a namespace this code owns
         # outright, and a count says enough: a report is not a directory
@@ -6247,6 +6277,7 @@ def attachment_report(cwd, now=None):
     because two consecutive `status` runs are pinned equal, and a duration
     derived from `now` at any finer grain would make that pin flake.
     """
+    now = time.time() if now is None else now
     parked, held, oldest, foreign = attachment_usage(cwd, now)
     if not parked:
         line = "Attachments:        none parked"
@@ -6255,6 +6286,14 @@ def attachment_report(cwd, now=None):
         aged = "today" if days == 0 else f"{days} day{'' if days == 1 else 's'} old"
         line = (f"Attachments:        {parked} parked, {held:,} bytes, "
                 f"oldest {aged}")
+        # Read receipts come from the peer's transcript through the ledger;
+        # a file without one is unread as far as anything can tell.
+        reads = ledger.read_times(cwd)
+        attachments, _foreign = _attachment_entries(cwd)
+        read = sum(1 for path, info in attachments
+                   if now - info.st_mtime <= ATTACHMENT_TTL
+                   and os.path.basename(path) in reads)
+        line += f"; {read} with a read receipt, {parked - read} without"
     if foreign:
         noun = "entry" if foreign == 1 else "entries"
         line += f"; {foreign} other {noun} left alone"
@@ -6350,8 +6389,12 @@ def _attachable(text):
 _Attachment = collections.namedtuple("_Attachment", "envelope path size")
 
 
-def _spill(cwd, text, alias, message_id):
+def _spill(cwd, text, alias, message_id, recipient=None):
     """Parks `text`; returns `(attachment, refusal)` with exactly one filled.
+
+    `recipient` is `(kind, alias)`: with it, a resend of these exact words by
+    this same sender to this same peer, within the ledger's TTL, names the
+    file that already exists instead of parking a second one.
 
     A refusal here is a plain string, never a `_ClassifiedRefusal`: an attached
     class means "the sender needs telling where its words still travel", and
@@ -6368,11 +6411,27 @@ def _spill(cwd, text, alias, message_id):
                           "attachment and did not finish within "
                           f"{ATTACHMENT_LOCK_PATIENCE:.0f} seconds; nothing "
                           "was written. Sending again is safe.")
-        return _spill_locked(cwd, text, alias, message_id, size)
+        return _spill_locked(cwd, text, alias, message_id, size, recipient)
 
 
-def _spill_locked(cwd, text, alias, message_id, size):
+def _spill_locked(cwd, text, alias, message_id, size, recipient=None):
     """The half of `_spill` that must not interleave with another peer's."""
+    digest = hashlib.sha256(text.encode()).hexdigest()
+    if recipient is not None:
+        existing = ledger.reusable_attachment(
+            cwd, digest, recipient[0], recipient[1], time.time(),
+            sender=alias or NO_ALIAS)
+        store = _sound_store(cwd) if existing else None
+        if store is not None:
+            # A retry is a retry of something: the same file, whose header
+            # keeps the first id, under a fresh envelope. The resend restarts
+            # the file's clock, so "eligible for removal 7 days after it was
+            # written" is true of this envelope too.
+            path = os.path.join(store, existing)
+            with contextlib.suppress(OSError):
+                os.utime(path, None)
+            return _Attachment(attachment_envelope(path, digest, size, alias),
+                               path, size), None
     parked, held, oldest, _foreign = attachment_usage(cwd)
     if held + size > ATTACHMENT_QUOTA:
         # Nothing is evicted to make room. An unexpired attachment is somebody
@@ -6432,7 +6491,8 @@ def reply(*_):
     outgoing, parked = text, None
     composed = f"{CHANNEL_LABEL} {label} {text}"
     if _oversized_for_queue(composed) and _attachable(text):
-        attachment, refusal = _spill(cwd, text, who, message_id)
+        attachment, refusal = _spill(cwd, text, who, message_id,
+                                     recipient=("codex", to))
         if refusal is not None:
             print(f"reply: {refusal}", file=sys.stderr)
             return 1
@@ -6735,7 +6795,8 @@ def _send_tool(cwd, text, to=None, sender=None):
     message_id = delivery_id()
     outgoing, parked = text, None
     if _oversized_for_claude(text, who, message_id) and _attachable(text):
-        attachment, refusal = _spill(cwd, text, who, message_id)
+        attachment, refusal = _spill(cwd, text, who, message_id,
+                                     recipient=("claude", to))
         if refusal is not None:
             return _tool_error(f"Not delivered to Claude: {refusal}")
         outgoing, parked = attachment.envelope, attachment

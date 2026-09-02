@@ -17317,6 +17317,158 @@ class AttachmentSpillTest(unittest.TestCase):
                              "foreign entries are counted, never named — a "
                              "store report is not a directory listing")
 
+class AttachmentReceiptTest(unittest.TestCase):
+    """What the ledger adds to a parked attachment: a resend of the same
+    words to the same peer names the file that already exists instead of a
+    second one; a file the peer's transcript shows being read is collected
+    an hour after that receipt; a file nobody read expires on the same TTL
+    as before and its sender hears about it on its next page. Measured
+    before this: a retry parked a second file under a second uuid, and the
+    expiry announcement reached whoever watched that terminal, never the
+    reader who never read it."""
+
+    UUID = RefusedSendHonestyTest.UUID
+    OTHER = "2e6b14f1-1659-544a-98d4-56d6eca8fa48"
+
+    @staticmethod
+    def _codex_peer(project, alias, owner, session=None):
+        RefusedSendHonestyTest._codex_peer(project, alias, owner, session)
+
+    @staticmethod
+    def _reply(project, payload):
+        return RefusedSendHonestyTest._reply(project, payload)
+
+    @classmethod
+    def _files(cls, project):
+        return AttachmentSpillTest._files(project)
+
+    @staticmethod
+    def _queue_recorder(queued):
+        return AttachmentSpillTest._queue_recorder(queued)
+
+    @staticmethod
+    def _spills_over(size):
+        return AttachmentSpillTest._spills_over(size)
+
+    def _entry(self, project, delivery, name, sender="ui", to_alias="build",
+               at=None):
+        ledger.record_sent(project, delivery, sender=sender, to_kind="codex",
+                           to_alias=to_alias, transport="queue", proof="live",
+                           sha256="a" * 64, size=5, attachment=name, at=at)
+
+    @staticmethod
+    def _sweep(project, now):
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            antiphon.sweep_attachments(project, now)
+        return err.getvalue()
+
+    def test_a_resend_of_the_same_words_to_the_same_peer_reuses_the_parked_file(self):
+        text = "y" * 4_000
+        with tempfile.TemporaryDirectory() as project:
+            self._codex_peer(project, "build", "300:build", self.UUID)
+            self._codex_peer(project, "review", "301:review", self.OTHER)
+            queued = []
+            with self._spills_over(500), self._queue_recorder(queued):
+                first = json.loads(self._reply(
+                    project, {"text": text, "to": "build", "sender_alias": "ui"})[1])
+                parked = os.path.join(project, ".antiphon", "messages", first["attachment"])
+                aged = time.time() - 3 * 86400
+                os.utime(parked, (aged, aged))
+                second = json.loads(self._reply(
+                    project, {"text": text, "to": "build", "sender_alias": "ui"})[1])
+                self.assertEqual(second["attachment"], first["attachment"])
+                self.assertEqual(len(self._files(project)), 1, "one file, not one per resend")
+                self.assertEqual(len(queued), 2, "two envelopes went")
+                self.assertIn(parked, queued[1][-1], "the second envelope names the same file")
+                self.assertGreater(os.stat(parked).st_mtime, time.time() - 60,
+                                   "the resend restarts the file's clock")
+                self.assertEqual([e["attachment"] for e in ledger.entries(project)],
+                                 [first["attachment"]] * 2)
+                # Not the same words, or not the same peer: a file of its own.
+                third = json.loads(self._reply(
+                    project, {"text": text, "to": "review", "sender_alias": "ui"})[1])
+                fourth = json.loads(self._reply(
+                    project, {"text": text + "!", "to": "build", "sender_alias": "ui"})[1])
+                # Nor the same words from another session under this one's name.
+                fifth = json.loads(self._reply(
+                    project, {"text": text, "to": "build", "sender_alias": "other"})[1])
+            names = {first["attachment"], third["attachment"], fourth["attachment"],
+                     fifth["attachment"]}
+            self.assertEqual(len(names), 4)
+            self.assertEqual(len(self._files(project)), 4)
+
+    def test_a_read_attachment_is_collected_an_hour_after_its_receipt(self):
+        with tempfile.TemporaryDirectory() as project:
+            fresh, _ = antiphon.write_attachment(project, "words", "ui", self.UUID)
+            old, _ = antiphon.write_attachment(project, "other words", "ui", self.OTHER)
+            self._entry(project, self.UUID, os.path.basename(fresh))
+            self._entry(project, self.OTHER, os.path.basename(old))
+            now = time.time()
+            ledger.mark_read(project, os.path.basename(fresh), now - 600)
+            ledger.mark_read(project, os.path.basename(old), now - 2 * 3600)
+            said = self._sweep(project, now)
+            self.assertTrue(os.path.exists(fresh), "ten minutes after its read receipt")
+            self.assertFalse(os.path.exists(old), "two hours after its read receipt")
+            self.assertIn(f"attachment read 120 minutes ago and collected: {old}", said)
+            self.assertNotIn("expired", said)
+            self.assertIsNone(ledger.read_entry(project, self.OTHER)["expired_unread_at"])
+            self.assertEqual(antiphon.ATTACHMENT_READ_GRACE, 3600)
+
+    def test_an_unread_attachment_expires_on_the_ttl_and_its_sender_hears_about_it(self):
+        with tempfile.TemporaryDirectory() as project:
+            path, _ = antiphon.write_attachment(project, "words", None, self.UUID)
+            name = os.path.basename(path)
+            aged = time.time() - antiphon.ATTACHMENT_TTL - 86400
+            os.utime(path, (aged, aged))
+            self._entry(project, self.UUID, name, sender="<unnamed>", at=aged)
+            out = io.StringIO()
+            with patch.object(antiphon, "project_dir", return_value=project), \
+                 patch.object(antiphon, "codex_rollout_files", return_value=[]), \
+                 patch.object(antiphon, "claude_transcripts", return_value=[]), \
+                 patch.object(antiphon.sys, "stdin", io.StringIO(json.dumps(
+                     {"cwd": project, "hook_event_name": "UserPromptSubmit"}))), \
+                 contextlib.redirect_stdout(out), contextlib.redirect_stderr(io.StringIO()) as err:
+                self.assertEqual(antiphon.hook("claude"), 0)
+            self.assertFalse(os.path.exists(path))
+            self.assertIn("expired unread after 8 days and was deleted", err.getvalue())
+            entry = ledger.read_entry(project, self.UUID)
+            self.assertIsNotNone(entry["expired_unread_at"])
+            context = json.loads(out.getvalue())["hookSpecificOutput"]["additionalContext"]
+            self.assertRegex(context, r"^Antiphon: the attachment you sent to Codex at "
+                                      r"\d\d:\d\d expired unread after 7 days$")
+
+    def test_an_unread_attachment_inside_the_ttl_is_kept(self):
+        with tempfile.TemporaryDirectory() as project:
+            path, _ = antiphon.write_attachment(project, "words", "ui", self.UUID)
+            self._entry(project, self.UUID, os.path.basename(path))
+            said = self._sweep(project, time.time() + antiphon.ATTACHMENT_TTL - 60)
+            self.assertTrue(os.path.exists(path))
+            self.assertEqual(said, "")
+
+    def test_a_file_from_before_the_ledger_expires_as_it_always_did(self):
+        with tempfile.TemporaryDirectory() as project:
+            path, _ = antiphon.write_attachment(project, "words", "ui", self.UUID)
+            said = self._sweep(project, time.time() + antiphon.ATTACHMENT_TTL + 86400)
+            self.assertFalse(os.path.exists(path))
+            self.assertIn("expired after 8 days and was deleted", said)
+            self.assertNotIn("unread", said, "nothing on the ledger says either way")
+
+    def test_status_counts_read_receipts_and_never_deletes(self):
+        with tempfile.TemporaryDirectory() as project:
+            read, _ = antiphon.write_attachment(project, "words", "ui", self.UUID)
+            unread, _ = antiphon.write_attachment(project, "other", "ui", self.OTHER)
+            self._entry(project, self.UUID, os.path.basename(read))
+            self._entry(project, self.OTHER, os.path.basename(unread))
+            ledger.mark_read(project, os.path.basename(read), time.time() - 7200)
+            line = antiphon.attachment_report(project)
+            self.assertIn("2 parked", line)
+            self.assertIn("; 1 with a read receipt, 1 without", line)
+            self.assertTrue(os.path.exists(read), "a report never collects")
+            self.assertNotIn("read receipt", antiphon.attachment_report(
+                tempfile.mkdtemp()), "nothing parked, nothing counted")
+
+
 class AttachmentLifecycleTest(unittest.TestCase):
     """What happens to a parked attachment after the send that made it.
 

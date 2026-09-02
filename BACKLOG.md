@@ -581,7 +581,7 @@ The boundary, stated straight: a reading agent can still choose to act on
 relayed words. What shipped makes their provenance impossible to misread, which
 is all a label can do.
 
-## P1 — Large direct-message attachments (shipped, minus acknowledgement and retry)
+## P1 — Large direct-message attachments (shipped; acknowledgement and retry closed 2026-09-03)
 
 The direct channel has a separate, honest 128 KiB byte cap, and it stays. What
 changed is what happens above it: an oversized direct message is no longer a
@@ -590,7 +590,7 @@ where it went.
 
 The entry asked for five things. Three shipped, one shipped in a form the entry
 did not ask for and this close names as a deviation, and two — acknowledgement
-and retry — are **not delivered and remain open below**.
+and retry — were open until 2026-09-03 and are closed at the end of this entry.
 
 ### What shipped — the decisions
 
@@ -750,20 +750,24 @@ reaches is whoever is looking at that terminal — **not** the reader who never
 read the message. That is a real gap against the words of the bullet, and
 closing it needs the acknowledgement protocol below.
 
-### Still open, by name
+### Closed 2026-09-03, with the delivery ledger
 
-- **Acknowledgement.** Nothing signals that the parked file was read. The
-  envelope rides the same at-least-once delivery every message does, and its
-  ack story is every message's: none beyond transport success. This is also
-  what would make the TTL's deletion provably safe rather than merely
-  announced.
-- **Retry.** A resent message parks a second file under a second uuid; nothing
-  reuses or supersedes the first. The first is then an ordinary attachment with
-  an ordinary TTL, so nothing leaks, but a retry is not a retry of anything —
-  it is a new attachment.
+- **Acknowledgement** is a read receipt from the peer's own transcript: the
+  reader that already walks it reports a tool call naming
+  `.antiphon/messages/<uuid>.txt`, and the ledger entry for that delivery
+  gets `read_at`. The sweep collects a read file `ATTACHMENT_READ_GRACE`
+  (3,600 s) after the receipt; a file with no receipt waits out the TTL as
+  before, and when it goes the entry is marked `expired_unread` and the
+  sender's next page says so — the party the stderr announcement never
+  reached. `status` counts the parked files with and without a receipt.
+- **Retry** reuses: the same words, from the same sender, to the same peer,
+  within the ledger's TTL, name the file that already exists (its header
+  keeps the first id) under a fresh envelope, and the resend restarts the
+  file's clock. Different words, a different peer or a different sender park
+  their own file.
 
-Both need pending-delivery state this release does not have, which is the same
-state the `reply correlation` entry below wants. They belong together.
+The pending-delivery state both needed is the ledger under
+`.antiphon/deliveries/`, the same state the reply-correlation entry uses.
 
 ## P1 — A marker in anything but the turn's last message is dropped (fixed)
 

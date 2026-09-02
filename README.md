@@ -476,9 +476,14 @@ byte for byte as the environment grows, measured here from 1,044,820 down to
 and an exec the kernel refuses for any other reason comes back as a named
 refusal instead of a traceback.
 
-Acknowledgement and retry are not part of this: an envelope rides the same
-at-least-once delivery every message does, nothing ever learns the file was
-read, and a resent message parks a second file rather than reusing the first.
-Those two remain a P1 item in [BACKLOG.md](BACKLOG.md).
+A parked file has a read receipt: the peer's own transcript shows the tool
+call that read it, and the reader that already walks that transcript records
+the receipt on the delivery ledger under `.antiphon/deliveries/`. A file with
+a read receipt is collected one hour after the read; a file without one waits
+out the 7 days and then expires unread, and its sender hears that on its next
+page. A resent message with the same words, from the same sender to the same
+peer, is reused: the envelope names the file that already exists and the
+store holds one copy. `antiphon status` counts the parked files with and
+without a read receipt.
 
 MIT.

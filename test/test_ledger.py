@@ -112,6 +112,22 @@ class LedgerTest(unittest.TestCase):
             self.assertIsNone(ledger.read_entry(project, THIRD)["read_at"])
             self.assertFalse(ledger.mark_read(project, "c.txt", 5_000.0))
 
+    def test_read_times_is_the_earliest_receipt_per_file(self):
+        with tempfile.TemporaryDirectory() as project:
+            self._sent(project, UUID, attachment="a.txt")
+            self._sent(project, OTHER, attachment="a.txt", at=1_100.0)
+            self._sent(project, THIRD, attachment="b.txt", at=1_200.0)
+            self.assertEqual(ledger.read_times(project), {})
+            ledger.mark_read(project, "a.txt", 5_000.0)
+            self.assertEqual(ledger.read_times(project), {"a.txt": 5_000.0})
+            self.assertEqual(ledger.mark_expired_unread(project, "b.txt", 9_000.0), 1)
+            self.assertEqual(ledger.mark_expired_unread(project, "b.txt", 9_500.0), 0,
+                             "marked once")
+            self.assertEqual(ledger.mark_expired_unread(project, "a.txt", 9_000.0), 0,
+                             "a read file never expires unread")
+            self.assertEqual(ledger.mark_expired_unread(project, "zz.txt", 9_000.0), 0,
+                             "a file from before the ledger")
+
     def test_record_receipts_applies_both_kinds(self):
         with tempfile.TemporaryDirectory() as project:
             self._sent(project, UUID, attachment="a.txt")
@@ -213,11 +229,34 @@ class LedgerTest(unittest.TestCase):
             self.assertIsNone(ledger.reusable_attachment(project, "0" * 64, "codex", "build", 200.0))
             self.assertIsNone(ledger.reusable_attachment(project, SHA, "codex", "review", 200.0))
             self.assertIsNone(ledger.reusable_attachment(project, SHA, "claude", "build", 200.0))
+            self.assertEqual(ledger.reusable_attachment(project, SHA, "codex", "build", 200.0,
+                                                        sender="ui"), "a.txt")
+            self.assertIsNone(ledger.reusable_attachment(project, SHA, "codex", "build", 200.0,
+                                                         sender="other"),
+                              "another session's words never travel under this one's name")
             self.assertIsNone(ledger.reusable_attachment(
                 project, SHA, "codex", "build", 100.0 + ledger.LEDGER_TTL + 1), "expired")
             os.unlink(os.path.join(store, "a.txt"))
             self.assertIsNone(ledger.reusable_attachment(project, SHA, "codex", "build", 200.0),
                               "the file is gone; nothing to reuse")
+
+    def test_prune_keeps_an_unheard_notice_for_a_second_ttl(self):
+        with tempfile.TemporaryDirectory() as project:
+            week = ledger.LEDGER_TTL
+            ledger.record_refused(project, UUID, sender="ui", to_kind="codex", to_alias=None,
+                                  reason="not delivered: nobody", preview="x", at=1_000.0)
+            self._sent(project, OTHER, attachment="a.txt", at=1_000.0)
+            ledger.mark_expired_unread(project, "a.txt", 1_000.0 + week + 1)
+            self._sent(project, THIRD, at=1_000.0)
+            ledger.prune(project, 1_000.0 + week + 10)
+            self.assertIsNotNone(ledger.read_entry(project, UUID), "a refusal not yet reported")
+            self.assertIsNotNone(ledger.read_entry(project, OTHER), "an expiry not yet reported")
+            self.assertIsNone(ledger.read_entry(project, THIRD), "nothing to tell: pruned on time")
+            ledger.mark_reported(project, [UUID], 1_000.0 + week + 20)
+            ledger.prune(project, 1_000.0 + week + 30)
+            self.assertIsNone(ledger.read_entry(project, UUID), "reported: pruned")
+            ledger.prune(project, 1_000.0 + 2 * week + 1)
+            self.assertIsNone(ledger.read_entry(project, OTHER), "a second TTL is the cap")
 
     def test_prune_removes_only_what_is_older_than_the_ttl(self):
         with tempfile.TemporaryDirectory() as project:

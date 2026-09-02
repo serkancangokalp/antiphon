@@ -556,10 +556,19 @@ class ShippedContractTest(unittest.TestCase):
         self.assertRegex(limits, r"(?i)eligible\s+for\s+removal",
                          "the TTL makes a file eligible, it does not delete it")
         self.assertRegex(limits, r"(?i)no\s+timer", "and the README says so")
-        # The two spec bullets this does not deliver are named as undelivered.
-        self.assertRegex(limits, r"(?i)acknowledgement[^.]*not|not[^.]*acknowledgement",
-                         "acknowledgement is named as absent")
-        self.assertRegex(limits, r"(?i)retry", "and so is retry")
+        # The two bullets that were open are what shipped: a read receipt from
+        # the peer's transcript, collection an hour after it, expiry unread
+        # that the sender hears about, and reuse on resend.
+        self.assertEqual(antiphon.ATTACHMENT_READ_GRACE, 3600)
+        self.assertRegex(limits, r"(?i)read\s+receipt", "the receipt is named")
+        self.assertRegex(limits, r"(?i)one\s+hour\s+after\s+the\s+read",
+                         "and the grace after it")
+        self.assertRegex(limits, r"(?i)expires\s+unread", "expiry without one")
+        self.assertRegex(limits, r"(?i)hears\s+that\s+on\s+its\s+next\s+page",
+                         "reaches the sender")
+        self.assertRegex(limits, r"(?i)reused", "and a resend reuses")
+        self.assertNotRegex(limits, r"(?i)acknowledgement[^.]*not part of this",
+                            "the old disclaimer is gone")
 
     def test_both_surfaces_teach_the_attachment_envelope(self):
         """An envelope naming a path an agent has never been told about is a
@@ -752,8 +761,11 @@ class ShippedContractTest(unittest.TestCase):
         self.assertRegex(
             backlog,
             r"## P1 — Large direct-message attachments[^\n]*"
-            r"minus acknowledgement and retry",
-            "and the entry that closed it names what it left open")
+            r"acknowledgement and retry closed 2026-09-03",
+            "and the entry that closed it names what it left open, and the "
+            "day that closed too")
+        self.assertRegex(backlog, r"(?i)### Closed 2026-09-03, with the delivery ledger",
+                         "the two open items close in writing, not by deletion")
         self.assertNotRegex(limits, r"(?i)\blossless\b(?![^.]*\bBACKLOG)",
                             "Limits calls the pull path lossless while tool "
                             "detail, discovery and backward paging still lose")
