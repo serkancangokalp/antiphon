@@ -68,6 +68,26 @@ class LedgerTest(unittest.TestCase):
             self.assertEqual([e["id"] for e in ledger.entries(project)], [UUID])
             self.assertIsNone(ledger.read_entry(project, OTHER))
             self.assertIsNone(ledger.read_entry(project, THIRD))
+            # Well-formed JSON that is not an entry: every one is refused by
+            # the validator, not by the parser, so a validator that stopped
+            # looking would let each of them onto the ledger.
+            good = json.load(open(os.path.join(directory, UUID + ".json")))
+            for label, mutate in (
+                    ("wrong kind", lambda e: e.update(to_kind="gemini")),
+                    ("future version", lambda e: e.update(version=2)),
+                    ("time as text", lambda e: e.update(sent_at="yesterday")),
+                    ("unknown key", lambda e: e.update(route="/tmp/x.sock")),
+                    ("missing key", lambda e: e.pop("proof")),
+                    ("bool size", lambda e: e.update(size=True)),
+                    ("id mismatch", lambda e: e.update(id=THIRD)),
+                    ("path as attachment", lambda e: e.update(attachment="../x.txt")),
+                    ("state unknown", lambda e: e.update(state="delivered"))):
+                bad = dict(good)
+                mutate(bad)
+                with open(os.path.join(directory, OTHER + ".json"), "w") as f:
+                    json.dump(bad, f)
+                self.assertIsNone(ledger.read_entry(project, OTHER), label)
+                self.assertEqual([e["id"] for e in ledger.entries(project)], [UUID], label)
         self.assertEqual(ledger.entries("/nonexistent/project"), [])
 
     def test_a_receipt_keeps_the_earliest_time_and_is_idempotent(self):
