@@ -12,6 +12,17 @@ import re
 OPENING_TAG = re.compile(r"^\s*<([A-Za-z][A-Za-z0-9_-]*)(?=[\s>/])")
 ABSENT = "<absent>"
 
+# The shapes that are not tags, mirrored from production (a contract test
+# compares them): the AGENTS.md injection is a user prefix plus a fence, the
+# external-agent relays are assistant prefixes, a compact summary is a
+# host-set flag, and the interruption markers are exact literals.
+AGENTS_INJECTION_HEAD = "# AGENTS.md instructions for "
+EXTERNAL_AGENT_CALL = re.compile(
+    r"\[external_agent_tool_call: ([A-Za-z0-9][A-Za-z0-9_.-]*)\](?:\n|$)")
+EXTERNAL_AGENT_RESULT_HEAD = "[external_agent_tool_result]"
+CLAUDE_HOST_LITERALS = ("[Request interrupted by user]",
+                        "[Request interrupted by user for tool use]")
+
 
 def opening_tag(text):
     """Return a complete opening tag name at the start of text, if present."""
@@ -69,13 +80,62 @@ def codex_user_blocks(record):
     return [(text, ABSENT)] if text != "" else []
 
 
-def _side_census(root, blocks_for):
+def claude_shapes(record):
+    """Shape names for one Claude record: the host-set summary flag and the
+    exact interruption literals, on production-eligible user messages."""
+    blocks = claude_user_blocks(record)
+    if not blocks:
+        return []
+    text = blocks[0][0]
+    shapes = []
+    if record.get("isCompactSummary"):
+        shapes.append("compact_summary")
+    if text in CLAUDE_HOST_LITERALS:
+        shapes.append("interruption_literal")
+    return shapes
+
+
+def codex_assistant_blocks(record):
+    """One joined Codex assistant message, the way the page reader joins it."""
+    if not isinstance(record, dict) or record.get("type") != "response_item":
+        return []
+    payload = record.get("payload")
+    if (not isinstance(payload, dict) or payload.get("type") != "message"
+            or payload.get("role") != "assistant"):
+        return []
+    content = payload.get("content")
+    if not isinstance(content, list):
+        return []
+    text = _join_text_blocks(
+        (block.get("text") or block.get("input_text") or "")
+        for block in content if isinstance(block, dict))
+    return [text] if text != "" else []
+
+
+def codex_shapes(record):
+    """Shape names for one Codex record: the AGENTS.md injection on a user
+    message, the external-agent relays on an assistant message."""
+    shapes = []
+    for text, _source in codex_user_blocks(record):
+        if text.startswith(AGENTS_INJECTION_HEAD) and "\n<INSTRUCTIONS>" in text:
+            shapes.append("agents_md_block")
+    for text in codex_assistant_blocks(record):
+        if EXTERNAL_AGENT_CALL.match(text):
+            shapes.append("external_agent_call")
+        elif text == EXTERNAL_AGENT_RESULT_HEAD or text.startswith(
+                EXTERNAL_AGENT_RESULT_HEAD + "\n"):
+            shapes.append("external_agent_result")
+    return shapes
+
+
+def _side_census(root, blocks_for, shapes_for):
     files = sorted(glob.glob(os.path.join(root, "**", "*.jsonl"),
                              recursive=True))
     malformed = 0
     messages = 0
     prompt_sources = collections.Counter()
     tags = collections.defaultdict(collections.Counter)
+    shapes = collections.Counter()
     for path in files:
         try:
             source = open(path, encoding="utf-8", errors="replace")
@@ -94,6 +154,8 @@ def _side_census(root, blocks_for):
                     tag = opening_tag(text)
                     if tag is not None:
                         tags[tag][prompt_source] += 1
+                for shape in shapes_for(record):
+                    shapes[shape] += 1
     return {
         "files": len(files),
         "malformed_lines": malformed,
@@ -101,14 +163,15 @@ def _side_census(root, blocks_for):
         "prompt_sources": dict(sorted(prompt_sources.items())),
         "tags": {tag: dict(sorted(sources.items()))
                  for tag, sources in sorted(tags.items())},
+        "shapes": dict(sorted(shapes.items())),
     }
 
 
 def census(claude_root, codex_root):
     """Aggregate counts only; no transcript path or content leaves this call."""
     return {
-        "claude": _side_census(claude_root, claude_user_blocks),
-        "codex": _side_census(codex_root, codex_user_blocks),
+        "claude": _side_census(claude_root, claude_user_blocks, claude_shapes),
+        "codex": _side_census(codex_root, codex_user_blocks, codex_shapes),
     }
 
 
