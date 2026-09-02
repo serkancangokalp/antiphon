@@ -616,16 +616,25 @@ class ShippedContractTest(unittest.TestCase):
                     "**Same-vendor.**", "`[Antiphon bridge] Codex:`", "`sender=\"claude\"`"):
             self.assertIn(row, readme, row)
         self.assertRegex(readme, r"(?i)bare\s+same-kind\s+line[^.]*refused")
-        self.assertRegex(readme, r"(?i)passive pull page does not carry same-kind")
+        # Review 2026-09-03: "never on the passive page" was false — a Stop
+        # marker is the sender's own reply and the other kind's page shows
+        # that reply; a same-kind tool call's arguments stay retrievable by
+        # id. The words say what the code does: no same-kind lane, and no
+        # confidentiality.
+        self.assertRegex(readme, r"(?i)passive pull page gains no same-kind lane")
+        self.assertRegex(readme, r"(?i)addressed,\s+not\s+confidential")
+        self.assertRegex(readme, r"(?i)retrievable by (their|its) public id")
+        self.assertNotRegex(readme, r"(?i)never on the passive page")
         self.assertRegex(section(readme, "Limits"), r"(?i)same-vendor message")
         self.assertIn("`antiphon_send(kind=\"codex\", to=name)`", antiphon.AGENTS_RULE)
         self.assertIn("`[Antiphon bridge] Codex:`", antiphon.AGENTS_RULE)
-        self.assertIn("always named, never on the passive page", antiphon.AGENTS_RULE)
         self.assertIn("`reply_to_claude(to=…)`", antiphon.CLAUDE_RULE)
         self.assertIn("`sender=\"claude\"`", antiphon.CLAUDE_RULE)
-        self.assertIn("always named, never on the passive page", antiphon.CLAUDE_RULE)
         node = read("lib", "channel.mjs")
         collapsed = re.sub(r'"\s*\+\s*\n\s*"', "", node)
+        for surface in (antiphon.AGENTS_RULE, antiphon.CLAUDE_RULE, collapsed):
+            self.assertIn("always named, not a lane of the passive page", surface)
+            self.assertNotIn("never on the passive page", surface)
         self.assertIn("reply_to_claude(to=…)", collapsed)
         self.assertIn('An event with sender=\\"claude\\" is another Claude session', collapsed)
         self.assertIn("a same-kind message to nobody in particular has no meaning", collapsed)

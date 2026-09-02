@@ -1329,7 +1329,7 @@ async function anOversizedMessageIsRefusedWithoutKillingTheSession() {
     // And the channel still works afterwards, which is the point of surviving.
     const ack = await sendTo(session.socketPath,
       JSON.stringify({ content: "after the refusal", message_id: "m-after" }));
-    assert.deepEqual(JSON.parse(ack), { ok: true, message_id: "m-after" });
+    assert.deepEqual(JSON.parse(ack), { ok: true, message_id: "m-after", sender_kind: "codex" });
   } finally {
     await cleanUp(session, dir);
   }
@@ -1399,7 +1399,7 @@ async function aRefusedClientCannotKeepStreaming() {
     // And the channel still serves everyone else.
     const ack = await sendTo(session.socketPath,
       JSON.stringify({ content: "still here", message_id: "m-stream" }));
-    assert.deepEqual(JSON.parse(ack), { ok: true, message_id: "m-stream" });
+    assert.deepEqual(JSON.parse(ack), { ok: true, message_id: "m-stream", sender_kind: "codex" });
   } finally {
     client.destroy();
     await cleanUp(session, dir);
@@ -1719,7 +1719,7 @@ try {
   const pendingIdentity = nextNotification();
   const ack = await sendToSocket({ content: "identity test", message_id: "m-test",
                                    sender_alias: "build" });
-  assert.deepEqual(ack, { ok: true, message_id: "m-test" });
+  assert.deepEqual(ack, { ok: true, message_id: "m-test", sender_kind: "codex" });
   const received = await pendingIdentity;
   assert.equal(received.params.content, "identity test");
   assert.deepEqual(received.params.meta, {
@@ -1734,8 +1734,10 @@ try {
   for (const [kind, expected] of [["claude", "claude"], ["human", "codex"],
                                   [undefined, "codex"]]) {
     const pendingKind = nextNotification();
-    await sendToSocket({ content: `kind ${String(kind)}`, message_id: `m-kind-${String(kind)}`,
-                         sender_alias: "api", sender_kind: kind });
+    const ackKind = await sendToSocket({ content: `kind ${String(kind)}`, message_id: `m-kind-${String(kind)}`,
+                                         sender_alias: "api", sender_kind: kind });
+    assert.equal(ackKind.sender_kind, expected,
+      "the listener echoes the kind it understood, so an older listener is told apart by silence");
     const seenKind = await pendingKind;
     assert.equal(seenKind.params.meta.sender, expected,
       `sender_kind ${JSON.stringify(kind)} must arrive as ${expected}`);

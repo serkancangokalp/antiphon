@@ -326,21 +326,30 @@ def _entries_naming(cwd, attachment):
     return [e for e in entries(cwd) if e["attachment"] == attachment]
 
 
-def mark_read(cwd, attachment, at, to_kind=None, snapshot=None):
+def mark_read(cwd, attachment, at, to_kind=None, snapshot=None, reader_alias=None):
     """A transcript shows the attachment file being read.
 
     Scoped to the recipient: with `to_kind`, only deliveries *to* that kind
     are marked, because the transcript that proved the read belongs to a
     session of that kind — the sender verifying its own parked file (the
     `tail -n +3 | shasum` ritual the envelope teaches) is not the recipient
-    reading it. A read clears an expiry marked in the meantime: a file that
-    was read did not expire unread, whichever the sweep saw first."""
+    reading it. A same-kind delivery shares the sender's kind with its
+    recipient, so the kind cannot tell them apart: such an entry is marked
+    only when `reader_alias` — the alias of the session whose own transcript
+    proved the read — is the entry's named recipient. A cross-kind reader,
+    which walks every transcript of the other kind without knowing whose,
+    never marks a same-kind entry. A read clears an expiry marked in the
+    meantime: a file that was read did not expire unread, whichever the
+    sweep saw first."""
     found = False
     rows = entries(cwd) if snapshot is None else snapshot
     for entry in rows:
         if entry["attachment"] != attachment:
             continue
         if to_kind is not None and entry["to_kind"] != to_kind:
+            continue
+        if sender_kind_of(entry) == entry["to_kind"] and (
+                reader_alias is None or entry["to_alias"] != reader_alias):
             continue
         found = True
 
@@ -388,11 +397,12 @@ def mark_reported(cwd, delivery_ids, at):
         _update(cwd, delivery_id, mutate)
 
 
-def record_receipts(cwd, receipts, read_by=None):
+def record_receipts(cwd, receipts, read_by=None, reader_alias=None):
     """Apply `("received", id, at)` / `("read", basename, at)` triples.
 
     `read_by` is the kind of session whose transcript the reads came from;
-    a read marks only deliveries to that kind. Receipts are folded to one
+    a read marks only deliveries to that kind, and a same-kind delivery only
+    when `reader_alias` is its named recipient. Receipts are folded to one
     per key (the earliest time) and the reads share one snapshot of the
     ledger, so a page naming a file several times costs one read of the
     directory, not one per mention."""
@@ -409,7 +419,8 @@ def record_receipts(cwd, receipts, read_by=None):
         else:
             if snapshot is None:
                 snapshot = entries(cwd)
-            mark_read(cwd, key, at, to_kind=read_by, snapshot=snapshot)
+            mark_read(cwd, key, at, to_kind=read_by, snapshot=snapshot,
+                      reader_alias=reader_alias)
 
 
 def _clock(stamp):

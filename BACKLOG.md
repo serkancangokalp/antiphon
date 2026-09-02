@@ -1600,11 +1600,16 @@ answered in code:
   `to`, `antiphon_send(kind="codex")` without `to` — each is refused with the
   reason, on the ledger, on the sender's next page. A session never addresses
   its own alias.
-- *Scope.* Direct-message road only. The passive page stays the other kind's
-  transcripts; a same-kind message is a receipt for the ledger there, never
-  speech. A same-kind receipt comes from the receiving session's own hook
-  reading the tail of its own transcript, scoped to its own kind, so a
-  Claude-only or Codex-only project gets receipts too.
+- *Scope.* Direct-message road only. The passive page gains no same-kind
+  lane: it stays the other kind's transcripts, and a same-kind message in
+  them is a receipt for the ledger, never speech. Addressed, not confidential
+  — a Stop-marker line is part of the sender's visible reply, which the other
+  kind's page shows, and a same-kind tool call's arguments stay retrievable by
+  their public id (the review of 2026-09-03 measured both). A same-kind
+  receipt comes from the receiving session's own hook reading the tail of its
+  own transcript, scoped to its own kind and, for a same-kind delivery, to its
+  own alias as the named receiver — the sender's verification of a file it
+  parked is never the receiver's read (the same review's critical finding).
 
 README, both rules and the channel instructions say it; the rule ceilings moved
 200 bytes each for one sentence (CLAUDE_RULE 5,300, AGENTS_RULE 5,800).
