@@ -11287,7 +11287,12 @@ def task(*args):
             payload = {}
         if not isinstance(payload, dict):
             payload = {}
-        ok, answer = _delegate(cwd, payload, None, None, os.environ)
+        # The channel server says which side it is and the alias it won;
+        # the same trust `reply` extends to `sender_alias`. Anything else is
+        # the CLI, which knows neither and asks the registry.
+        side = payload.get("side") if payload.get("side") in OTHER_SIDE else None
+        sender = payload.get("sender_alias") if side is not None else None
+        ok, answer = _delegate(cwd, payload, sender, side, os.environ)
         if not ok:
             print(f"task: {answer}", file=sys.stderr)
             return 1
