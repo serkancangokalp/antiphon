@@ -4552,13 +4552,16 @@ class DeliveryReceiptTest(unittest.TestCase):
                            proof="live" if to_kind == "codex" else "channel",
                            sha256="a" * 64, size=13)
 
-    def _hook(self, project, side, codex=(), claude=()):
+    def _hook(self, project, side, codex=(), claude=(), transcript=None):
         out = io.StringIO()
+        payload = {"cwd": project, "hook_event_name": "UserPromptSubmit"}
+        if transcript is not None:
+            payload["transcript_path"] = transcript
         with patch.object(antiphon, "project_dir", return_value=project), \
              patch.object(antiphon, "codex_rollout_files", return_value=list(codex)), \
              patch.object(antiphon, "claude_transcripts", return_value=list(claude)), \
-             patch.object(antiphon.sys, "stdin", io.StringIO(json.dumps(
-                 {"cwd": project, "hook_event_name": "UserPromptSubmit"}))), \
+             patch.object(antiphon, "_hook_catalog_update", return_value=True), \
+             patch.object(antiphon.sys, "stdin", io.StringIO(json.dumps(payload))), \
              contextlib.redirect_stdout(out), contextlib.redirect_stderr(io.StringIO()):
             code = antiphon.hook(side)
         return code, out.getvalue()
@@ -4786,6 +4789,55 @@ class DeliveryReceiptTest(unittest.TestCase):
                           "address another", note)
             self.assertNotIn("2 deliveries", note, "the unknowable one is not a fault")
             self.assertIn("1 older than the 24-hour page horizon", note)
+
+    # ---- same-kind receipts: the receiver's own transcript ----
+
+    def test_a_claude_hook_reads_receipts_off_its_own_transcript(self):
+        """A Claude→Claude delivery shows in the receiving Claude's transcript;
+        without a Codex reader walking it, the receiver's own hook is the
+        only reader there is. Scoped to its own kind: its verification of a
+        file it parked for Codex is not Codex reading it."""
+        other = "2e6b14f1-1659-544a-98d4-56d6eca8fa48"
+        third = "3f7c25a2-2760-455b-a9e5-67e7fdb90b59"
+        with tempfile.TemporaryDirectory() as project:
+            store = os.path.join(project, ".antiphon", "messages", self.ATTACHMENT)
+            ledger.record_sent(project, self.MID, sender="api", to_kind="claude", to_alias="ui",
+                               transport="channel", proof="channel", sha256="a" * 64, size=4,
+                               sender_kind="claude")
+            ledger.record_sent(project, other, sender="api", to_kind="claude", to_alias="ui",
+                               transport="channel", proof="channel", sha256="a" * 64, size=4,
+                               attachment=self.ATTACHMENT, sender_kind="claude")
+            ledger.record_sent(project, third, sender="ui", to_kind="codex", to_alias="build",
+                               transport="queue", proof="live", sha256="a" * 64, size=4,
+                               attachment=self.ATTACHMENT, sender_kind="claude")
+            own = self._claude_transcript(project, [
+                self._claude_channel(self.MID),
+                self._claude_tool_use("Read", {"file_path": store}),
+                self._claude_assistant("noted")])
+            code, out = self._hook(project, "claude", transcript=own)
+            self.assertEqual((code, out), (0, ""), "its own transcript is not a page")
+            self.assertIsNotNone(ledger.read_entry(project, self.MID)["received_at"])
+            self.assertIsNotNone(ledger.read_entry(project, other)["read_at"],
+                                 "a file parked for this Claude, read by it")
+            self.assertIsNone(ledger.read_entry(project, third)["read_at"],
+                              "a file this Claude parked for Codex: not Codex reading it")
+
+    def test_a_codex_hook_reads_receipts_off_its_own_rollout(self):
+        with tempfile.TemporaryDirectory() as project:
+            ledger.record_sent(project, self.MID, sender="build", to_kind="codex",
+                               to_alias="review", transport="queue", proof="live",
+                               sha256="a" * 64, size=4, sender_kind="codex")
+            own = self._codex_rollout(project, [self._codex_message(
+                "user", f"{antiphon.PUSH_LABEL_CODEX} [from=build id={self.MID}] ship it")])
+            code, _out = self._hook(project, "codex", transcript=own)
+            self.assertEqual(code, 0)
+            self.assertIsNotNone(ledger.read_entry(project, self.MID)["received_at"])
+
+    def test_a_missing_own_transcript_is_silent(self):
+        with tempfile.TemporaryDirectory() as project:
+            self.assertEqual(self._hook(project, "claude",
+                                        transcript=os.path.join(project, "gone.jsonl")),
+                             (0, ""))
 
     def test_a_reader_without_a_collector_reports_nothing_and_breaks_nothing(self):
         with tempfile.TemporaryDirectory() as project:

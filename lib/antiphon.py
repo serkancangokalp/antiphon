@@ -4548,6 +4548,15 @@ def hook(side="claude"):
         record_claude_session(cwd, input_data.get("session_id"),
                               input_data.get("transcript_path"))
 
+    # This session's own transcript, for what it proves about deliveries *to*
+    # this session: another session of the same kind writes here, and no
+    # reader of the other kind may ever walk this file (a Claude-only
+    # project has no Codex reader). One bounded read of the tail, receipts
+    # scoped to this side's kind, on every event.
+    _ledger_call("own receipts", lambda: ledger.record_receipts(
+        cwd, _own_transcript_receipts(side, input_data.get("transcript_path")),
+        read_by=side))
+
     if event != "UserPromptSubmit":
         # Only a prompt has something for context to attach to. Anything else —
         # `SessionStart`, or an event this version has never heard of — records
@@ -4639,6 +4648,28 @@ def hook(side="claude"):
             print("antiphon: delivered, but could not record the cursor",
                   file=sys.stderr)
         return 0
+
+
+def _own_transcript_receipts(side, transcript_path):
+    """Receipts in the tail of this session's own transcript, by this side's
+    own collector. A missing or unreadable path is an empty list."""
+    if not isinstance(transcript_path, str) or not os.path.isfile(transcript_path):
+        return []
+    receipts = []
+    for line in tail_lines(transcript_path):
+        try:
+            record = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(record, dict):
+            continue
+        if side == "claude":
+            _collect_claude_receipts(record, receipts)
+        elif record.get("type") == "response_item":
+            payload = record.get("payload")
+            _collect_codex_receipts(record, payload if isinstance(payload, dict) else {},
+                                    receipts)
+    return receipts
 
 
 def _ledger_call(what, action):
