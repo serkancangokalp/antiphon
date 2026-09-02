@@ -79,7 +79,19 @@ TAIL_BYTES = 300_000      # amount to read from the tail of each transcript file
 EVENT_LIMIT = 40          # completed source records per page
 PAGE_BUDGET = 8_000       # UTF-8 bytes in an ordinary complete page envelope
 RECENT_FILES = 3          # bounded fallback/current-window discovery per side
-LOOKBACK = 6 * 3600       # anything older than this doesn't count as part of "this session"
+LOOKBACK = 6 * 3600       # a new reader starts this far back
+# A reader never delivers a record older than this much before the other
+# side's newest complete record, across every source it reads: what is older
+# is skipped, counted and announced. Relative to the other side's own clock,
+# not to the wall: an overnight run is still there in the morning, and a
+# side that stopped days ago yields its last day. Measured before this
+# existed: a reader more than 400 pages behind, every page a day old, 2,000
+# tokens per turn spent on history nobody asked for; bounded to a day, 21
+# pages.
+PAGE_HORIZON = 24 * 3600
+HORIZON_BISECT_ABOVE = 1024 * 1024     # bytes of unread span before bisecting
+HORIZON_BISECT_STEP = 4096             # the bisection converges to this span
+HORIZON_BISECT_SLACK = 256 * 1024      # then the linear scan resumes this far back
 CATALOG_VERSION = 1
 CATALOG_BATCH = 8
 ANCHOR_HASH_CHUNK = 64 * 1024
@@ -451,6 +463,9 @@ def _join_text_blocks(blocks):
 # person's pasted text. If a future non-meta host record uses either tag, one
 # visible host line may leak; `_is_self_injected` is not a second guard for
 # them. The seven remaining Claude tags and all eleven Codex tags matched.
+# Re-measured 2026-09-02 over 206 Codex files: `codex_internal_context`, the
+# ChatGPT app's goal continuation, 133 user records and 931 KB, every one
+# host-written and reaching the Claude page as `To Codex:` — Codex only.
 # See BACKLOG.md for the repeatable release check.
 CLAUDE_HOST_WRAPPERS = (
     "task-notification", "ide_opened_file",
@@ -459,11 +474,19 @@ CLAUDE_HOST_WRAPPERS = (
     "bash-input", "bash-stdout",
 )
 
+# Two host literals, exact. Claude Code writes them as the user record that
+# ends an interrupted turn; nobody typed them. Equality, never a prefix: a
+# person's line that begins the same way stays a person's line. Measured
+# 2026-09-02: seven such records had reached Codex's page as `To Claude:`;
+# the 2026-09-03 census counts 14 across all 525 Claude transcripts.
+CLAUDE_HOST_LITERALS = ("[Request interrupted by user]",
+                        "[Request interrupted by user for tool use]")
+
 CODEX_HOST_WRAPPERS = (
     "task-notification", "recommended_plugins", "realtime_delegation",
     "subagent_notification", "environment_context", "ide_opened_file",
     "command-name", "command-message", "local-command-stdout",
-    "bash-input", "bash-stdout",
+    "bash-input", "bash-stdout", "codex_internal_context",
 )
 
 # `promptSource` values measured carrying host records as well as people's
@@ -499,6 +522,20 @@ def _is_host_record(text, wrappers, prompt_source=None):
     if prompt_source and prompt_source not in MIXED_SOURCES:
         return False
     return wrappers.match((text or "").lstrip()) is not None
+
+
+# The Codex host injects the project's AGENTS.md as the first user message of
+# a session: `# AGENTS.md instructions for <cwd>`, a blank line, then an
+# `<INSTRUCTIONS>` fence. Measured 2026-09-02: 18 records, 32 KB, every one
+# host-written — and the rule inside is this bridge's own text, relayed back
+# to the other side at 8 KB a session. Both halves are required: a heading
+# alone could be a person's document, a fence alone could be quoted.
+AGENTS_INJECTION_HEAD = "# AGENTS.md instructions for "
+
+
+def _is_codex_host_block(text):
+    return (isinstance(text, str) and text.startswith(AGENTS_INJECTION_HEAD)
+            and "\n<INSTRUCTIONS>" in text)
 
 
 def sender_alias(candidate):
@@ -1455,6 +1492,31 @@ def _anchor_from_stream(stream, offset):
     return {"start": start, "sha256": digest.hexdigest()}
 
 
+def _first_record_from_stream(stream, offset):
+    """The first complete record starting at or after `offset` in a binary
+    stream, as `(start, end, line)`, or None.
+
+    An offset inside a line skips to the next line; an offset that is a
+    boundary — byte zero, or one just after a newline — starts the record
+    there. The byte before `offset` decides which, so a trusted cursor
+    position is never mistaken for the middle of the record it begins.
+    """
+    if not isinstance(offset, int) or isinstance(offset, bool) or offset < 0:
+        return None
+    position = offset
+    stream.seek(max(0, offset - 1))
+    if offset > 0:
+        if stream.read(1) != b"\n":
+            rest = stream.readline()
+            if not rest.endswith(b"\n"):
+                return None
+            position = offset + len(rest)
+    raw = stream.readline()
+    if not raw.endswith(b"\n"):
+        return None
+    return position, position + len(raw), raw[:-1].decode("utf-8", "replace")
+
+
 def _retrieval_records_from_stream(stream):
     """Yield the raw bytes of every record in one captured complete prefix.
 
@@ -1622,6 +1684,13 @@ class SafeSource:
         except OSError:
             return None
 
+    def first_record_at(self, offset):
+        try:
+            with self._reader() as stream:
+                return _first_record_from_stream(stream, offset)
+        except OSError:
+            return None
+
     def size(self):
         try:
             return os.fstat(self.fd).st_size
@@ -1772,6 +1841,13 @@ class _PathSource:
         try:
             with open(self.path, "rb") as stream:
                 return _anchor_from_stream(stream, offset)
+        except OSError:
+            return None
+
+    def first_record_at(self, offset):
+        try:
+            with open(self.path, "rb") as stream:
+                return _first_record_from_stream(stream, offset)
         except OSError:
             return None
 
@@ -2931,6 +3007,128 @@ def _source_offset_at_or_after(source, timestamp):
     return end
 
 
+def _record_time(line):
+    """The record's own timestamp as an epoch float, or None.
+
+    Both hosts stamp every record at the top level. A record without one, or
+    with one that does not parse, has no time — never zero, which would read
+    as 1970 and skip it."""
+    try:
+        record = json.loads(line)
+    except ValueError:
+        return None
+    if not isinstance(record, dict):
+        return None
+    stamp = record.get("timestamp")
+    if not isinstance(stamp, str) or not stamp:
+        return None
+    return iso_epoch(stamp) or None
+
+
+def _source_newest_time(source):
+    """The timestamp of the source's last complete record, or None when it
+    has none or that record carries none — and then there is no horizon."""
+    end = source.complete_prefix_end()
+    if not end:
+        return None
+    anchor = source.anchor_at(end)
+    if anchor is None:
+        return None
+    record = source.first_record_at(anchor["start"])
+    return _record_time(record[2]) if record else None
+
+
+def _first_offset_at_or_after(source, timestamp, start):
+    """The start of the first record at or after `timestamp`, searching from
+    the record boundary `start`; the complete-prefix end when there is none.
+
+    Bisects over record boundaries when the span is large — a reader can be
+    a hundred megabytes behind — then scans the last slack linearly, so a
+    local misorder of timestamps costs a few repeated records rather than
+    skipped ones. Measured 2026-09-03: Codex appends in time order (0
+    inversions in 108,801 records); Claude has sub-second reorderings (2,751
+    in 95,089 records, 2 of them beyond the slack and both 0 s wide). A
+    misorder wider than the slack that also straddles the horizon is the
+    stated residual, unobserved."""
+    size = source.complete_prefix_end()
+    lo, hi = start, size
+    if hi - lo > HORIZON_BISECT_ABOVE:
+        while hi - lo > HORIZON_BISECT_STEP:
+            mid = (lo + hi) // 2
+            record = source.first_record_at(mid)
+            if record is None or record[0] >= hi:
+                hi = mid
+                continue
+            when = _record_time(record[2])
+            if when is not None and when >= timestamp:
+                hi = record[0]
+            else:
+                lo = record[1]
+        lo = max(start, lo - HORIZON_BISECT_SLACK)
+        boundary = source.first_record_at(lo)
+        lo = boundary[0] if boundary else lo
+    for record_start, _end, line in source.read_records(lo):
+        when = _record_time(line)
+        if when is not None and when >= timestamp:
+            return record_start
+    return size
+
+
+def _reader_horizon(cwd, kind, paths):
+    """The moment before which this reader delivers nothing: PAGE_HORIZON
+    before the newest complete record across every source it can read, or
+    None when no source has a readable newest time.
+
+    Across sources, not per source. Measured per source on the live project,
+    every one of thirty old rollouts still yielded its own last day — a
+    hundred pages of days-old tool lines; against the other side's newest
+    record, a rollout that stopped days ago is entirely behind the horizon."""
+    newest = None
+    for path in paths:
+        opened = _open_discovered_source(path, cwd, kind, report=False)
+        if isinstance(opened, SourceRefusal):
+            continue
+        with opened as source:
+            when = _source_newest_time(source)
+        if when is not None and (newest is None or when > newest):
+            newest = when
+    if newest is None:
+        return None
+    # Bounded above by the wall clock: a single record stamped in the future
+    # — a clock set forward and corrected, an edited transcript — would
+    # otherwise put the horizon past everything real on that side, for every
+    # source, permanently. The source's own clock only ever needs to move the
+    # horizon backwards (an overnight run is still there in the morning), and
+    # that direction is kept. Measured 2026-09-03: 0 future-stamped records
+    # in 203,890 live ones, so this is the unobserved case, bounded anyway.
+    return min(newest, time.time()) - PAGE_HORIZON
+
+
+def _apply_horizon(source, start, horizon):
+    """`(start, skipped)`: the start every start rule agreed on — a cursor,
+    a recovery at byte zero, the `since` road — moved forward to the first
+    record at or after `horizon`, and how many raw bytes that left behind.
+    Nothing moves without a horizon or when the next record is already
+    inside it.
+
+    A first record without a timestamp does not switch the horizon off.
+    Measured 2026-09-03: 11,077 of 95,089 Claude records carry none (host
+    bookkeeping — `last-prompt`, `file-history-snapshot`, …) and 101 of 526
+    transcripts end on one; none of those shapes is visible to a reader, so
+    the landing is the first timestamped record inside the horizon and the
+    bookkeeping before it goes with the rest."""
+    if horizon is None:
+        return start, 0
+    first = source.first_record_at(start)
+    if first is None:
+        return start, 0
+    when = _record_time(first[2])
+    if when is not None and when >= horizon:
+        return start, 0
+    landing = _first_offset_at_or_after(source, horizon, start)
+    return landing, max(0, landing - start)
+
+
 def _source_size(path):
     """The file's size, or None when it could not be measured at all.
 
@@ -3187,7 +3385,7 @@ def claude_transcripts(cwd):
 
 
 def claude_events(cwd, positions=None, since=None, visible_record_limit=None,
-                  source_paths=None):
+                  source_paths=None, skipped=None, horizon=None):
     """Return visible events and the safe scanned position for each source.
 
     A completed JSONL record consumes at most one visible lookahead slot even
@@ -3207,6 +3405,12 @@ def claude_events(cwd, positions=None, since=None, visible_record_limit=None,
             visible_records = 0
             sid, gen = source.source, source.generation
             offset = _start_source_offset(source, positions, since)
+            # The horizon, after every start rule: a reader never lags this
+            # source by more than PAGE_HORIZON of its own clock, and what it
+            # leaves behind is counted for the page to say so.
+            offset, cut = _apply_horizon(source, offset, horizon)
+            if cut and skipped is not None:
+                skipped[sid] = skipped.get(sid, 0) + cut
             previous_anchor = source.anchor_at(offset) if offset else None
             if gen is not None:
                 reached[sid] = {
@@ -3234,7 +3438,13 @@ def claude_events(cwd, positions=None, since=None, visible_record_limit=None,
                             text = _join_text_blocks(
                                 c.get("text", "") for c in content
                                 if isinstance(c, dict) and c.get("type") == "text")
+                        # A compact summary is the host's own restatement of
+                        # context — measured 17 KB each, always an oversized
+                        # record — and it is host-set, not text-shaped, so
+                        # the flag decides rather than any wrapper.
                         if (text != ""
+                                and not d.get("isCompactSummary")
+                                and text not in CLAUDE_HOST_LITERALS
                                 and not _is_host_record(text, CLAUDE_WRAPPER_OPENING,
                                                         d.get("promptSource"))
                                 and not _is_self_injected(text)):
@@ -3353,6 +3563,34 @@ def _codex_tool_fields(payload):
     return kind, name, namespace, payload[argument_key]
 
 
+# The ChatGPT app records an external agent's tool traffic — Claude Code's
+# own Bash and Read calls, when Claude runs inside the app — as assistant
+# messages in the Codex rollout. Measured 2026-09-02: 8,936 records, 11 MB,
+# rendered as Codex speech with the commands and their output in full. Both
+# shapes are that agent's own activity, already in its own transcript, and
+# are filtered whole. Exact at the first line: the bracket, the fixed prefix,
+# one tool-name token, nothing leading.
+EXTERNAL_AGENT_CALL = re.compile(
+    r"\[external_agent_tool_call: (" + TOOL_COMPONENT.pattern + r")\](?:\n|$)")
+EXTERNAL_AGENT_RESULT_HEAD = "[external_agent_tool_result]"
+
+
+def _external_agent_relay(text):
+    """`("call", name)`, `("result", None)` or None for one assistant text."""
+    if not isinstance(text, str):
+        return None
+    matched = EXTERNAL_AGENT_CALL.match(text)
+    if matched:
+        return "call", matched.group(1)
+    if text == EXTERNAL_AGENT_RESULT_HEAD or text.startswith(
+            EXTERNAL_AGENT_RESULT_HEAD + "\n"):
+        return "result", None
+    # The whole record goes when it starts with a relay: measured, a relay
+    # record carries nothing else (1,022 of 1,022). A record that put Codex's
+    # own words after a relay would lose them — unobserved, stated.
+    return None
+
+
 def _codex_tool_name(payload):
     """Return the only safe page detail from one measured Codex tool call.
 
@@ -3442,7 +3680,7 @@ def _codex_tool_shape_count(cwd, discovery=None, source_paths=None):
 
 
 def codex_events(cwd, positions=None, since=None, visible_record_limit=None,
-                 source_paths=None):
+                 source_paths=None, skipped=None, horizon=None):
     """Return visible events and the safe scanned position for each rollout."""
     events = []
     reached = {}
@@ -3457,6 +3695,12 @@ def codex_events(cwd, positions=None, since=None, visible_record_limit=None,
             visible_records = 0
             sid, gen = source.source, source.generation
             offset = _start_source_offset(source, positions, since)
+            # The horizon, after every start rule: a reader never lags this
+            # source by more than PAGE_HORIZON of its own clock, and what it
+            # leaves behind is counted for the page to say so.
+            offset, cut = _apply_horizon(source, offset, horizon)
+            if cut and skipped is not None:
+                skipped[sid] = skipped.get(sid, 0) + cut
             previous_anchor = source.anchor_at(offset) if offset else None
             if gen is not None:
                 reached[sid] = {
@@ -3484,16 +3728,26 @@ def codex_events(cwd, positions=None, since=None, visible_record_limit=None,
                         if text != "" and role != "developer":
                             if role == "user":
                                 if (not _is_host_record(text, CODEX_WRAPPER_OPENING)
+                                        and not _is_codex_host_block(text)
                                         and not _is_self_injected(text)):
                                     events.append((ts, path, next(position),
                                                   Event(ts, "you", text, sid, gen,
                                                         start, end, previous_anchor,
                                                         anchor)))
                             elif role == "assistant":
-                                events.append((ts, path, next(position),
-                                              Event(ts, "codex", text, sid, gen,
-                                                    start, end, previous_anchor,
-                                                    anchor)))
+                                # A relayed external-agent call or result is
+                                # the other agent's own activity, already in
+                                # that agent's transcript: filtered whole,
+                                # while the safe scanned frontier advances.
+                                # Measured as tool lines instead: 1,022 of
+                                # them inside one day's horizon on the live
+                                # project, every one a mirror of Claude's own
+                                # commands.
+                                if _external_agent_relay(text) is None:
+                                    events.append((ts, path, next(position),
+                                                  Event(ts, "codex", text, sid, gen,
+                                                        start, end, previous_anchor,
+                                                        anchor)))
                     elif kind == "response_item":
                         invocation = _codex_invocation(payload, sid, start)
                         if invocation is not None:
@@ -3887,7 +4141,7 @@ def _append_page_section(text, section):
 
 
 def _render_page(side, records, has_more, replay_reason, join=None,
-                 discovery=None):
+                 discovery=None, skipped=None):
     """Render the exact visible envelope whose UTF-8 size is page-bounded."""
     # Over the SELECTED records, never the candidates. The measured shape of a
     # real page is two sources discovered and one delivered — 55 of 60 — and a
@@ -3920,6 +4174,13 @@ def _render_page(side, records, has_more, replay_reason, join=None,
     if discovery is not None and discovery.state != "complete":
         text = _append_page_section(
             text, f"discovery: {discovery.state} — {discovery.reason}")
+    if skipped:
+        # Once, on the page where it happened; the cursor then stands past
+        # what was skipped and the next page has nothing to announce.
+        text = _append_page_section(text, (
+            f"skipped: {sum(skipped.values()):,} raw bytes of {name} activity "
+            f"older than {PAGE_HORIZON // 3600} hours in {len(skipped)} "
+            "source(s) — not delivered; the transcripts keep it"))
     if replay_reason is not None:
         text = _append_page_section(text, REPLAY_NOTICES[replay_reason])
     for record in records:
@@ -3994,7 +4255,7 @@ def _page_frontier(records, selected, scanned):
 
 
 def _build_page(events, scanned, side, replay_reason=None, join=None,
-                discovery=None, next_lane="active"):
+                discovery=None, next_lane="active", skipped=None):
     """Build one bounded, whole-record page and its safe source frontier."""
     if replay_reason not in REPLAY_NOTICES and replay_reason is not None:
         raise ValueError("unknown replay reason")
@@ -4003,17 +4264,24 @@ def _build_page(events, scanned, side, replay_reason=None, join=None,
         if not scanned:
             if discovery is not None and discovery.state == "degraded":
                 text = _render_page(side, [], False, replay_reason,
-                                    NO_SESSION_JOIN, discovery)
+                                    NO_SESSION_JOIN, discovery, skipped)
                 return text, None, 0
             return "", None, 0
         if replay_reason is None:
+            if skipped:
+                # Nothing left inside the window, but something was skipped
+                # to get here: a page that says so, never a silent advance.
+                text = _render_page(side, [], False, None, NO_SESSION_JOIN,
+                                    discovery, skipped)
+                return text, PageAdvance(
+                    dict(scanned), False, None, next_lane), 0
             return "", PageAdvance(
                 dict(scanned), False, None, next_lane), 0
         # No records, so no sources and nothing to label. The join this
         # replay would have used says the same thing; passing the empty one
         # says it where a reader can see it.
         text = _render_page(side, [], False, replay_reason, NO_SESSION_JOIN,
-                            discovery)
+                            discovery, skipped)
         return text, PageAdvance(
             dict(scanned), False, replay_reason, next_lane), 0
 
@@ -4036,7 +4304,7 @@ def _build_page(events, scanned, side, replay_reason=None, join=None,
             dead if scheduled == "active" else active))
         candidate = _render_page(
             side, candidates[:length], has_more, replay_reason,
-            join, discovery)
+            join, discovery, skipped)
         if len(candidate.encode("utf-8")) <= PAGE_BUDGET:
             selected = length
             text = candidate
@@ -4046,7 +4314,7 @@ def _build_page(events, scanned, side, replay_reason=None, join=None,
         has_more = selected < len(candidates) or mixed
         text = _render_page(
             side, candidates[:selected], has_more,
-            replay_reason, join, discovery)
+            replay_reason, join, discovery, skipped)
 
     chosen = candidates[:selected]
     has_more = selected < len(candidates) or mixed
@@ -4074,14 +4342,16 @@ def build_summary(cwd, side, positions=None, since=None, replay_reason=None,
         discovery = discovery._replace(
             state="degraded", refusals=max(1, discovery.refusals),
             reason="some project sources could not be proved")
+    skipped = {}
+    horizon = _reader_horizon(cwd, kind, discovery.sources)
     if side == "claude":
         events, reached = codex_events(
             cwd, positions, since, visible_record_limit=EVENT_LIMIT + 1,
-            source_paths=discovery.sources)
+            source_paths=discovery.sources, skipped=skipped, horizon=horizon)
     else:
         events, reached = claude_events(
             cwd, positions, since, visible_record_limit=EVENT_LIMIT + 1,
-            source_paths=discovery.sources)
+            source_paths=discovery.sources, skipped=skipped, horizon=horizon)
     expected = {
         (path.candidate.expected_source
          if isinstance(path, DiscoveredSourcePath) else source_id(path))
@@ -4104,7 +4374,7 @@ def build_summary(cwd, side, positions=None, since=None, replay_reason=None,
     join = _session_join(cwd, OTHER_SIDE[side][0])
     return _build_page(
         events, reached, side, replay_reason, join, discovery,
-        getattr(positions, "next_lane", "active"))
+        getattr(positions, "next_lane", "active"), skipped)
 
 
 # ---------- hook (both sides share the same contract) ----------
@@ -4367,7 +4637,14 @@ def _codex_turn(transcript_path, turn_id=None):
             return None
         texts = [c.get("text") or c.get("output_text") or c.get("input_text") or ""
                 for c in p.get("content") or [] if isinstance(c, dict)]
-        return texts if any(texts) else None
+        if not any(texts):
+            return None
+        # A relayed external-agent call is the other agent's own command
+        # text, and it can carry `@claude` at a line start; it is not Codex
+        # addressing anyone.
+        if _external_agent_relay("\n".join(texts)) is not None:
+            return None
+        return texts
 
     def task_marker(d):
         p = d.get("payload") or {}
@@ -6187,18 +6464,16 @@ RETRIEVE_DESCRIPTION = (
 TOOLS = [{
     "name": "antiphon_read",
     "description": ("Returns one page of what happened on the Claude Code side since "
-                    "your last turn, oldest first. When the page ends with "
-                    "`has_more: true`, more completed records are already waiting: call "
-                    "this tool again, or let later turns drain them. A `has_more: false` "
-                    "page with `has_more_scope: catalogued project sources` covers the "
-                    "durable project catalog only when it has no `discovery: building` "
-                    "or `discovery: degraded` line; either marker means the boundary is "
-                    "explicitly incomplete. If the next record alone is larger than an "
-                    "ordinary page, this tool refuses it instead of truncating: nothing "
-                    "is read or marked seen, and the next automatic prompt hook — whose "
-                    "host can spill an oversized record to a file — delivers it whole. "
-                    "Pages normally arrive automatically via the hook; reach for this "
-                    "tool to drain a backlog or when the bridge seems quiet."),
+                    "your last turn, oldest first. `has_more: true` means more is "
+                    "waiting: call this tool again, or let later turns drain it. A "
+                    "`has_more: false` page with `has_more_scope: catalogued project "
+                    "sources` covers the durable catalog only when it has no "
+                    "`discovery: building` or `discovery: degraded` line; either "
+                    "means the boundary is incomplete. If the next record alone is "
+                    "larger than a page, this refuses it instead of truncating: "
+                    "nothing is read or marked seen, and the next automatic prompt "
+                    "hook delivers it whole. Pages normally arrive via the hook; "
+                    "reach for this to drain a backlog or when the bridge seems quiet."),
     "inputSchema": {"type": "object", "properties": {}},
 }, {
     "name": "antiphon_send",
@@ -6955,6 +7230,8 @@ CLAUDE_LOCAL_SETTINGS_FILE = os.path.join(".claude", "settings.local.json")
 CODEX_HOOKS_FILE = os.path.join(".codex", "hooks.json")
 CODEX_CONFIG_FILE = os.path.join(".codex", "config.toml")
 MCP_CONFIG_FILE = ".mcp.json"
+AGENTS_FILE = "AGENTS.md"
+CLAUDE_MD_FILE = "CLAUDE.md"
 
 CODEX_MCP_TABLE = "mcp_servers.antiphon"
 CODEX_MCP_ENV_TABLE = CODEX_MCP_TABLE + ".env"
@@ -7061,207 +7338,169 @@ def hook_installed(data, shape):
 
 
 SECTION_HEADING = "## The Antiphon bridge"
+# Closes the generated section. Without it the section runs to the next `## `
+# heading or the end of the file, and a rewrite takes whatever a person
+# appended after it — their own notes — along with the stale words.
+SECTION_END = "<!-- antiphon: end of the generated section -->"
 
 TOOL_RETRIEVAL_RULE = (
-    "Every compact tool-call entry carries a 22-character opaque, content-bound "
-    "`tc1` id. Call the `antiphon_retrieve` tool with `id=\"<id>\"` for the complete invocation "
-    "only, never the tool result. Retrieval is read-only and cursor-neutral; it "
-    "reports `invalid-id`, `unavailable`, `ambiguous` or `untrusted` without "
-    "inventing content. An MCP value above 8,000 UTF-8 bytes is refused without "
-    "truncation; run `antiphon retrieve <id>` for the full invocation. Host "
-    "retention or `antiphon sources compact` can make an old id unavailable. Two "
-    "copies of one transcript identity inside a host discovery root make retrieval "
-    "untrusted; backups outside those roots do not affect it. There is no persistent "
-    "invocation index or tombstone, so changed, expired and never-existed ids all "
-    "honestly collapse to `unavailable`; binding invocation content into the id "
-    "prevents changed bytes from being returned under the old id.")
+    "Every compact tool-call line carries a content-bound `tc1` id: the "
+    "`antiphon_retrieve` tool with `id=\"<id>\"` returns that invocation only, "
+    "never the tool result, read-only and cursor-neutral; above 8,000 bytes it refuses "
+    "without truncation and `antiphon retrieve <id>` prints it whole. Host "
+    "retention or `antiphon sources compact` can make an id `unavailable`; "
+    "two copies of one transcript make retrieval `untrusted`.")
 
 MULTILINE_MARKER_RULE = (
-    "A Stop marker can carry a block: make its one-line message exactly "
-    "`<<TOKEN`, where TOKEN matches `[A-Z][A-Z0-9_]{0,31}`, put the body on "
-    "following lines, and use an exact `TOKEN` line to close it. Blocks do not "
-    "nest and the closer is not Markdown-fence-aware, so choose a token absent "
-    "from the body. Marker-looking lines inside the body are content. A malformed "
-    "or unclosed block sends nothing from that turn. To send literal text "
-    "beginning with `<<`, put it inside a block body.")
+    "A marker can carry a block: make its one-line message exactly `<<TOKEN` "
+    "(TOKEN matches `[A-Z][A-Z0-9_]{0,31}`), put the body on the next lines "
+    "and close it with an exact `TOKEN` line. Blocks do not nest and the "
+    "closer is not fence-aware, so choose a token absent from the body; "
+    "marker-looking lines inside are content; a malformed or unclosed block "
+    "sends nothing from that turn; literal text beginning with `<<` goes in a "
+    "block body.")
 
 LONG_MARKER_RULE = (
-    "Use `{tool}` for long content: an oversized direct-tool message can be "
-    "parked as an attachment, while an oversized Stop-marker block is refused "
-    "and not parked.")
+    "Use `{tool}` for long content: an oversized direct-tool message is parked "
+    "as an attachment, while an oversized Stop-marker block is refused and not "
+    "parked.")
 
 AUTOMATIC_PEER_IDENTITY_RULE = (
-    "Without `ANTIPHON_NAME`, Antiphon may derive an automatic `auto-` peer alias "
-    "from a canonical host session UUID. Codex publishes one only after its first "
-    "hook records that UUID and a writer lock positively proves the session live. "
-    "Every census remains `at least N` because sessions before their first hook "
-    "may be invisible. "
-    "Claude accepts one only from a fixed Claude probe that finds exactly one "
-    "interactive record with this session's CLI-root pid and exact project cwd; "
-    "the host display name is ignored, and the Claude hook must join the same "
-    "endpoint, owner and identity. Probe or hook failure stays `<unnamed>`. "
-    "`ANTIPHON_NAME` overrides automatic identity. One positively live automatic "
-    "peer can be addressed by alias and is the only automatic case a bare send may "
-    "choose; two or more positively live candidates make a bare send refused. "
-    "Older or mixed-version peers are never guessed into automatic identity. The "
-    "full host session id, identity digest, owner key and socket route stay "
-    "private; status, doctor, labels, refusals and errors expose only the "
-    "public alias and the remedy beside it. "
-    "After a session rotates to a new host session, its old automatic alias "
-    "stops resolving at once and its new one is unreachable until a fresh "
-    "endpoint exists \u2014 in practice an MCP reconnect. `status` and `doctor` "
-    "name the current alias beside that remedy; an identity whose owner cannot "
-    "be proved live is counted, never addressed.")
+    "Without `ANTIPHON_NAME` a session may get an automatic `auto-` peer alias "
+    "— Codex once its first hook proves it live, Claude from a fixed "
+    "Claude probe (the host display name is ignored) — and a census is "
+    "`at least N` since a session before its first hook may be invisible. "
+    "`ANTIPHON_NAME` overrides automatic identity; older peers are never "
+    "guessed into one. One positively live automatic peer is the only bare-send "
+    "case; two or more candidates refuse. The session id, identity digest, "
+    "owner key and socket route stay private — status, doctor, labels, "
+    "refusals and errors expose only the public alias. After a rotation the "
+    "old alias stops resolving and the new one is unreachable until a fresh "
+    "endpoint exists (an MCP reconnect); an owner not proved live is counted, "
+    "never addressed.")
+
+# What the bridge does with a refused named send, and what the receiver may
+# see of it. Shared by both rules and the channel instructions; seven tests
+# pin its words on every surface.
+RECOVERY_RULE = (
+    "An `Antiphon delivery notice:` event is a bridge-authored diagnostic with "
+    "no original message content; it does not turn the sender's refusal into "
+    "delivery. That refusal follows one content-free recovery request to the "
+    "named socket — a current listener can restore its own endpoint, so "
+    "the words go only if the registry resolves again; an old or unverified "
+    "listener stays refused; doctor only reports it. If a label carries "
+    "`reply_to=<unavailable>`, do not reply to that `from` alias: it belongs "
+    "to a different session.")
 
 AGENTS_RULE = ("\n## The Antiphon bridge\n\n"
-               "You are working alongside Claude Code on this project. What happens on the "
-               "other side is injected into your context automatically at the start of each "
-               "turn — you don't need to do anything else. It arrives as one page of "
-               "completed records, oldest first; a `has_more: true` line means more is "
-               "already waiting, so call the `antiphon_read` tool again (or let later turns "
-               "drain it) until it reports `has_more: false`. Its "
-               "`has_more_scope: catalogued project sources` covers the durable project "
-               "catalog only when the page has no `discovery: building` or "
-               "`discovery: degraded` line; either marker means discovery is explicitly "
-               "incomplete. A page carrying "
-               "a replay notice is re-delivering history after an upgrade or cursor "
-               "recovery and can contain duplicates; it is complete when the notice "
-               "disappears. If the single next record is larger than an ordinary page, "
-               "`antiphon_read` refuses it instead of truncating it — nothing is read or marked seen — and the next "
-               "automatic prompt hook delivers it whole. That injected context is "
-               "project-wide awareness rather than mail addressed to you: it may merge "
-               "activity from several project transcripts under one Claude label, so read "
-               "it as what is happening nearby. Paging writes `<side>_pages_v4` beside "
-               "the preserved v3 sibling. During adoption, at most the v3 frontier's last "
-               "record repeats while a content anchor is established. Live and unknown "
-               "sources stay in the active lane; only a current process fingerprint can "
-               "prove a source dead, and mixed backlog alternates whole pages between "
-               "active and dead after successful delivery. Candidate retirement is never "
-               "a hook side effect: `antiphon sources compact` explicitly retires only "
-               "aged, gone sources every relevant v4 reader proves consumed. Hooks never "
-               "retire candidates. " + TOOL_RETRIEVAL_RULE + "\n\n"
-               "When Claude wants to tell you something directly, you'll see it as a user "
-               "message starting with `[Antiphon bridge] Claude:` (pushed from Claude's Stop "
-               "hook) or `[Antiphon channel] Claude:` (a direct reply through the channel) — "
-               "either way, these are Claude's words, not the user's. After that prefix comes "
-               "`[from=<alias> id=<uuid>]`, naming which Claude peer spoke; when the "
-               "same label also contains `reply_to=<unavailable>`, follow the exception "
-               "below instead of addressing it back. Otherwise reply with "
-               "`antiphon_send(to=<alias>)` or `@claude:<alias>`. A literal "
-               "`from=<unnamed>` means that peer has no name and cannot be addressed back — "
-               "with only one Claude peer live you can leave the recipient out entirely. The "
-               "id names one delivery attempt; nothing routes replies by it. A Claude "
-               "alias is its configured identity, not proof that its named return channel "
-               "is reachable. If a direct reply is refused, keep that refusal: `antiphon "
-               "doctor` can name the broken channel, which needs the Claude session to "
-               "restart. If a label carries `reply_to=<unavailable>`, do not reply to its "
-               "`from` alias: that channel belongs to a different session. An `Antiphon "
-               "delivery notice:` event is a bridge-authored "
-               "diagnostic: it carries no original message content and does not turn the "
-               "sender's refusal into delivery. Before that refusal, Antiphon makes one "
-               "content-free recovery request to the exact named socket. A current listener "
-               "can restore its own endpoint; the original words are sent only if the "
-               "registry resolves again. An old or unverified listener stays refused and "
-               "may need a restart. Doctor only reports this state; it never performs the "
-               "recovery.\n\n"
-               "When you want to hand Claude a task directly, put `@claude` at the start of a "
-               "line in your reply; only that line is sent to the Claude session as an MCP "
-               "Channel event. To reach Claude without ending your turn, call the "
-               "`antiphon_send` tool instead: it delivers immediately, so Claude can start "
-               "working while you carry on, and `antiphon_read` picks up the answer later in "
-               "the same turn. " + MULTILINE_MARKER_RULE + " "
+               "You work alongside Claude Code here. Its side is injected into "
+               "your context at the start of each turn as one page of completed "
+               "records, oldest first — project-wide awareness, not mail "
+               "addressed to you, possibly merging several Claude sessions "
+               "under one label. `has_more: true` means more is waiting: call "
+               "`antiphon_read` again, or let later turns drain it, until "
+               "`has_more: false`, whose `has_more_scope: catalogued project "
+               "sources` covers the durable catalog only when no `discovery: "
+               "building` or `discovery: degraded` line says the boundary is "
+               "incomplete. A page never carries a record older than 24 hours "
+               "before the newest record in Claude's transcripts; what that "
+               "left behind is announced on the page as `skipped:`. A page with "
+               "a replay notice re-delivers history after "
+               "an upgrade or cursor recovery and can carry duplicates until the "
+               "notice disappears. If the single next record is larger than a "
+               "page, `antiphon_read` refuses it rather than truncating "
+               "— nothing is read or marked seen — and the next "
+               "automatic prompt hook delivers it whole. "
+               + TOOL_RETRIEVAL_RULE + "\n\n"
+               "Claude's own words reach you as a user message starting with "
+               "`[Antiphon bridge] Claude:` (its Stop hook) or "
+               "`[Antiphon channel] Claude:` (a direct reply) — Claude's "
+               "words, not the user's — then `[from=<alias> id=<uuid>]`. "
+               "Reply to that peer with `antiphon_send(to=<alias>)` or "
+               "`@claude:<alias>`; a literal `from=<unnamed>` is a peer with no "
+               "name that cannot be addressed back, and with one Claude peer "
+               "live you can leave the recipient out. The id names one delivery "
+               "attempt; nothing routes by it. A Claude alias is its configured "
+               "identity, not proof that its return channel is reachable: a "
+               "refused reply is a fault `antiphon doctor` names and a restart "
+               "of that Claude session repairs. " + RECOVERY_RULE + "\n\n"
+               "To hand Claude a task, put `@claude` at the start of a line in "
+               "your reply; only that line is sent. To reach Claude without "
+               "ending your turn, call `antiphon_send`: it delivers at once and "
+               "`antiphon_read` picks up the answer later in the same turn. "
+               + MULTILINE_MARKER_RULE + " "
                + LONG_MARKER_RULE.format(tool="antiphon_send") + "\n\n"
-               "A direct send reaches one peer and is never broadcast. Write `@claude:name`, "
-               "or `antiphon_send(to=name)`, whenever more than one Claude peer is live: an "
-               "unaddressed send is refused rather than delivered to a guess. For the same "
-               "reason, use each peer's automatic alias or start every terminal with a "
-               "distinct `ANTIPHON_NAME`; a session whose identity proof failed remains "
-               "unaddressable. "
+               "A direct send reaches one peer and is never broadcast: write "
+               "`@claude:name` or `antiphon_send(to=name)` whenever more than "
+               "one Claude peer is live, because an unaddressed send is refused "
+               "rather than delivered to a guess; use each peer's automatic "
+               "alias or start every terminal with a distinct `ANTIPHON_NAME`. "
                + AUTOMATIC_PEER_IDENTITY_RULE + "\n\n"
-               "A message too large for the channel arrives as an envelope instead of the "
-               "words: a line starting with `[Antiphon attachment]` naming an absolute path "
-               "under `.antiphon/messages/`, the content's size and its SHA-256. Read that "
-               "file. It is on this same machine, in this project, and it holds the peer's "
-               "own words rather than the project's — its first line says whose, and the "
-               "content is everything after the first blank line, which is what the hash "
-               "covers: `tail -n +3 <path> | shasum -a 256`. It becomes eligible for "
-               f"removal {ATTACHMENT_TTL // 86400} days after it was written and goes on "
-               "the next hook either side runs — there is no timer, so read it rather "
-               "than assuming it waits. The two roads differ "
-               "here: your own oversized `antiphon_send` is parked the same way and its "
-               "result names the file, while an oversized `@claude` line is not parked — it "
-               "is refused, and its words travel with your visible reply through the passive "
-               "pages instead.\n")
+               "A message too large for the channel arrives as an envelope: a "
+               "`[Antiphon attachment]` line naming an absolute path under "
+               "`.antiphon/messages/`, the size and the SHA-256. Read that file "
+               "— on this same machine, in this project, holding the "
+               "peer's own words; its first line says whose, the content is "
+               "everything after the first blank line and is what the hash "
+               "covers (`tail -n +3 <path> | shasum -a 256`). It becomes "
+               f"eligible for removal {ATTACHMENT_TTL // 86400} days after it "
+               "was written, on the next hook either side runs; there is no "
+               "timer. Your own oversized `antiphon_send` is parked the same "
+               "way and its result names the file; an oversized `@claude` line "
+               "is not parked — it is refused and its words travel with "
+               "your visible reply through the passive pages.\n"
+               + SECTION_END + "\n")
 
 CLAUDE_RULE = ("\n## The Antiphon bridge\n\n"
-               "You are working alongside another agent on this project. What happens on the "
-               "other side is injected into your context at the start of each turn, as one "
-               "page of completed records, oldest first. A `has_more: true` line means more "
-               "is waiting; let later turns drain it until `has_more: false`. Its "
-               "`has_more_scope: catalogued project sources` covers the durable project "
-               "catalog only when the page has no `discovery: building` or "
-               "`discovery: degraded` line; either marker means discovery is explicitly "
-               "incomplete. That "
-               "injected context is project-wide awareness rather than mail addressed to you: "
-               "it may merge activity from several project transcripts under one Codex label, "
-               "so read it as what is happening nearby. Paging writes `<side>_pages_v4` "
-               "beside the preserved v3 sibling. During adoption, at most the v3 frontier's "
-               "last record repeats while a content anchor is established. Live and unknown "
-               "sources stay in the active lane; only a current process fingerprint can "
-               "prove a source dead, and mixed backlog alternates whole pages between active "
-               "and dead after successful delivery. Candidate retirement is never a hook "
-               "side effect: `antiphon sources compact` explicitly retires only aged, gone "
-               "sources every relevant v4 reader proves consumed. Hooks never retire "
-               "candidates. " + TOOL_RETRIEVAL_RULE + "\n\n"
-               "Events that come directly from that agent are marked "
-               "`<channel source=\"antiphon\" sender=\"codex\" sender_kind=\"agent\" "
-               "sender_alias=\"...\">`; ordinary events "
-               "are the words of the Codex agent, not of the human user. Use the "
-               "`reply_to_codex` tool to answer them, passing `sender_alias` back "
-               "as `to` whenever it is a name rather than the literal `<unnamed>`. "
-               "A bare reply works when no Codex peer is registered, or when one "
-               "positively live automatic peer is the only candidate. It is refused "
-               "when an explicit named peer or multiple positive candidates are live, "
-               "because unnamed sessions before their first hook cannot be ruled out. "
-               "A `sender_alias` of "
-               "`<unnamed>` means that peer has no name: it cannot be answered by "
-               "name, and a bare reply reaches it only where nothing is registered "
-               "— passing `<unnamed>` as `to` is the same as leaving it out. Your "
-               "valid Claude `ANTIPHON_NAME` is also your configured identity on "
-               "outgoing bridge messages, not proof that your named return channel is "
-               "reachable. If startup warned that the channel was not acquired, run "
-               "`antiphon doctor` and restart this Claude session. If your outgoing label "
-               "carries `reply_to=<unavailable>`, do not reply to its `from` alias: that "
-               "channel belongs to a different session. An `Antiphon delivery "
-               "notice:` event is a bridge-authored diagnostic: it carries no original "
-               "message content and does not turn the sender's refusal into delivery. Before "
-               "that refusal, Antiphon makes one content-free recovery request to your exact "
-               "named socket. A current listener can restore its own endpoint; the original "
-               "words arrive only if the registry resolves again. An old or unverified "
-               "listener stays refused and may need a restart. Doctor only reports this "
-               "state; it never performs the recovery.\n\n"
-               "A reply reaches one peer and is never broadcast, and the same holds when you "
-               "open the exchange: `@codex:name` at the start of a line addresses one peer, "
-               "and an unaddressed line is refused rather than delivered to a guess. For the "
-               "same reason, use each peer's automatic alias or start every terminal with a "
-               "distinct `ANTIPHON_NAME`; a session before its first hook can still be unseen, "
-               "which is why ambiguous bare messages are refused. "
-               + AUTOMATIC_PEER_IDENTITY_RULE + " "
+               "You work alongside a Codex agent here. Its side is injected "
+               "into your context at the start of each turn as one page of "
+               "completed records, oldest first — project-wide awareness, "
+               "not mail addressed to you, possibly merging several Codex "
+               "sessions under one label. `has_more: true` means more is "
+               "waiting; later turns drain it until `has_more: false`, whose "
+               "`has_more_scope: catalogued project sources` covers the durable "
+               "catalog only when no `discovery: building` or `discovery: "
+               "degraded` line says the boundary is incomplete. A page never "
+               "carries a record older than 24 hours before the newest record "
+               "in Codex's transcripts; what that left behind is announced on "
+               "the page as `skipped:`. "
+               + TOOL_RETRIEVAL_RULE + "\n\n"
+               "Events straight from that agent are marked "
+               "`<channel source=\"antiphon\" sender=\"codex\" "
+               "sender_kind=\"agent\" sender_alias=\"...\">`; they are the "
+               "Codex agent's words, not the human user's. Answer with the "
+               "`reply_to_codex` tool, passing `sender_alias` back as `to` "
+               "when it is a name rather than the literal `<unnamed>`; a bare "
+               "reply works only while no Codex peer is registered or one "
+               "positively live automatic peer is the only candidate, and is "
+               "refused otherwise. `<unnamed>` means that peer has no name; "
+               "passing it as `to` is the same as leaving it out. Your valid "
+               "`ANTIPHON_NAME` is your configured identity on outgoing "
+               "messages, not proof that your return channel is reachable: if "
+               "startup warned that the channel was not acquired, run "
+               "`antiphon doctor` and restart this session. " + RECOVERY_RULE
+               + "\n\n"
+               "A reply reaches one peer and is never broadcast; `@codex:name` "
+               "at the start of a line addresses one peer, and an unaddressed "
+               "line is refused rather than delivered to a guess; use each "
+               "peer's automatic alias or start every terminal with a distinct "
+               "`ANTIPHON_NAME`. " + AUTOMATIC_PEER_IDENTITY_RULE + " "
                + MULTILINE_MARKER_RULE + " "
                + LONG_MARKER_RULE.format(tool="reply_to_codex") + "\n\n"
-               "A message too large for the transport arrives as an envelope instead of the "
-               "words: a line starting with `[Antiphon attachment]` naming an absolute path "
-               "under `.antiphon/messages/`, the content's size and its SHA-256. Read that "
-               "file. It is on this same machine, in this project, and it holds the Codex "
-               "agent's own words rather than the project's — its first line says whose, and "
-               "the content is everything after the first blank line, which is what the hash "
-               "covers: `tail -n +3 <path> | shasum -a 256`. It becomes eligible for "
-               f"removal {ATTACHMENT_TTL // 86400} days after it was written and goes on "
-               "the next hook either side runs — there is no timer, so read it rather "
-               "than assuming it waits. The two roads differ "
-               "here: an oversized `reply_to_codex` is parked the same way, while an "
-               "oversized `@codex` line is not parked — it is refused, and its words travel "
-               "with your visible reply through the passive pages instead.\n")
+               "A message too large for the transport arrives as an envelope: "
+               "a `[Antiphon attachment]` line naming an absolute path under "
+               "`.antiphon/messages/`, the size and the SHA-256. Read that file "
+               "— on this same machine, in this project, holding the Codex "
+               "agent's own words; its first line says whose, the content is "
+               "everything after the first blank line and is what the hash "
+               "covers (`tail -n +3 <path> | shasum -a 256`). It becomes "
+               f"eligible for removal {ATTACHMENT_TTL // 86400} days after it "
+               "was written, on the next hook either side runs; there is no "
+               "timer. An oversized `reply_to_codex` is parked the same way; an "
+               "oversized `@codex` line is not parked — it is refused and "
+               "its words travel with your visible reply through the passive "
+               "pages.\n"
+               + SECTION_END + "\n")
 
 
 class ConfigFileError(Exception):
@@ -7496,18 +7735,38 @@ def _add_hook(hooks, command, legacy_commands=None, label=None):
     return True
 
 
+def _rule_section(current):
+    """`(start, end, section)` of the Antiphon section in a rules file, or
+    None when the heading is absent. One reader for the writer and doctor: a
+    diagnostic holding its own idea of where the section ends is the drift
+    this arrangement exists to prevent."""
+    heading = SECTION_HEADING
+    start = current.find(heading)
+    if start == -1:
+        return None
+    ends = []
+    marker = current.find(SECTION_END, start + len(heading))
+    if marker != -1:
+        after = marker + len(SECTION_END)
+        ends.append(after + 1 if current[after:after + 1] == "\n" else after)
+    next_heading = current.find("\n## ", start + len(heading))
+    if next_heading != -1:
+        ends.append(next_heading)
+    end = min(ends) if ends else -1
+    section = current[start:] if end == -1 else current[start:end]
+    return start, end, section
+
+
 def _update_instructions(current, rule):
     """Adds the Antiphon section, or edits it in place if it's stale.
 
     Just checking the heading and skipping wasn't enough: when the rule text
     changed, the old text stayed put and kept telling the agent something no
     longer true."""
-    heading = SECTION_HEADING
-    start = current.find(heading)
-    if start == -1:
+    found = _rule_section(current)
+    if found is None:
         return current + rule, "added"
-    end = current.find("\n## ", start + len(heading))
-    old_section = current[start:] if end == -1 else current[start:end]
+    start, end, old_section = found
     if old_section.strip() == rule.strip():
         return current, "already up to date"
     tail = "" if end == -1 else current[end:]
@@ -7707,29 +7966,37 @@ def setup():
             "Claude MCP local permission updated",
             "Claude MCP local permission already up to date")
 
-    # --- AGENTS.md rule ---
-    agents = os.path.join(cwd, "AGENTS.md")
-    current = ""
-    if os.path.exists(agents):
-        with open(agents, encoding="utf-8") as f:
-            current = f.read()
-    new_text, status_word = _update_instructions(current, AGENTS_RULE)
-    if new_text != current:
-        with open(agents, "w", encoding="utf-8") as f:
-            f.write(new_text)
-    print(f"{'✓' if new_text != current else '·'} AGENTS.md rule {status_word}: {agents}")
+    def rules_text(path):
+        """The rules file as it is: '' when absent, None — and a recorded
+        failure — when it exists but cannot be read. The same three answers
+        `_config_state` gives doctor, so `setup` refuses the file doctor
+        names rather than aborting on it with a traceback after the hooks
+        were already written."""
+        try:
+            with open(path, encoding="utf-8") as f:
+                return f.read()
+        except FileNotFoundError:
+            return ""
+        except UnicodeDecodeError:
+            failures.append(path)
+            print(f"✗ {os.path.basename(path)}: not valid UTF-8 — fix or "
+                  "delete it, then run `antiphon setup` again", file=sys.stderr)
+        except OSError as error:
+            failures.append(path)
+            print(f"✗ {os.path.basename(path)}: could not be read "
+                  f"({error.strerror or type(error).__name__})", file=sys.stderr)
+        return None
 
-    # --- CLAUDE.md rule ---
-    claude_md = os.path.join(cwd, "CLAUDE.md")
-    current = ""
-    if os.path.exists(claude_md):
-        with open(claude_md, encoding="utf-8") as f:
-            current = f.read()
-    new_text, status_word = _update_instructions(current, CLAUDE_RULE)
-    if new_text != current:
-        with open(claude_md, "w", encoding="utf-8") as f:
-            f.write(new_text)
-    print(f"{'✓' if new_text != current else '·'} CLAUDE.md rule {status_word}: {claude_md}")
+    for name, rule in (("AGENTS.md", AGENTS_RULE), ("CLAUDE.md", CLAUDE_RULE)):
+        target = os.path.join(cwd, name)
+        current = rules_text(target)
+        if current is None:
+            continue
+        new_text, status_word = _update_instructions(current, rule)
+        if new_text != current:
+            with open(target, "w", encoding="utf-8") as f:
+                f.write(new_text)
+        print(f"{'✓' if new_text != current else '·'} {name} rule {status_word}: {target}")
 
     print("\n— One last step: Codex hooks need a one-time security approval.")
     print("  Open `codex` in this directory; approve the hook at the 'New hook - review required' prompt.")
@@ -7908,12 +8175,18 @@ def _backlog_line(key, backlog):
     if backlog is None:
         return (f"unread {key}: unknown (the cursor could not be trusted; "
                 "the next turn replays)")
-    unread, positioned, unpositioned, replay = backlog
-    line = (f"unread {key}: {unread:,} raw bytes across "
+    unread, positioned, unpositioned, replay, skipped = backlog
+    # The headline counts everything not yet delivered, the skip included:
+    # "0 raw bytes" beside 150 MB about to be dropped would be the zero the
+    # replay line was written never to claim.
+    line = (f"unread {key}: {unread + skipped:,} raw bytes across "
             f"{positioned + unpositioned} "
             f"source{'' if positioned + unpositioned == 1 else 's'}")
     if unpositioned:
         line += f"; {unpositioned} not yet positioned"
+    if skipped:
+        line += (f", of which {skipped:,} older than the "
+                 f"{PAGE_HORIZON // 3600}-hour horizon will be skipped")
     if replay:
         line += " — replaying history; `antiphon catch-up` skips it"
     return line
@@ -8188,19 +8461,22 @@ def _config_state(cwd):
     # The TOML file has no `_read_json_object` to raise for it — the writer
     # reads it with a bare `open` — so the pre-pass supplies its own bound and
     # its own reason, and the promise "every file, once, or a stated reason"
-    # covers all five.
-    path = os.path.join(cwd, CODEX_CONFIG_FILE)
-    try:
-        with open(path, encoding="utf-8") as f:
-            states[CODEX_CONFIG_FILE] = ConfigState(path, f.read(), None)
-    except FileNotFoundError:
-        states[CODEX_CONFIG_FILE] = ConfigState(path, "", None)
-    except OSError as error:
-        states[CODEX_CONFIG_FILE] = ConfigState(
-            path, None, f"could not be read "
-                        f"({error.strerror or type(error).__name__})")
-    except UnicodeDecodeError:
-        states[CODEX_CONFIG_FILE] = ConfigState(path, None, "not valid UTF-8")
+    # covers all seven.
+    # The two rules files are text too, read the same way: absent is an
+    # empty text (setup adds the section), unreadable is a stated reason.
+    for name in (CODEX_CONFIG_FILE, AGENTS_FILE, CLAUDE_MD_FILE):
+        path = os.path.join(cwd, name)
+        try:
+            with open(path, encoding="utf-8") as f:
+                states[name] = ConfigState(path, f.read(), None)
+        except FileNotFoundError:
+            states[name] = ConfigState(path, "", None)
+        except OSError as error:
+            states[name] = ConfigState(
+                path, None, f"could not be read "
+                            f"({error.strerror or type(error).__name__})")
+        except UnicodeDecodeError:
+            states[name] = ConfigState(path, None, "not valid UTF-8")
     return states
 
 
@@ -8686,6 +8962,33 @@ def _doctor_config(report, cwd, states):
             [f"[{CODEX_MCP_TABLE}]"] if not present
             else [f"`{line}`" for line in expected if line not in present])
 
+    # The rules files, against the rule this version generates. The text
+    # changes with the contract, and a section from an older version keeps
+    # teaching its agent a rule that is no longer true — measured on the
+    # maintainer's own project, a 0.3.2-era section beside a 0.4.0 install,
+    # with nothing saying so. `setup` rewrites it in place.
+    for name, rule in ((AGENTS_FILE, AGENTS_RULE), (CLAUDE_MD_FILE, CLAUDE_RULE)):
+        state = states[name]
+        if state.reason is not None:
+            report.bad(f"{name}: unreadable: {state.reason} — fix or delete "
+                       "it, then run `antiphon setup`")
+            continue
+        found = _rule_section(state.data or "")
+        if found is None:
+            report.bad(f"{name}: the Antiphon section is missing — run "
+                       "`antiphon setup`")
+        elif found[2].strip() != rule.strip():
+            # A section from before the end marker is rewritten through the
+            # next `## ` heading, notes appended to it included; said once,
+            # here, where the person decides.
+            legacy = ("" if SECTION_END in found[2] else
+                      " (a section this old has no end marker, so the rewrite "
+                      "replaces everything up to the next `## ` heading)")
+            report.bad(f"{name}: the Antiphon section is stale — run "
+                       f"`antiphon setup`{legacy}")
+        else:
+            report.ok(f"{name}: the Antiphon section is current")
+
 
 def _doctor_alias(report):
     """Through `peers.explicit_name()`, which is what the routing uses.
@@ -9040,9 +9343,12 @@ def _doctor_replay(report, cwd):
             continue
         if not backlog[3]:
             continue
-        unread = backlog[0]
+        unread, skipped = backlog[0] + backlog[4], backlog[4]
+        behind = (f", {skipped:,} of them behind the {PAGE_HORIZON // 3600}-hour "
+                  "horizon" if skipped else "")
         report.note(f"replay: the {side} reader is re-delivering history "
-                    f"({unread:,} raw bytes unread); `antiphon catch-up` skips it")
+                    f"({unread:,} raw bytes unread{behind}); `antiphon catch-up` "
+                    "skips it")
 
 
 def _doctor_sources(report, cwd):
@@ -9140,10 +9446,12 @@ CATCH_UP_SOURCES = {"claude": "codex", "codex": "claude"}
 def reader_backlog(cwd, side, cursor, cursor_state="valid"):
     """How far one side's page reader is behind, in the unit that is true.
 
-    `(unread, positioned, unpositioned, replay)`: raw transcript bytes the
-    reader has still to read across the discovered sources — each counted
-    from where `_resolve_start` says the reader will actually start, the
-    same rule the reader runs — how many of those sources start from a
+    `(unread, positioned, unpositioned, replay, skipped)`: raw transcript
+    bytes the reader has still to read across the discovered sources — each
+    counted from where `_resolve_start` says the reader will actually start
+    and the page horizon then moves it, the same rules the reader runs —
+    `skipped` being the raw bytes the horizon leaves behind; how many of
+    those sources start from a
     trusted recorded position, how many do not (placed by time, restarted at
     byte zero for a replaced generation or an offset past EOF, or never
     positioned), and the replay marker if any. Raw bytes, never pages: a
@@ -9159,7 +9467,8 @@ def reader_backlog(cwd, side, cursor, cursor_state="valid"):
     positions, since, replay = positions_for(cursor, side, cursor_state)
     kind = CATCH_UP_SOURCES[side]
     discovery = _discover_sources(cwd, kind, side, positions, since)
-    unread, positioned, unpositioned = 0, 0, 0
+    unread, positioned, unpositioned, skipped = 0, 0, 0, 0
+    horizon = _reader_horizon(cwd, kind, discovery.sources)
     for path in discovery.sources:
         opened = _open_discovered_source(path, cwd, kind)
         if isinstance(opened, SourceRefusal):
@@ -9169,12 +9478,14 @@ def reader_backlog(cwd, side, cursor, cursor_state="valid"):
             if size is None:
                 continue
             start, reason = _resolve_source_start(source, positions, since)
+            start, cut = _apply_horizon(source, start, horizon)
+            skipped += cut
             unread += max(0, size - start)
             if reason == "positioned":
                 positioned += 1
             else:
                 unpositioned += 1
-    return unread, positioned, unpositioned, replay
+    return unread, positioned, unpositioned, replay, skipped
 
 
 def catch_up(side=None):

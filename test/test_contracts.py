@@ -442,6 +442,22 @@ class ShippedContractTest(unittest.TestCase):
             self.assertTrue(answers, f"no handshake answer; stderr: {done.stderr}")
             self.assertEqual(answers[0]["result"]["serverInfo"]["version"], version)
 
+    def test_the_horizon_is_one_moment_for_the_reader_and_named_on_both_rules(self):
+        """The shipped horizon is cross-source and wall-clock bounded. The
+        README once described the abandoned per-source design, and the pin on
+        'older than 24 hours' passed on the wrong sentence."""
+        limits = section(read("README.md"), "Limits")
+        self.assertRegex(limits, r"newest complete\s+record the other side wrote in\s+any of its sources")
+        self.assertRegex(limits, r"skipped\s+whole")
+        self.assertRegex(limits, r"never later than the\s+wall clock")
+        for rule in (antiphon.AGENTS_RULE, antiphon.CLAUDE_RULE):
+            self.assertIn("`skipped:`", rule,
+                          "the page's own word, so an agent seeing it knows what it is")
+            self.assertRegex(rule, r"older than 24 hours before the newest record "
+                                   r"in (Claude|Codex)'s transcripts")
+            self.assertTrue(rule.rstrip("\n").endswith(antiphon.SECTION_END),
+                            "the generated section closes itself")
+
     def test_paged_context_limits_match_code(self):
         """Every number the README states about the pull path is read back off
         the constant that enforces it, and the retired cuts are gone from both
@@ -450,6 +466,8 @@ class ShippedContractTest(unittest.TestCase):
         self.assertEqual(antiphon.PAGE_BUDGET, 8_000)
         self.assertEqual(antiphon.EVENT_LIMIT, 40)
         self.assertEqual(antiphon.RECENT_FILES, 3)
+        self.assertEqual(antiphon.PAGE_HORIZON, 24 * 3600)
+        self.assertEqual(antiphon.LOOKBACK, 6 * 3600)
         self.assertEqual(antiphon.PAGE_CURSOR_VERSION, 3)
         for side in ("claude", "codex"):
             self.assertEqual(antiphon.page_cursor_key(side), side + "_pages")
@@ -472,7 +490,11 @@ class ShippedContractTest(unittest.TestCase):
                 ("the catalog hook batch",
                  (str(antiphon.CATALOG_BATCH), "candidate", "records", "per", "hook")),
                 ("the direct-channel cap",
-                 (str(antiphon.MAX_CHANNEL_BYTES // 1024), "KiB"))):
+                 (str(antiphon.MAX_CHANNEL_BYTES // 1024), "KiB")),
+                ("the page horizon",
+                 ("older", "than", str(antiphon.PAGE_HORIZON // 3600), "hours")),
+                ("the new-reader lookback",
+                 (str(antiphon.LOOKBACK // 3600), "hours", "back"))):
             self.assertRegex(limits, r"\s+".join(map(re.escape, words)), what)
         self.assertRegex(
             limits, r"(?i)8,000 UTF-8 bytes[^.]*measured[^.]*not a\s+permanent",
@@ -1115,6 +1137,47 @@ class IdentityPrivacyContractTest(unittest.TestCase):
         register = register[register.index("def register_peer("):]
         register = register[:register.index("\ndef ")]
         self.assertIn('"fingerprint_field": "process_birth"', register)
+
+    def test_the_agent_surfaces_stay_small(self):
+        """Every byte here is paid on every turn (the rules) or every session
+        (the instructions), and the host truncates a long instructions
+        string. Measured before the rewrite: 7,354 / 8,120 / ~6,000 bytes;
+        after it 4,740 / 5,338 / 3,183. The contract facts the tests around
+        this one pin fill roughly 4.5 KB on their own, so the ceilings sit
+        just above the rewrite rather than at the 3,000 the campaign aimed
+        for; they exist so the surfaces cannot regrow unnoticed. The
+        instructions are measured as the collapsed source slice, a few bytes
+        over the string itself (quotes and escapes)."""
+        node = read("lib", "channel.mjs")
+        start = node.index("    instructions:")
+        end = node.index("\n  },\n);", start)
+        channel = re.sub(r'"\s*\+\s*\n\s*"', "", node[start:end])
+        for where, text, ceiling in (("CLAUDE_RULE", antiphon.CLAUDE_RULE, 5_000),
+                                     ("AGENTS_RULE", antiphon.AGENTS_RULE, 5_500),
+                                     ("channel instructions", channel, 3_500)):
+            self.assertLessEqual(len(text.encode("utf-8")), ceiling,
+                                 f"{where}: {len(text.encode('utf-8'))} bytes")
+
+    def test_the_token_entry_names_what_it_measured_and_what_it_reversed(self):
+        """The horizon reverses one documented sentence — repeat, never skip
+        — for records beyond it, and the entry has to say so beside the
+        measurement, or the next reader files the skip as a bug."""
+        entry = section(read("BACKLOG.md"),
+                        "P1 — Token cost of the passive page and the static surfaces (fixed)")
+        self.assertIsNotNone(entry, "the token entry is gone")
+        for phrase in ("skipped:", "24 hours", "external_agent_tool_call",
+                       "isCompactSummary", "codex_internal_context",
+                       "AGENTS.md instructions for", "Request interrupted by user",
+                       "more than 400 pages", "20 pages",
+                       "never delivers a record older than", "reverses",
+                       "antiphon catch-up", "ceilings pinned",
+                       "section is missing or differs"):
+            self.assertIn(phrase, entry, phrase)
+        self.assertEqual(antiphon.PAGE_HORIZON // 3600, 24,
+                         "the entry's 24 hours is the constant's")
+        limits = section(read("README.md"), "Limits")
+        self.assertRegex(limits, r"(?i)skipped:", "README §Limits names the skip line")
+        self.assertRegex(read("README.md"), r"(?i)never rendered as either agent's speech")
 
     def test_the_socket_path_is_never_unlinked_after_a_close(self):
         """`close()` removes the socket file the server bound. An explicit

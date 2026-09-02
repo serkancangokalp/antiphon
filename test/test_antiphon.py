@@ -2388,13 +2388,155 @@ class AntiphonTest(unittest.TestCase):
                                "environment_context", "ide_opened_file",
                                "command-name", "command-message",
                                "local-command-stdout", "bash-input",
-                               "bash-stdout")
+                               "bash-stdout", "codex_internal_context")
         self.assertEqual(sorted(every_codex_wrapper),
                          sorted(antiphon.CODEX_HOST_WRAPPERS),
                          "CODEX_HOST_WRAPPERS changed without this test being updated")
         for tag in every_codex_wrapper:
             text = "<%s>host wrote this</%s>" % (tag, tag)
             self.assertEqual(self._codex_user_texts(text), [], tag)
+
+    @staticmethod
+    def _codex_line(role, text, second=0):
+        return json.dumps({"type": "response_item",
+                           "timestamp": f"2026-08-30T10:00:{second:02d}.000Z",
+                           "payload": {"type": "message", "role": role,
+                                       "content": [{"type": "input_text" if role == "user"
+                                                    else "output_text", "text": text}]}})
+
+    @staticmethod
+    def _codex_events_for(lines):
+        with patch.object(antiphon, "codex_rollout_files", return_value=["r.jsonl"]), \
+             patch.object(antiphon, "read_records", side_effect=_as_records(lines)):
+            events, _ = antiphon.codex_events("/tmp/project")
+            return [(e.kind, e.text, e.public_id) for e in events]
+
+    def test_codex_goal_continuation_is_a_host_record(self):
+        """The ChatGPT app's goal continuation, measured 2026-09-02: 133
+        records, 931 KB, every one host-written, reaching Claude's page as
+        `To Codex:`. A tag, so it joins the set; a whole tag name, as every
+        other wrapper."""
+        self.assertIn("codex_internal_context", antiphon.CODEX_HOST_WRAPPERS)
+        self.assertTrue(antiphon._is_host_record(
+            '<codex_internal_context source="goal">\nContinue working toward '
+            "the active thread goal.", antiphon.CODEX_WRAPPER_OPENING))
+        self.assertFalse(antiphon._is_host_record(
+            "<codex_internal_contexts> is a word", antiphon.CODEX_WRAPPER_OPENING))
+
+    def test_codex_agents_md_injection_is_a_host_record(self):
+        """Codex injects the project's AGENTS.md as its first user message —
+        the bridge's own rule relayed back to the other side, 8 KB a session.
+        Both halves are required: a heading alone could be a person's document
+        and a fence alone could be quoted."""
+        block = ("# AGENTS.md instructions for /Users/x/project\n\n"
+                 "<INSTRUCTIONS>\n\n## The Antiphon bridge\n...\n</INSTRUCTIONS>\n"
+                 "<environment_context>\n  <cwd>/Users/x/project</cwd>\n"
+                 "</environment_context>")
+        self.assertTrue(antiphon._is_codex_host_block(block))
+        self.assertFalse(antiphon._is_codex_host_block(
+            "# AGENTS.md instructions for my talk\n\nslides"))
+        self.assertFalse(antiphon._is_codex_host_block(
+            "please read <INSTRUCTIONS> in the doc"))
+        self.assertFalse(antiphon._is_codex_host_block(""))
+        self.assertFalse(antiphon._is_codex_host_block(None))
+        self.assertEqual(self._codex_events_for([self._codex_line("user", block)]), [])
+
+    def test_codex_external_agent_relays_are_filtered_whole(self):
+        """The ChatGPT app records an external agent's tool traffic — Claude
+        Code's own Bash and Read calls, when Claude runs inside the app — as
+        assistant messages in the Codex rollout. Measured 2026-09-02: 8,936
+        records, 11 MB, rendered as Codex speech. Rendered as tool lines instead,
+        1,022 of them sat inside one day's horizon on the live project. Both
+        shapes are that agent's own activity, already in its own transcript:
+        filtered whole."""
+        rendered = self._codex_events_for([
+            self._codex_line("assistant",
+                             "[external_agent_tool_call: Bash]\ndescription: list\n"
+                             "command: ls -la /secret\n[/external_agent_tool_call]", 1),
+            self._codex_line("assistant",
+                             "[external_agent_tool_result]\ntotal 0\n"
+                             "SECRET-OUTPUT\n[/external_agent_tool_result]", 2),
+            self._codex_line("assistant", "Plain words from Codex.", 3),
+            self._codex_line("user",
+                             '<codex_internal_context source="goal">\nGOAL-SECRET', 4),
+            self._codex_line("user", "a person typed this", 5),
+        ])
+        self.assertEqual(rendered, [
+            ("codex", "Plain words from Codex.", None),
+            ("you", "a person typed this", None),
+        ], "a relay is the other agent's own activity: filtered whole")
+        joined = "\n".join(text for _kind, text, _id in rendered)
+        for secret in ("ls -la", "SECRET-OUTPUT", "GOAL-SECRET", "external agent"):
+            self.assertNotIn(secret, joined)
+
+    def test_the_relay_predicate_is_exact_about_its_shape(self):
+        self.assertEqual(antiphon._external_agent_relay(
+            "[external_agent_tool_call: mcp__antiphon__reply_to_codex]\ninput: {}"),
+            ("call", "mcp__antiphon__reply_to_codex"))
+        self.assertEqual(antiphon._external_agent_relay(
+            "[external_agent_tool_call: Bash]"), ("call", "Bash"))
+        self.assertEqual(antiphon._external_agent_relay(
+            "[external_agent_tool_result]\nok"), ("result", None))
+        self.assertEqual(antiphon._external_agent_relay(
+            "[external_agent_tool_result]"), ("result", None))
+        for text in ("[external_agent_tool_call: ]\nx", "[external_agent_tool_call:Bash]",
+                     "external_agent_tool_call: Bash", "[external_agent_tool_call: Bad Name]",
+                     " [external_agent_tool_call: Bash]", "[external_agent_tool_result]x",
+                     "", None):
+            self.assertIsNone(antiphon._external_agent_relay(text), repr(text))
+
+    def test_a_codex_stop_hook_never_pushes_a_marker_out_of_a_relay(self):
+        """A relayed external-agent call can carry `@claude` at a line start —
+        it is the other agent's own command text. The Stop reader must not
+        read it as Codex addressing anyone."""
+        with tempfile.TemporaryDirectory() as project:
+            path = os.path.join(project, "rollout.jsonl")
+            with open(path, "w", encoding="utf-8") as stream:
+                stream.write(json.dumps({"type": "event_msg", "payload": {
+                    "type": "task_started", "turn_id": "t1"}}) + "\n")
+                stream.write(self._codex_line(
+                    "assistant", "[external_agent_tool_call: Bash]\ncommand: echo "
+                    "'@claude hi'\n[/external_agent_tool_call]", 1) + "\n")
+                stream.write(self._codex_line("assistant", "@claude real marker", 2) + "\n")
+            text, key = antiphon._codex_turn(path, "t1")
+        self.assertEqual(text, "@claude real marker")
+        self.assertEqual(key, "t1")
+
+    @staticmethod
+    def _claude_events_for(lines):
+        with patch.object(antiphon, "claude_transcripts", return_value=["t.jsonl"]), \
+             patch.object(antiphon, "read_records", side_effect=_as_records(lines)):
+            events, _ = antiphon.claude_events("/tmp/project")
+            return [(e.kind, e.text) for e in events]
+
+    @staticmethod
+    def _claude_user_line(text, second=0, **record):
+        return json.dumps(dict({"type": "user",
+                                "timestamp": f"2026-08-30T10:00:{second:02d}.000Z",
+                                "message": {"content": text}}, **record))
+
+    def test_claude_compact_summaries_and_interruptions_are_host_records(self):
+        """A compact summary is the host's own restatement of context —
+        measured 2026-09-02: six records, 104 KB, 17 KB each, always an
+        oversized record — and it is host-set, not text-shaped. The two
+        interruption markers are exact literals nobody typed. Equality, never
+        a prefix: a person's line that begins the same way stays a person's."""
+        self.assertEqual(antiphon.CLAUDE_HOST_LITERALS,
+                         ("[Request interrupted by user]",
+                          "[Request interrupted by user for tool use]"))
+        rendered = self._claude_events_for([
+            self._claude_user_line("This session is being continued from a "
+                                   "previous conversation. SUMMARY-SECRET", 1,
+                                   isCompactSummary=True),
+            self._claude_user_line("[Request interrupted by user]", 2),
+            self._claude_user_line("[Request interrupted by user for tool use]", 3),
+            self._claude_user_line("[Request interrupted by user] and more", 4),
+            self._claude_user_line("a person typed this", 5),
+        ])
+        self.assertEqual(rendered, [
+            ("you", "[Request interrupted by user] and more"),
+            ("you", "a person typed this"),
+        ])
 
     def test_an_attachment_is_not_a_host_record(self):
         """`<image>` was measured on real Codex rollouts and is a person's
@@ -3879,6 +4021,275 @@ class ToolInvocationRetrievalTest(unittest.TestCase):
         self.assertEqual(json.loads(out.getvalue())["result"], answer)
 
 
+class PageHorizonTest(unittest.TestCase):
+    """A reader never lags a source by more than a day of that source's own
+    clock. Measured on the live project: a Claude reader more than 400 pages
+    behind, every page 31 August; bounded to 24 hours, 21 pages. Relative to
+    the source's newest record, not to the wall clock: an overnight run is
+    still there in the morning, and a source that stopped days ago yields its
+    last day rather than nothing or everything.
+    """
+
+    SID = "1d5a03e0-0548-4339-87c3-45c5dbf7e9d7"
+
+    def _rollout(self, times, project=None, filler=0):
+        """One real Codex rollout with an assistant record at each ISO time;
+        `filler` pads every message so a window can span several pages."""
+        root = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, root, ignore_errors=True)
+        path = os.path.join(root, f"rollout-2026-08-28T00-00-00-{self.SID}.jsonl")
+        with open(path, "w", encoding="utf-8") as stream:
+            stream.write(json.dumps({"timestamp": times[0], "type": "session_meta",
+                                     "payload": {"cwd": project or "/tmp/project"}})
+                         + "\n")
+            for index, when in enumerate(times):
+                stream.write(json.dumps({
+                    "timestamp": when, "type": "response_item",
+                    "payload": {"type": "message", "role": "assistant",
+                                "content": [{"type": "output_text",
+                                             "text": f"message {index}"
+                                                     + (" x" * filler)}]}}) + "\n")
+        return path
+
+    @staticmethod
+    def _hourly(hours):
+        return [f"2026-08-{28 + hour // 24:02d}T{hour % 24:02d}:00:00.000Z"
+                for hour in range(hours)]
+
+    def _drain(self, project, path, positions):
+        pages = []
+        with patch.object(antiphon, "codex_rollout_files", return_value=[path]):
+            while len(pages) < 50:
+                text, advance, _ = antiphon.build_summary(
+                    project, "claude", positions, None, None)
+                if not text:
+                    break
+                pages.append(text)
+                sources = dict(positions)
+                for sid, raw in advance.sources.items():
+                    sources[sid] = dict(raw)
+                positions = antiphon.RuntimePositions(
+                    sources, adopting={}, next_lane=advance.next_lane)
+                if not advance.has_more:
+                    break
+        return pages
+
+    def _at_byte_zero(self, path):
+        return antiphon.RuntimePositions(
+            {self.SID: {"gen": antiphon.source_generation(path),
+                        "offset": 0, "anchor": None}})
+
+    def test_a_positioned_reader_skips_what_is_older_than_a_day_of_the_source(self):
+        # Three days of records, one per hour; the reader is positioned at the
+        # very start. Only the last 24 hours of the source's own clock arrive.
+        with tempfile.TemporaryDirectory() as project:
+            path = self._rollout(self._hourly(72), project, filler=300)
+            pages = self._drain(project, path, self._at_byte_zero(path))
+        joined = "\n".join(pages)
+        self.assertNotIn("message 46 ", joined, "older than a day of the newest")
+        self.assertIn("message 47 ", joined, "exactly 24 hours before the newest")
+        self.assertIn("message 71 ", joined)
+        self.assertGreater(len(pages), 1, "the window spans pages, so 'once' means something")
+        self.assertRegex(pages[0], r"skipped: [\d,]+ raw bytes of Codex activity "
+                                   r"older than 24 hours in 1 source\(s\) — not "
+                                   r"delivered; the transcripts keep it")
+        self.assertEqual(sum("skipped:" in page for page in pages), 1,
+                         "announced once, where it happened")
+
+    def test_a_source_within_the_horizon_is_never_skipped(self):
+        with tempfile.TemporaryDirectory() as project:
+            path = self._rollout(self._hourly(23), project)
+            pages = self._drain(project, path, self._at_byte_zero(path))
+        joined = "\n".join(pages)
+        self.assertIn("message 0\n", joined + "\n")
+        self.assertNotIn("skipped:", joined)
+
+    def test_the_skip_lands_on_a_record_boundary_the_anchor_can_prove(self):
+        path = self._rollout(self._hourly(72))
+        with antiphon._PathSource(path, "codex") as source:
+            horizon = antiphon._source_newest_time(source) - antiphon.PAGE_HORIZON
+            start, skipped = antiphon._apply_horizon(source, 0, horizon)
+            self.assertGreater(skipped, 0)
+            record = source.first_record_at(start)
+            self.assertEqual(record[0], start, "a boundary")
+            self.assertIn("message 47", record[2])
+            self.assertIsNotNone(source.anchor_at(start))
+            self.assertEqual(antiphon._apply_horizon(source, start, horizon), (start, 0),
+                             "idempotent")
+            self.assertEqual(antiphon._apply_horizon(source, 0, None), (0, 0),
+                             "no horizon, nothing moves")
+
+    def test_first_record_at_reads_boundaries_and_mid_lines_alike(self):
+        path = self._rollout(self._hourly(3))
+        with antiphon._PathSource(path, "codex") as source:
+            first = source.first_record_at(0)
+            self.assertEqual(first[0], 0)
+            self.assertIn("session_meta", first[2])
+            second = source.first_record_at(first[1])
+            self.assertEqual(second[0], first[1], "a boundary starts the record there")
+            inside = source.first_record_at(first[1] + 5)
+            self.assertEqual(inside[0], second[1], "an offset inside a line skips to the next")
+            self.assertIsNone(source.first_record_at(source.size()))
+            self.assertIsNone(source.first_record_at(source.size() + 10))
+
+    def test_bisection_agrees_with_the_linear_scan_on_a_large_source(self):
+        # Enough bytes that the bisecting road is taken; the answer must be the
+        # linear scan's answer, record for record — also with one record near
+        # the boundary stamped out of order, which the slack absorbs.
+        times = [f"2026-08-{28 + hour // 24:02d}T{hour % 24:02d}:{minute:02d}:00.000Z"
+                 for hour in range(72) for minute in range(0, 60, 2)]
+        boundary = times.index("2026-08-30T00:00:00.000Z")
+        # One record stamped after the boundary sits thirty records before
+        # it: the bisection's monotone view steps over it, the slack must not.
+        times[boundary - 30] = "2026-08-30T00:00:30.000Z"
+        path = self._rollout(times, filler=250)
+        with antiphon._PathSource(path, "codex") as source:
+            self.assertGreater(source.size(), antiphon.HORIZON_BISECT_ABOVE)
+            newest = antiphon._source_newest_time(source)
+            horizon = newest - antiphon.PAGE_HORIZON
+            linear = next(start for start, _end, line in source.read_records(0)
+                          if (antiphon._record_time(line) or 0) >= horizon)
+            self.assertEqual(antiphon._first_offset_at_or_after(source, horizon, 0),
+                             linear)
+
+    def test_an_unparseable_newest_record_disables_the_horizon(self):
+        path = self._rollout(self._hourly(72))
+        with open(path, "a", encoding="utf-8") as stream:
+            stream.write('{"type": "event_msg", "payload": {}}\n')
+        with antiphon._PathSource(path, "codex") as source:
+            self.assertIsNone(antiphon._source_newest_time(source))
+            self.assertIsNone(antiphon._reader_horizon("/tmp/project", "codex", [path]))
+            self.assertEqual(antiphon._apply_horizon(source, 0, None), (0, 0))
+        self.assertIsNone(antiphon._record_time("not json"))
+        self.assertIsNone(antiphon._record_time('{"timestamp": ""}'))
+        self.assertIsNone(antiphon._record_time("[1, 2]"))
+
+    def test_the_horizon_is_the_other_sides_newest_record_across_sources(self):
+        """Per source, thirty old rollouts on the live project each yielded
+        their own last day — a hundred pages of days-old tool lines. The
+        horizon is one moment for the whole reader: a day before the newest
+        record the other side wrote anywhere, so a source that stopped days
+        ago is entirely behind it."""
+        old = self._hourly(24)                                   # 08-28
+        new = [f"2026-09-01T{hour:02d}:00:00.000Z" for hour in range(6)]
+        live_sid = "2e6b14f1-1659-544a-98d4-56d6eca8fa48"
+        with tempfile.TemporaryDirectory() as project:
+            stale = self._rollout(old, project)
+            live = self._rollout(new, project)
+            renamed = live.replace(self.SID, live_sid)
+            os.rename(live, renamed)
+            positions = antiphon.RuntimePositions({
+                self.SID: {"gen": antiphon.source_generation(stale),
+                           "offset": 0, "anchor": None},
+                live_sid: {"gen": antiphon.source_generation(renamed),
+                           "offset": 0, "anchor": None}})
+            with patch.object(antiphon, "codex_rollout_files",
+                              return_value=[stale, renamed]):
+                text, _advance, _ = antiphon.build_summary(
+                    project, "claude", positions, None, None)
+        self.assertIn("skipped:", text)
+        self.assertIn("in 1 source(s)", text, "the stale source, whole; the live one untouched")
+        self.assertNotIn("message 23\n", text + "\n", "nothing of the stale source")
+        self.assertIn("message 0\n", text + "\n", "all of the live source")
+        self.assertIn("message 5\n", text + "\n")
+
+    def test_status_counts_what_the_horizon_will_skip(self):
+        with tempfile.TemporaryDirectory() as project:
+            path = self._rollout(self._hourly(72), project)
+            cursor = {"claude_pages_v4": {"v": 4, "sources": {
+                self.SID: {"gen": antiphon.source_generation(path),
+                           "offset": 0, "anchor": None}},
+                "adopting_v3": {}, "next_lane": "active"}}
+            with patch.object(antiphon, "codex_rollout_files", return_value=[path]):
+                unread, positioned, unpositioned, replay, skipped = \
+                    antiphon.reader_backlog(project, "claude", cursor)
+        self.assertGreater(skipped, 0)
+        self.assertGreater(unread, 0)
+        self.assertEqual(positioned, 1)
+        line = antiphon._backlog_line(
+            "claude_pages", (unread, positioned, unpositioned, replay, skipped))
+        # The headline counts the skip too: "0 raw bytes" beside megabytes
+        # about to be dropped is the zero the replay line never claims.
+        self.assertIn(f"unread claude_pages: {unread + skipped:,} raw bytes across "
+                      f"1 source, of which {skipped:,} older than the 24-hour "
+                      "horizon will be skipped", line)
+        self.assertNotIn("horizon", antiphon._backlog_line(
+            "claude_pages", (unread, positioned, unpositioned, replay, 0)))
+
+    def test_a_future_stamped_record_cannot_move_the_horizon_past_now(self):
+        """One record stamped in the future — a clock set forward and put
+        back, an edited transcript — would otherwise put the horizon past
+        everything real on that side, for every source, permanently. The
+        source's clock moves the horizon backwards only."""
+        now = time.time()
+        times = [time.strftime("%Y-%m-%dT%H:%M:%S.000Z", time.gmtime(now - 7200 + 600 * i))
+                 for i in range(6)]
+        times.append("2030-01-01T00:00:00.000Z")
+        with tempfile.TemporaryDirectory() as project:
+            path = self._rollout(times, project)
+            horizon = antiphon._reader_horizon(project, "codex", [path])
+            self.assertGreaterEqual(horizon, now - antiphon.PAGE_HORIZON)
+            self.assertLessEqual(horizon, now + 60 - antiphon.PAGE_HORIZON,
+                                 "bounded by the wall clock, not by 2030")
+            pages = self._drain(project, path, self._at_byte_zero(path))
+        joined = "\n".join(pages)
+        self.assertIn("message 0\n", joined + "\n", "two hours old is inside the horizon")
+        self.assertIn("message 6\n", joined + "\n")
+        self.assertNotIn("skipped:", joined)
+
+    def test_a_page_that_only_skipped_still_says_so_and_moves_the_cursor(self):
+        """An old backlog whose whole in-horizon tail is host bookkeeping:
+        nothing visible to deliver, yet the cursor moves past days of
+        records. The page says so — never a silent advance — and the
+        position it leaves is anchored and provable."""
+        with tempfile.TemporaryDirectory() as project:
+            path = self._rollout(self._hourly(30), project)
+            with open(path, "a", encoding="utf-8") as stream:
+                for hour in range(6):
+                    stream.write(json.dumps({
+                        "timestamp": f"2026-09-01T{hour:02d}:00:00.000Z",
+                        "type": "response_item",
+                        "payload": {"type": "message", "role": "developer",
+                                    "content": [{"type": "input_text",
+                                                 "text": "host bookkeeping"}]}})
+                        + "\n")
+            with patch.object(antiphon, "codex_rollout_files", return_value=[path]):
+                text, advance, count = antiphon.build_summary(
+                    project, "claude", self._at_byte_zero(path), None, None)
+            self.assertIn("skipped:", text)
+            self.assertNotIn("message ", text)
+            self.assertNotIn("host bookkeeping", text)
+            self.assertEqual(count, 0)
+            self.assertFalse(advance.has_more)
+            position = advance.sources[self.SID]
+            self.assertTrue(antiphon._valid_anchored_position(position), position)
+            with antiphon._PathSource(path, "codex") as source:
+                self.assertEqual(position["offset"], source.complete_prefix_end())
+
+    def test_a_first_record_without_a_timestamp_does_not_switch_the_horizon_off(self):
+        """Measured: 101 of 526 Claude transcripts end on a bookkeeping record
+        with no timestamp, and a reader whose frontier lands on one used to
+        get one unbounded page."""
+        path = self._rollout(self._hourly(72))
+        with open(path, encoding="utf-8") as stream:
+            body = stream.read()
+        with open(path, "w", encoding="utf-8") as stream:
+            stream.write('{"type": "event_msg", "payload": {}}\n' + body)
+        with antiphon._PathSource(path, "codex") as source:
+            horizon = antiphon._source_newest_time(source) - antiphon.PAGE_HORIZON
+            start, skipped = antiphon._apply_horizon(source, 0, horizon)
+            self.assertGreater(skipped, 0)
+            self.assertIn("message 47", source.first_record_at(start)[2])
+
+    def test_a_degraded_page_without_records_still_announces_the_skip(self):
+        degraded = antiphon.Discovery((), "degraded", 0, 1, 0,
+                                      "some project sources could not be proved")
+        text, _advance, _count = antiphon._build_page(
+            [], {}, "claude", discovery=degraded, skipped={self.SID: 4096})
+        self.assertIn("discovery: degraded", text)
+        self.assertRegex(text, r"skipped: 4,096 raw bytes of Codex activity")
+
+
 class LiveCodexTargetTest(unittest.TestCase):
     """A bare `@codex` push goes to a *running* Codex session, never to the
     newest transcript file. Measured on Codex 0.151.0: a thread opened at
@@ -4280,24 +4691,29 @@ class CatchUpTest(unittest.TestCase):
             with self.subTest(case="numeric v1 before its first page"):
                 antiphon.write_cursor(project, {"claude_seen": future}, "claude")
                 cursor, state = antiphon._read_cursor_state(project, "claude")
-                unread, positioned, unpositioned, replay = antiphon.reader_backlog(
+                unread, positioned, unpositioned, replay, _skipped = antiphon.reader_backlog(
                     project, "claude", cursor, state)
                 self.assertEqual(unread, total - size, "only the record at/after the v1 time")
                 self.assertEqual((positioned, unpositioned, replay), (0, 1, "legacy_upgrade"))
 
+            # From here on the page horizon is part of the start rule too: the
+            # 2030 record makes everything before it older than a day of the
+            # source's newest, so a byte-zero restart reads `total` bytes as
+            # `skipped` + `unread`, and only the 2030 record is unread.
             with self.subTest(case="offset past EOF restarts at byte zero"):
-                unread, positioned, unpositioned, _ = self.backlog_after(project, {
+                unread, positioned, unpositioned, _, skipped = self.backlog_after(project, {
                     "v": 3, "sources": {self.SID_CODEX: {"gen": gen, "offset": total + 500}}})
-                self.assertEqual((unread, positioned, unpositioned), (total, 0, 1))
+                self.assertEqual((unread + skipped, positioned, unpositioned), (total, 0, 1))
+                self.assertEqual(skipped, size, "the horizon leaves the 2026 records behind")
 
             with self.subTest(case="generation mismatch restarts at byte zero"):
-                unread, positioned, unpositioned, _ = self.backlog_after(project, {
+                unread, positioned, unpositioned, _, skipped = self.backlog_after(project, {
                     "v": 3, "sources": {self.SID_CODEX: {"gen": "other:gen:0000", "offset": 10}}})
-                self.assertEqual((unread, positioned, unpositioned), (total, 0, 1))
+                self.assertEqual((unread + skipped, positioned, unpositioned), (total, 0, 1))
 
             with self.subTest(case="an anchored v4 position counts the remainder"):
                 first_end = list(antiphon.read_records(codex))[0][1]
-                unread, positioned, unpositioned, _ = self.backlog_after(
+                unread, positioned, unpositioned, _, skipped = self.backlog_after(
                     project, {
                         "v": 4,
                         "sources": {self.SID_CODEX: {
@@ -4308,13 +4724,13 @@ class CatchUpTest(unittest.TestCase):
                         "adopting_v3": {},
                         "next_lane": "active",
                     }, key=antiphon.anchored_page_cursor_key("claude"))
-                self.assertEqual((unread, positioned, unpositioned),
+                self.assertEqual((unread + skipped, positioned, unpositioned),
                                  (total - first_end, 1, 0))
 
             with self.subTest(case="a malformed page key recovers from byte zero: the whole file"):
-                unread, positioned, unpositioned, replay = self.backlog_after(
+                unread, positioned, unpositioned, replay, skipped = self.backlog_after(
                     project, {"v": 999, "sources": {"x": "bad"}})
-                self.assertEqual((unread, positioned, unpositioned, replay),
+                self.assertEqual((unread + skipped, positioned, unpositioned, replay),
                                  (total, 0, 1, "cursor_recovery"))
 
             with self.subTest(case="an unreadable cursor file is unknown, never zero"):
@@ -4436,6 +4852,114 @@ class DoctorTest(unittest.TestCase):
         return code, out.getvalue()
 
     # ---- the explicit configuration-only repair mode ----
+
+    def test_doctor_names_a_stale_rule_section(self):
+        """The rule text changes with the contract; a project whose CLAUDE.md
+        still carries an older section teaches its agent a rule that is no
+        longer true, and nothing said so — measured on the maintainer's own
+        project, a 0.3.2-era section beside a 0.4.0 install."""
+        project = self.project()
+        self.set_up(project)
+        with open(os.path.join(project, "CLAUDE.md"), "w", encoding="utf-8") as f:
+            f.write("# Mine\n\n## The Antiphon bridge\n\nold words\n\n## After\n\nkept\n")
+        code, printed = self.run_doctor(project)
+        self.assertEqual(code, 1)
+        line = self.line_for(printed, "CLAUDE.md")
+        self.assertTrue(line.startswith("✗ CLAUDE.md: the Antiphon section is stale"), line)
+        self.assertIn("run `antiphon setup`", line)
+        self.assertTrue(self.line_for(printed, "AGENTS.md").startswith("✓"), printed)
+
+    def test_doctor_names_a_missing_rule_section(self):
+        project = self.project()
+        self.set_up(project)
+        os.unlink(os.path.join(project, "AGENTS.md"))
+        code, printed = self.run_doctor(project)
+        self.assertEqual(code, 1)
+        line = self.line_for(printed, "AGENTS.md")
+        self.assertTrue(line.startswith("✗ AGENTS.md: the Antiphon section is missing"), line)
+        self.assertIn("run `antiphon setup`", line)
+
+    def test_doctor_names_an_unreadable_rules_file(self):
+        project = self.project()
+        self.set_up(project)
+        with open(os.path.join(project, "AGENTS.md"), "wb") as f:
+            f.write(b"## The Antiphon bridge\n\xff\xfe\n")
+        code, printed = self.run_doctor(project)
+        self.assertEqual(code, 1)
+        line = self.line_for(printed, "AGENTS.md")
+        self.assertTrue(line.startswith("✗ AGENTS.md: unreadable: not valid UTF-8"), line)
+        self.assertIn("fix or delete it, then run `antiphon setup`", line)
+
+    def test_setup_refuses_an_unreadable_rules_file_and_finishes_the_rest(self):
+        """Doctor's advice is "fix or delete it, then run `antiphon setup`";
+        setup read the same file with a bare `open` and died on it with a
+        traceback after the hooks were already written."""
+        project = self.project()
+        with open(os.path.join(project, "AGENTS.md"), "wb") as f:
+            f.write(b"\xff\xfe")
+        err = io.StringIO()
+        with patch.object(antiphon, "project_dir", return_value=project), \
+             contextlib.redirect_stdout(io.StringIO()), \
+             contextlib.redirect_stderr(err):
+            code = antiphon.setup()
+        self.assertEqual(code, 1)
+        self.assertIn("✗ AGENTS.md: not valid UTF-8", err.getvalue())
+        self.assertIn("run `antiphon setup` again", err.getvalue())
+        self.assertNotIn("Traceback", err.getvalue())
+        with open(os.path.join(project, "AGENTS.md"), "rb") as f:
+            self.assertEqual(f.read(), b"\xff\xfe", "left untouched")
+        with open(os.path.join(project, "CLAUDE.md"), encoding="utf-8") as f:
+            self.assertIn(antiphon.SECTION_HEADING, f.read(),
+                          "the rest of setup still ran")
+
+    def test_setup_keeps_a_persons_notes_after_the_marked_section(self):
+        """The section ends at its own marker now. Before, it ran to the
+        next `## ` heading or the end of the file, and a rewrite took the
+        notes a person had appended after it along with the stale words."""
+        stale = antiphon.AGENTS_RULE.replace("You work alongside",
+                                             "You used to work alongside")
+        current = "# Mine\n" + stale + "\nMy own notes, no heading.\n"
+        new_text, word = antiphon._update_instructions(current, antiphon.AGENTS_RULE)
+        self.assertEqual(word, "updated")
+        self.assertTrue(new_text.startswith("# Mine\n"))
+        self.assertTrue(new_text.endswith(antiphon.AGENTS_RULE
+                                          + "\nMy own notes, no heading.\n"),
+                        new_text[-200:])
+        self.assertNotIn("used to work", new_text)
+        # A person's own `## ` heading inside the section still ends it
+        # there, marker or not: the earlier boundary wins.
+        headed = ("## The Antiphon bridge\n\nold words\n\n## Mine\n\nkept\n"
+                  + antiphon.SECTION_END + "\n")
+        self.assertEqual(antiphon._rule_section(headed)[2],
+                         "## The Antiphon bridge\n\nold words\n")
+
+    def test_doctor_says_what_a_rewrite_of_an_unmarked_section_replaces(self):
+        project = self.project()
+        self.set_up(project)
+        with open(os.path.join(project, "CLAUDE.md"), "w", encoding="utf-8") as f:
+            f.write("## The Antiphon bridge\n\nold words\n\nmy notes, no heading\n")
+        _code, printed = self.run_doctor(project)
+        line = self.line_for(printed, "CLAUDE.md")
+        self.assertTrue(line.startswith("✗ CLAUDE.md: the Antiphon section is stale"), line)
+        self.assertIn("no end marker", line)
+        self.assertIn("up to the next `## ` heading", line)
+        with open(os.path.join(project, "CLAUDE.md"), "w", encoding="utf-8") as f:
+            f.write(antiphon.CLAUDE_RULE.replace("You work", "You used to work"))
+        _code, printed = self.run_doctor(project)
+        line = self.line_for(printed, "CLAUDE.md")
+        self.assertTrue(line.startswith("✗ CLAUDE.md: the Antiphon section is stale"), line)
+        self.assertNotIn("no end marker", line, "a marked section is rewritten exactly")
+
+    def test_doctor_fix_repairs_a_stale_rule_section(self):
+        project = self.project()
+        self.set_up(project)
+        with open(os.path.join(project, "CLAUDE.md"), "w", encoding="utf-8") as f:
+            f.write("## The Antiphon bridge\n\nold words\n")
+        with patch.object(antiphon, "project_dir", return_value=project), \
+             self.hermetic(project), contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(antiphon.doctor("--fix"), 0)
+        with open(os.path.join(project, "CLAUDE.md"), encoding="utf-8") as f:
+            self.assertEqual(f.read().strip(), antiphon.CLAUDE_RULE.strip())
 
     def test_doctor_fix_runs_setup_then_a_read_only_recheck(self):
         with patch.object(antiphon, "setup", return_value=0) as setup, \
@@ -5841,13 +6365,20 @@ class PagedSummaryModelTest(unittest.TestCase):
             self.event("small first record", offset=0, end=100),
             self.event(multibyte, offset=100, end=200, when=11),
         ]
+        # The widest envelope there is: a five-source skip line with a
+        # nine-digit count (measured: 126 bytes) rides on every page of a
+        # reader far behind, so the pinned overhead includes it.
+        widest_skip = {f"source-{i}": 30_000_000 for i in range(5)}
         complete = antiphon._render_page(
-            "claude", antiphon._ordered_records(events), False, None)
+            "claude", antiphon._ordered_records(events), False, None,
+            None, None, widest_skip)
         self.assertLessEqual(len(complete), antiphon.PAGE_BUDGET)
         self.assertGreater(len(complete.encode("utf-8")), antiphon.PAGE_BUDGET)
-        text, advance, count = self.page(
-            events, self.scanned(("source", "generation", 200)))
+        text, advance, count = antiphon._build_page(
+            events, self.scanned(("source", "generation", 200)), "claude",
+            skipped=widest_skip)
         self.assertLessEqual(len(text.encode("utf-8")), antiphon.PAGE_BUDGET)
+        self.assertIn("skipped: 150,000,000 raw bytes", text)
         self.assertIn("small first record", text)
         self.assertNotIn(multibyte, text)
         self.assertTrue(advance.has_more)
@@ -7504,7 +8035,7 @@ class CatalogDiscoveryTest(unittest.TestCase):
         held = {"gen": "unresolved-generation", "offset": 123}
         cursor = {"codex_pages": {"v": antiphon.PAGE_CURSOR_VERSION,
                                   "sources": {"unresolved": held}}}
-        unread, positioned, unpositioned, replay = antiphon.reader_backlog(
+        unread, positioned, unpositioned, replay, _skipped = antiphon.reader_backlog(
             self.project, "codex", cursor)
         self.assertEqual(unread, sum(os.path.getsize(path)
                                      for _sid, path in sources))
@@ -14312,28 +14843,36 @@ class SenderIdentityTest(unittest.TestCase):
                 self.assertIn("invocation only", words)
                 self.assertIn("never the tool result", words)
 
-    def test_every_agent_facing_surface_states_the_v4_retention_contract(self):
+    def test_the_v4_retention_contract_lives_in_the_documents_not_the_rules(self):
+        """The retention contract — cursor key names, the v3 sibling, lanes,
+        compaction — is an operator's and a maintainer's fact, and it was
+        costing every agent turn a paragraph it never acts on. README and
+        BACKLOG carry it in full; the three agent surfaces carry none of it,
+        deliberately, so the narrative cannot creep back into the per-turn
+        bill."""
         node = read_source("lib", "channel.mjs")
         start = node.index("    instructions:")
         end = node.index("\n  },\n);", start)
         channel = re.sub(r'"\s*\+\s*\n\s*"', "", node[start:end])
-        surfaces = {
-            "AGENTS.md rule": antiphon.AGENTS_RULE,
-            "CLAUDE.md rule": antiphon.CLAUDE_RULE,
-            "channel instructions": channel,
-            "README": read_source("README.md"),
-            "BACKLOG": read_source("BACKLOG.md"),
-        }
         required = (
             "<side>_pages_v4", "v3 sibling", "last record repeats",
             "current process fingerprint", "alternates whole pages",
             "antiphon sources compact", "hooks never retire",
         )
-        for name, surface in surfaces.items():
+        for name, surface in (("README", read_source("README.md")),
+                              ("BACKLOG", read_source("BACKLOG.md"))):
             with self.subTest(surface=name):
                 words = surface.lower()
                 for phrase in required:
                     self.assertIn(phrase, words)
+        for name, surface in (("AGENTS.md rule", antiphon.AGENTS_RULE),
+                              ("CLAUDE.md rule", antiphon.CLAUDE_RULE),
+                              ("channel instructions", channel)):
+            with self.subTest(surface=name):
+                words = surface.lower()
+                for phrase in ("<side>_pages_v4", "v3 sibling",
+                               "alternates whole pages", "hooks never retire"):
+                    self.assertNotIn(phrase, words)
 
     def test_every_agent_facing_surface_separates_claude_identity_from_reachability(self):
         """A labelled message must not make either agent infer that its reply
