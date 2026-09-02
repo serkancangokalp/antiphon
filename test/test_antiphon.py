@@ -4777,6 +4777,43 @@ class DoctorTest(unittest.TestCase):
 
     # ---- the explicit configuration-only repair mode ----
 
+    def test_doctor_names_a_stale_rule_section(self):
+        """The rule text changes with the contract; a project whose CLAUDE.md
+        still carries an older section teaches its agent a rule that is no
+        longer true, and nothing said so — measured on the maintainer's own
+        project, a 0.3.2-era section beside a 0.4.0 install."""
+        project = self.project()
+        self.set_up(project)
+        with open(os.path.join(project, "CLAUDE.md"), "w", encoding="utf-8") as f:
+            f.write("# Mine\n\n## The Antiphon bridge\n\nold words\n\n## After\n\nkept\n")
+        code, printed = self.run_doctor(project)
+        self.assertEqual(code, 1)
+        line = self.line_for(printed, "CLAUDE.md")
+        self.assertTrue(line.startswith("✗ CLAUDE.md: the Antiphon section is stale"), line)
+        self.assertIn("run `antiphon setup`", line)
+        self.assertTrue(self.line_for(printed, "AGENTS.md").startswith("✓"), printed)
+
+    def test_doctor_names_a_missing_rule_section(self):
+        project = self.project()
+        self.set_up(project)
+        os.unlink(os.path.join(project, "AGENTS.md"))
+        code, printed = self.run_doctor(project)
+        self.assertEqual(code, 1)
+        line = self.line_for(printed, "AGENTS.md")
+        self.assertTrue(line.startswith("✗ AGENTS.md: the Antiphon section is missing"), line)
+        self.assertIn("run `antiphon setup`", line)
+
+    def test_doctor_fix_repairs_a_stale_rule_section(self):
+        project = self.project()
+        self.set_up(project)
+        with open(os.path.join(project, "CLAUDE.md"), "w", encoding="utf-8") as f:
+            f.write("## The Antiphon bridge\n\nold words\n")
+        with patch.object(antiphon, "project_dir", return_value=project), \
+             self.hermetic(project), contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(antiphon.doctor("--fix"), 0)
+        with open(os.path.join(project, "CLAUDE.md"), encoding="utf-8") as f:
+            self.assertEqual(f.read().strip(), antiphon.CLAUDE_RULE.strip())
+
     def test_doctor_fix_runs_setup_then_a_read_only_recheck(self):
         with patch.object(antiphon, "setup", return_value=0) as setup, \
              patch.object(antiphon, "_doctor_readonly",

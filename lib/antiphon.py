@@ -7205,6 +7205,8 @@ CLAUDE_LOCAL_SETTINGS_FILE = os.path.join(".claude", "settings.local.json")
 CODEX_HOOKS_FILE = os.path.join(".codex", "hooks.json")
 CODEX_CONFIG_FILE = os.path.join(".codex", "config.toml")
 MCP_CONFIG_FILE = ".mcp.json"
+AGENTS_FILE = "AGENTS.md"
+CLAUDE_MD_FILE = "CLAUDE.md"
 
 CODEX_MCP_TABLE = "mcp_servers.antiphon"
 CODEX_MCP_ENV_TABLE = CODEX_MCP_TABLE + ".env"
@@ -7700,18 +7702,30 @@ def _add_hook(hooks, command, legacy_commands=None, label=None):
     return True
 
 
+def _rule_section(current):
+    """`(start, end, section)` of the Antiphon section in a rules file, or
+    None when the heading is absent. One reader for the writer and doctor: a
+    diagnostic holding its own idea of where the section ends is the drift
+    this arrangement exists to prevent."""
+    heading = SECTION_HEADING
+    start = current.find(heading)
+    if start == -1:
+        return None
+    end = current.find("\n## ", start + len(heading))
+    section = current[start:] if end == -1 else current[start:end]
+    return start, end, section
+
+
 def _update_instructions(current, rule):
     """Adds the Antiphon section, or edits it in place if it's stale.
 
     Just checking the heading and skipping wasn't enough: when the rule text
     changed, the old text stayed put and kept telling the agent something no
     longer true."""
-    heading = SECTION_HEADING
-    start = current.find(heading)
-    if start == -1:
+    found = _rule_section(current)
+    if found is None:
         return current + rule, "added"
-    end = current.find("\n## ", start + len(heading))
-    old_section = current[start:] if end == -1 else current[start:end]
+    start, end, old_section = found
     if old_section.strip() == rule.strip():
         return current, "already up to date"
     tail = "" if end == -1 else current[end:]
@@ -8396,18 +8410,21 @@ def _config_state(cwd):
     # reads it with a bare `open` — so the pre-pass supplies its own bound and
     # its own reason, and the promise "every file, once, or a stated reason"
     # covers all five.
-    path = os.path.join(cwd, CODEX_CONFIG_FILE)
-    try:
-        with open(path, encoding="utf-8") as f:
-            states[CODEX_CONFIG_FILE] = ConfigState(path, f.read(), None)
-    except FileNotFoundError:
-        states[CODEX_CONFIG_FILE] = ConfigState(path, "", None)
-    except OSError as error:
-        states[CODEX_CONFIG_FILE] = ConfigState(
-            path, None, f"could not be read "
-                        f"({error.strerror or type(error).__name__})")
-    except UnicodeDecodeError:
-        states[CODEX_CONFIG_FILE] = ConfigState(path, None, "not valid UTF-8")
+    # The two rules files are text too, read the same way: absent is an
+    # empty text (setup adds the section), unreadable is a stated reason.
+    for name in (CODEX_CONFIG_FILE, AGENTS_FILE, CLAUDE_MD_FILE):
+        path = os.path.join(cwd, name)
+        try:
+            with open(path, encoding="utf-8") as f:
+                states[name] = ConfigState(path, f.read(), None)
+        except FileNotFoundError:
+            states[name] = ConfigState(path, "", None)
+        except OSError as error:
+            states[name] = ConfigState(
+                path, None, f"could not be read "
+                            f"({error.strerror or type(error).__name__})")
+        except UnicodeDecodeError:
+            states[name] = ConfigState(path, None, "not valid UTF-8")
     return states
 
 
@@ -8892,6 +8909,27 @@ def _doctor_config(report, cwd, states):
     verdict(CODEX_CONFIG_FILE,
             [f"[{CODEX_MCP_TABLE}]"] if not present
             else [f"`{line}`" for line in expected if line not in present])
+
+    # The rules files, against the rule this version generates. The text
+    # changes with the contract, and a section from an older version keeps
+    # teaching its agent a rule that is no longer true — measured on the
+    # maintainer's own project, a 0.3.2-era section beside a 0.4.0 install,
+    # with nothing saying so. `setup` rewrites it in place.
+    for name, rule in ((AGENTS_FILE, AGENTS_RULE), (CLAUDE_MD_FILE, CLAUDE_RULE)):
+        state = states[name]
+        if state.reason is not None:
+            report.bad(f"{name}: unreadable: {state.reason} — fix or delete "
+                       "it, then run `antiphon setup`")
+            continue
+        found = _rule_section(state.data or "")
+        if found is None:
+            report.bad(f"{name}: the Antiphon section is missing — run "
+                       "`antiphon setup`")
+        elif found[2].strip() != rule.strip():
+            report.bad(f"{name}: the Antiphon section is stale — run "
+                       "`antiphon setup`")
+        else:
+            report.ok(f"{name}: the Antiphon section is current")
 
 
 def _doctor_alias(report):
