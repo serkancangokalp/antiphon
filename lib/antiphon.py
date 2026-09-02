@@ -5098,7 +5098,7 @@ def push(target="codex"):
             ok, detail = send_to_codex(
                 cwd, (f"{PUSH_LABEL} "
                       f"{queue_label(who, attempt, can_reply)} {outgoing}"),
-                recipient)
+                recipient, sender=who)
         else:
             ok, detail = send_to_claude(cwd, outgoing, recipient,
                                         sender_alias=who, message_id=attempt)
@@ -5439,7 +5439,32 @@ ResolvedTarget = collections.namedtuple("ResolvedTarget",
                                         defaults=(None,))
 
 
-def _resolve_target(cwd, kind, alias=None):
+def _age_words(seconds):
+    """`under a minute`, `5 min`, `2 h`, `3 d` — for advice, never arithmetic."""
+    if seconds < 60:
+        return "under a minute"
+    if seconds < 3600:
+        return f"{int(seconds // 60)} min"
+    if seconds < 86400:
+        return f"{int(seconds // 3600)} h"
+    return f"{int(seconds // 86400)} d"
+
+
+def _correlation_advice(cwd, kind, sender):
+    """The tail of a bare refusal: who wrote to this session last and has not
+    been written back to. The ledger's answer, offered as advice with the
+    exact argument to pass — the bridge itself still never chooses. Empty
+    when nobody is owed a reply, so the refusal stays byte-identical."""
+    mine = "claude" if kind == "codex" else "codex"
+    found = ledger.last_unanswered_sender(cwd, mine, sender, time.time())
+    if found is None:
+        return ""
+    who, age = found
+    return (f"; the last unanswered sender was {who!r} ({_age_words(age)} ago): "
+            f"pass to=\"{who}\"")
+
+
+def _resolve_target(cwd, kind, alias=None, sender=None):
     """Which peer a message goes to, including how its address was found.
 
     `address` is None when nothing can be delivered safely. The bridge does not
@@ -5541,6 +5566,10 @@ def _resolve_target(cwd, kind, alias=None):
     if len(live) > 1:
         detail = (f"not delivered: {len(live)} {kind} peers are live "
                   f"({_peer_states(live)}); address one by name")
+        # Reached by a bare send only — an explicit alias returned above,
+        # matched or refused by name — so this is the one refusal a sender
+        # can act on by choosing, and the ledger is consulted here alone.
+        detail += _correlation_advice(cwd, kind, sender)
         if kind == "codex" and identities.automatic:
             detail = _ClassifiedRefusal(detail, "no-peer")
         return ResolvedTarget(
@@ -5566,7 +5595,8 @@ def _resolve_target(cwd, kind, alias=None):
             None, (f"not delivered: {_peer_states(live)} is the only "
                    "registered Codex peer, but unnamed Codex sessions are "
                    "not all observable and cannot be ruled out — address a "
-                   "peer by name"), "refusal")
+                   "peer by name") + _correlation_advice(cwd, kind, sender),
+            "refusal")
     # Reached only for Claude, whose live records always carry a usable address:
     # the addressless shape is Codex-only and `read_peers` skips every other
     # unusable one.
@@ -5579,8 +5609,10 @@ def resolve_target(cwd, kind, alias=None):
     return target.address, target.detail
 
 
-def send_to_codex(cwd, message, alias=None):
+def send_to_codex(cwd, message, alias=None, sender=None):
     """Sends a message to a Codex peer, chosen by `alias` or by there being one.
+    `sender` is the alias this side writes under; a bare refusal uses it to
+    say who last wrote to that alias without an answer.
 
     Returns (ok, detail): on success `detail` is the proof class the address
     was chosen on (`registered`, `automatic`, `live`, `unproven`), which the
@@ -5588,7 +5620,7 @@ def send_to_codex(cwd, message, alias=None):
     Nothing is started when the recipient cannot be decided: the refusal
     happens before the transport is touched.
     """
-    target = _resolve_target(cwd, "codex", alias)
+    target = _resolve_target(cwd, "codex", alias, sender)
     if target.address is None:
         return False, target.detail
     ok, detail = _queue_codex(target.address, message)
@@ -5733,7 +5765,7 @@ def send_to_claude(cwd, text, alias=None, sender_alias=None, message_id=None):
     while True:
         # Re-resolved every attempt: a named peer can register in the meantime,
         # which moves the address from the project-wide path to its own.
-        target = _resolve_target(cwd, "claude", alias)
+        target = _resolve_target(cwd, "claude", alias, sender_alias)
         address, detail = target.address, target.detail
         if address is None:
             valid_alias = alias is not None and peers.valid_name(alias)
@@ -6498,7 +6530,7 @@ def reply(*_):
             return 1
         outgoing, parked = attachment.envelope, attachment
         composed = f"{CHANNEL_LABEL} {label} {outgoing}"
-    ok, detail = send_to_codex(cwd, composed, to)
+    ok, detail = send_to_codex(cwd, composed, to, sender=who)
     if not ok:
         if parked is not None:
             drop_attachment(cwd, parked.path)

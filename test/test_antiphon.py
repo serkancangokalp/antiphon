@@ -14236,6 +14236,90 @@ class RoutingTest(unittest.TestCase):
         self.assertIn("api", detail)
         self.assertIn("address one by name", detail)
 
+    # ---- a bare refusal names the sender most likely meant ----
+
+    MID = "83f48150-6f08-4d21-b51e-10af885dc39f"
+    MID2 = "0b4b0f7a-3b7e-4d0e-9d6c-2f1c3a4b5c6d"
+
+    def _wrote(self, project, sender, to_kind, to_alias, delivery, age):
+        ledger.record_sent(project, delivery, sender=sender, to_kind=to_kind,
+                           to_alias=to_alias,
+                           transport="channel" if to_kind == "claude" else "queue",
+                           proof="channel" if to_kind == "claude" else "live",
+                           sha256="a" * 64, size=2, at=time.time() - age)
+
+    def test_a_bare_refusal_names_the_last_unanswered_sender(self):
+        """Measured: with two Codex peers live a bare reply is refused with
+        "address one by name" while the sender looks at a list of two. The
+        ledger knows who wrote to this session last without an answer, and
+        the refusal says so — as advice. The bridge still never chooses."""
+        with tempfile.TemporaryDirectory() as project:
+            self._codex_peer(project, "build", "300:build")
+            self._codex_peer(project, "review", "301:review")
+            plain = antiphon._resolve_target(project, "codex", sender="ui").detail
+            self.assertIn("address one by name", plain)
+            self._wrote(project, "build", "claude", "ui", self.MID, 300)
+            advised = antiphon._resolve_target(project, "codex", sender="ui")
+            self.assertIsNone(advised.address)
+            self.assertEqual(advised.detail, plain + "; the last unanswered sender "
+                                              "was 'build' (5 min ago): pass to=\"build\"")
+            # Answered since: the refusal is byte-identical to before.
+            self._wrote(project, "ui", "codex", "build", self.MID2, 60)
+            self.assertEqual(antiphon._resolve_target(project, "codex", sender="ui").detail,
+                             plain)
+            # An explicit `to` never consults the ledger — matched, or missed:
+            # a name that is nobody's has its own refusal, and advising a
+            # sender who already chose would be the bridge choosing over it.
+            with patch.object(antiphon.ledger, "last_unanswered_sender",
+                              side_effect=AssertionError("consulted")):
+                named = antiphon._resolve_target(project, "codex", "build", sender="ui")
+                missed = antiphon._resolve_target(project, "codex", "nobody", sender="ui")
+            self.assertNotIn("unanswered", named.detail)
+            self.assertIn("no live codex peer named 'nobody'", missed.detail)
+            self.assertNotIn("unanswered", missed.detail)
+
+    def test_the_single_named_codex_refusal_and_the_claude_refusal_carry_the_advice_too(self):
+        with tempfile.TemporaryDirectory() as project:
+            self._codex_peer(project, "build", "300:build")
+            self._wrote(project, "build", "claude", None, self.MID, 7200)
+            detail = antiphon._resolve_target(project, "codex", sender="ui").detail
+            self.assertIn("address a peer by name", detail)
+            self.assertTrue(detail.endswith("; the last unanswered sender was 'build' "
+                                            "(2 h ago): pass to=\"build\""), detail)
+        with tempfile.TemporaryDirectory() as project:
+            antiphon.peers.register(project, "claude", "ui", "/tmp/ui.sock")
+            antiphon.peers.register(project, "claude", "api", "/tmp/api.sock")
+            self._wrote(project, "api", "codex", "build", self.MID, 30)
+            self._wrote(project, "ui", "codex", "build", self.MID2, 20)
+            detail = antiphon._resolve_target(project, "claude", sender="build").detail
+            self.assertIn("address one by name", detail)
+            self.assertTrue(detail.endswith("; the last unanswered sender was 'ui' "
+                                            "(under a minute ago): pass to=\"ui\""), detail)
+            self.assertNotIn("consulted", detail)
+        with tempfile.TemporaryDirectory() as project:
+            antiphon.peers.register(project, "claude", "ui", "/tmp/ui.sock")
+            antiphon.peers.register(project, "claude", "api", "/tmp/api.sock")
+            self.assertNotIn("unanswered",
+                             antiphon._resolve_target(project, "claude", sender="build").detail,
+                             "nobody wrote: no advice, the old refusal")
+
+    def test_the_advice_travels_through_the_senders_own_road(self):
+        """`reply` and `antiphon_send` hand the resolver the alias they carry;
+        the marker road hands it the alias it claims."""
+        with tempfile.TemporaryDirectory() as project:
+            self._codex_peer(project, "build", "300:build")
+            self._codex_peer(project, "review", "301:review")
+            self._wrote(project, "review", "claude", "ui", self.MID, 120)
+            _ok, detail = antiphon.send_to_codex(project, "hi", sender="ui")
+            self.assertIn("pass to=\"review\"", detail)
+            err = io.StringIO()
+            with patch.object(antiphon, "project_dir", return_value=project), \
+                 patch.object(antiphon.sys, "stdin", io.StringIO(json.dumps(
+                     {"text": "hi", "sender_alias": "ui"}))), \
+                 contextlib.redirect_stderr(err):
+                self.assertEqual(antiphon.reply(), 1)
+            self.assertIn("pass to=\"review\"", err.getvalue())
+
     def test_a_registered_peer_never_falls_back_to_the_old_path(self):
         """The legacy address belongs to the case where nothing is registered.
         Reaching for it because the registered peer is not ready, or because
@@ -14984,7 +15068,7 @@ class ToolRecipientTest(unittest.TestCase):
         sent = []
         with tempfile.TemporaryDirectory() as project, \
              patch.object(antiphon, "send_to_codex",
-                          side_effect=lambda cwd, message, to=None:
+                          side_effect=lambda cwd, message, to=None, **_kw:
                               sent.append(message) or (True, "")):
             code, err = self._reply(project, {"text": "run the suite"})
             self.assertEqual(code, 0, err)
@@ -15006,7 +15090,7 @@ class ToolRecipientTest(unittest.TestCase):
         sent = []
         with tempfile.TemporaryDirectory() as project, \
              patch.object(antiphon, "send_to_codex",
-                          side_effect=lambda cwd, message, to=None:
+                          side_effect=lambda cwd, message, to=None, **_kw:
                               sent.append(message) or (True, "")):
             code, err = self._reply(project, {"text": "do X"})
             self.assertEqual(code, 0, err)
@@ -15023,7 +15107,7 @@ class ToolRecipientTest(unittest.TestCase):
         observed behaviour, not a hypothesis."""
         sent = []
 
-        def transport(cwd, message, to=None):
+        def transport(cwd, message, to=None, **_kw):
             if "something else" in message:
                 return False, "refused"
             sent.append(message)
@@ -15100,7 +15184,7 @@ class ToolRecipientTest(unittest.TestCase):
         recipients = []
         with tempfile.TemporaryDirectory() as project, \
              patch.object(antiphon, "send_to_codex",
-                          side_effect=lambda cwd, message, to=None:
+                          side_effect=lambda cwd, message, to=None, **_kw:
                               recipients.append(to) or (True, "")):
             code, err = self._reply(project, {"text": "parked", "to": "review"})
             self.assertEqual(code, 0, err)
@@ -15124,7 +15208,7 @@ class ToolRecipientTest(unittest.TestCase):
         sent = []
         with tempfile.TemporaryDirectory() as project, \
              patch.object(antiphon, "send_to_codex",
-                          side_effect=lambda cwd, message, to=None:
+                          side_effect=lambda cwd, message, to=None, **_kw:
                               sent.append(message) or (True, "")):
             code, err = self._reply(project, {"text": "run the suite"})
             self.assertEqual(code, 0, err)
