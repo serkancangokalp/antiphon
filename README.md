@@ -201,6 +201,16 @@ Codex hooks once when Codex first shows them.
 Re-running `setup` migrates hooks and instruction blocks written by older
 versions in place; it never creates duplicates.
 
+A long-lived bridge server keeps the code it loaded, so an upgrade on disk
+runs beside sessions still using the old reader for a while. That is safe in
+both directions: a 0.3.x reader keeps a current endpoint record on its pid
+alone (the current fingerprint lives in a field it never selects), and a
+listener whose Node and Python halves disagree about that field is refused
+with a remedy — reconnect the Claude session, or reinstall so both sides
+match — rather than told it recovered. A record written by 0.4.0 before this
+change stays prunable by a 0.3.x reader until its owner rewrites it; `doctor`
+names such a record and the remedy by kind (reconnect Claude, restart Codex).
+
 ## Commands
 
 ```bash

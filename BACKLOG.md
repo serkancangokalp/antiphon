@@ -11,6 +11,13 @@ deliberate: see *P1 — 0.4.0 is on `main` and held back from npm* below for the
 reason and for what resuming would take. Nothing is half-applied and nothing is
 waiting on a decision inside the code.
 
+**Mixed-version pruning** (a 0.3.x reader deleting current endpoints; a
+listener whose in-memory Node and on-disk Python disagree being told it
+recovered) is closed by the `process_birth` sibling, the two-way
+`fingerprint_field` claim and the verdict's current-fingerprint rule — see the
+0.4.0 paragraph under *P0 — A named Claude session can identify itself as
+`<unnamed>`*.
+
 **Picking the work up.** The open items are the P0/P1/P2 sections that follow,
 in that order. The two rules this project runs on, learned the expensive way
 and worth reading before touching anything:
@@ -1428,9 +1435,31 @@ claim has completed but before bind; none may leave an endpoint or socket.
 
 New process observations now run `ps` under `LC_ALL=C` and `TZ=UTC`, parse its
 fields rather than slicing inherited output, mark endpoint births with their
-fingerprint generation and generate owner keys as `pid:vN:start`. A legacy
-endpoint birth retains PID-only liveness until its owner refreshes it: its old
-rendered value is evidence of nothing under the new canon. Equal legacy owner
+fingerprint generation and generate owner keys as `pid:vN:start`. The canonical fingerprint is written as `process_birth: "v1:<start>"`, a field
+the 0.3.x reader never selects, because that reader interpreted `birth`
+against its own timezone and pruned live listeners while `birth_version` sat
+unread beside it (reproduced 2026-09-02 with the byte-exact 0.3.3 reader,
+`test/fixtures/peers_0_3_3.py`). Both readers select on one grammar and one
+range check, by key presence: a present sibling is the only thing consulted;
+this generation's token with anything but the writer's shape after it is
+malformed, not another generation; the 0.4.0 pair (`birth` + lexical integer
+`birth_version: 1`) is migration input read strictly and never dead for
+lacking the sibling; anything else is pid-only for liveness and UNREADY for
+routing, because a current listener always writes a current sibling and a
+governed record without one is one no current listener serves. Integer
+tokens are bounded at parse time so a near-ceiling digit run is not a record
+on any Python. The claim is a two-way capability: Node declares
+`fingerprint_field`, Python acknowledges it, an undeclared automatic claim is
+refused with a reconnect remedy, and a listener whose registry does not
+acknowledge withdraws its own endpoint and says to reinstall — the
+alternative in each direction told the sender it had recovered and then
+refused the words. The claim answers the fingerprint it wrote, from its
+one observation, never a second `ps` and never the file. Records still in
+the 0.4.0 spelling stay prunable by a 0.3.x reader until their owner
+rewrites them — a Claude session by reconnecting (the old listener's
+reassert is refused without writing), a Codex session by restarting; doctor
+names that as a risk. Old readers judge current records by pid alone, as
+they always did; only current readers keep the recycled-pid check. Equal legacy owner
 keys still join, equal current keys join, and a mixed generation never joins by
 pid alone; `doctor` reports that rolling-upgrade state without writing either
 record. A reconnect that finds a live current named listener asks that listener
