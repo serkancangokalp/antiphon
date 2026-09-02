@@ -6300,6 +6300,41 @@ def drop_attachment(cwd, path):
               f"{path}", file=sys.stderr)
 
 
+# Seconds a delivery may go without the peer's transcript showing it before
+# doctor mentions it: a peer mid-turn reads its queue at the next turn, and ten
+# minutes is longer than any turn measured on this project.
+RECEIPT_PATIENCE = 10 * 60
+
+
+def _delivery_report(cwd, now=None):
+    """The `status` line for the delivery ledger. A reader, never a writer.
+
+    Counts only — no id, no alias, no words: what left and was never seen in
+    the peer's transcript (and how long the oldest has waited), what was
+    seen, and what never left, with how many of those refusals the sender's
+    own page has not carried yet."""
+    now = time.time() if now is None else now
+    rows = ledger.entries(cwd)
+    if not rows:
+        return "Deliveries:         none on the ledger"
+    waiting = [now - row["sent_at"] for row in rows
+               if row["state"] == "sent" and row["received_at"] is None]
+    received = sum(1 for row in rows
+                   if row["state"] == "sent" and row["received_at"] is not None)
+    refused = [row for row in rows if row["state"] == "refused"]
+    unreported = sum(1 for row in refused if row["reported_at"] is None)
+    parts = []
+    if waiting:
+        parts.append(f"{len(waiting)} awaiting receipt "
+                     f"(oldest {_age_words(max(0.0, max(waiting)))})")
+    if received:
+        parts.append(f"{received} received")
+    if refused:
+        parts.append(f"{len(refused)} refused" + (
+            f" ({unreported} not yet reported to the sender)" if unreported else ""))
+    return "Deliveries:         " + ", ".join(parts)
+
+
 def attachment_report(cwd, now=None):
     """The `status` line for the parked store. A reader, never a sweeper.
 
@@ -8538,6 +8573,7 @@ def status():
                else "down")
     print(f"Claude channel:     {channel}")
     print(attachment_report(cwd))
+    print(_delivery_report(cwd))
     print(_codex_census_line(live["codex"], identities))
     for line in _peer_report(displayed, identities):
         print(line)
@@ -9490,6 +9526,26 @@ def _doctor_codex(report, cwd):
     _doctor_codex_queue(report, cwd)
 
 
+def _doctor_deliveries(report, cwd):
+    """Deliveries the peer's transcript has not shown after RECEIPT_PATIENCE.
+
+    Measured: a queued row sat in an open app-hosted thread's queue for over
+    an hour while the tool had said delivered. A note, never ✗ — a peer that
+    has not taken a turn is not a fault — and read-only: the ledger is read,
+    never marked, by a diagnosis."""
+    late = [age for _entry, age in ledger.awaiting_receipt(cwd, time.time())
+            if age > RECEIPT_PATIENCE]
+    if not late:
+        return
+    count = len(late)
+    verb = "has" if count == 1 else "have"
+    noun = "delivery" if count == 1 else "deliveries"
+    report.note(f"deliveries: {count} {noun} sent more than "
+                f"{RECEIPT_PATIENCE // 60} minutes ago {verb} no receipt (oldest "
+                f"{_age_words(max(late))}) — the peer has not read it yet; if its "
+                "session is closed, address another")
+
+
 def _doctor_codex_tool_shapes(report, cwd):
     """Expose fail-closed Codex schema drift without printing its payload."""
     count = _codex_tool_shape_count(cwd)
@@ -9588,6 +9644,7 @@ def _doctor_readonly():
     _doctor_codex_observations(report, cwd, live)
     _doctor_channel(report, cwd, live)
     _doctor_codex(report, cwd)
+    _doctor_deliveries(report, cwd)
     _doctor_sources(report, cwd)
     _doctor_codex_tool_shapes(report, cwd)
     _doctor_replay(report, cwd)

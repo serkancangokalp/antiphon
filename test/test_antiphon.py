@@ -1916,7 +1916,7 @@ class AntiphonTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as project, \
              patch.object(antiphon.socket, "socket", chan), \
              patch.object(antiphon, "_resolve_target",
-                          side_effect=lambda cwd, kind, alias=None:
+                          side_effect=lambda cwd, kind, alias=None, sender=None:
                               antiphon.ResolvedTarget(
                                   "/tmp/ui.sock", "", "registered")) as resolve:
             ok, detail = antiphon.send_to_claude(project, "the first thing said")
@@ -1944,7 +1944,7 @@ class AntiphonTest(unittest.TestCase):
         """Waiting cannot resolve ambiguity — more peers will not become fewer."""
         with tempfile.TemporaryDirectory() as project, \
              patch.object(antiphon, "_resolve_target",
-                          side_effect=lambda cwd, kind, alias=None:
+                          side_effect=lambda cwd, kind, alias=None, sender=None:
                               antiphon.ResolvedTarget(
                                   None, "not delivered: 2 peers",
                                   "refusal")) as resolve:
@@ -1959,7 +1959,7 @@ class AntiphonTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as project, \
              patch.object(antiphon.socket, "socket", chan), \
              patch.object(antiphon, "_resolve_target",
-                          side_effect=lambda cwd, kind, alias=None:
+                          side_effect=lambda cwd, kind, alias=None, sender=None:
                               antiphon.ResolvedTarget(
                                   "/tmp/ui.sock", "", "registered")):
             ok, detail = antiphon.send_to_claude(project, "hello")
@@ -4341,6 +4341,43 @@ class DeliveryReceiptTest(unittest.TestCase):
             entry = ledger.read_entry(project, self.MID)
         self.assertIsNotNone(entry["received_at"])
 
+    def test_status_counts_the_ledger(self):
+        """What left and was never seen, what was seen, what never left."""
+        third = "3f7c25a2-2760-455b-a9e5-67e7fdb90b59"
+        other = "2e6b14f1-1659-544a-98d4-56d6eca8fa48"
+
+        def status_line(project):
+            out = io.StringIO()
+            with patch.object(antiphon, "project_dir", return_value=project), \
+                 patch.object(antiphon, "codex_rollout_files", return_value=[]), \
+                 patch.object(antiphon, "claude_transcripts", return_value=[]), \
+                 contextlib.redirect_stdout(out), \
+                 contextlib.redirect_stderr(io.StringIO()):
+                antiphon.status()
+            return next((row for row in out.getvalue().splitlines()
+                         if row.startswith("Deliveries:")), None)
+
+        with tempfile.TemporaryDirectory() as project:
+            self.assertEqual(status_line(project), "Deliveries:         none on the ledger")
+            now = time.time()
+            ledger.record_sent(project, self.MID, sender="ui", to_kind="codex", to_alias="build",
+                               transport="queue", proof="live", sha256="a" * 64, size=2,
+                               at=now - 12 * 60)
+            ledger.record_sent(project, other, sender="ui", to_kind="codex", to_alias="build",
+                               transport="queue", proof="live", sha256="a" * 64, size=2,
+                               at=now - 60)
+            ledger.mark_received(project, other, now - 30)
+            ledger.record_refused(project, third, sender="<unnamed>", to_kind="codex",
+                                  to_alias=None, reason="not delivered: nobody", preview="x",
+                                  at=now - 40)
+            self.assertEqual(status_line(project),
+                             "Deliveries:         1 awaiting receipt (oldest 12 min), "
+                             "1 received, 1 refused (1 not yet reported to the sender)")
+            ledger.mark_reported(project, [third], now)
+            self.assertEqual(status_line(project),
+                             "Deliveries:         1 awaiting receipt (oldest 12 min), "
+                             "1 received, 1 refused")
+
     def test_status_reads_the_ledger_and_never_writes_a_receipt(self):
         with tempfile.TemporaryDirectory() as project:
             self._sent(project)
@@ -5245,6 +5282,38 @@ class DoctorTest(unittest.TestCase):
         line = self.line_for(printed, "AGENTS.md")
         self.assertTrue(line.startswith("✗ AGENTS.md: the Antiphon section is missing"), line)
         self.assertIn("run `antiphon setup`", line)
+
+    def test_doctor_notes_deliveries_without_a_receipt_after_ten_minutes(self):
+        """Measured: a queued row sat in an open app-hosted thread for over an
+        hour while the tool had said delivered. Doctor reads the ledger and
+        says what has no receipt yet, with the remedy; a note, not ✗, because
+        a peer that has not taken a turn yet is not a fault — and read-only,
+        because a diagnosis that marked the ledger would be a delivery."""
+        project = self.project()
+        self.set_up(project)
+        now = time.time()
+        late = "83f48150-6f08-4d21-b51e-10af885dc39f"
+        fresh = "2e6b14f1-1659-544a-98d4-56d6eca8fa48"
+        for delivery, age in ((late, 25 * 60), (fresh, 5 * 60)):
+            ledger.record_sent(project, delivery, sender="ui", to_kind="codex",
+                               to_alias="build", transport="queue", proof="live",
+                               sha256="a" * 64, size=2, at=now - age)
+        directory = ledger.ledger_dir(project)
+        before = {name: open(os.path.join(directory, name), "rb").read()
+                  for name in os.listdir(directory)}
+        code, printed = self.run_doctor(project)
+        line = self.line_for(printed, "deliveries:")
+        self.assertTrue(line.startswith("· deliveries: 1 delivery sent more than 10 minutes "
+                                        "ago has no receipt (oldest 25 min)"), line)
+        self.assertIn("the peer has not read it yet; if its session is closed, "
+                      "address another", line)
+        self.assertEqual(antiphon.RECEIPT_PATIENCE, 600)
+        self.assertEqual({name: open(os.path.join(directory, name), "rb").read()
+                          for name in os.listdir(directory)}, before, "read-only")
+        ledger.mark_received(project, late, now)
+        _code, printed = self.run_doctor(project)
+        self.assertEqual(self.line_for(printed, "deliveries:"), "",
+                         "five minutes without a receipt is not news")
 
     def test_doctor_names_an_unreadable_rules_file(self):
         project = self.project()
