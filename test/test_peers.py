@@ -900,9 +900,9 @@ class RecycledPidTest(unittest.TestCase):
                       '"address": "/tmp/ui.sock", "started_at": 1.0, '
                       '"birth": "%s", "birth_version": %s}'
                       % (os.getpid(), self.LIVE, digits))
-            started = time.monotonic()
+            # Not timed: the refusal is asserted on the value, and a clock
+            # would only add a flake on a loaded machine.
             record = peers._read_record(peers._peer_file(project, "claude", "ui"))
-            self.assertLess(time.monotonic() - started, 0.5)
             self.assertIsNone(record, "a record with an unbounded integer is not a record")
             self.assertEqual(self._listed(project, self.RECYCLED), [])
         self.assertEqual(peers._bounded_int("1"), 1)
@@ -948,6 +948,28 @@ class RecycledPidTest(unittest.TestCase):
             with self.subTest(version=version):
                 self.assertIsNone(peers._fingerprint_of(
                     {"birth": self.LIVE, "birth_version": version}))
+
+    def test_a_start_the_readers_cannot_read_is_no_fingerprint(self):
+        """Writer and reader agree by construction. `_process_info` checks
+        three of the seven fields it renders; a `ps` that leaks a locale name
+        or a five-digit year would otherwise be written as a sibling neither
+        reader selects — UNREADY forever, with a reconnect remedy that
+        reproduces it. Off the canon, the process has no fingerprint, which
+        is the documented evidence-of-nothing road on both sides."""
+        for start in ("Sat Aug 30 01:00:00 12026", "Çar Eyl 2 16:13:13 2026",
+                      "Sat Aug 30 01:00:00 2026 "):
+            with self.subTest(start=start), \
+                    tempfile.TemporaryDirectory() as project, \
+                    patch.object(peers, "_process_info",
+                                 return_value=("1", start, "node server.js")):
+                self.assertIsNone(peers._process_birth(os.getpid()))
+                ok, detail, fingerprint = peers.register_claim(
+                    project, "claude", "ui", "/tmp/ui.sock", pid=os.getpid())
+                self.assertTrue(ok, detail)
+                self.assertIsNone(fingerprint)
+                self.assertNotIn("process_birth", self._read(project))
+                self.assertEqual([p["name"] for p in peers.read_peers(project)],
+                                 ["ui"], "pid-only liveness, as before the field")
 
     def test_the_response_spelling_is_the_records_spelling(self):
         with self._ps(self.LIVE):

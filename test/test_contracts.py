@@ -1092,6 +1092,7 @@ class IdentityPrivacyContractTest(unittest.TestCase):
              'process.stdout.write(JSON.stringify({'
              'grammar: m.CANONICAL_START, weekdays: m.WEEKDAYS, months: m.MONTHS,'
              'version: m.PROCESS_FINGERPRINT_VERSION,'
+             'generation: m.GENERATION_TOKEN,'
              'ceiling: m.INTEGER_TOKEN_CEILING}));'],
             capture_output=True, text=True, cwd=ROOT, check=True).stdout)
         self.assertEqual(exported["grammar"], antiphon.peers.CANONICAL_START)
@@ -1101,6 +1102,12 @@ class IdentityPrivacyContractTest(unittest.TestCase):
                          antiphon.peers.PROCESS_FINGERPRINT_VERSION)
         self.assertEqual(exported["ceiling"],
                          antiphon.peers.INTEGER_TOKEN_CEILING)
+        # The generation token too: a positive integer with no leading zero,
+        # anchored at the start on both sides. It was the one selector
+        # constant not compared here, so `v0:` could have parted the readers.
+        self.assertEqual(exported["generation"], antiphon.peers.GENERATION_TOKEN)
+        self.assertEqual(antiphon.peers._GENERATION.pattern,
+                         antiphon.peers.GENERATION_TOKEN)
         channel = read("lib", "channel.mjs")
         self.assertIn('fingerprint_field: "process_birth"', channel)
         self.assertIn('answer?.fingerprint_field !== "process_birth"', channel)

@@ -2894,6 +2894,10 @@ async function aCurrentListenerOverADowngradedPythonWithdrawsItsOwnEndpoint() {
       `the listener names the downgrade: ${session.stderr()}`);
     assert.ok(!existsSync(endpointFor(dir, STALE_A_ALIAS)), "and leaves no endpoint behind");
     assert.doesNotMatch(session.stderr(), /channel ready/, "and does not announce a channel it cannot govern");
+    // One remedy, not two: the generic startup line must not send the
+    // operator after a unique name when the fault is the registry on disk.
+    assert.doesNotMatch(session.stderr(), /unique ANTIPHON_NAME/,
+      `the generic remedy contradicts the withdrawal: ${session.stderr()}`);
     console.log("a current listener over a downgraded python withdraws its own endpoint: ok");
   } finally {
     session.child.kill("SIGKILL");
@@ -3019,8 +3023,79 @@ async function theNodeGrammarIsTheWritersOwnShapeAndInRange() {
 }
 
 await theNodeGrammarIsTheWritersOwnShapeAndInRange();
+async function aMidLifeDowngradeIsRefusedOnceNotChurned() {
+  // The listener bound under a current Python, then the Python on disk was
+  // downgraded and the endpoint pruned. Every reassert would otherwise write
+  // the old record and withdraw it again — a window in which another reader
+  // enumerates a record no listener governs, and a remedy printed forever.
+  // The first unacknowledged answer is remembered; later claims refuse
+  // before shelling out.
+  const mixed = await materialiseLib({ node: "worktree", python: "worktree" });
+  if (!mixed) { console.log("mid-life downgrade: skipped (no git)"); return; }
+  const dir = await mkdtemp(join(tmpdir(), "antiphon-midlife-"));
+  const stub = await makeAutomaticIdentityPython({
+    alias: STALE_A_ALIAS, identity_digest: STALE_A_DIGEST, session_id: STALE_A,
+  });
+  const session = spawnMixedListener(mixed.lib, dir, stub.env);
+  let socket = null;
+  try {
+    socket = await boundSocketOfMixed(session);
+    assert.ok(socket && existsSync(socket), `listener never bound: ${session.stderr()}`);
+    const endpoint = endpointFor(dir, STALE_A_ALIAS);
+    assert.ok(existsSync(endpoint));
+    // The hook half and a current proof, so the old registry's reassert road
+    // is open and its unacknowledged answer is the only thing under test.
+    runPeers(dir, `
+import json, os
+owner = json.load(open(${JSON.stringify(endpoint)}))["owner"]
+peers.write_session(${JSON.stringify(dir)}, "claude", "${STALE_A_ALIAS}", ${JSON.stringify(STALE_A)},
+                    "/t/a.jsonl", owner, ${JSON.stringify(STALE_A_DIGEST)}, True)
+peers.write_identity_proof(${JSON.stringify(dir)}, owner, ${JSON.stringify(STALE_A)}, ${JSON.stringify(STALE_A_DIGEST)})
+`);
+    assert.ok(mixed.swapPython("f0c529f"), "the downgrade on disk");
+    await rm(endpoint, { force: true });
+    const control = (nonce) => JSON.stringify({
+      control: "antiphon.channel", version: 1, action: "reassert",
+      alias: STALE_A_ALIAS, nonce,
+    });
+    const first = JSON.parse(await sendTo(socket, control("first")));
+    assert.equal(first.ok, false, JSON.stringify(first));
+    assert.ok(!existsSync(endpoint), "the record the old registry wrote was withdrawn");
+    const withdrawals = () =>
+      (session.stderr().match(/the endpoint it wrote was withdrawn/g) || []).length;
+    assert.equal(withdrawals(), 1, session.stderr());
+    const second = JSON.parse(await sendTo(socket, control("second")));
+    assert.equal(second.ok, false, JSON.stringify(second));
+    assert.ok(!existsSync(endpoint), "and nothing was written the second time");
+    assert.equal(withdrawals(), 1, `no churn: ${session.stderr()}`);
+    assert.match(session.stderr(), /refusing further claims until it is restarted/,
+      `the second refusal says why it did not try: ${session.stderr()}`);
+    console.log("a mid-life downgrade is refused once, not churned: ok");
+  } finally {
+    session.child.kill("SIGKILL");
+    await waitForExit(session.child, 2_000);
+    if (socket) await rm(socket, { force: true }).catch(() => {});
+    for (const p of [dir, stub.dir, mixed.dir]) await rm(p, { recursive: true, force: true }).catch(() => {});
+  }
+}
+
+async function aMissingCommitFailsTheMixedLibLoudly() {
+  // "No git" and "no such object" were one `null`, and the two rolling-
+  // upgrade tests print `skipped (no git)` on it — after a rewritten history
+  // the whole mixed-version contract would have passed by skipping.
+  await assert.rejects(
+    materialiseLib({ node: "0000000000000000000000000000000000000000", python: "worktree" }),
+    /0000000000000000000000000000000000000000/);
+  const real = await materialiseLib({ node: "worktree", python: "worktree" });
+  assert.ok(real, "the working tree is always materialisable");
+  await rm(real.dir, { recursive: true, force: true }).catch(() => {});
+  console.log("a missing commit fails the mixed lib loudly: ok");
+}
+
+await aMissingCommitFailsTheMixedLibLoudly();
 await thePublishedReaderLeavesALiveListenerRegistered();
 await anOldListenerOverAnUpgradedPythonIsRefusedNotToldItRecovered();
+await aMidLifeDowngradeIsRefusedOnceNotChurned();
 await aCurrentListenerOverADowngradedPythonWithdrawsItsOwnEndpoint();
 await anEndpointIsClassifiedNotCollapsed();
 await aWithdrawalThatDidNotHappenIsNotAnnounced();

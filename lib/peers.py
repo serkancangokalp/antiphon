@@ -86,7 +86,10 @@ _CANONICAL_START = re.compile(CANONICAL_START)
 # must neither convert nor choke on a long digit run, only tell whether the
 # token is its own. A generation is a positive integer with no leading zero,
 # like a pid in an owner key; `v0:` and `v01:` are malformed, not "other".
-_GENERATION = re.compile(r"v([1-9][0-9]{0,8}):")
+# Spelled once as a string so the contract test can compare it with the
+# Node mirror at runtime, like the grammar above.
+GENERATION_TOKEN = r"v([1-9][0-9]{0,8}):"
+_GENERATION = re.compile(GENERATION_TOKEN)
 INTEGER_TOKEN_CEILING = 20      # digits; a pid, a version, a clock all fit
 
 
@@ -1786,7 +1789,14 @@ def _process_birth(pid):
     trusts for the same purpose.
     """
     info = _process_info(pid)
-    return (info[1] or None) if info else None
+    # Through the same grammar the readers select on, so writer and reader
+    # agree by construction. `_process_info` checks three of the seven fields
+    # it renders; a `ps` that leaked a locale name or a five-digit year would
+    # otherwise be written as a sibling neither reader can select — UNREADY
+    # forever, with a reconnect remedy that reproduces it. Off the canon the
+    # process simply has no fingerprint, the documented evidence-of-nothing
+    # road, and the same answer on both sides.
+    return canonical_start(info[1]) if info else None
 
 
 def _render_fingerprint(start):

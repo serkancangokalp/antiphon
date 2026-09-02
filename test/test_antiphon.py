@@ -17733,6 +17733,12 @@ class ReadinessParityTest(unittest.TestCase):
             "sibling of a nine-digit generation": lambda p, a: (
                 self._proof(p, self.A),
                 self._patch_endpoint(p, a, process_birth="v999999999:" + self._own_birth())),
+            "sibling of generation zero": lambda p, a: (
+                self._proof(p, self.A),
+                self._patch_endpoint(p, a, process_birth="v0:" + self._own_birth())),
+            "sibling of a zero-padded generation": lambda p, a: (
+                self._proof(p, self.A),
+                self._patch_endpoint(p, a, process_birth="v01:" + self._own_birth())),
             "sibling shaped but out of range": lambda p, a: (
                 self._proof(p, self.A),
                 self._patch_endpoint(p, a, process_birth="v1:Mon Jan 99 99:99:99 2026")),

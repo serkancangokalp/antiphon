@@ -1459,8 +1459,8 @@ the 0.4.0 spelling stay prunable by a 0.3.x reader until their owner
 rewrites them — a Claude session by reconnecting (the old listener's
 reassert is refused without writing), a Codex session by restarting; doctor
 names that as a risk. Old readers judge current records by pid alone, as
-they always did; only current readers keep the recycled-pid check. Equal legacy owner
-keys still join, equal current keys join, and a mixed generation never joins by
+they always did; only current readers keep the recycled-pid check. Equal
+legacy owner keys still join, equal current keys join, and a mixed generation never joins by
 pid alone; `doctor` reports that rolling-upgrade state without writing either
 record. A reconnect that finds a live current named listener asks that listener
 to reassert itself before claiming or touching its socket, so the persistent
