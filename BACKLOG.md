@@ -2015,7 +2015,7 @@ implementation narrative (v4 cursor keys, the v3 sibling, lanes, compaction),
 which now lives in README and this file only: 4,740 / 5,338 / 3,183 bytes,
 with ceilings pinned at 5,000 / 5,500 / 3,500 so they cannot regrow unnoticed.
 The 3,000 the campaign aimed for was not reachable without dropping pinned
-contract facts, which fill about 4.5 KB on their own.
+contract facts, which fill about 4.5 KB on their own. On 2026-09-03 the delivery-truth review asked for one clause the recipient acts on — "or 1 hour after the bridge sees it read" — and the ceilings moved by 100 bytes each for it (CLAUDE_RULE 5,100, AGENTS_RULE 5,600); the measured sizes are 5,013 and 5,533.
 
 **Doctor sees rule drift.** `CLAUDE.md` and `AGENTS.md` whose Antiphon
 section is missing or differs from the generated rule are `✗ … run
