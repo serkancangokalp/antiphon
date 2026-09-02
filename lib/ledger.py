@@ -12,6 +12,10 @@ thread stayed in the queue for over an hour — and because a refused Stop-hook
 line printed on exit-0 stderr, which reaches a debug log and never the agent
 that wrote it.
 
+Concurrency: both sides' hooks write here. An update takes one exclusive
+flock on `.antiphon/deliveries/.lock` around its read-modify-write; a write
+of a new entry is one atomic replace of its own file and needs no lock.
+
 An entry holds no message content, no route, no session id and no socket
 path: public aliases, kinds, a transport, a proof class, times, a content
 digest and size, an attachment file name, a state, a redacted reason and a
@@ -20,6 +24,7 @@ project).
 """
 
 import contextlib
+import fcntl
 import hashlib
 import json
 import os
@@ -40,7 +45,13 @@ LABEL = {"claude": "Claude", "codex": "Codex"}
 
 DELIVERY_ID = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}")
 ATTACHMENT_BASENAME = re.compile(
-    r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\.txt|[A-Za-z0-9_.-]{1,80}")
+    r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\.txt"
+    r"|[A-Za-z0-9_-][A-Za-z0-9_.-]{0,79}")
+SHA256_HEX = re.compile(r"[0-9a-f]{64}")
+# The largest time a validated entry may carry: past this `time.localtime`
+# overflows the platform's time_t, and a validated entry that made the hook
+# raise every turn was the finding that put it here. Far past any clock.
+MAX_TIME = float(2 ** 40)
 
 OPTIONAL_TIMES = ("received_at", "read_at", "reported_at", "expired_unread_at")
 KEYS = frozenset({
@@ -103,7 +114,7 @@ def _time_or_none(value):
         return True
     return (isinstance(value, (int, float)) and not isinstance(value, bool)
             and value == value and value not in (float("inf"), float("-inf"))
-            and value >= 0)
+            and 0 <= value <= MAX_TIME)
 
 
 def _valid(entry, expected_id):
@@ -127,7 +138,8 @@ def _valid(entry, expected_id):
     if not _time_or_none(entry["sent_at"]) or entry["sent_at"] is None:
         return False
     if entry["sha256"] is not None and not (
-            isinstance(entry["sha256"], str) and len(entry["sha256"]) == 64):
+            isinstance(entry["sha256"], str)
+            and SHA256_HEX.fullmatch(entry["sha256"])):
         return False
     if entry["size"] is not None and (
             type(entry["size"]) is not int or entry["size"] < 0):
@@ -242,15 +254,45 @@ def record_refused(cwd, delivery_id, *, sender, to_kind, to_alias, reason,
     return _write(cwd, entry)
 
 
+@contextlib.contextmanager
+def _locked(cwd):
+    """One exclusive lock over the ledger for a read-modify-write.
+
+    Both sides' hooks mark entries — a receipt from one, a notice reported by
+    the other — and an unlocked read-modify-write let the loser's field
+    vanish; a lost receipt is permanent, because the record that carried it
+    was consumed when the cursor advanced. The section is microseconds and a
+    process that dies releases its flock, so a plain blocking lock is safe."""
+    directory = _sound_dir(cwd)
+    if directory is None:
+        yield False
+        return
+    try:
+        fd = os.open(os.path.join(directory, ".lock"),
+                     os.O_CREAT | os.O_RDWR, 0o600)
+    except OSError:
+        yield False
+        return
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        try:
+            yield True
+        finally:
+            fcntl.flock(fd, fcntl.LOCK_UN)
+    finally:
+        os.close(fd)
+
+
 def _update(cwd, delivery_id, mutate):
-    entry = read_entry(cwd, delivery_id)
-    if entry is None:
-        return False
-    changed = dict(entry)
-    mutate(changed)
-    if changed == entry:
-        return True
-    return _write(cwd, changed)
+    with _locked(cwd):
+        entry = read_entry(cwd, delivery_id)
+        if entry is None:
+            return False
+        changed = dict(entry)
+        mutate(changed)
+        if changed == entry:
+            return True
+        return _write(cwd, changed)
 
 
 def mark_received(cwd, delivery_id, at):
@@ -265,15 +307,28 @@ def _entries_naming(cwd, attachment):
     return [e for e in entries(cwd) if e["attachment"] == attachment]
 
 
-def mark_read(cwd, attachment, at):
-    """The peer's transcript shows the attachment file being read."""
+def mark_read(cwd, attachment, at, to_kind=None, snapshot=None):
+    """A transcript shows the attachment file being read.
+
+    Scoped to the recipient: with `to_kind`, only deliveries *to* that kind
+    are marked, because the transcript that proved the read belongs to a
+    session of that kind — the sender verifying its own parked file (the
+    `tail -n +3 | shasum` ritual the envelope teaches) is not the recipient
+    reading it. A read clears an expiry marked in the meantime: a file that
+    was read did not expire unread, whichever the sweep saw first."""
     found = False
-    for entry in _entries_naming(cwd, attachment):
+    rows = entries(cwd) if snapshot is None else snapshot
+    for entry in rows:
+        if entry["attachment"] != attachment:
+            continue
+        if to_kind is not None and entry["to_kind"] != to_kind:
+            continue
         found = True
 
         def mutate(changed):
             if changed["read_at"] is None or at < changed["read_at"]:
                 changed["read_at"] = float(at)
+            changed["expired_unread_at"] = None
         _update(cwd, entry["id"], mutate)
     return found
 
@@ -314,13 +369,28 @@ def mark_reported(cwd, delivery_ids, at):
         _update(cwd, delivery_id, mutate)
 
 
-def record_receipts(cwd, receipts):
-    """Apply `("received", id, at)` / `("read", basename, at)` triples."""
+def record_receipts(cwd, receipts, read_by=None):
+    """Apply `("received", id, at)` / `("read", basename, at)` triples.
+
+    `read_by` is the kind of session whose transcript the reads came from;
+    a read marks only deliveries to that kind. Receipts are folded to one
+    per key (the earliest time) and the reads share one snapshot of the
+    ledger, so a page naming a file several times costs one read of the
+    directory, not one per mention."""
+    earliest = {}
     for kind, key, at in receipts:
+        if kind not in ("received", "read"):
+            continue
+        if (kind, key) not in earliest or at < earliest[(kind, key)]:
+            earliest[(kind, key)] = at
+    snapshot = None
+    for (kind, key), at in earliest.items():
         if kind == "received":
             mark_received(cwd, key, at)
-        elif kind == "read":
-            mark_read(cwd, key, at)
+        else:
+            if snapshot is None:
+                snapshot = entries(cwd)
+            mark_read(cwd, key, at, to_kind=read_by, snapshot=snapshot)
 
 
 def _clock(stamp):
@@ -332,7 +402,10 @@ def pending_notices(cwd, side, alias):
 
     A refusal is reported to the session that wrote the line: the entry's
     sender is this alias, or `<unnamed>` when this session has no name. An
-    attachment that expired unread is reported to its sender the same way.
+    attachment that expired unread is reported to its sender the same way —
+    never one that was read after all. Two unnamed sessions on one side are
+    one sender here: whichever runs its hook first carries, and reports, the
+    other's notice. That is what `<unnamed>` means, and the remedy is a name.
     """
     mine = {alias} if alias else set()
     if not alias or alias == "<unnamed>":
@@ -354,7 +427,7 @@ def pending_notices(cwd, side, alias):
                 f"Antiphon: your @{entry['to_kind']}{named} line at "
                 f"{_clock(entry['sent_at'])} (\"{entry['preview'] or ''}\") "
                 f"was not delivered — {reason}")))
-        elif entry["expired_unread_at"] is not None:
+        elif entry["expired_unread_at"] is not None and entry["read_at"] is None:
             notices.append((entry["id"], (
                 f"Antiphon: the attachment you sent to {target} at "
                 f"{_clock(entry['sent_at'])} expired unread after "
@@ -386,7 +459,12 @@ def last_unanswered_sender(cwd, to_kind, to_alias, now):
                 and entry["to_alias"] in (to_alias, None)
                 and sender != "<unnamed>" and sender != to_alias):
             latest[sender] = max(latest.get(sender, 0.0), entry["sent_at"])
-        if sender == to_alias and entry["to_alias"]:
+        # Written back: by this alias, or by the unnamed session of this kind
+        # when this session has no name — its replies go to the other kind.
+        mine = (sender == to_alias
+                or (to_alias is None and sender == "<unnamed>"
+                    and entry["to_kind"] != to_kind))
+        if mine and entry["to_alias"]:
             answered[entry["to_alias"]] = max(
                 answered.get(entry["to_alias"], 0.0), entry["sent_at"])
     open_senders = [(when, sender) for sender, when in latest.items()
@@ -399,12 +477,14 @@ def last_unanswered_sender(cwd, to_kind, to_alias, now):
 
 def reusable_attachment(cwd, sha256, to_kind, to_alias, now, sender=None):
     """The parked file an earlier, unexpired send of these exact words to this
-    recipient left behind, when it is still there; else None. With `sender`,
-    only a send by that same sender counts: the file's header names whose
-    words they are, and a reuse must not put one session's words under
-    another's name."""
+    recipient left behind, when it is still there and nobody has read it;
+    else None. With `sender`, only a send by that same sender counts: the
+    file's header names whose words they are, and a reuse must not put one
+    session's words under another's name. A file with a read receipt is never
+    reused: the read grace would collect it under the fresh envelope."""
     for entry in reversed(entries(cwd)):
         if (entry["state"] == "sent" and entry["attachment"]
+                and entry["read_at"] is None
                 and entry["sha256"] == sha256 and entry["to_kind"] == to_kind
                 and entry["to_alias"] == to_alias
                 and (sender is None or entry["sender"] == sender)
