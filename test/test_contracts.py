@@ -1142,6 +1142,27 @@ class IdentityPrivacyContractTest(unittest.TestCase):
             self.assertLessEqual(len(text.encode("utf-8")), ceiling,
                                  f"{where}: {len(text.encode('utf-8'))} bytes")
 
+    def test_the_token_entry_names_what_it_measured_and_what_it_reversed(self):
+        """The horizon reverses one documented sentence — repeat, never skip
+        — for records beyond it, and the entry has to say so beside the
+        measurement, or the next reader files the skip as a bug."""
+        entry = section(read("BACKLOG.md"),
+                        "P1 — Token cost of the passive page and the static surfaces (fixed)")
+        self.assertIsNotNone(entry, "the token entry is gone")
+        for phrase in ("skipped:", "24 hours", "external_agent_tool_call",
+                       "isCompactSummary", "codex_internal_context",
+                       "AGENTS.md instructions for", "Request interrupted by user",
+                       "more than 400 pages", "20 pages",
+                       "never delivers a record older than", "reverses",
+                       "antiphon catch-up", "ceilings pinned",
+                       "the Antiphon section is missing or differs"):
+            self.assertIn(phrase, entry, phrase)
+        self.assertEqual(antiphon.PAGE_HORIZON // 3600, 24,
+                         "the entry's 24 hours is the constant's")
+        limits = section(read("README.md"), "Limits")
+        self.assertRegex(limits, r"(?i)skipped:", "README §Limits names the skip line")
+        self.assertRegex(read("README.md"), r"(?i)never rendered as either agent's speech")
+
     def test_the_socket_path_is_never_unlinked_after_a_close(self):
         """`close()` removes the socket file the server bound. An explicit
         unlink after it is a second removal with an await in front of it, and

@@ -21,7 +21,9 @@ The other side's recent messages enter your turn's context when you type
 something. Nobody is woken up.
 
 This path is project-wide awareness, not delivery. It is not addressed to
-anyone. When a page interleaves multiple sessions, blocks that can be joined to
+anyone. A host's own bookkeeping — an injected AGENTS.md, a goal continuation,
+a compact summary, an interruption marker, an external agent's relayed tool
+traffic — is never rendered as either agent's speech. When a page interleaves multiple sessions, blocks that can be joined to
 a current named peer carry that peer's label; older, unnamed or unjoinable
 blocks remain honestly unlabelled. Do not read pull context as a private line
 between two particular peers.

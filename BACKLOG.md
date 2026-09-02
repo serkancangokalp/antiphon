@@ -18,6 +18,11 @@ recovered) is closed by the `process_birth` sibling, the two-way
 0.4.0 paragraph under *P0 — A named Claude session can identify itself as
 `<unnamed>`*.
 
+**Token cost** (2026-09-03): host records are no longer rendered as speech,
+the page has a 24-hour horizon relative to the other side's newest record,
+the agent surfaces are a third smaller, and doctor sees a stale rule section
+— see *P1 — Token cost of the passive page and the static surfaces*.
+
 **Picking the work up.** The open items are the P0/P1/P2 sections that follow,
 in that order. The two rules this project runs on, learned the expensive way
 and worth reading before touching anything:
@@ -1895,6 +1900,76 @@ still only visible in an interactive session's MCP log; and `codex exec` writes
 its rollout at once, so the window where a live thread has no transcript yet
 does not reproduce.
 
+## P1 — Token cost of the passive page and the static surfaces (fixed)
+
+Asked for on 2026-09-02: the bridge must stop growing the token bill of the
+sessions it serves. Measured before anything changed, read-only on the
+maintainer's own project:
+
+| What | Measured |
+|---|---|
+| Claude page reader backlog from the live cursor, drained in memory | **more than 400 pages** (cap hit), 2.6 MB rendered, 2,436 messages, every page 31 August — 2,000 tokens a turn on history nobody asked for |
+| The same backlog bounded to the last 24 hours / 6 hours | 21 / 6 pages |
+| `[external_agent_tool_call: …]` / `[external_agent_tool_result]` assistant records in project rollouts | 8,936 records, 11 MB, rendered as `Codex:` speech with commands and output in full |
+| `<codex_internal_context source="goal">` user records | 133, 931 KB, reaching the Claude page as `To Codex:` |
+| `# AGENTS.md instructions for …` user records | 18, 32 KB — the bridge's own rule relayed back |
+| Claude `isCompactSummary` user records | 6, 104 KB, 17 KB each, always an oversized record |
+| Claude interruption literals | 14 records |
+| `CLAUDE_RULE` / `AGENTS_RULE` / channel `instructions` | 7,354 / 8,120 / ~6,000 bytes, every turn or every session; the host truncates the instructions |
+
+### What shipped
+
+**Host records are not speech.** Five shapes, each on measured evidence:
+`codex_internal_context` joined `CODEX_HOST_WRAPPERS`; a Codex user record
+beginning `# AGENTS.md instructions for ` with a complete `<INSTRUCTIONS>` fence
+is a host record; a Codex assistant record beginning
+`[external_agent_tool_call: NAME]` or `[external_agent_tool_result]` — the
+ChatGPT app relaying an external agent's tool traffic, which is that agent's own
+activity and already in its own transcript — is filtered whole (rendered as
+name-only tool lines instead, 1,022 of them sat inside one day's horizon on the
+live project); a Claude user record with `isCompactSummary: true` is a host
+record; a Claude user record that is exactly `[Request interrupted by user]`
+or `[Request interrupted by user for tool use]` is a host record, by equality
+and never by prefix. The Codex Stop reader skips relays too, so an `@claude`
+inside a relayed command never pushes. The census utility counts the prefix
+shapes beside the tag shapes and a test compares its predicates with
+production's.
+
+**The page has a horizon.** A reader never delivers a record older than
+`PAGE_HORIZON` (24 hours) before the newest complete record the other side
+wrote in any of its sources. A positioned start older than that is moved to
+the first record at or after the horizon — bisected over record boundaries
+when the span is large, converged to 4 KB, then rescanned one 256 KB slack
+back so a local misorder repeats rather than skips — and the skip is counted
+and said once on the page where it happened (`skipped: N raw bytes of Codex
+activity older than 24 hours in K source(s) — not delivered; the transcripts
+keep it`), also when nothing newer is left, never as a silent advance.
+`status` counts what the next page will skip. The horizon is relative to the
+other side's clock, not the wall: an overnight run is still there in the
+morning, a side that stopped days ago yields its last day, and the suite's
+fixed-date fixtures stand. Measured per source first, every one of thirty old
+rollouts still yielded its own last day — a hundred pages — which is why it is
+one moment for the whole reader. Measured after: the Claude reader is 20 pages
+behind (88 KB) and the Codex reader 5, with the first page naming 150,137,892
+raw bytes skipped in 5 sources. This reverses, for records beyond the horizon,
+the sentence above that "skipping is the error this bridge does not accept":
+inside the horizon every untrusted start still repeats; beyond it the twenty
+deaf hours recorded in this file are the measured cost of never skipping.
+`antiphon catch-up` remains the way to skip to the live edge at once.
+
+**The surfaces shrank by a third.** `CLAUDE_RULE`, `AGENTS_RULE` and the
+channel instructions keep every fact the contract tests pin and lose the
+implementation narrative (v4 cursor keys, the v3 sibling, lanes, compaction),
+which now lives in README and this file only: 4,740 / 5,338 / 3,183 bytes,
+with ceilings pinned at 5,000 / 5,500 / 3,500 so they cannot regrow unnoticed.
+The 3,000 the campaign aimed for was not reachable without dropping pinned
+contract facts, which fill about 4.5 KB on their own.
+
+**Doctor sees rule drift.** `CLAUDE.md` and `AGENTS.md` whose Antiphon
+section is missing or differs from the generated rule are `✗ … run
+`antiphon setup``, like the missing permission doctor already reported;
+`setup` and `doctor --fix` rewrite the section in place.
+
 ## P1 — Re-run the host wrapper census before release
 
 `CLAUDE_HOST_WRAPPERS` and `CODEX_HOST_WRAPPERS` in `lib/antiphon.py` hold
@@ -1909,8 +1984,14 @@ tags matched the constants. `<channel>` and `<local-command-caveat>` appeared
 only on Claude records already excluded by `isMeta`, so both were removed:
 keeping them could silently discard a person's pasted text. The accepted cost
 is that a future non-meta host record using either tag would leak one visible
-line; `_is_self_injected` is not a second guard for either tag), and nothing
-else. They will go
+line; `_is_self_injected` is not a second guard for either tag; re-run
+2026-09-03 with the prefix shapes beside the tags — 1,245 Claude user
+messages in 525 files and 1,515 Codex user messages in 209 files;
+`codex_internal_context` (133, the ChatGPT app's goal continuation) joined
+the Codex set on that evidence, and the census now also counts 18 AGENTS.md
+injections, 4,463 external-agent calls and 4,336 results on the Codex side,
+6 compact summaries and 14 interruption literals on the Claude side), and
+nothing else. They will go
 stale as each host adds, renames or drops its own wrapper tags. Re-run before
 every release with:
 
