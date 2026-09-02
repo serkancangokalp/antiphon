@@ -11,6 +11,7 @@ import pathlib
 import multiprocessing
 import subprocess
 import tempfile
+import time
 import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -2971,3 +2972,41 @@ class PidCeilingHalvesAreSeparateTest(unittest.TestCase):
         self.assertFalse(peers.alive(self.HUGE))
         self.assertFalse(peers.alive(-1))
         self.assertFalse(peers.alive("not a pid"))
+
+
+OLD_READER_SHA256 = "4bb3ea14ab9415f84a734b16472638c09d0acfd56eba83ee96d11d3ea29a060b"
+OLD_READER_COMMITS = ("943da8a", "a076723")   # 0.3.3 as published; the same bytes one release earlier
+
+
+class FrozenReaderFixtureTest(unittest.TestCase):
+    """The cross-version tests drive the reader 0.3.3 actually shipped, not a
+    model of it. The fixture is byte-exact, and when git history is at hand the
+    blobs are compared too, so a hand edit to the fixture cannot quietly turn
+    the old reader into a kinder one."""
+
+    FIXTURE = os.path.join(os.path.dirname(__file__), "fixtures", "peers_0_3_3.py")
+    REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+    def test_the_fixture_is_the_shipped_reader(self):
+        with open(self.FIXTURE, "rb") as stream:
+            self.assertEqual(hashlib.sha256(stream.read()).hexdigest(),
+                             OLD_READER_SHA256)
+
+    def test_the_fixture_matches_both_pinned_blobs(self):
+        for commit in OLD_READER_COMMITS:
+            with self.subTest(commit=commit):
+                try:
+                    blob = subprocess.run(
+                        ["git", "show", f"{commit}:lib/peers.py"],
+                        capture_output=True, check=True, timeout=10,
+                        cwd=self.REPO).stdout
+                except (OSError, subprocess.SubprocessError):
+                    self.skipTest("no git history in this checkout")
+                self.assertEqual(hashlib.sha256(blob).hexdigest(),
+                                 OLD_READER_SHA256)
+
+    def test_the_fixture_imports_and_is_the_old_reader(self):
+        from test.fixtures import peers_0_3_3 as old
+        self.assertFalse(hasattr(old, "PROCESS_FINGERPRINT_VERSION"),
+                         "0.3.3 had no fingerprint generation at all")
+        self.assertTrue(callable(old._record_alive))
