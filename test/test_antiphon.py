@@ -2502,6 +2502,42 @@ class AntiphonTest(unittest.TestCase):
         self.assertEqual(text, "@claude real marker")
         self.assertEqual(key, "t1")
 
+    @staticmethod
+    def _claude_events_for(lines):
+        with patch.object(antiphon, "claude_transcripts", return_value=["t.jsonl"]), \
+             patch.object(antiphon, "read_records", side_effect=_as_records(lines)):
+            events, _ = antiphon.claude_events("/tmp/project")
+            return [(e.kind, e.text) for e in events]
+
+    @staticmethod
+    def _claude_user_line(text, second=0, **record):
+        return json.dumps(dict({"type": "user",
+                                "timestamp": f"2026-08-30T10:00:{second:02d}.000Z",
+                                "message": {"content": text}}, **record))
+
+    def test_claude_compact_summaries_and_interruptions_are_host_records(self):
+        """A compact summary is the host's own restatement of context —
+        measured 2026-09-02: six records, 104 KB, 17 KB each, always an
+        oversized record — and it is host-set, not text-shaped. The two
+        interruption markers are exact literals nobody typed. Equality, never
+        a prefix: a person's line that begins the same way stays a person's."""
+        self.assertEqual(antiphon.CLAUDE_HOST_LITERALS,
+                         ("[Request interrupted by user]",
+                          "[Request interrupted by user for tool use]"))
+        rendered = self._claude_events_for([
+            self._claude_user_line("This session is being continued from a "
+                                   "previous conversation. SUMMARY-SECRET", 1,
+                                   isCompactSummary=True),
+            self._claude_user_line("[Request interrupted by user]", 2),
+            self._claude_user_line("[Request interrupted by user for tool use]", 3),
+            self._claude_user_line("[Request interrupted by user] and more", 4),
+            self._claude_user_line("a person typed this", 5),
+        ])
+        self.assertEqual(rendered, [
+            ("you", "[Request interrupted by user] and more"),
+            ("you", "a person typed this"),
+        ])
+
     def test_an_attachment_is_not_a_host_record(self):
         """`<image>` was measured on real Codex rollouts and is a person's
         attachment, not the host's bookkeeping. It belongs in neither set."""

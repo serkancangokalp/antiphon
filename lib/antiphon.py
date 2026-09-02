@@ -462,6 +462,13 @@ CLAUDE_HOST_WRAPPERS = (
     "bash-input", "bash-stdout",
 )
 
+# Two host literals, exact. Claude Code writes them as the user record that
+# ends an interrupted turn; nobody typed them. Equality, never a prefix: a
+# person's line that begins the same way stays a person's line. Measured
+# 2026-09-02: seven such records reaching Codex's page as `To Claude:`.
+CLAUDE_HOST_LITERALS = ("[Request interrupted by user]",
+                        "[Request interrupted by user for tool use]")
+
 CODEX_HOST_WRAPPERS = (
     "task-notification", "recommended_plugins", "realtime_delegation",
     "subagent_notification", "environment_context", "ide_opened_file",
@@ -3251,7 +3258,13 @@ def claude_events(cwd, positions=None, since=None, visible_record_limit=None,
                             text = _join_text_blocks(
                                 c.get("text", "") for c in content
                                 if isinstance(c, dict) and c.get("type") == "text")
+                        # A compact summary is the host's own restatement of
+                        # context — measured 17 KB each, always an oversized
+                        # record — and it is host-set, not text-shaped, so
+                        # the flag decides rather than any wrapper.
                         if (text != ""
+                                and not d.get("isCompactSummary")
+                                and text not in CLAUDE_HOST_LITERALS
                                 and not _is_host_record(text, CLAUDE_WRAPPER_OPENING,
                                                         d.get("promptSource"))
                                 and not _is_self_injected(text)):
