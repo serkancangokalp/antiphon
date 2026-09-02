@@ -2388,13 +2388,119 @@ class AntiphonTest(unittest.TestCase):
                                "environment_context", "ide_opened_file",
                                "command-name", "command-message",
                                "local-command-stdout", "bash-input",
-                               "bash-stdout")
+                               "bash-stdout", "codex_internal_context")
         self.assertEqual(sorted(every_codex_wrapper),
                          sorted(antiphon.CODEX_HOST_WRAPPERS),
                          "CODEX_HOST_WRAPPERS changed without this test being updated")
         for tag in every_codex_wrapper:
             text = "<%s>host wrote this</%s>" % (tag, tag)
             self.assertEqual(self._codex_user_texts(text), [], tag)
+
+    @staticmethod
+    def _codex_line(role, text, second=0):
+        return json.dumps({"type": "response_item",
+                           "timestamp": f"2026-08-30T10:00:{second:02d}.000Z",
+                           "payload": {"type": "message", "role": role,
+                                       "content": [{"type": "input_text" if role == "user"
+                                                    else "output_text", "text": text}]}})
+
+    @staticmethod
+    def _codex_events_for(lines):
+        with patch.object(antiphon, "codex_rollout_files", return_value=["r.jsonl"]), \
+             patch.object(antiphon, "read_records", side_effect=_as_records(lines)):
+            events, _ = antiphon.codex_events("/tmp/project")
+            return [(e.kind, e.text, e.public_id) for e in events]
+
+    def test_codex_goal_continuation_is_a_host_record(self):
+        """The ChatGPT app's goal continuation, measured 2026-09-02: 133
+        records, 931 KB, every one host-written, reaching Claude's page as
+        `To Codex:`. A tag, so it joins the set; a whole tag name, as every
+        other wrapper."""
+        self.assertIn("codex_internal_context", antiphon.CODEX_HOST_WRAPPERS)
+        self.assertTrue(antiphon._is_host_record(
+            '<codex_internal_context source="goal">\nContinue working toward '
+            "the active thread goal.", antiphon.CODEX_WRAPPER_OPENING))
+        self.assertFalse(antiphon._is_host_record(
+            "<codex_internal_contexts> is a word", antiphon.CODEX_WRAPPER_OPENING))
+
+    def test_codex_agents_md_injection_is_a_host_record(self):
+        """Codex injects the project's AGENTS.md as its first user message —
+        the bridge's own rule relayed back to the other side, 8 KB a session.
+        Both halves are required: a heading alone could be a person's document
+        and a fence alone could be quoted."""
+        block = ("# AGENTS.md instructions for /Users/x/project\n\n"
+                 "<INSTRUCTIONS>\n\n## The Antiphon bridge\n...\n</INSTRUCTIONS>\n"
+                 "<environment_context>\n  <cwd>/Users/x/project</cwd>\n"
+                 "</environment_context>")
+        self.assertTrue(antiphon._is_codex_host_block(block))
+        self.assertFalse(antiphon._is_codex_host_block(
+            "# AGENTS.md instructions for my talk\n\nslides"))
+        self.assertFalse(antiphon._is_codex_host_block(
+            "please read <INSTRUCTIONS> in the doc"))
+        self.assertFalse(antiphon._is_codex_host_block(""))
+        self.assertFalse(antiphon._is_codex_host_block(None))
+        self.assertEqual(self._codex_events_for([self._codex_line("user", block)]), [])
+
+    def test_codex_external_agent_relays_are_tool_lines_not_speech(self):
+        """The ChatGPT app records an external agent's tool traffic — Claude
+        Code's own Bash and Read calls, when Claude runs inside the app — as
+        assistant messages in the Codex rollout. Measured 2026-09-02: 8,936
+        records, 11 MB, rendered as Codex speech. A call is one name-only tool
+        line, as every Codex tool call is; a result is a tool output and stays
+        filtered."""
+        rendered = self._codex_events_for([
+            self._codex_line("assistant",
+                             "[external_agent_tool_call: Bash]\ndescription: list\n"
+                             "command: ls -la /secret\n[/external_agent_tool_call]", 1),
+            self._codex_line("assistant",
+                             "[external_agent_tool_result]\ntotal 0\n"
+                             "SECRET-OUTPUT\n[/external_agent_tool_result]", 2),
+            self._codex_line("assistant", "Plain words from Codex.", 3),
+            self._codex_line("user",
+                             '<codex_internal_context source="goal">\nGOAL-SECRET', 4),
+            self._codex_line("user", "a person typed this", 5),
+        ])
+        self.assertEqual(rendered, [
+            ("tool", "external agent: Bash", None),
+            ("codex", "Plain words from Codex.", None),
+            ("you", "a person typed this", None),
+        ])
+        joined = "\n".join(text for _kind, text, _id in rendered)
+        for secret in ("ls -la", "SECRET-OUTPUT", "GOAL-SECRET"):
+            self.assertNotIn(secret, joined)
+
+    def test_the_relay_predicate_is_exact_about_its_shape(self):
+        self.assertEqual(antiphon._external_agent_relay(
+            "[external_agent_tool_call: mcp__antiphon__reply_to_codex]\ninput: {}"),
+            ("call", "mcp__antiphon__reply_to_codex"))
+        self.assertEqual(antiphon._external_agent_relay(
+            "[external_agent_tool_call: Bash]"), ("call", "Bash"))
+        self.assertEqual(antiphon._external_agent_relay(
+            "[external_agent_tool_result]\nok"), ("result", None))
+        self.assertEqual(antiphon._external_agent_relay(
+            "[external_agent_tool_result]"), ("result", None))
+        for text in ("[external_agent_tool_call: ]\nx", "[external_agent_tool_call:Bash]",
+                     "external_agent_tool_call: Bash", "[external_agent_tool_call: Bad Name]",
+                     " [external_agent_tool_call: Bash]", "[external_agent_tool_result]x",
+                     "", None):
+            self.assertIsNone(antiphon._external_agent_relay(text), repr(text))
+
+    def test_a_codex_stop_hook_never_pushes_a_marker_out_of_a_relay(self):
+        """A relayed external-agent call can carry `@claude` at a line start —
+        it is the other agent's own command text. The Stop reader must not
+        read it as Codex addressing anyone."""
+        with tempfile.TemporaryDirectory() as project:
+            path = os.path.join(project, "rollout.jsonl")
+            with open(path, "w", encoding="utf-8") as stream:
+                stream.write(json.dumps({"type": "event_msg", "payload": {
+                    "type": "task_started", "turn_id": "t1"}}) + "\n")
+                stream.write(self._codex_line(
+                    "assistant", "[external_agent_tool_call: Bash]\ncommand: echo "
+                    "'@claude hi'\n[/external_agent_tool_call]", 1) + "\n")
+                stream.write(self._codex_line("assistant", "@claude real marker", 2) + "\n")
+            text, key = antiphon._codex_turn(path, "t1")
+        self.assertEqual(text, "@claude real marker")
+        self.assertEqual(key, "t1")
 
     def test_an_attachment_is_not_a_host_record(self):
         """`<image>` was measured on real Codex rollouts and is a person's

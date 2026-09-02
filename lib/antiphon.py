@@ -451,6 +451,9 @@ def _join_text_blocks(blocks):
 # person's pasted text. If a future non-meta host record uses either tag, one
 # visible host line may leak; `_is_self_injected` is not a second guard for
 # them. The seven remaining Claude tags and all eleven Codex tags matched.
+# Re-measured 2026-09-02 over 206 Codex files: `codex_internal_context`, the
+# ChatGPT app's goal continuation, 133 user records and 931 KB, every one
+# host-written and reaching the Claude page as `To Codex:` — Codex only.
 # See BACKLOG.md for the repeatable release check.
 CLAUDE_HOST_WRAPPERS = (
     "task-notification", "ide_opened_file",
@@ -463,7 +466,7 @@ CODEX_HOST_WRAPPERS = (
     "task-notification", "recommended_plugins", "realtime_delegation",
     "subagent_notification", "environment_context", "ide_opened_file",
     "command-name", "command-message", "local-command-stdout",
-    "bash-input", "bash-stdout",
+    "bash-input", "bash-stdout", "codex_internal_context",
 )
 
 # `promptSource` values measured carrying host records as well as people's
@@ -499,6 +502,20 @@ def _is_host_record(text, wrappers, prompt_source=None):
     if prompt_source and prompt_source not in MIXED_SOURCES:
         return False
     return wrappers.match((text or "").lstrip()) is not None
+
+
+# The Codex host injects the project's AGENTS.md as the first user message of
+# a session: `# AGENTS.md instructions for <cwd>`, a blank line, then an
+# `<INSTRUCTIONS>` fence. Measured 2026-09-02: 18 records, 32 KB, every one
+# host-written — and the rule inside is this bridge's own text, relayed back
+# to the other side at 8 KB a session. Both halves are required: a heading
+# alone could be a person's document, a fence alone could be quoted.
+AGENTS_INJECTION_HEAD = "# AGENTS.md instructions for "
+
+
+def _is_codex_host_block(text):
+    return (isinstance(text, str) and text.startswith(AGENTS_INJECTION_HEAD)
+            and "\n<INSTRUCTIONS>" in text)
 
 
 def sender_alias(candidate):
@@ -3353,6 +3370,32 @@ def _codex_tool_fields(payload):
     return kind, name, namespace, payload[argument_key]
 
 
+# The ChatGPT app records an external agent's tool traffic — Claude Code's
+# own Bash and Read calls, when Claude runs inside the app — as assistant
+# messages in the Codex rollout. Measured 2026-09-02: 8,936 records, 11 MB,
+# rendered as Codex speech with the commands and their output in full. A call
+# is one name-only tool line, as every Codex tool call is; a result is a tool
+# output and stays filtered. Exact at the first line: the bracket, the fixed
+# prefix, one tool-name token, nothing leading. Nothing retrievable backs a
+# relay, so it carries no id.
+EXTERNAL_AGENT_CALL = re.compile(
+    r"\[external_agent_tool_call: (" + TOOL_COMPONENT.pattern + r")\](?:\n|$)")
+EXTERNAL_AGENT_RESULT_HEAD = "[external_agent_tool_result]"
+
+
+def _external_agent_relay(text):
+    """`("call", name)`, `("result", None)` or None for one assistant text."""
+    if not isinstance(text, str):
+        return None
+    matched = EXTERNAL_AGENT_CALL.match(text)
+    if matched:
+        return "call", matched.group(1)
+    if text == EXTERNAL_AGENT_RESULT_HEAD or text.startswith(
+            EXTERNAL_AGENT_RESULT_HEAD + "\n"):
+        return "result", None
+    return None
+
+
 def _codex_tool_name(payload):
     """Return the only safe page detail from one measured Codex tool call.
 
@@ -3484,16 +3527,27 @@ def codex_events(cwd, positions=None, since=None, visible_record_limit=None,
                         if text != "" and role != "developer":
                             if role == "user":
                                 if (not _is_host_record(text, CODEX_WRAPPER_OPENING)
+                                        and not _is_codex_host_block(text)
                                         and not _is_self_injected(text)):
                                     events.append((ts, path, next(position),
                                                   Event(ts, "you", text, sid, gen,
                                                         start, end, previous_anchor,
                                                         anchor)))
                             elif role == "assistant":
-                                events.append((ts, path, next(position),
-                                              Event(ts, "codex", text, sid, gen,
-                                                    start, end, previous_anchor,
-                                                    anchor)))
+                                relay = _external_agent_relay(text)
+                                if relay is None:
+                                    events.append((ts, path, next(position),
+                                                  Event(ts, "codex", text, sid, gen,
+                                                        start, end, previous_anchor,
+                                                        anchor)))
+                                elif relay[0] == "call":
+                                    events.append((ts, path, next(position),
+                                                  Event(ts, "tool",
+                                                        f"external agent: {relay[1]}",
+                                                        sid, gen, start, end,
+                                                        previous_anchor, anchor)))
+                                # a relayed result is a tool output: filtered,
+                                # while the safe scanned frontier still advances
                     elif kind == "response_item":
                         invocation = _codex_invocation(payload, sid, start)
                         if invocation is not None:
@@ -4367,7 +4421,14 @@ def _codex_turn(transcript_path, turn_id=None):
             return None
         texts = [c.get("text") or c.get("output_text") or c.get("input_text") or ""
                 for c in p.get("content") or [] if isinstance(c, dict)]
-        return texts if any(texts) else None
+        if not any(texts):
+            return None
+        # A relayed external-agent call is the other agent's own command
+        # text, and it can carry `@claude` at a line start; it is not Codex
+        # addressing anyone.
+        if _external_agent_relay("\n".join(texts)) is not None:
+            return None
+        return texts
 
     def task_marker(d):
         p = d.get("payload") or {}
