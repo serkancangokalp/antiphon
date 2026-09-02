@@ -12428,9 +12428,14 @@ class SourceActivityTest(unittest.TestCase):
                          {self.A: antiphon.peers.auto_identity(self.A)[0]})
         self.assertEqual(join.states, {self.A: "live"})
 
+    SIBLING = object()   # the current spelling: `process_birth: "v1:<start>"`
+
     def _claim(self, project, name, source, endpoint_pid=100, owner_pid=300,
                owner_version=1, endpoint_owner=None, session_owner=None,
-               endpoint_birth_version=1):
+               endpoint_birth_version=SIBLING):
+        """`endpoint_birth_version=SIBLING` (the default) writes the current
+        `process_birth` sibling; `1` writes the 0.4.0 migration pair; `None`
+        writes an unversioned `birth` no reader may compare."""
         owner = (f"{owner_pid}:v{owner_version}:{self.OWNER_START}"
                  if owner_version is not None
                  else f"{owner_pid}:{self.OWNER_START}")
@@ -12441,11 +12446,14 @@ class SourceActivityTest(unittest.TestCase):
         endpoint = {
             "kind": "codex", "name": name, "pid": endpoint_pid,
             "address": source, "owner": endpoint_owner,
-            "birth": self.ENDPOINT_START,
             "started_at": 1.0,
         }
-        if endpoint_birth_version is not None:
-            endpoint["birth_version"] = endpoint_birth_version
+        if endpoint_birth_version is self.SIBLING:
+            endpoint["process_birth"] = "v1:" + self.ENDPOINT_START
+        else:
+            endpoint["birth"] = self.ENDPOINT_START
+            if endpoint_birth_version is not None:
+                endpoint["birth_version"] = endpoint_birth_version
         with open(os.path.join(directory, "endpoint.json"), "w",
                   encoding="utf-8") as stream:
             json.dump(endpoint, stream)

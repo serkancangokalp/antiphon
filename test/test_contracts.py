@@ -1066,8 +1066,12 @@ class IdentityPrivacyContractTest(unittest.TestCase):
         python = read("lib", "antiphon.py")
         register = python[python.index("def register_peer("):]
         register = register[:register.index("\ndef ")]
-        self.assertIn('json.dumps({"birth"', register,
-                      "and the operation returns it")
+        self.assertIn("register_claim(", register,
+                      "the claim is the operation that returns it")
+        self.assertIn('json.dumps({"birth": fingerprint', register,
+                      "and the operation's own return is what is answered")
+        self.assertNotIn("_process_birth(", register,
+                         "never a second observation")
 
     def test_the_two_readers_select_the_fingerprint_the_same_way(self):
         """One selector per language, one grammar compared at runtime — never

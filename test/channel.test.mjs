@@ -2973,6 +2973,52 @@ async function aWithdrawalThatDidNotHappenIsNotAnnounced() {
   }
 }
 
+// The Node grammar and selector, on values, without a listener. The parity
+// suite cannot see this side's range check: an out-of-range start is UNREADY
+// on both sides whichever way Node decides it, because it can never equal the
+// listener's own birth. Pinned here instead, mirror for mirror with Python's
+// `test_the_grammar_is_the_writers_own_shape_and_in_range`.
+async function theNodeGrammarIsTheWritersOwnShapeAndInRange() {
+  const { canonicalStart, fingerprintOf, renderFingerprint } = await import("../lib/identity.mjs");
+  const live = "Sat Aug 30 01:00:00 2026";
+  for (const start of [live, "Wed Sep 2 16:13:13 2026", "Thu Jan 1 00:00:00 1970"]) {
+    assert.equal(canonicalStart(start), start, start);
+    assert.deepEqual(fingerprintOf({ record: { process_birth: `v1:${start}` } }),
+      { kind: "current", start }, start);
+    assert.equal(renderFingerprint(fingerprintOf({ record: { process_birth: `v1:${start}` } })),
+      `v1:${start}`);
+    assert.deepEqual(fingerprintOf({ record: { birth: start, birth_version: 1 } }),
+      { kind: "current", start }, `migration pair ${start}`);
+  }
+  for (const start of ["Wed Sep  2 16:13:13 2026", "Çar Eyl 2 16:13:13 2026",
+    "Mon Jan 99 99:99:99 2026", "Abc Xxx 0 00:00:00 0000", "Sat Aug 30 01:00:00 1969",
+    "Sat Aug 30 24:00:00 2026", "Sat Aug 30 01:60:00 2026", "Sat Aug 30 01:00:60 2026",
+    "Sat Aug 0 01:00:00 2026", "Sat Aug 32 01:00:00 2026", `${live} `, ` ${live}`,
+    `${live}\u0085`, `\ufeff${live}`, ""]) {
+    assert.equal(canonicalStart(start), null, JSON.stringify(start));
+    assert.equal(fingerprintOf({ record: { process_birth: `v1:${start}` } }), null, JSON.stringify(start));
+    assert.equal(fingerprintOf({ record: { birth: start, birth_version: 1 } }), null, JSON.stringify(start));
+  }
+  // Precedence by key presence; a malformed current sibling is malformed, not
+  // "other"; a different bounded generation is "other"; a generation with a
+  // leading zero is malformed.
+  for (const bad of ["", "v1:", "v1:garbage", `1:${live}`, "v0:x", "v01:x", 7, null, [], {}]) {
+    assert.equal(fingerprintOf({ record: { process_birth: bad, birth: live, birth_version: 1 } }),
+      null, `sibling ${JSON.stringify(bad)} beside a valid pair`);
+  }
+  for (const sibling of ["v2:2026-08-30T01:00:00Z", `v999999999:${live}`]) {
+    assert.deepEqual(fingerprintOf({ record: { process_birth: sibling } }), { kind: "other" }, sibling);
+    assert.equal(renderFingerprint(fingerprintOf({ record: { process_birth: sibling } })), null);
+  }
+  assert.equal(fingerprintOf({ record: { birth: live, birth_version: 2 } }), null);
+  assert.equal(fingerprintOf({ record: { birth: live } }), null);
+  assert.equal(fingerprintOf({ record: { birth: live, birth_version: 1 },
+    scan: { integral: new Map([["birth_version", false]]) } }), null, "1.0 is not the integer 1");
+  assert.equal(fingerprintOf(null), null);
+  console.log("the Node grammar is the writer's own shape and in range: ok");
+}
+
+await theNodeGrammarIsTheWritersOwnShapeAndInRange();
 await thePublishedReaderLeavesALiveListenerRegistered();
 await anOldListenerOverAnUpgradedPythonIsRefusedNotToldItRecovered();
 await aCurrentListenerOverADowngradedPythonWithdrawsItsOwnEndpoint();
