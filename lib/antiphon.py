@@ -410,6 +410,14 @@ SESSION_ID = re.compile(r"([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-"
 # so the two can't drift apart.
 PUSH_LABEL = "[Antiphon bridge] Claude:"
 CHANNEL_LABEL = "[Antiphon channel] Claude:"
+# The same two roads from a Codex sender to another Codex session: its Stop
+# hook and its `antiphon_send(kind="codex")`. A Codex rollout carrying one is
+# another session's words to this one, and the same guard below keeps them
+# off the page.
+PUSH_LABEL_CODEX = "[Antiphon bridge] Codex:"
+CHANNEL_LABEL_CODEX = "[Antiphon channel] Codex:"
+SIDE_LABELS = {"claude": (PUSH_LABEL, CHANNEL_LABEL),
+               "codex": (PUSH_LABEL_CODEX, CHANNEL_LABEL_CODEX)}
 
 # A message this bridge pushed arrives on the other side as an ordinary
 # `role: user` event. Skipping those keeps the summary from echoing the
@@ -417,7 +425,7 @@ CHANNEL_LABEL = "[Antiphon channel] Claude:"
 # a substring test would also swallow a user typing "antiphon is dropping
 # messages", and that message would then never reach the other agent.
 _SELF_INJECTION_PREFIXES = tuple(
-    label.lower() for label in (PUSH_LABEL, CHANNEL_LABEL))
+    label.lower() for labels in SIDE_LABELS.values() for label in labels)
 
 
 def _is_self_injected(text):

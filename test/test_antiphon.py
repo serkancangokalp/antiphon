@@ -4085,6 +4085,53 @@ class ToolInvocationRetrievalTest(unittest.TestCase):
         self.assertEqual(json.loads(out.getvalue())["result"], answer)
 
 
+class SameVendorTest(unittest.TestCase):
+    """A Claude session reaches another Claude session and a Codex session
+    another Codex session, always by name, over the transports that already
+    exist. Asked for on 2026-08-31 after two Codex terminals and one Claude
+    on a second machine. The passive page stays the other kind's transcripts;
+    the bridge forwards nothing automatically, so no bridge-level loop."""
+
+    MID = "83f48150-6f08-4d21-b51e-10af885dc39f"
+
+    # ---- Task 1: a Codex sender's labels ----
+
+    def test_a_codex_senders_labels_are_this_bridges_own_traffic(self):
+        self.assertEqual(antiphon.PUSH_LABEL_CODEX, "[Antiphon bridge] Codex:")
+        self.assertEqual(antiphon.CHANNEL_LABEL_CODEX, "[Antiphon channel] Codex:")
+        for label in (antiphon.PUSH_LABEL, antiphon.CHANNEL_LABEL,
+                      antiphon.PUSH_LABEL_CODEX, antiphon.CHANNEL_LABEL_CODEX):
+            self.assertTrue(antiphon._is_self_injected(f"{label} [from=ui id=x] hi"), label)
+            self.assertTrue(antiphon._is_self_injected(f"  {label.lower()} hi"), label)
+        self.assertFalse(antiphon._is_self_injected("antiphon is dropping messages"))
+        self.assertEqual(antiphon.SIDE_LABELS["codex"],
+                         (antiphon.PUSH_LABEL_CODEX, antiphon.CHANNEL_LABEL_CODEX))
+        self.assertEqual(antiphon.SIDE_LABELS["claude"],
+                         (antiphon.PUSH_LABEL, antiphon.CHANNEL_LABEL))
+
+    def test_a_codex_to_codex_message_is_a_receipt_on_the_page_never_speech(self):
+        now = time.strftime("%Y-%m-%dT%H:%M:%S.000Z", time.gmtime())
+        sid = "1d5a03e0-0548-4339-87c3-45c5dbf7e9d7"
+        with tempfile.TemporaryDirectory() as project:
+            path = os.path.join(project, f"rollout-2026-09-03T00-00-00-{sid}.jsonl")
+            with open(path, "w", encoding="utf-8") as f:
+                f.write(json.dumps({"timestamp": now, "type": "session_meta",
+                                    "payload": {"cwd": project}}) + "\n")
+                f.write(json.dumps({"timestamp": now, "type": "response_item", "payload": {
+                    "type": "message", "role": "user", "content": [{
+                        "type": "input_text",
+                        "text": f"{antiphon.PUSH_LABEL_CODEX} [from=build id={self.MID}] ship it"}]}})
+                        + "\n")
+                f.write(json.dumps({"timestamp": now, "type": "response_item", "payload": {
+                    "type": "message", "role": "assistant", "content": [{
+                        "type": "output_text", "text": "shipping"}]}}) + "\n")
+            receipts = []
+            events, _ = antiphon.codex_events(project, source_paths=[path], receipts=receipts)
+        self.assertEqual([e.text for e in events], ["shipping"],
+                         "another Codex session's words to this one are not this page's news")
+        self.assertEqual([(kind, key) for kind, key, _at in receipts], [("received", self.MID)])
+
+
 class DeliveryReceiptTest(unittest.TestCase):
     """A delivery is received when the peer's own transcript shows it, and
     only then. Measured 2026-09-03 across the live transcripts: 180 Codex
