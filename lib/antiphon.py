@@ -61,6 +61,7 @@ import time
 import uuid
 
 import peers
+import ledger
 from datetime import datetime
 
 HOME = os.path.expanduser("~")
@@ -4980,6 +4981,13 @@ def push(target="codex"):
         if ok:
             print(f"antiphon: delivered to {target.title()}{named} "
                   f"({len(outgoing)} characters)", file=sys.stderr)
+            ledger.record_sent(
+                cwd, attempt, sender=who or NO_ALIAS, to_kind=target,
+                to_alias=recipient,
+                transport="queue" if target == "codex" else "channel",
+                proof=(detail or "registered") if target == "codex" else "channel",
+                sha256=hashlib.sha256(outgoing.encode()).hexdigest(),
+                size=len(outgoing.encode()))
         else:
             # Returning False leaves this recipient's fingerprint where it was,
             # so the line is offered again next turn instead of being recorded
@@ -4990,6 +4998,13 @@ def push(target="codex"):
             # keep clean by construction.
             print(f"antiphon: delivery failed — {redact_private(str(detail))}",
                   file=sys.stderr)
+            # This line reaches a debug log and not the agent (exit-0 hook
+            # stderr, measured), so the refusal goes on the ledger and the
+            # sender's next page says it.
+            ledger.record_refused(
+                cwd, attempt, sender=who or NO_ALIAS, to_kind=target,
+                to_alias=recipient, reason=redact_private(str(detail)),
+                preview=outgoing)
         return ok
 
     # The send happens here, outside any lock — reversing an earlier ruling
@@ -6311,7 +6326,38 @@ def reply(*_):
     # fingerprints bare marker lines, never composed ones, so parking the
     # composed string would leave the park matching nothing.
     _record_delivery(cwd, "codex", outgoing, to)
+    # What actually happened, for the ledger and for the caller. A queue
+    # accepting a row is not the peer reading it — measured, a row sat in an
+    # open app-hosted thread's queue for over an hour — so the word is
+    # "queued", the proof class travels with it, and the receipt that
+    # `status` shows later is the only "delivered" there is.
+    attachment = os.path.basename(parked.path) if parked is not None else None
+    ledger.record_sent(cwd, message_id, sender=who or NO_ALIAS, to_kind="codex",
+                       to_alias=to, transport="queue", proof=detail or "registered",
+                       sha256=hashlib.sha256(text.encode()).hexdigest(),
+                       size=len(text.encode()), attachment=attachment)
+    print(json.dumps({"queued": True, "id": message_id, "proof": detail or "registered",
+                      "to": to, "attachment": attachment,
+                      "text": queued_words(to, message_id, detail or "registered",
+                                           attachment)}))
     return 0
+
+
+def queued_words(to, message_id, proof, attachment=None):
+    """The `reply_to_codex` result, composed here so one spelling is tested.
+
+    Never "delivered": the transport accepted a row, and only the peer's own
+    transcript proves it was read."""
+    where = (f"Codex peer '{to}'" if to else "the newest Codex session")
+    text = (f"Queued for {where} (id {message_id}): Codex reads its queue at "
+            "its next turn; run antiphon status to see whether it was received.")
+    if proof == "unproven":
+        text += (" That thread is unproven: the host keeps no writer lock for "
+                 "it, so it may be open or long closed.")
+    if attachment:
+        text += (" The message was too large for the queue, so its words are "
+                 "parked as an attachment and the envelope names the file.")
+    return text
 
 
 def _record_delivery(cwd, target, text, alias=None):
@@ -6578,20 +6624,30 @@ def _send_tool(cwd, text, to=None, sender=None):
         return _tool_error(f"Not delivered to Claude: "
                            f"{_guided(detail, 'only a tool-name line')}")
     _record_delivery(cwd, "claude", outgoing, to)
+    ledger.record_sent(cwd, message_id, sender=who or NO_ALIAS, to_kind="claude",
+                       to_alias=to, transport="channel", proof="channel",
+                       sha256=hashlib.sha256(text.encode()).hexdigest(),
+                       size=len(text.encode()),
+                       attachment=(os.path.basename(parked.path)
+                                   if parked is not None else None))
     # Naming the peer back is what lets the sender notice it addressed the wrong
     # one. With a single peer there is nothing to distinguish, so the old
-    # wording stands.
+    # wording stands. "Delivered" is true here — the channel server accepted
+    # the notification for the host — and the receipt `status` shows later is
+    # the peer's own transcript.
     where = f"peer {to!r}" if to else "channel"
+    receipt = ("antiphon status shows when Claude's transcript received it")
     if parked is not None:
         # Announced, never silent: the sender asked for a message to be
         # delivered and something else was, so it is told what and where.
         return {"content": [{"type": "text", "text": (
-            f"Delivered to the Claude Code {where} as an attachment: the "
-            f"message was too large for the channel, so its {parked.size} "
-            f"bytes are parked at {parked.path} and an envelope naming that "
-            "file went in its place.")}]}
+            f"Delivered to the Claude Code {where} (id {message_id}) as an "
+            f"attachment: the message was too large for the channel, so its "
+            f"{parked.size} bytes are parked at {parked.path} and an envelope "
+            f"naming that file went in its place; {receipt}.")}]}
     return {"content": [{"type": "text",
-                         "text": f"Delivered to the Claude Code {where}."}]}
+                         "text": f"Delivered to the Claude Code {where} "
+                                 f"(id {message_id}); {receipt}."}]}
 
 
 def _retrieve_tool(cwd, public_id):

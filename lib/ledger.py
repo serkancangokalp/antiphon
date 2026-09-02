@@ -330,10 +330,14 @@ def pending_notices(cwd, side, alias):
         target = LABEL[entry["to_kind"]]
         if entry["state"] == "refused":
             named = f":{entry['to_alias']}" if entry["to_alias"] else ""
+            # Every refusal the senders write starts "not delivered: "; the
+            # notice says that once.
+            reason = re.sub(r"^\s*not delivered:\s*", "",
+                            entry["reason"] or "") or "no reason recorded"
             notices.append((entry["id"], (
                 f"Antiphon: your @{entry['to_kind']}{named} line at "
                 f"{_clock(entry['sent_at'])} (\"{entry['preview'] or ''}\") "
-                f"was not delivered — {entry['reason'] or 'no reason recorded'}")))
+                f"was not delivered — {reason}")))
         elif entry["expired_unread_at"] is not None:
             notices.append((entry["id"], (
                 f"Antiphon: the attachment you sent to {target} at "

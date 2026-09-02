@@ -1633,6 +1633,10 @@ try {
   });
   assert.match(named.content[0].text, /review/,
     "an explicit recipient must be named back");
+  assert.match(named.content[0].text, /^Queued for Codex peer 'review' \(id [0-9a-f-]{36}\)/,
+    "a queue accepting a row is not the peer reading it: queued, with the id the receipt will show");
+  assert.doesNotMatch(named.content[0].text, /delivered/i);
+  assert.match(named.content[0].text, /antiphon status/);
   assert.match(readFileSync(queueLog, "utf8"), new RegExp(CODEX_SESSION),
     "and the message must be queued against that peer's session");
 

@@ -1,6 +1,7 @@
 import sys, os
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "lib"))
 import antiphon
+import ledger
 
 import contextlib
 import errno
@@ -1523,6 +1524,69 @@ class AntiphonTest(unittest.TestCase):
             self.assertEqual(antiphon.reply(), 0)
         self.assertEqual(written, [{"last_pushed_codex": {antiphon.MID_TURN_SLOT:
                                     {"": antiphon.batch_fingerprint(["hello"])}}}])
+
+    def test_reply_puts_the_delivery_on_the_ledger_and_says_queued(self):
+        """Measured 2026-09-03: a queued message sat in an open app-hosted
+        thread's queue for over an hour while the tool had said delivered. The
+        reply records what it did and reports it: queued, to whom, on what
+        proof, under which id — and the words' digest, never the words."""
+        out = io.StringIO()
+        with tempfile.TemporaryDirectory() as project, \
+             patch.object(antiphon, "project_dir", return_value=project), \
+             patch.object(antiphon, "send_to_codex", return_value=(True, "unproven")), \
+             patch.object(antiphon.sys, "stdin",
+                          io.StringIO(json.dumps({"text": "run the suite",
+                                                  "sender_alias": "ui"}))), \
+             contextlib.redirect_stdout(out), \
+             contextlib.redirect_stderr(io.StringIO()):
+            self.assertEqual(antiphon.reply(), 0)
+            entries = ledger.entries(project)
+        self.assertEqual(len(entries), 1)
+        entry = entries[0]
+        answer = json.loads(out.getvalue().strip().splitlines()[-1])
+        self.assertEqual(answer.pop("text"), (
+            f"Queued for the newest Codex session (id {entry['id']}): Codex reads "
+            "its queue at its next turn; run antiphon status to see whether it was "
+            "received. That thread is unproven: the host keeps no writer lock for "
+            "it, so it may be open or long closed."))
+        self.assertEqual(answer, {"queued": True, "id": entry["id"], "proof": "unproven",
+                                  "to": None, "attachment": None})
+        self.assertEqual((entry["sender"], entry["to_kind"], entry["to_alias"],
+                          entry["transport"], entry["proof"], entry["state"],
+                          entry["sha256"], entry["size"]),
+                         ("ui", "codex", None, "queue", "unproven", "sent",
+                          hashlib.sha256(b"run the suite").hexdigest(), 13))
+
+    def test_the_queued_words_never_say_delivered(self):
+        """The reply tool's result, composed once here so the channel server
+        relays it verbatim: the peer, the id the receipt will show, the
+        unproven caveat only when the proof is unproven, the parked file only
+        when there is one."""
+        mid = "0b4b0f7a-3b7e-4d0e-9d6c-2f1c3a4b5c6d"
+        named = antiphon.queued_words("review", mid, "registered")
+        self.assertTrue(named.startswith(f"Queued for Codex peer 'review' (id {mid}): "))
+        self.assertIn("run antiphon status", named)
+        self.assertNotIn("unproven", named)
+        self.assertNotIn("attachment", named)
+        self.assertNotIn("elivered", named)
+        parked = antiphon.queued_words(None, mid, "live", f"{mid}.txt")
+        self.assertTrue(parked.startswith(f"Queued for the newest Codex session (id {mid}): "))
+        self.assertIn("parked as an attachment", parked)
+        self.assertNotIn("unproven", parked)
+
+    def test_a_refused_reply_writes_nothing_to_the_ledger(self):
+        """A refusal on the tool road is already reported to the caller in
+        full; the ledger is for what left, and for Stop-hook refusals nobody
+        else reports."""
+        with tempfile.TemporaryDirectory() as project, \
+             patch.object(antiphon, "project_dir", return_value=project), \
+             patch.object(antiphon, "send_to_codex",
+                          return_value=(False, "not delivered: nobody")), \
+             patch.object(antiphon.sys, "stdin",
+                          io.StringIO(json.dumps({"text": "hello"}))), \
+             contextlib.redirect_stderr(io.StringIO()):
+            self.assertEqual(antiphon.reply(), 1)
+            self.assertEqual(ledger.entries(project), [])
 
     # ---- choosing which peer a message goes to: see RoutingTest ----
 
@@ -14045,6 +14109,24 @@ class RoutingTest(unittest.TestCase):
         self.assertTrue(result.get("isError"))
         self.assertIn("api", result["content"][0]["text"])
 
+    def test_the_send_tool_puts_the_delivery_on_the_ledger_and_names_the_receipt(self):
+        with tempfile.TemporaryDirectory() as project, \
+             patch.object(antiphon, "send_to_claude", return_value=(True, "")), \
+             patch.object(antiphon, "_record_delivery"):
+            result = antiphon._send_tool(project, "hello there", "ui", sender="build")
+            entries = ledger.entries(project)
+        self.assertFalse(result.get("isError"), result)
+        text = result["content"][0]["text"]
+        self.assertEqual(len(entries), 1)
+        entry = entries[0]
+        self.assertIn(f"Delivered to the Claude Code peer 'ui' (id {entry['id']})", text)
+        self.assertIn("antiphon status", text)
+        self.assertEqual((entry["sender"], entry["to_kind"], entry["to_alias"],
+                          entry["transport"], entry["proof"], entry["state"],
+                          entry["sha256"]),
+                         ("build", "claude", "ui", "channel", "channel", "sent",
+                          hashlib.sha256(b"hello there").hexdigest()))
+
 
 class ToolRecipientTest(unittest.TestCase):
     """`to` on both channel tools, and the dedupe that has to follow it.
@@ -14414,6 +14496,45 @@ class ToolRecipientTest(unittest.TestCase):
              contextlib.redirect_stderr(err):
             code = antiphon.push(target)
         return code, err.getvalue()
+
+    def test_a_push_puts_each_attempt_on_the_ledger(self):
+        with tempfile.TemporaryDirectory() as project, \
+             patch.object(antiphon, "send_to_codex", return_value=(True, "live")), \
+             patch.object(antiphon, "claimed_alias", return_value="ui"):
+            code, err = self._stop(project, "@codex run the suite\n@codex:build ship it")
+            self.assertEqual(code, 0, err)
+            entries = ledger.entries(project)
+        self.assertEqual(sorted(((e["to_alias"], e["state"], e["proof"], e["transport"])
+                                 for e in entries), key=lambda row: row[0] or ""),
+                         [(None, "sent", "live", "queue"), ("build", "sent", "live", "queue")])
+        self.assertEqual({e["sender"] for e in entries}, {"ui"})
+        bare = next(e for e in entries if e["to_alias"] is None)
+        self.assertEqual(bare["sha256"], hashlib.sha256(b"run the suite").hexdigest())
+
+    def test_a_refused_push_is_on_the_ledger_with_its_reason_and_preview(self):
+        """The Stop hook's refusal prints on exit-0 stderr, which reaches a
+        debug log and not the agent — measured: the Codex peer said
+        "Gönderdim" for a marker that never left. The ledger keeps the
+        reason and the sender's own first words, so the next page can say."""
+        refusal = antiphon._ClassifiedRefusal(
+            "not delivered: no Codex session found in this directory", "no-peer")
+        with tempfile.TemporaryDirectory() as project, \
+             patch.object(antiphon, "send_to_codex", return_value=(False, refusal)), \
+             patch.object(antiphon, "claimed_alias", return_value=None):
+            code, err = self._stop(project, "@codex " + "x" * 200)
+            self.assertEqual(code, 0, err)
+            entries = ledger.entries(project)
+            notices = ledger.pending_notices(project, "claude", None)
+        self.assertEqual(len(entries), 1)
+        entry = entries[0]
+        self.assertEqual((entry["state"], entry["sender"], entry["to_kind"], entry["to_alias"]),
+                         ("refused", "<unnamed>", "codex", None))
+        self.assertIn("no Codex session found", entry["reason"])
+        self.assertEqual(entry["preview"], "x" * 60)
+        self.assertEqual([i for i, _ in notices], [entry["id"]])
+        self.assertEqual(notices[0][1].count("not delivered"), 1,
+                         "the refusal already says 'not delivered:'; the notice "
+                         "must not say it twice")
 
     def test_a_later_turns_identical_marker_survives_a_tool_reply(self):
         """The measured BACKLOG loss, verbatim. Turn A answers through the reply
@@ -16290,27 +16411,31 @@ class RefusedSendHonestyTest(unittest.TestCase):
         self.assertNotIn("passive pages", oversize)
 
     def test_a_successful_send_stays_quiet(self):
-        """A delivered message says what it always said. `reply()` says nothing
-        at all on success — the pin there is on the empty string."""
+        """A delivered message says what it always said, plus the id its
+        receipt will show. `reply()` writes one JSON line for the channel
+        server on stdout and nothing on stderr — the pin there is on the
+        empty string."""
         with tempfile.TemporaryDirectory() as project:
             self._codex_peer(project, "build", "300:build", self.UUID)
             with patch.object(antiphon.subprocess, "run",
                               return_value=self._Queued()):
-                delivered = self._reply(project, {"text": "hi", "to": "build"})
-        self.assertEqual(delivered, (0, "", ""))
+                code, out, err = self._reply(project, {"text": "hi", "to": "build"})
+        self.assertEqual((code, err), (0, ""))
+        self.assertEqual(json.loads(out)["queued"], True)
 
         with tempfile.TemporaryDirectory() as project:
             antiphon.peers.register(project, "claude", "ui", "/tmp/ui.sock")
             with patch.object(antiphon.socket, "socket", self._LiveSocket()):
                 named = antiphon._send_tool(project, "hi", "ui")
-        self.assertEqual(named, {"content": [
-            {"type": "text", "text": "Delivered to the Claude Code peer 'ui'."}]})
+        self.assertRegex(named["content"][0]["text"],
+                         r"^Delivered to the Claude Code peer 'ui' \(id [0-9a-f-]{36}\); "
+                         r"antiphon status shows when Claude's transcript received it\.$")
 
         with tempfile.TemporaryDirectory() as project:
             with patch.object(antiphon.socket, "socket", self._LiveSocket()):
                 bare = antiphon._send_tool(project, "hi")
-        self.assertEqual(bare, {"content": [
-            {"type": "text", "text": "Delivered to the Claude Code channel."}]})
+        self.assertRegex(bare["content"][0]["text"],
+                         r"^Delivered to the Claude Code channel \(id [0-9a-f-]{36}\); ")
 
     def test_an_oversized_multiline_stop_is_refused_and_never_parked(self):
         body = self._oversized()
@@ -16522,7 +16647,11 @@ class AttachmentSpillTest(unittest.TestCase):
             with self._spills_over(500), self._queue_recorder(queued):
                 code, out, err = self._reply(project, {"text": text,
                                                        "to": "build"})
-            self.assertEqual((code, out), (0, ""), err)
+            self.assertEqual(code, 0, err)
+            self.assertEqual(err, "")
+            self.assertRegex(json.loads(out)["attachment"],
+                             r"^[0-9a-f-]{36}\.txt$",
+                             "the caller learns the parked file's name")
             path, content = self._only_parked(project)
             self.assertEqual(content, text.encode())
             self.assertEqual(len(queued), 1)
@@ -16673,8 +16802,9 @@ class AttachmentSpillTest(unittest.TestCase):
             self._codex_peer(project, "build", "300:build", self.UUID)
             with patch.object(antiphon.subprocess, "run",
                               return_value=self._Queued()):
-                delivered = self._reply(project, {"text": "hi", "to": "build"})
-            self.assertEqual(delivered, (0, "", ""))
+                code, out, err = self._reply(project, {"text": "hi", "to": "build"})
+            self.assertEqual((code, err), (0, ""))
+            self.assertIsNone(json.loads(out)["attachment"])
             self.assertFalse(os.path.exists(self._store(project)))
 
     def test_the_envelope_fits_both_caps(self):
