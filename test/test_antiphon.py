@@ -4087,6 +4087,454 @@ class ToolInvocationRetrievalTest(unittest.TestCase):
         self.assertEqual(json.loads(out.getvalue())["result"], answer)
 
 
+class SameVendorTest(unittest.TestCase):
+    """A Claude session reaches another Claude session and a Codex session
+    another Codex session, always by name, over the transports that already
+    exist. Asked for on 2026-08-31 after two Codex terminals and one Claude
+    on a second machine. The passive page stays the other kind's transcripts;
+    the bridge forwards nothing automatically, so no bridge-level loop."""
+
+    MID = "83f48150-6f08-4d21-b51e-10af885dc39f"
+
+    # ---- Task 1: a Codex sender's labels ----
+
+    def test_a_codex_senders_labels_are_this_bridges_own_traffic(self):
+        self.assertEqual(antiphon.PUSH_LABEL_CODEX, "[Antiphon bridge] Codex:")
+        self.assertEqual(antiphon.CHANNEL_LABEL_CODEX, "[Antiphon channel] Codex:")
+        for label in (antiphon.PUSH_LABEL, antiphon.CHANNEL_LABEL,
+                      antiphon.PUSH_LABEL_CODEX, antiphon.CHANNEL_LABEL_CODEX):
+            self.assertTrue(antiphon._is_self_injected(f"{label} [from=ui id=x] hi"), label)
+            self.assertTrue(antiphon._is_self_injected(f"  {label.lower()} hi"), label)
+        self.assertFalse(antiphon._is_self_injected("antiphon is dropping messages"))
+        self.assertEqual(antiphon.SIDE_LABELS["codex"],
+                         (antiphon.PUSH_LABEL_CODEX, antiphon.CHANNEL_LABEL_CODEX))
+        self.assertEqual(antiphon.SIDE_LABELS["claude"],
+                         (antiphon.PUSH_LABEL, antiphon.CHANNEL_LABEL))
+
+    # ---- Task 3: same-kind Stop markers ----
+
+    def _stop(self, project, side, reply_text, turn_key="", who="ui",
+              sends=None):
+        """One Stop hook of `side`, with both transports mocked and recorded.
+
+        `sends` collects `("claude", args, kwargs)` / `("codex", args, kwargs)`.
+        The transports answer success with a proof class, as the real ones do.
+        """
+        sends = [] if sends is None else sends
+
+        def to_claude(*args, **kwargs):
+            sends.append(("claude", args, kwargs))
+            return True, ""
+
+        def to_codex(*args, **kwargs):
+            sends.append(("codex", args, kwargs))
+            return True, "live"
+
+        target = "codex" if side == "claude" else "claude"
+        reader = "_claude_turn" if side == "claude" else "_codex_turn"
+        payload = {"cwd": project, "transcript_path": "/tmp/transcript",
+                   "session_id": "s1"}
+        err = io.StringIO()
+        with patch.object(antiphon.os.path, "exists", return_value=True), \
+             patch.object(antiphon, reader, return_value=(reply_text, turn_key)), \
+             patch.object(antiphon, "claimed_alias", return_value=who), \
+             patch.object(antiphon, "reply_available", return_value=True), \
+             patch.object(antiphon, "send_to_claude", side_effect=to_claude), \
+             patch.object(antiphon, "send_to_codex", side_effect=to_codex), \
+             patch.object(antiphon.sys, "stdin", io.StringIO(json.dumps(payload))), \
+             contextlib.redirect_stderr(err):
+            code = antiphon.push(target)
+        return code, err.getvalue(), sends
+
+    def test_a_claude_session_reaches_a_named_claude_peer_from_its_stop_hook(self):
+        with tempfile.TemporaryDirectory() as project:
+            antiphon.peers.register(project, "claude", "api", "/tmp/api.sock")
+            code, err, sends = self._stop(project, "claude", "@claude:api look at this")
+            self.assertEqual(code, 0, err)
+            self.assertEqual(len(sends), 1, sends)
+            kind, args, kwargs = sends[0]
+            self.assertEqual((kind, args[1], args[2]), ("claude", "look at this", "api"))
+            self.assertEqual(kwargs["sender_alias"], "ui")
+            self.assertEqual(kwargs["sender_kind"], "claude")
+            self.assertRegex(kwargs["message_id"], r"^[0-9a-f-]{36}$")
+            entry = ledger.entries(project)[0]
+            self.assertEqual((entry["sender"], entry["to_kind"], entry["to_alias"],
+                              entry["transport"], entry["state"]),
+                             ("ui", "claude", "api", "channel", "sent"))
+            self.assertIn("antiphon: delivered to Claude:api", err)
+            cursor = antiphon.read_cursor(project, "claude")
+            self.assertIn("@api", cursor["last_pushed_claude_same"],
+                          "its own key, so the shared unnamed cursor cannot collide")
+
+    def test_a_codex_session_reaches_a_named_codex_peer_from_its_stop_hook(self):
+        with tempfile.TemporaryDirectory() as project:
+            code, err, sends = self._stop(project, "codex", "@codex:review ship it",
+                                          who="build")
+            self.assertEqual(code, 0, err)
+            self.assertEqual(len(sends), 1, sends)
+            kind, args, kwargs = sends[0]
+            self.assertEqual(kind, "codex")
+            self.assertRegex(args[1], r"^\[Antiphon bridge\] Codex: \[from=build "
+                                      r"id=[0-9a-f-]{36}\] ship it$")
+            self.assertEqual(args[2], "review")
+            self.assertEqual(kwargs["sender"], "build")
+            entry = ledger.entries(project)[0]
+            self.assertEqual((entry["sender"], entry["to_kind"], entry["to_alias"],
+                              entry["transport"], entry["proof"]),
+                             ("build", "codex", "review", "queue", "live"))
+
+    def test_a_bare_same_kind_marker_is_refused_and_reported(self):
+        with tempfile.TemporaryDirectory() as project:
+            code, err, sends = self._stop(project, "claude", "@claude do it")
+            self.assertEqual(code, 0)
+            self.assertEqual(sends, [], "nothing goes to a guess")
+            self.assertIn("a bare @claude line from a Claude session has no meaning", err)
+            entry = ledger.entries(project)[0]
+            self.assertEqual((entry["state"], entry["to_kind"], entry["to_alias"]),
+                             ("refused", "claude", None))
+            self.assertIn("name the peer (@claude:name)", entry["reason"])
+            self.assertEqual(entry["preview"], "do it")
+            self.assertEqual([i for i, _ in ledger.pending_notices(project, "claude", "ui")],
+                             [entry["id"]], "the sender's next page says so")
+
+    def test_a_session_never_addresses_its_own_alias(self):
+        with tempfile.TemporaryDirectory() as project:
+            antiphon.peers.register(project, "claude", "ui", "/tmp/ui.sock")
+            code, err, sends = self._stop(project, "claude", "@claude:ui note to self")
+            self.assertEqual(code, 0)
+            self.assertEqual(sends, [])
+            self.assertIn("'ui' is this session's own alias", err)
+            self.assertEqual(ledger.entries(project)[0]["state"], "refused")
+
+    def test_a_same_kind_marker_is_not_resent_for_the_same_turn(self):
+        with tempfile.TemporaryDirectory() as project:
+            antiphon.peers.register(project, "claude", "api", "/tmp/api.sock")
+            sends = []
+            self._stop(project, "claude", "@claude:api once", turn_key="t1", sends=sends)
+            self._stop(project, "claude", "@claude:api once", turn_key="t1", sends=sends)
+            self.assertEqual(len(sends), 1, "the same turn's marker goes once")
+            self._stop(project, "claude", "@claude:api once", turn_key="t2", sends=sends)
+            self.assertEqual(len(sends), 2, "a later turn's identical marker is new")
+
+    def test_a_reply_can_address_both_kinds_at_once(self):
+        with tempfile.TemporaryDirectory() as project:
+            antiphon.peers.register(project, "claude", "api", "/tmp/api.sock")
+            code, err, sends = self._stop(project, "claude", "@codex fix it\n@claude:api look")
+            self.assertEqual(code, 0, err)
+            self.assertEqual([(kind, args[1] if kind == "claude" else args[1][-6:])
+                              for kind, args, _ in sends],
+                             [("codex", "fix it"), ("claude", "look")])
+            self.assertEqual(sorted(e["to_kind"] for e in ledger.entries(project)),
+                             ["claude", "codex"])
+
+    # ---- Task 4: reply_to_claude on the channel, reply(kind="claude") in Python ----
+
+    def _reply(self, project, payload, sends=None):
+        sends = [] if sends is None else sends
+
+        def to_claude(*args, **kwargs):
+            sends.append((args, kwargs))
+            return True, ""
+
+        out, err = io.StringIO(), io.StringIO()
+        with patch.object(antiphon, "project_dir", return_value=project), \
+             patch.object(antiphon, "send_to_claude", side_effect=to_claude), \
+             patch.object(antiphon.sys, "stdin", io.StringIO(json.dumps(payload))), \
+             contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            code = antiphon.reply()
+        return code, out.getvalue(), err.getvalue(), sends
+
+    def test_reply_to_claude_delivers_to_a_named_claude_peer(self):
+        with tempfile.TemporaryDirectory() as project:
+            antiphon.peers.register(project, "claude", "api", "/tmp/api.sock")
+            code, out, err, sends = self._reply(
+                project, {"text": "look", "to": "api", "kind": "claude", "sender_alias": "ui"})
+            self.assertEqual(code, 0, err)
+            self.assertEqual(len(sends), 1)
+            args, kwargs = sends[0]
+            self.assertEqual((args[1], args[2]), ("look", "api"))
+            self.assertEqual((kwargs["sender_alias"], kwargs["sender_kind"]), ("ui", "claude"))
+            answer = json.loads(out.strip().splitlines()[-1])
+            self.assertEqual((answer["queued"], answer["delivered"], answer["to"],
+                              answer["attachment"], answer["proof"]),
+                             (False, True, "api", None, "channel"))
+            self.assertEqual(answer["id"], kwargs["message_id"])
+            self.assertEqual(answer["text"],
+                             f"Delivered to the Claude Code peer 'api' (id {answer['id']}); "
+                             "antiphon status shows when its transcript received it.")
+            entry = ledger.read_entry(project, answer["id"])
+            self.assertEqual((entry["sender"], entry["sender_kind"], entry["to_kind"],
+                              entry["to_alias"], entry["transport"]),
+                             ("ui", "claude", "claude", "api", "channel"))
+            park = antiphon.parked_deliveries(
+                antiphon.read_cursor(project, "claude")["last_pushed_claude_same"])
+            self.assertEqual(park["@api"], antiphon.batch_fingerprint(["look"]),
+                             "parked where the same-kind Stop looks, so the turn's "
+                             "closing @claude:api line does not send it twice")
+
+    def test_a_same_kind_tool_delivery_is_not_resent_by_the_stop_hook(self):
+        with tempfile.TemporaryDirectory() as project:
+            antiphon.peers.register(project, "claude", "api", "/tmp/api.sock")
+            self._reply(project, {"text": "look", "to": "api", "kind": "claude",
+                                  "sender_alias": "ui"})
+            code, _err, sends = self._stop(project, "claude", "@claude:api look", turn_key="t1")
+            self.assertEqual(code, 0)
+            self.assertEqual(sends, [], "delivered by the tool already")
+            _code, _err, sends = self._stop(project, "claude", "@claude:api look again",
+                                            turn_key="t1")
+            self.assertEqual(len(sends), 1, "different words are a new message")
+
+    def test_reply_to_claude_requires_a_name_and_refuses_the_senders_own(self):
+        with tempfile.TemporaryDirectory() as project:
+            antiphon.peers.register(project, "claude", "ui", "/tmp/ui.sock")
+            code, _out, err, sends = self._reply(
+                project, {"text": "hi", "kind": "claude", "sender_alias": "ui"})
+            self.assertEqual((code, sends), (1, []))
+            self.assertIn("reply: to is required — a reply to another Claude session "
+                          "names its peer", err)
+            code, _out, err, sends = self._reply(
+                project, {"text": "hi", "kind": "claude", "to": "<unnamed>",
+                          "sender_alias": "ui"})
+            self.assertEqual((code, sends), (1, []), "the sentinel is not a name")
+            code, _out, err, sends = self._reply(
+                project, {"text": "hi", "kind": "claude", "to": "ui", "sender_alias": "ui"})
+            self.assertEqual((code, sends), (1, []))
+            self.assertIn("'ui' is this session's own alias", err)
+            code, _out, err, sends = self._reply(
+                project, {"text": "hi", "kind": "human", "to": "ui", "sender_alias": "ui"})
+            self.assertEqual((code, sends), (1, []))
+            self.assertIn("reply: kind must be codex or claude", err)
+            self.assertEqual(ledger.entries(project), [],
+                             "a tool refusal is reported to the caller in full")
+
+    # ---- Task 5: antiphon_send(kind="codex") ----
+
+    def test_antiphon_send_reaches_a_named_codex_peer(self):
+        with tempfile.TemporaryDirectory() as project:
+            sends = []
+
+            def to_codex(cwd, message, to=None, sender=None):
+                sends.append((message, to, sender))
+                return True, "live"
+            with patch.object(antiphon, "send_to_codex", side_effect=to_codex):
+                result = antiphon._send_tool(project, "ship it", "review", sender="build",
+                                             kind="codex")
+            self.assertIsNot(result.get("isError"), True, result)
+            text = result["content"][0]["text"]
+            self.assertRegex(text, r"^Queued for Codex peer 'review' \(id [0-9a-f-]{36}\): "
+                                   r"Codex reads its queue at its next turn; run antiphon "
+                                   r"status to see whether it was received\.$")
+            message, to, sender = sends[0]
+            self.assertRegex(message, r"^\[Antiphon channel\] Codex: \[from=build "
+                                      r"id=[0-9a-f-]{36}\] ship it$")
+            self.assertEqual((to, sender), ("review", "build"))
+            entry = ledger.entries(project)[0]
+            self.assertEqual((entry["sender"], entry["sender_kind"], entry["to_kind"],
+                              entry["to_alias"], entry["transport"], entry["proof"]),
+                             ("build", "codex", "codex", "review", "queue", "live"))
+            park = antiphon.parked_deliveries(
+                antiphon.read_cursor(project, "codex")["last_pushed_codex_same"])
+            self.assertEqual(park["@review"], antiphon.batch_fingerprint(["ship it"]),
+                             "parked where the same-kind Stop looks")
+
+    def test_antiphon_send_to_codex_parks_an_oversized_message(self):
+        text = "y" * 4_000
+        with tempfile.TemporaryDirectory() as project:
+            sends = []
+            with patch.object(antiphon, "send_to_codex",
+                              side_effect=lambda cwd, m, to=None, sender=None:
+                                  sends.append(m) or (True, "live")), \
+                 patch.object(antiphon, "_oversized_for_queue",
+                              side_effect=lambda message: len(message) > 500):
+                result = antiphon._send_tool(project, text, "review", sender="build",
+                                             kind="codex")
+            self.assertIsNot(result.get("isError"), True, result)
+            self.assertIn("parked as an attachment", result["content"][0]["text"])
+            self.assertIn(antiphon.ATTACHMENT_LABEL, sends[0])
+            self.assertTrue(sends[0].startswith(antiphon.CHANNEL_LABEL_CODEX))
+            entry = ledger.entries(project)[0]
+            self.assertRegex(entry["attachment"], r"^[0-9a-f-]{36}\.txt$")
+            with open(os.path.join(project, ".antiphon", "messages", entry["attachment"]),
+                      encoding="utf-8") as f:
+                self.assertTrue(f.read().startswith("[Antiphon attachment from=build "))
+
+    def test_antiphon_send_to_codex_requires_a_name_and_refuses_the_senders_own(self):
+        with tempfile.TemporaryDirectory() as project, \
+             patch.object(antiphon, "send_to_codex") as send:
+            for to in (None, "<unnamed>"):
+                result = antiphon._send_tool(project, "hi", to, sender="build", kind="codex")
+                self.assertTrue(result.get("isError"), result)
+                self.assertIn("to is required: a message to another Codex session names "
+                              "its peer", result["content"][0]["text"])
+            result = antiphon._send_tool(project, "hi", "build", sender="build", kind="codex")
+            self.assertTrue(result.get("isError"))
+            self.assertIn("'build' is this session's own alias", result["content"][0]["text"])
+            result = antiphon._send_tool(project, "hi", "review", sender="build", kind="human")
+            self.assertTrue(result.get("isError"))
+            self.assertIn("kind must be claude or codex", result["content"][0]["text"])
+            send.assert_not_called()
+            self.assertEqual(ledger.entries(project), [])
+
+    def test_a_refused_same_kind_send_gets_no_passive_page_guidance(self):
+        """The guidance sentence says the words travel with the passive
+        pages; a same-kind message does not, so it would be untrue here."""
+        with tempfile.TemporaryDirectory() as project, \
+             patch.object(antiphon, "send_to_codex", return_value=(
+                 False, antiphon._ClassifiedRefusal("not delivered: nobody", "no-peer"))):
+            result = antiphon._send_tool(project, "hi", "review", sender="build", kind="codex")
+        self.assertTrue(result.get("isError"))
+        self.assertEqual(result["content"][0]["text"],
+                         "Not delivered to Codex: not delivered: nobody")
+
+    def test_the_send_tool_schema_offers_the_kind_and_the_server_passes_it(self):
+        tool = next(t for t in antiphon.TOOLS if t["name"] == "antiphon_send")
+        kind = tool["inputSchema"]["properties"]["kind"]
+        self.assertEqual(kind["enum"], ["claude", "codex"])
+        self.assertIn("another Codex session", kind["description"])
+        self.assertIn("`to` is required", kind["description"])
+        self.assertEqual(tool["inputSchema"]["required"], ["text"])
+        request = {"jsonrpc": "2.0", "id": 3, "method": "tools/call",
+                   "params": {"name": "antiphon_send",
+                              "arguments": {"text": "hi", "to": "review", "kind": "codex"}}}
+        answer = {"content": [{"type": "text", "text": "queued"}]}
+        with patch.object(antiphon.sys, "stdin", io.StringIO(json.dumps(request) + "\n")), \
+             patch.object(antiphon, "_send_tool", return_value=answer) as called, \
+             contextlib.redirect_stdout(io.StringIO()):
+            antiphon._mcp_serve("/tmp/project", "build")
+        called.assert_called_once_with("/tmp/project", "hi", "review", "build", kind="codex")
+
+    # ---- review 2026-09-03 ----
+
+    def test_status_names_the_same_kind_cursor_keys(self):
+        with tempfile.TemporaryDirectory() as project:
+            antiphon.write_cursor(project, {"last_pushed_claude_same": {"@api": "d" * 64}},
+                                  "claude")
+            out = io.StringIO()
+            with patch.object(antiphon, "project_dir", return_value=project), \
+                 patch.object(antiphon, "codex_rollout_files", return_value=[]), \
+                 patch.object(antiphon, "claude_transcripts", return_value=[]), \
+                 contextlib.redirect_stdout(out), contextlib.redirect_stderr(io.StringIO()):
+                antiphon.status()
+            self.assertIn("last_pushed_claude_same", out.getvalue())
+            self.assertNotIn("unknown cursor entry", out.getvalue())
+
+    def test_a_malformed_to_is_refused_naming_the_right_kind(self):
+        with tempfile.TemporaryDirectory() as project:
+            code, _out, err, _sends = self._reply(project, {"text": "hi", "kind": "claude",
+                                                            "to": 42})
+            self.assertEqual(code, 1)
+            self.assertIn("to must be a string naming one live Claude peer", err)
+            result = antiphon._send_tool(project, "hi", 42, sender="build", kind="codex")
+            self.assertIn("to must be a string naming one live Codex peer",
+                          result["content"][0]["text"])
+
+    def test_an_old_listener_that_cannot_say_who_spoke_is_named_in_the_result(self):
+        """Review 2026-09-03: a channel server from before this branch shows
+        a Claude sender as Codex. The listener now echoes the kind it
+        understood; a missing echo is said in the reply's own words."""
+        with tempfile.TemporaryDirectory() as project:
+            antiphon.peers.register(project, "claude", "api", "/tmp/api.sock")
+            wire = self._Capture()
+            wire.answer = b'{"ok": true, "message_id": "m1"}'
+            with patch.object(antiphon.socket, "socket", wire):
+                ok, detail = antiphon.send_to_claude(project, "hi", "api", sender_alias="ui",
+                                                     message_id=self.MID, sender_kind="claude")
+            self.assertEqual((ok, detail), (True, "old-listener"))
+            wire = self._Capture()
+            wire.answer = b'{"ok": true, "message_id": "m1", "sender_kind": "claude"}'
+            with patch.object(antiphon.socket, "socket", wire):
+                ok, detail = antiphon.send_to_claude(project, "hi", "api", sender_alias="ui",
+                                                     message_id=self.MID, sender_kind="claude")
+            self.assertEqual((ok, detail), (True, ""))
+            out = io.StringIO()
+            with patch.object(antiphon, "project_dir", return_value=project), \
+                 patch.object(antiphon, "send_to_claude", return_value=(True, "old-listener")), \
+                 patch.object(antiphon.sys, "stdin", io.StringIO(json.dumps(
+                     {"text": "hi", "to": "api", "kind": "claude", "sender_alias": "ui"}))), \
+                 contextlib.redirect_stdout(out), contextlib.redirect_stderr(io.StringIO()):
+                code = antiphon.reply()
+            self.assertEqual(code, 0)
+            self.assertIn("channel server predates same-kind sends and shows this as "
+                          "Codex's words; reconnect that session", json.loads(out.getvalue())["text"])
+
+    # ---- Task 2: a Claude sender's kind travels to a Claude peer ----
+
+    class _Capture:
+        """A channel socket that records the request it was handed."""
+
+        def __init__(self):
+            self.sent = b""
+            self.answer = b'{"ok": true, "message_id": "m1"}'
+
+        def __call__(self, *_a, **_k):
+            return self
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_a):
+            return False
+
+        def settimeout(self, _):
+            pass
+
+        def close(self):
+            pass
+
+        def connect(self, _path):
+            pass
+
+        def sendall(self, data):
+            self.sent += data
+
+        def shutdown(self, _how):
+            pass
+
+        def recv(self, _n):
+            answer, self.answer = self.answer, b""
+            return answer
+
+    def test_send_to_claude_carries_the_senders_kind_only_when_it_is_claude(self):
+        with tempfile.TemporaryDirectory() as project:
+            antiphon.peers.register(project, "claude", "api", "/tmp/api.sock")
+            wire = self._Capture()
+            with patch.object(antiphon.socket, "socket", wire):
+                ok, _ = antiphon.send_to_claude(project, "hi", "api", sender_alias="ui",
+                                                message_id=self.MID, sender_kind="claude")
+            self.assertTrue(ok)
+            request = json.loads(wire.sent.decode())
+            self.assertEqual(request, {"content": "hi", "message_id": self.MID,
+                                       "sender_alias": "ui", "sender_kind": "claude"})
+            wire = self._Capture()
+            with patch.object(antiphon.socket, "socket", wire):
+                antiphon.send_to_claude(project, "hi", "api", sender_alias="build",
+                                        message_id=self.MID)
+            self.assertNotIn("sender_kind", json.loads(wire.sent.decode()),
+                             "a Codex sender is the shape every listener already reads")
+
+    def test_a_codex_to_codex_message_is_a_receipt_on_the_page_never_speech(self):
+        now = time.strftime("%Y-%m-%dT%H:%M:%S.000Z", time.gmtime())
+        sid = "1d5a03e0-0548-4339-87c3-45c5dbf7e9d7"
+        with tempfile.TemporaryDirectory() as project:
+            path = os.path.join(project, f"rollout-2026-09-03T00-00-00-{sid}.jsonl")
+            with open(path, "w", encoding="utf-8") as f:
+                f.write(json.dumps({"timestamp": now, "type": "session_meta",
+                                    "payload": {"cwd": project}}) + "\n")
+                f.write(json.dumps({"timestamp": now, "type": "response_item", "payload": {
+                    "type": "message", "role": "user", "content": [{
+                        "type": "input_text",
+                        "text": f"{antiphon.PUSH_LABEL_CODEX} [from=build id={self.MID}] ship it"}]}})
+                        + "\n")
+                f.write(json.dumps({"timestamp": now, "type": "response_item", "payload": {
+                    "type": "message", "role": "assistant", "content": [{
+                        "type": "output_text", "text": "shipping"}]}}) + "\n")
+            receipts = []
+            events, _ = antiphon.codex_events(project, source_paths=[path], receipts=receipts)
+        self.assertEqual([e.text for e in events], ["shipping"],
+                         "another Codex session's words to this one are not this page's news")
+        self.assertEqual([(kind, key) for kind, key, _at in receipts], [("received", self.MID)])
+
+
 class DeliveryReceiptTest(unittest.TestCase):
     """A delivery is received when the peer's own transcript shows it, and
     only then. Measured 2026-09-03 across the live transcripts: 180 Codex
@@ -4158,13 +4606,16 @@ class DeliveryReceiptTest(unittest.TestCase):
                            proof="live" if to_kind == "codex" else "channel",
                            sha256="a" * 64, size=13)
 
-    def _hook(self, project, side, codex=(), claude=()):
+    def _hook(self, project, side, codex=(), claude=(), transcript=None):
         out = io.StringIO()
+        payload = {"cwd": project, "hook_event_name": "UserPromptSubmit"}
+        if transcript is not None:
+            payload["transcript_path"] = transcript
         with patch.object(antiphon, "project_dir", return_value=project), \
              patch.object(antiphon, "codex_rollout_files", return_value=list(codex)), \
              patch.object(antiphon, "claude_transcripts", return_value=list(claude)), \
-             patch.object(antiphon.sys, "stdin", io.StringIO(json.dumps(
-                 {"cwd": project, "hook_event_name": "UserPromptSubmit"}))), \
+             patch.object(antiphon, "_hook_catalog_update", return_value=True), \
+             patch.object(antiphon.sys, "stdin", io.StringIO(json.dumps(payload))), \
              contextlib.redirect_stdout(out), contextlib.redirect_stderr(io.StringIO()):
             code = antiphon.hook(side)
         return code, out.getvalue()
@@ -4392,6 +4843,103 @@ class DeliveryReceiptTest(unittest.TestCase):
                           "address another", note)
             self.assertNotIn("2 deliveries", note, "the unknowable one is not a fault")
             self.assertIn("1 older than the 24-hour page horizon", note)
+
+    # ---- same-kind receipts: the receiver's own transcript ----
+
+    def test_a_claude_hook_reads_receipts_off_its_own_transcript(self):
+        """A Claude→Claude delivery shows in the receiving Claude's transcript;
+        without a Codex reader walking it, the receiver's own hook is the
+        only reader there is. Scoped to its own kind: its verification of a
+        file it parked for Codex is not Codex reading it."""
+        other = "2e6b14f1-1659-544a-98d4-56d6eca8fa48"
+        third = "3f7c25a2-2760-455b-a9e5-67e7fdb90b59"
+        with tempfile.TemporaryDirectory() as project:
+            store = os.path.join(project, ".antiphon", "messages", self.ATTACHMENT)
+            ledger.record_sent(project, self.MID, sender="api", to_kind="claude", to_alias="ui",
+                               transport="channel", proof="channel", sha256="a" * 64, size=4,
+                               sender_kind="claude")
+            ledger.record_sent(project, other, sender="api", to_kind="claude", to_alias="ui",
+                               transport="channel", proof="channel", sha256="a" * 64, size=4,
+                               attachment=self.ATTACHMENT, sender_kind="claude")
+            ledger.record_sent(project, third, sender="ui", to_kind="codex", to_alias="build",
+                               transport="queue", proof="live", sha256="a" * 64, size=4,
+                               attachment=self.ATTACHMENT, sender_kind="claude")
+            own = self._claude_transcript(project, [
+                self._claude_channel(self.MID),
+                self._claude_tool_use("Read", {"file_path": store}),
+                self._claude_assistant("noted")])
+            # The receiver is named — a same-kind send always names one — and
+            # only the named receiver's own read counts as the read.
+            with patch.object(antiphon, "claimed_alias", return_value="ui"):
+                code, out = self._hook(project, "claude", transcript=own)
+            self.assertEqual((code, out), (0, ""), "its own transcript is not a page")
+            self.assertIsNotNone(ledger.read_entry(project, self.MID)["received_at"])
+            self.assertIsNotNone(ledger.read_entry(project, other)["read_at"],
+                                 "a file parked for this Claude, read by it")
+            self.assertIsNone(ledger.read_entry(project, third)["read_at"],
+                              "a file this Claude parked for Codex: not Codex reading it")
+
+    def test_a_senders_own_read_of_its_same_kind_attachment_is_not_the_receivers(self):
+        """Review 2026-09-03, critical. Claude `ui` parks words for Claude
+        `api`; `ui` verifies its own file; neither `ui`'s own hook nor the
+        Codex reader walking `ui`'s transcript may mark it read — only
+        `api`'s own hook, reading `api`'s transcript, is the receiver."""
+        with tempfile.TemporaryDirectory() as project:
+            store = os.path.join(project, ".antiphon", "messages", self.ATTACHMENT)
+            ledger.record_sent(project, self.MID, sender="ui", to_kind="claude", to_alias="api",
+                               transport="channel", proof="channel", sha256="a" * 64, size=4,
+                               attachment=self.ATTACHMENT, sender_kind="claude")
+            own = self._claude_transcript(project, [
+                self._claude_tool_use("Bash", {"command": f"tail -n +3 {store} | shasum -a 256"}),
+                self._claude_assistant("verified")])
+            with patch.object(antiphon, "claimed_alias", return_value="ui"):
+                self.assertEqual(self._hook(project, "claude", transcript=own)[0], 0)
+            self.assertIsNone(ledger.read_entry(project, self.MID)["read_at"],
+                              "the sender's own hook, its own verification")
+            code, _out = self._hook(project, "codex", claude=[own])
+            self.assertEqual(code, 0)
+            self.assertIsNone(ledger.read_entry(project, self.MID)["read_at"],
+                              "the Codex reader walking the sender's transcript")
+            api = self._claude_transcript(project, [
+                self._claude_tool_use("Read", {"file_path": store})])
+            with patch.object(antiphon, "claimed_alias", return_value="api"):
+                self._hook(project, "claude", transcript=api)
+            self.assertIsNotNone(ledger.read_entry(project, self.MID)["read_at"],
+                                 "the named receiver, reading its own transcript")
+
+    def test_own_receipts_are_read_on_a_prompt_not_on_session_start(self):
+        with tempfile.TemporaryDirectory() as project:
+            self._sent(project, to_kind="claude", to_alias="ui")
+            own = self._claude_transcript(project, [self._claude_channel(self.MID)])
+            out = io.StringIO()
+            with patch.object(antiphon, "project_dir", return_value=project), \
+                 patch.object(antiphon, "_hook_catalog_update", return_value=True), \
+                 patch.object(antiphon.sys, "stdin", io.StringIO(json.dumps(
+                     {"cwd": project, "hook_event_name": "SessionStart",
+                      "transcript_path": own}))), \
+                 contextlib.redirect_stdout(out), contextlib.redirect_stderr(io.StringIO()):
+                self.assertEqual(antiphon.hook("claude"), 0)
+            self.assertIsNone(ledger.read_entry(project, self.MID)["received_at"],
+                              "a SessionStart proves nothing new")
+            self.assertEqual(self._hook(project, "claude", transcript=own)[0], 0)
+            self.assertIsNotNone(ledger.read_entry(project, self.MID)["received_at"])
+
+    def test_a_codex_hook_reads_receipts_off_its_own_rollout(self):
+        with tempfile.TemporaryDirectory() as project:
+            ledger.record_sent(project, self.MID, sender="build", to_kind="codex",
+                               to_alias="review", transport="queue", proof="live",
+                               sha256="a" * 64, size=4, sender_kind="codex")
+            own = self._codex_rollout(project, [self._codex_message(
+                "user", f"{antiphon.PUSH_LABEL_CODEX} [from=build id={self.MID}] ship it")])
+            code, _out = self._hook(project, "codex", transcript=own)
+            self.assertEqual(code, 0)
+            self.assertIsNotNone(ledger.read_entry(project, self.MID)["received_at"])
+
+    def test_a_missing_own_transcript_is_silent(self):
+        with tempfile.TemporaryDirectory() as project:
+            self.assertEqual(self._hook(project, "claude",
+                                        transcript=os.path.join(project, "gone.jsonl")),
+                             (0, ""))
 
     def test_a_reader_without_a_collector_reports_nothing_and_breaks_nothing(self):
         with tempfile.TemporaryDirectory() as project:
@@ -14537,6 +15085,25 @@ class RoutingTest(unittest.TestCase):
             self.assertNotIn("unanswered",
                              antiphon._resolve_target(project, "claude", sender="build").detail,
                              "nobody wrote: no advice, the old refusal")
+
+    def test_advice_for_a_reply_never_names_a_peer_of_the_other_kind(self):
+        """Review 2026-09-03: a Codex peer wrote to Codex `build` a minute
+        ago and a Claude peer ten minutes ago; a bare send from `build` to
+        Claude is refused among two Claude peers, and the advice must name
+        the Claude one."""
+        with tempfile.TemporaryDirectory() as project:
+            antiphon.peers.register(project, "claude", "ui", "/tmp/ui.sock")
+            antiphon.peers.register(project, "claude", "api", "/tmp/api.sock")
+            ledger.record_sent(project, self.MID, sender="review", to_kind="codex",
+                               to_alias="build", transport="queue", proof="live",
+                               sha256="a" * 64, size=2, sender_kind="codex",
+                               at=time.time() - 60)
+            ledger.record_sent(project, self.MID2, sender="ui", to_kind="codex",
+                               to_alias="build", transport="queue", proof="live",
+                               sha256="a" * 64, size=2, at=time.time() - 600)
+            detail = antiphon._resolve_target(project, "claude", sender="build").detail
+            self.assertIn("pass to=\"ui\"", detail)
+            self.assertNotIn("review", detail)
 
     def test_the_advice_travels_through_the_senders_own_road(self):
         """`reply` and `antiphon_send` hand the resolver the alias they carry;

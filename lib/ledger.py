@@ -55,9 +55,22 @@ MAX_TIME = float(2 ** 40)
 
 OPTIONAL_TIMES = ("received_at", "read_at", "reported_at", "expired_unread_at")
 KEYS = frozenset({
-    "version", "id", "sender", "to_kind", "to_alias", "transport", "proof",
-    "state", "sent_at", "sha256", "size", "attachment", "reason", "preview",
-    *OPTIONAL_TIMES})
+    "version", "id", "sender", "sender_kind", "to_kind", "to_alias", "transport",
+    "proof", "state", "sent_at", "sha256", "size", "attachment", "reason",
+    "preview", *OPTIONAL_TIMES})
+# Entries written before same-kind sends existed carry no `sender_kind`; the
+# sender was then always the other kind of the recipient.
+LEGACY_KEYS = KEYS - {"sender_kind"}
+
+
+def _other(kind):
+    return "claude" if kind == "codex" else "codex"
+
+
+def sender_kind_of(entry):
+    """The kind of the session that sent this entry, inferred for an entry
+    from before the field existed."""
+    return entry.get("sender_kind") or _other(entry["to_kind"])
 
 
 def ledger_dir(cwd):
@@ -118,7 +131,9 @@ def _time_or_none(value):
 
 
 def _valid(entry, expected_id):
-    if not isinstance(entry, dict) or set(entry) != KEYS:
+    if not isinstance(entry, dict) or set(entry) not in (KEYS, LEGACY_KEYS):
+        return False
+    if "sender_kind" in entry and entry["sender_kind"] not in KINDS:
         return False
     if entry["version"] != LEDGER_VERSION or type(entry["version"]) is not int:
         return False
@@ -216,9 +231,11 @@ def _write(cwd, entry):
     return True
 
 
-def _new(delivery_id, sender, to_kind, to_alias, transport, proof, state, at):
+def _new(delivery_id, sender, to_kind, to_alias, transport, proof, state, at,
+         sender_kind=None):
     return {
         "version": LEDGER_VERSION, "id": delivery_id, "sender": sender,
+        "sender_kind": sender_kind or _other(to_kind),
         "to_kind": to_kind, "to_alias": to_alias, "transport": transport,
         "proof": proof, "state": state, "sent_at": float(at),
         "sha256": None, "size": None, "attachment": None, "reason": None,
@@ -228,10 +245,12 @@ def _new(delivery_id, sender, to_kind, to_alias, transport, proof, state, at):
 
 
 def record_sent(cwd, delivery_id, *, sender, to_kind, to_alias, transport,
-                proof, sha256, size, attachment=None, at=None):
-    """An attempt the transport accepted. Returns whether it is on the ledger."""
+                proof, sha256, size, attachment=None, at=None, sender_kind=None):
+    """An attempt the transport accepted. Returns whether it is on the ledger.
+    `sender_kind` defaults to the other kind of the recipient; a same-kind
+    send says so."""
     entry = _new(delivery_id, sender, to_kind, to_alias, transport, proof,
-                 "sent", time.time() if at is None else at)
+                 "sent", time.time() if at is None else at, sender_kind)
     entry["sha256"] = sha256
     entry["size"] = size
     entry["attachment"] = attachment
@@ -241,12 +260,12 @@ def record_sent(cwd, delivery_id, *, sender, to_kind, to_alias, transport,
 
 
 def record_refused(cwd, delivery_id, *, sender, to_kind, to_alias, reason,
-                   preview, at=None):
+                   preview, at=None, sender_kind=None):
     """An attempt that never left: the reason, and enough of the sender's own
     line to recognise it. Returns whether it is on the ledger."""
     entry = _new(delivery_id, sender, to_kind, to_alias, "queue"
                  if to_kind == "codex" else "channel", "unproven", "refused",
-                 time.time() if at is None else at)
+                 time.time() if at is None else at, sender_kind)
     entry["reason"] = str(reason)
     entry["preview"] = " ".join(str(preview).split())[:PREVIEW_LENGTH]
     if not _valid(entry, delivery_id):
@@ -307,21 +326,30 @@ def _entries_naming(cwd, attachment):
     return [e for e in entries(cwd) if e["attachment"] == attachment]
 
 
-def mark_read(cwd, attachment, at, to_kind=None, snapshot=None):
+def mark_read(cwd, attachment, at, to_kind=None, snapshot=None, reader_alias=None):
     """A transcript shows the attachment file being read.
 
     Scoped to the recipient: with `to_kind`, only deliveries *to* that kind
     are marked, because the transcript that proved the read belongs to a
     session of that kind — the sender verifying its own parked file (the
     `tail -n +3 | shasum` ritual the envelope teaches) is not the recipient
-    reading it. A read clears an expiry marked in the meantime: a file that
-    was read did not expire unread, whichever the sweep saw first."""
+    reading it. A same-kind delivery shares the sender's kind with its
+    recipient, so the kind cannot tell them apart: such an entry is marked
+    only when `reader_alias` — the alias of the session whose own transcript
+    proved the read — is the entry's named recipient. A cross-kind reader,
+    which walks every transcript of the other kind without knowing whose,
+    never marks a same-kind entry. A read clears an expiry marked in the
+    meantime: a file that was read did not expire unread, whichever the
+    sweep saw first."""
     found = False
     rows = entries(cwd) if snapshot is None else snapshot
     for entry in rows:
         if entry["attachment"] != attachment:
             continue
         if to_kind is not None and entry["to_kind"] != to_kind:
+            continue
+        if sender_kind_of(entry) == entry["to_kind"] and (
+                reader_alias is None or entry["to_alias"] != reader_alias):
             continue
         found = True
 
@@ -369,11 +397,12 @@ def mark_reported(cwd, delivery_ids, at):
         _update(cwd, delivery_id, mutate)
 
 
-def record_receipts(cwd, receipts, read_by=None):
+def record_receipts(cwd, receipts, read_by=None, reader_alias=None):
     """Apply `("received", id, at)` / `("read", basename, at)` triples.
 
     `read_by` is the kind of session whose transcript the reads came from;
-    a read marks only deliveries to that kind. Receipts are folded to one
+    a read marks only deliveries to that kind, and a same-kind delivery only
+    when `reader_alias` is its named recipient. Receipts are folded to one
     per key (the earliest time) and the reads share one snapshot of the
     ledger, so a page naming a file several times costs one read of the
     directory, not one per mention."""
@@ -390,7 +419,8 @@ def record_receipts(cwd, receipts, read_by=None):
         else:
             if snapshot is None:
                 snapshot = entries(cwd)
-            mark_read(cwd, key, at, to_kind=read_by, snapshot=snapshot)
+            mark_read(cwd, key, at, to_kind=read_by, snapshot=snapshot,
+                      reader_alias=reader_alias)
 
 
 def _clock(stamp):
@@ -414,8 +444,8 @@ def pending_notices(cwd, side, alias):
     for entry in entries(cwd):
         if entry["sender"] not in mine or entry["reported_at"] is not None:
             continue
-        if entry["to_kind"] == side:
-            continue                       # a delivery this side received, not sent
+        if sender_kind_of(entry) != side:
+            continue                       # the other side's send, not this one's
         target = LABEL[entry["to_kind"]]
         if entry["state"] == "refused":
             named = f":{entry['to_alias']}" if entry["to_alias"] else ""
@@ -444,38 +474,42 @@ def awaiting_receipt(cwd, now):
     return waiting
 
 
-def last_unanswered_sender(cwd, to_kind, to_alias, now):
+def last_unanswered_sender(cwd, to_kind, to_alias, now, sender_kind=None):
     """`(alias, age)` of the newest peer that wrote to this session — by its
     alias, or to nobody in particular — and has not been written back to
-    since; None when nobody is owed a reply. Advice for a refusal, never a
-    route: the bridge does not choose."""
+    since; None when nobody is owed a reply. With `sender_kind`, only peers of
+    that kind count: advice for choosing among Codex peers must not name a
+    Claude one. Advice for a refusal, never a route: the bridge does not
+    choose."""
     latest = {}
     answered = {}
     for entry in entries(cwd):
         if entry["state"] != "sent":
             continue
-        sender = entry["sender"]
-        if (entry["to_kind"] == to_kind
+        sender, kind = entry["sender"], sender_kind_of(entry)
+        if (entry["to_kind"] == to_kind and kind == (sender_kind or kind)
                 and entry["to_alias"] in (to_alias, None)
-                and sender != "<unnamed>" and sender != to_alias):
-            latest[sender] = max(latest.get(sender, 0.0), entry["sent_at"])
+                and sender != "<unnamed>"
+                and (sender, kind) != (to_alias, to_kind)):
+            latest[(kind, sender)] = max(latest.get((kind, sender), 0.0),
+                                         entry["sent_at"])
         # Written back: by this alias, or by the unnamed session of this kind
-        # when this session has no name — its replies go to the other kind.
-        mine = (sender == to_alias
-                or (to_alias is None and sender == "<unnamed>"
-                    and entry["to_kind"] != to_kind))
+        # when this session has no name.
+        mine = ((sender, kind) == (to_alias, to_kind)
+                or (to_alias is None and sender == "<unnamed>" and kind == to_kind))
         if mine and entry["to_alias"]:
-            answered[entry["to_alias"]] = max(
-                answered.get(entry["to_alias"], 0.0), entry["sent_at"])
-    open_senders = [(when, sender) for sender, when in latest.items()
-                    if answered.get(sender, -1.0) < when]
+            key = (entry["to_kind"], entry["to_alias"])
+            answered[key] = max(answered.get(key, 0.0), entry["sent_at"])
+    open_senders = [(when, sender) for (kind, sender), when in latest.items()
+                    if answered.get((kind, sender), -1.0) < when]
     if not open_senders:
         return None
     when, sender = max(open_senders)
     return sender, max(0.0, now - when)
 
 
-def reusable_attachment(cwd, sha256, to_kind, to_alias, now, sender=None):
+def reusable_attachment(cwd, sha256, to_kind, to_alias, now, sender=None,
+                        sender_kind=None):
     """The parked file an earlier, unexpired send of these exact words to this
     recipient left behind, when it is still there and nobody has read it;
     else None. With `sender`, only a send by that same sender counts: the
@@ -488,6 +522,7 @@ def reusable_attachment(cwd, sha256, to_kind, to_alias, now, sender=None):
                 and entry["sha256"] == sha256 and entry["to_kind"] == to_kind
                 and entry["to_alias"] == to_alias
                 and (sender is None or entry["sender"] == sender)
+                and (sender_kind is None or sender_kind_of(entry) == sender_kind)
                 and now - entry["sent_at"] <= LEDGER_TTL):
             path = os.path.join(cwd, ".antiphon", "messages", entry["attachment"])
             try:

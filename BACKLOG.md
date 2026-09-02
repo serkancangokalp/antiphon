@@ -1532,7 +1532,7 @@ with a reply 15-20 turns away. Live and unknown work now takes the active lane;
 only current-generation owner proof demotes a source to dead, and mixed backlog
 alternates whole pages so neither lane starves.
 
-## P1 — Same-vendor bridging: Codex ↔ Codex and Claude ↔ Claude
+## P1 — Same-vendor bridging: Codex ↔ Codex and Claude ↔ Claude (shipped 2026-09-03)
 
 Asked for on 2026-08-31 after running two Codex terminals and one Claude on a
 second machine. Today the bridge is defined by its two sides: a Claude session
@@ -1576,6 +1576,43 @@ would not see another Claude session's work at all.
 
 The honest order is: unnamed addressability first (below), because same-vendor
 routing is unusable without it, then the surfaces, then loop bounds.
+
+### What shipped (2026-09-03)
+
+The surfaces, on the machinery that already existed. `@claude:name` in a
+Claude reply and `@codex:name` in a Codex reply push to the named same-kind
+peer from the same Stop hook, under a cursor key of their own
+(`last_pushed_<kind>_same`); the Claude channel offers `reply_to_claude(text,
+to)`; Codex's `antiphon_send` takes `kind="codex"`. The four questions above,
+answered in code:
+
+- *Identity.* A Codex sender's words carry `[Antiphon bridge] Codex:` /
+  `[Antiphon channel] Codex:` and the same `[from=… id=…]` label; a Claude
+  sender's channel payload carries `sender_kind`, and the notification arrives
+  with `sender="claude"`. The self-injection guard knows all four labels, so
+  another Codex session's words are never rendered as this one's user. The
+  ledger records the sender's kind, so a same-kind refusal is reported to its
+  own side and correlation advice never names a peer of the other kind.
+- *Loops.* The bridge forwards nothing automatically; a message reaches the
+  one peer named on it and stops. There is no bridge-level loop to bound.
+- *The unnamed default.* A same-kind send is always addressed: a bare
+  `@claude` from Claude, a bare `@codex` from Codex, `reply_to_claude` without
+  `to`, `antiphon_send(kind="codex")` without `to` — each is refused with the
+  reason, on the ledger, on the sender's next page. A session never addresses
+  its own alias.
+- *Scope.* Direct-message road only. The passive page gains no same-kind
+  lane: it stays the other kind's transcripts, and a same-kind message in
+  them is a receipt for the ledger, never speech. Addressed, not confidential
+  — a Stop-marker line is part of the sender's visible reply, which the other
+  kind's page shows, and a same-kind tool call's arguments stay retrievable by
+  their public id (the review of 2026-09-03 measured both). A same-kind
+  receipt comes from the receiving session's own hook reading the tail of its
+  own transcript, scoped to its own kind and, for a same-kind delivery, to its
+  own alias as the named receiver — the sender's verification of a file it
+  parked is never the receiver's read (the same review's critical finding).
+
+README, both rules and the channel instructions say it; the rule ceilings moved
+200 bytes each for one sentence (CLAUDE_RULE 5,300, AGENTS_RULE 5,800).
 
 ## P1 — An unnamed peer is invisible, and two of them are indistinguishable (fixed)
 

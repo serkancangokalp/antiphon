@@ -1329,7 +1329,7 @@ async function anOversizedMessageIsRefusedWithoutKillingTheSession() {
     // And the channel still works afterwards, which is the point of surviving.
     const ack = await sendTo(session.socketPath,
       JSON.stringify({ content: "after the refusal", message_id: "m-after" }));
-    assert.deepEqual(JSON.parse(ack), { ok: true, message_id: "m-after" });
+    assert.deepEqual(JSON.parse(ack), { ok: true, message_id: "m-after", sender_kind: "codex" });
   } finally {
     await cleanUp(session, dir);
   }
@@ -1399,7 +1399,7 @@ async function aRefusedClientCannotKeepStreaming() {
     // And the channel still serves everyone else.
     const ack = await sendTo(session.socketPath,
       JSON.stringify({ content: "still here", message_id: "m-stream" }));
-    assert.deepEqual(JSON.parse(ack), { ok: true, message_id: "m-stream" });
+    assert.deepEqual(JSON.parse(ack), { ok: true, message_id: "m-stream", sender_kind: "codex" });
   } finally {
     client.destroy();
     await cleanUp(session, dir);
@@ -1544,7 +1544,27 @@ try {
 
   const tools = await client.listTools();
   assert.deepEqual(tools.tools.map((tool) => tool.name),
-    ["reply_to_codex", "antiphon_retrieve"]);
+    ["reply_to_codex", "reply_to_claude", "antiphon_retrieve"]);
+  const claudeTool = tools.tools.find((tool) => tool.name === "reply_to_claude");
+  assert.deepEqual(claudeTool.inputSchema.required, ["text", "to"],
+    "a same-kind message is always named");
+  assert.match(claudeTool.description, /another Claude Code session/);
+  assert.match(claudeTool.description, /antiphon status/);
+  // Refused by this server, before any process starts: the Python bridge
+  // would refuse too, but through "Failed to deliver reply to Claude: …".
+  const refusedHere = (error) =>
+    /to is required/.test(error.message) && !/Failed to deliver/.test(error.message);
+  await assert.rejects(
+    () => client.callTool({ name: "reply_to_claude", arguments: { text: "hi" } }),
+    refusedHere, "refused before any process is started");
+  await assert.rejects(
+    () => client.callTool({ name: "reply_to_claude", arguments: { text: "hi", to: "<unnamed>" } }),
+    refusedHere, "the sentinel is not a name");
+  await assert.rejects(
+    () => client.callTool({ name: "reply_to_claude",
+                            arguments: { text: "hi", to: "nobody-here" } }),
+    /no live claude peer named 'nobody-here'/,
+    "the kind reaches the Python resolver: it looked for a Claude peer");
   const replyTool = tools.tools.find((tool) => tool.name === "reply_to_codex");
   const retrieveTool = tools.tools.find((tool) => tool.name === "antiphon_retrieve");
   assert.doesNotMatch(replyTool.description, /you can leave it out/,
@@ -1670,7 +1690,7 @@ try {
   const pendingIdentity = nextNotification();
   const ack = await sendToSocket({ content: "identity test", message_id: "m-test",
                                    sender_alias: "build" });
-  assert.deepEqual(ack, { ok: true, message_id: "m-test" });
+  assert.deepEqual(ack, { ok: true, message_id: "m-test", sender_kind: "codex" });
   const received = await pendingIdentity;
   assert.equal(received.params.content, "identity test");
   assert.deepEqual(received.params.meta, {
@@ -1679,6 +1699,21 @@ try {
     sender_alias: "build",
     message_id: "m-test",
   });
+
+  // Another Claude session's words arrive as `sender: "claude"` — only on the
+  // exact word; every other value, and the key's absence, is Codex.
+  for (const [kind, expected] of [["claude", "claude"], ["human", "codex"],
+                                  [undefined, "codex"]]) {
+    const pendingKind = nextNotification();
+    const ackKind = await sendToSocket({ content: `kind ${String(kind)}`, message_id: `m-kind-${String(kind)}`,
+                                         sender_alias: "api", sender_kind: kind });
+    assert.equal(ackKind.sender_kind, expected,
+      "the listener echoes the kind it understood, so an older listener is told apart by silence");
+    const seenKind = await pendingKind;
+    assert.equal(seenKind.params.meta.sender, expected,
+      `sender_kind ${JSON.stringify(kind)} must arrive as ${expected}`);
+    assert.equal(seenKind.params.meta.sender_alias, "api");
+  }
 
   // The alias crossed a socket, so it is a claim rather than a fact. Anything
   // that is not a name the registry would accept reaches the agent as the
