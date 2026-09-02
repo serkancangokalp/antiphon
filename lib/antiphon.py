@@ -62,6 +62,7 @@ import uuid
 
 import peers
 import ledger
+import workers
 from datetime import datetime
 
 HOME = os.path.expanduser("~")
@@ -4528,8 +4529,10 @@ def hook(side="claude"):
         except OSError as error:
             print(f"antiphon: the attachment sweep failed: {error}",
                   file=sys.stderr)
-        # The ledger's own sweep, on the same trust.
+        # The ledger's own sweep, on the same trust; and the workers' —
+        # collected results and expired tasks go, a running worker never.
         _ledger_call("prune", lambda: ledger.prune(cwd, time.time()))
+        _ledger_call("workers sweep", lambda: workers.sweep(cwd, time.time()))
 
     # Every reserve and merge inside this bounded update releases the catalog
     # lock before transcript inspection. The whole update returns before any
@@ -7032,6 +7035,22 @@ TO_DESCRIPTION = ("Alias of the peer to send to. Required whenever the recipient
                   "refused rather than guessed — so pass it whenever you know "
                   "which peer you mean.")
 
+DELEGATE_DESCRIPTION = (
+    "Delegates one task to a worker of the other kind (or of a kind you name) "
+    "and returns at once with a task id: a fresh `claude -p` / `codex exec` "
+    "session in this project, read-only by default, in a git worktree of its "
+    "own for a write task — or, with `to`, the task handed to a running named "
+    "peer over the ordinary addressed send. Every result names the worker; the "
+    "bridge never merges its work, never widens its permissions, and refuses a "
+    "delegation from a session already at the hop budget (ANTIPHON_HOP_BUDGET, "
+    "default 1). Collect with antiphon_task(id, \"result\", wait).")
+
+TASK_DESCRIPTION = (
+    "The lifecycle of a delegated task by id: status, result (with a bounded "
+    "wait and the evidence — log tail, a completed write task's diff and its "
+    "tests.txt), or cancel. Read-only except cancel; a task's record and the "
+    "worker's directory are swept a week after the task, never while it runs.")
+
 RETRIEVE_DESCRIPTION = (
     "Read-only, write-free retrieval of the complete tool invocation named by a "
     "tc1 id from the original project transcript. It returns the invocation only, "
@@ -7075,6 +7094,47 @@ TOOLS = [{
                                      "queued.")},
         },
         "required": ["text"],
+    },
+}, {
+    "name": "antiphon_delegate",
+    "description": DELEGATE_DESCRIPTION,
+    "inputSchema": {
+        "type": "object",
+        "properties": {
+            "text": {"type": "string", "description": "The task, in full."},
+            "kind": {"type": "string", "enum": ["claude", "codex"],
+                     "description": ("The worker's kind; the other side by default. "
+                                     "A fresh worker of that kind runs the task, "
+                                     "unless `to` names a running peer of that kind.")},
+            "to": {"type": "string",
+                   "description": ("Hand the task to this running named peer of `kind` "
+                                   "instead of starting a worker.")},
+            "task": {"type": "string", "enum": ["read", "write"],
+                     "description": ("read (default): review, explain, search — the "
+                                     "worker runs in the project read-only. write: the "
+                                     "worker edits in a git worktree of its own and "
+                                     "returns a diff; nothing is merged.")},
+            "timeout": {"type": "integer",
+                        "description": "Seconds before the worker is stopped (default 900, at most 3600)."},
+        },
+        "required": ["text"],
+    },
+}, {
+    "name": "antiphon_task",
+    "description": TASK_DESCRIPTION,
+    "inputSchema": {
+        "type": "object",
+        "properties": {
+            "id": {"type": "string", "description": "The task id `antiphon_delegate` returned."},
+            "action": {"type": "string", "enum": ["status", "result", "cancel"],
+                       "description": ("status: the record now. result: the state and the "
+                                       "evidence (log tail; a completed write task's diff "
+                                       "and tests.txt), after waiting up to `wait` seconds. "
+                                       "cancel: stop the worker and remove its directory.")},
+            "wait": {"type": "integer",
+                     "description": "For result: seconds to wait for the task to finish (0 to 300)."},
+        },
+        "required": ["id", "action"],
     },
 }, {
     "name": "antiphon_retrieve",
@@ -7788,6 +7848,14 @@ def _mcp_serve(cwd, alias=None):
                 _mcp_result(mid, _send_tool(cwd, arguments.get("text"),
                                             arguments.get("to"), alias,
                                             kind=arguments.get("kind") or "claude"))
+            elif name == "antiphon_delegate":
+                arguments = p.get("arguments")
+                arguments = arguments if isinstance(arguments, dict) else {}
+                _mcp_result(mid, _delegate_tool(cwd, arguments, alias, "codex"))
+            elif name == "antiphon_task":
+                arguments = p.get("arguments")
+                arguments = arguments if isinstance(arguments, dict) else {}
+                _mcp_result(mid, _task_tool(cwd, arguments))
             elif name == "antiphon_retrieve":
                 arguments = p.get("arguments")
                 arguments = arguments if isinstance(arguments, dict) else {}
@@ -11080,8 +11148,172 @@ def print_summary(side="claude"):
     return 0
 
 
+# ---------- managed workers: delegate, and follow a task by id ----------
+
+TASK_MARK = "[Antiphon task {task_id}]"
+
+
+def _delegate(cwd, payload, sender=None, side=None, env=None):
+    """`(True, answer)` or `(False, reason)` for one delegation.
+
+    `side` is the delegating session's kind when known (the MCP servers know
+    theirs; the CLI does not); `kind` defaults to the other side. With `to`,
+    the task is handed to that running named peer of `kind` over the ordinary
+    addressed send and recorded as `handed`; without it a fresh worker of
+    `kind` is started (lib/workers.py). Every refusal names its reason and
+    leaves no record."""
+    env = os.environ if env is None else env
+    text = payload.get("text")
+    if not isinstance(text, str) or not text.strip():
+        return False, "not delegated: the task text is empty"
+    text = text.strip()
+    kind = payload.get("kind")
+    if kind is None and side in OTHER_SIDE:
+        kind = OTHER_SIDE[side][0]
+    if kind not in workers.KINDS:
+        return False, "not delegated: name a kind (claude or codex)"
+    task_class = payload.get("task") or "read"
+    if task_class not in workers.CLASSES:
+        return False, "not delegated: task must be read or write"
+    to = payload.get("to")
+    if to is not None and (not isinstance(to, str) or not to.strip() or to == NO_ALIAS):
+        return False, "not delegated: to must name a running peer"
+    timeout = payload.get("timeout")
+    timeout = timeout if isinstance(timeout, (int, float)) and not isinstance(timeout, bool) \
+        else workers.DEFAULT_TIMEOUT
+    try:
+        workers.check_hop(env)
+    except workers.Refused as refusal:
+        return False, str(refusal)
+    sender_side = side or OTHER_SIDE[kind][0]
+    who = sender_alias(sender) if sender is not None else claimed_alias(cwd, sender_side, None)
+    digest = hashlib.sha256(text.encode()).hexdigest()
+    size = len(text.encode())
+    hop = workers.current_hop(env) + 1
+    if to:
+        try:
+            record = workers.new_task(cwd, kind=kind, task_class=task_class, sha256=digest,
+                                      size=size, timeout=timeout, hop=hop, to=to)
+        except (ValueError, OSError) as error:
+            return False, f"not delegated: {error}"
+        task_id = record["id"]
+        headline = f"{TASK_MARK.format(task_id=task_id)} {text}"
+        if kind == "codex":
+            message = (f"{SIDE_LABELS[sender_side][1]} "
+                       f"{queue_label(who, task_id, True)} {headline}")
+            ok, detail = send_to_codex(cwd, message, to, sender=who)
+            transport, proof = "queue", (detail or "registered")
+            how = "queued for it; Codex reads its queue at its next turn"
+        else:
+            ok, detail = send_to_claude(cwd, headline, to, sender_alias=who,
+                                        message_id=task_id, sender_kind=sender_side)
+            transport, proof = "channel", "channel"
+            how = "delivered to its channel"
+        if not ok:
+            workers.update_task(cwd, task_id, lambda changed: changed.update(
+                state="failed", finished_at=time.time()))
+            return False, f"not delegated: {redact_private(str(detail))}"
+        workers.update_task(cwd, task_id, lambda changed: changed.update(state="handed"))
+        ledger.record_sent(cwd, task_id, sender=who or NO_ALIAS, to_kind=kind, to_alias=to,
+                           transport=transport, proof=proof, sha256=digest, size=size,
+                           sender_kind=sender_side)
+        words = (f"Handed task {task_id} to {ledger.LABEL[kind]} peer {to!r} ({how}); "
+                 "antiphon status shows the receipt, and the peer answers in its own "
+                 "words — nothing is collected by id.")
+        return True, {"task_id": task_id, "state": "handed", "to": to, "kind": kind,
+                      "task_class": task_class, "text": words}
+    try:
+        workers.admit(cwd)
+        record = workers.new_task(cwd, kind=kind, task_class=task_class, sha256=digest,
+                                  size=size, timeout=timeout, hop=hop)
+    except (workers.Refused, ValueError, OSError) as error:
+        return False, str(error) if isinstance(error, workers.Refused) else f"not delegated: {error}"
+    try:
+        started = workers.start(cwd, record, text, env=dict(env))
+    except workers.Refused as refusal:
+        return False, str(refusal)
+    task_id = record["id"]
+    worker = {"kind": kind, "name": f"worker-{task_id[:8]}",
+              "directory": workers.worker_dir(cwd, task_id)}
+    words = (f"Delegated task {task_id} to a fresh {kind} worker ({worker['name']}, "
+             f"{task_class} task, timeout {record['timeout']} s) in {worker['directory']}; "
+             f"antiphon_task(id, \"result\", wait) collects it and antiphon_task(id, "
+             "\"cancel\") stops it. Its words carry the label "
+             f"{workers.WORKER_LABEL.format(kind=kind, task_id=task_id)}; the bridge "
+             "never merges its work.")
+    return True, {"task_id": task_id, "state": started["state"], "kind": kind,
+                  "task_class": task_class, "timeout": record["timeout"], "worker": worker,
+                  "text": words}
+
+
+def _delegate_tool(cwd, arguments, sender, side):
+    ok, answer = _delegate(cwd, arguments, sender, side)
+    if not ok:
+        return _tool_error(f"Not delegated: {answer[len('not delegated: '):] if answer.startswith('not delegated: ') else answer}")
+    return {"content": [{"type": "text", "text": answer["text"]}]}
+
+
+def _task_tool(cwd, arguments):
+    task_id, action = arguments.get("id"), arguments.get("action")
+    if not isinstance(task_id, str) or workers.read_task(cwd, task_id) is None:
+        return _tool_error("unknown task id")
+    if action == "status":
+        record = workers.status(cwd, task_id)
+        return {"content": [{"type": "text", "text": json.dumps(record, indent=1)}]}
+    if action == "result":
+        wait = arguments.get("wait")
+        wait = wait if isinstance(wait, (int, float)) and not isinstance(wait, bool) else 0
+        answer = workers.result(cwd, task_id, wait)
+        return {"content": [{"type": "text", "text": json.dumps(answer, indent=1,
+                                                                 ensure_ascii=False)}]}
+    if action == "cancel":
+        record = workers.cancel(cwd, task_id)
+        return {"content": [{"type": "text", "text": json.dumps(record, indent=1)}]}
+    return _tool_error("action must be status, result or cancel")
+
+
+def task(*args):
+    """`antiphon task delegate | status <id> | result <id> [wait] | cancel <id>`."""
+    usage = "task: delegate | status <id> | result <id> [wait] | cancel <id>"
+    action = args[0] if args else None
+    if action not in ("delegate", "status", "result", "cancel"):
+        print(usage, file=sys.stderr)
+        return 1
+    cwd = project_dir()
+    if action == "delegate":
+        try:
+            payload = json.load(sys.stdin)
+        except (json.JSONDecodeError, ValueError):
+            payload = {}
+        if not isinstance(payload, dict):
+            payload = {}
+        ok, answer = _delegate(cwd, payload, None, None, os.environ)
+        if not ok:
+            print(f"task: {answer}", file=sys.stderr)
+            return 1
+        print(json.dumps(answer, ensure_ascii=False))
+        return 0
+    task_id = args[1] if len(args) > 1 else None
+    if not isinstance(task_id, str) or workers.read_task(cwd, task_id) is None:
+        print("task: unknown task id", file=sys.stderr)
+        return 1
+    if action == "status":
+        answer = workers.status(cwd, task_id)
+    elif action == "result":
+        try:
+            wait = float(args[2]) if len(args) > 2 else 0.0
+        except ValueError:
+            wait = 0.0
+        answer = workers.result(cwd, task_id, wait)
+    else:
+        answer = workers.cancel(cwd, task_id)
+    print(json.dumps(answer, ensure_ascii=False))
+    return 0
+
+
 COMMANDS = {
     "setup": setup, "status": status, "doctor": doctor, "catch-up": catch_up,
+    "task": task,
     "sources": sources, "retrieve": retrieve,
     "hook": hook, "summary": print_summary,
     "push": push, "reply": reply, "mcp": mcp, "register_peer": register_peer,

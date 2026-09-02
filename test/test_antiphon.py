@@ -2,6 +2,7 @@ import sys, os
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "lib"))
 import antiphon
 import ledger
+import workers
 
 import contextlib
 import errno
@@ -4085,6 +4086,172 @@ class ToolInvocationRetrievalTest(unittest.TestCase):
             antiphon._mcp_serve("/tmp/project")
         called.assert_called_once_with("/tmp/project", "tc1.c.AAAAAAAAAAAAAAAA")
         self.assertEqual(json.loads(out.getvalue())["result"], answer)
+
+
+class ManagedWorkerToolTest(unittest.TestCase):
+    """`antiphon task` and the two MCP tools over lib/workers.py: a task is
+    delegated to a fresh worker of a kind, or handed to a running named peer
+    of that kind; its lifecycle is asked by id; every refusal names its
+    reason; nothing is merged or forwarded."""
+
+    def _stub_path(self, root, body="exit 0"):
+        for kind in ("claude", "codex"):
+            path = os.path.join(root, kind)
+            with open(path, "w") as f:
+                f.write("#!/bin/sh\n" + body + "\n")
+            os.chmod(path, 0o755)
+        return root + os.pathsep + os.environ.get("PATH", "")
+
+    def _task(self, project, args, payload=None, env=None):
+        out, err = io.StringIO(), io.StringIO()
+        with patch.object(antiphon, "project_dir", return_value=project), \
+             patch.dict(antiphon.os.environ, env or {}, clear=False), \
+             patch.object(antiphon.sys, "stdin", io.StringIO(json.dumps(payload or {}))), \
+             contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            code = antiphon.task(*args)
+        return code, out.getvalue(), err.getvalue()
+
+    def test_delegate_starts_a_fresh_worker_and_says_so(self):
+        with tempfile.TemporaryDirectory() as project, tempfile.TemporaryDirectory() as bin_dir:
+            env = {"PATH": self._stub_path(bin_dir)}
+            code, out, err = self._task(project, ("delegate",),
+                                        {"text": "review the diff", "kind": "codex"}, env)
+            self.assertEqual(code, 0, err)
+            answer = json.loads(out)
+            self.assertEqual(answer["state"], "running")
+            self.assertEqual(answer["worker"]["kind"], "codex")
+            self.assertEqual(answer["worker"]["name"], f"worker-{answer['task_id'][:8]}")
+            self.assertEqual(answer["task_class"], "read")
+            self.assertIn(f"Delegated task {answer['task_id']} to a fresh codex worker", answer["text"])
+            self.assertIn("antiphon_task", answer["text"])
+            record = workers.read_task(project, answer["task_id"])
+            self.assertEqual((record["kind"], record["task_class"], record["hop"],
+                              record["sha256"]),
+                             ("codex", "read", 1, hashlib.sha256(b"review the diff").hexdigest()))
+            code, out, _err = self._task(project, ("result", answer["task_id"], "5"))
+            self.assertEqual(code, 0)
+            self.assertEqual(json.loads(out)["state"], "completed")
+
+    def test_delegate_refuses_without_a_kind_at_the_hop_budget_and_at_the_cap(self):
+        with tempfile.TemporaryDirectory() as project, tempfile.TemporaryDirectory() as bin_dir:
+            env = {"PATH": self._stub_path(bin_dir, "sleep 30")}
+            code, _out, err = self._task(project, ("delegate",), {"text": "x"}, env)
+            self.assertEqual(code, 1)
+            self.assertIn("task: not delegated: name a kind (claude or codex)", err)
+            code, _out, err = self._task(project, ("delegate",), {"text": "", "kind": "codex"}, env)
+            self.assertEqual(code, 1)
+            self.assertIn("task: not delegated: the task text is empty", err)
+            code, _out, err = self._task(project, ("delegate",),
+                                         {"text": "x", "kind": "codex"},
+                                         dict(env, ANTIPHON_HOP="1"))
+            self.assertEqual(code, 1)
+            self.assertIn("hop budget 1 reached", err)
+            self.assertEqual(workers.tasks(project), [], "a refusal leaves no record")
+            ids = []
+            for _ in range(4):
+                code, out, err = self._task(project, ("delegate",),
+                                            {"text": "x", "kind": "codex"}, env)
+                self.assertEqual(code, 0, err)
+                ids.append(json.loads(out)["task_id"])
+            code, _out, err = self._task(project, ("delegate",),
+                                         {"text": "x", "kind": "codex"}, env)
+            self.assertEqual(code, 1)
+            self.assertIn("4 workers already run", err)
+            for task_id in ids:
+                self._task(project, ("cancel", task_id))
+
+    def test_delegate_hands_a_task_to_a_running_named_peer(self):
+        with tempfile.TemporaryDirectory() as project:
+            sends = []
+            with patch.object(antiphon, "send_to_codex",
+                              side_effect=lambda cwd, message, to=None, sender=None:
+                                  sends.append((message, to, sender)) or (True, "live")), \
+                 patch.object(antiphon, "claimed_alias", return_value="ui"):
+                code, out, err = self._task(project, ("delegate",),
+                                            {"text": "review the diff", "kind": "codex",
+                                             "to": "build"})
+            self.assertEqual(code, 0, err)
+            answer = json.loads(out)
+            self.assertEqual(answer["state"], "handed")
+            self.assertIn(f"Handed task {answer['task_id']} to Codex peer 'build'", answer["text"])
+            self.assertIn("queued", answer["text"].lower())
+            message, to, sender = sends[0]
+            self.assertEqual((to, sender), ("build", "ui"))
+            self.assertIn(f"[Antiphon task {answer['task_id']}]", message)
+            self.assertIn("review the diff", message)
+            self.assertTrue(message.startswith(antiphon.CHANNEL_LABEL), message[:60])
+            record = workers.read_task(project, answer["task_id"])
+            self.assertEqual((record["state"], record["to"], record["kind"]),
+                             ("handed", "build", "codex"))
+            entry = ledger.read_entry(project, answer["task_id"])
+            self.assertEqual((entry["to_kind"], entry["to_alias"], entry["sender_kind"]),
+                             ("codex", "build", "claude"))
+            code, _out, err = self._task(project, ("delegate",),
+                                         {"text": "x", "kind": "codex", "to": "build"})
+            self.assertEqual(code, 1, "no transport: refused")
+
+    def test_status_result_and_cancel_by_id(self):
+        with tempfile.TemporaryDirectory() as project, tempfile.TemporaryDirectory() as bin_dir:
+            env = {"PATH": self._stub_path(bin_dir, "sleep 30")}
+            code, out, _err = self._task(project, ("delegate",), {"text": "x", "kind": "claude"}, env)
+            task_id = json.loads(out)["task_id"]
+            code, out, _err = self._task(project, ("status", task_id))
+            self.assertEqual((code, json.loads(out)["state"]), (0, "running"))
+            code, out, _err = self._task(project, ("result", task_id))
+            self.assertEqual((code, json.loads(out)["state"]), (0, "running"))
+            code, out, _err = self._task(project, ("cancel", task_id))
+            self.assertEqual((code, json.loads(out)["state"]), (0, "cancelled"))
+            code, _out, err = self._task(project, ("status", "2e6b14f1-1659-544a-98d4-56d6eca8fa48"))
+            self.assertEqual(code, 1)
+            self.assertIn("task: unknown task id", err)
+            code, _out, err = self._task(project, ("frobnicate", task_id))
+            self.assertEqual(code, 1)
+            self.assertIn("task: delegate | status <id> | result <id> [wait] | cancel <id>", err)
+
+    def test_the_codex_server_offers_delegate_and_task(self):
+        names = [tool["name"] for tool in antiphon.TOOLS]
+        self.assertIn("antiphon_delegate", names)
+        self.assertIn("antiphon_task", names)
+        delegate = next(t for t in antiphon.TOOLS if t["name"] == "antiphon_delegate")
+        self.assertEqual(delegate["inputSchema"]["required"], ["text"])
+        self.assertEqual(delegate["inputSchema"]["properties"]["kind"]["enum"], ["claude", "codex"])
+        self.assertEqual(delegate["inputSchema"]["properties"]["task"]["enum"], ["read", "write"])
+        self.assertIn("never merges", delegate["description"])
+        task = next(t for t in antiphon.TOOLS if t["name"] == "antiphon_task")
+        self.assertEqual(task["inputSchema"]["required"], ["id", "action"])
+        self.assertEqual(task["inputSchema"]["properties"]["action"]["enum"],
+                         ["status", "result", "cancel"])
+        request = {"jsonrpc": "2.0", "id": 5, "method": "tools/call",
+                   "params": {"name": "antiphon_delegate",
+                              "arguments": {"text": "x", "kind": "claude", "task": "write",
+                                            "timeout": 60}}}
+        answer = {"content": [{"type": "text", "text": "delegated"}]}
+        with patch.object(antiphon.sys, "stdin", io.StringIO(json.dumps(request) + "\n")), \
+             patch.object(antiphon, "_delegate_tool", return_value=answer) as called, \
+             contextlib.redirect_stdout(io.StringIO()):
+            antiphon._mcp_serve("/tmp/project", "build")
+        called.assert_called_once_with("/tmp/project", {"text": "x", "kind": "claude",
+                                                        "task": "write", "timeout": 60},
+                                       "build", "codex")
+        request["params"] = {"name": "antiphon_task",
+                             "arguments": {"id": "t", "action": "result", "wait": 3}}
+        with patch.object(antiphon.sys, "stdin", io.StringIO(json.dumps(request) + "\n")), \
+             patch.object(antiphon, "_task_tool", return_value=answer) as called, \
+             contextlib.redirect_stdout(io.StringIO()):
+            antiphon._mcp_serve("/tmp/project", "build")
+        called.assert_called_once_with("/tmp/project", {"id": "t", "action": "result", "wait": 3})
+
+    def test_the_delegate_tool_defaults_the_kind_to_the_other_side(self):
+        with tempfile.TemporaryDirectory() as project, tempfile.TemporaryDirectory() as bin_dir:
+            with patch.dict(antiphon.os.environ, {"PATH": self._stub_path(bin_dir)}):
+                result = antiphon._delegate_tool(project, {"text": "look"}, "build", "codex")
+            self.assertIsNot(result.get("isError"), True, result)
+            self.assertIn("to a fresh claude worker", result["content"][0]["text"])
+            result = antiphon._delegate_tool(project, {"text": ""}, "build", "codex")
+            self.assertTrue(result.get("isError"))
+            self.assertIn("the task text is empty", result["content"][0]["text"])
+            for task_id in [t["id"] for t in workers.tasks(project)]:
+                workers.cancel(project, task_id)
 
 
 class SameVendorTest(unittest.TestCase):
