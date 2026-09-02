@@ -14930,7 +14930,8 @@ class ClaimedAliasTest(unittest.TestCase):
         # re-read the record to learn what it published would be asking the
         # same bytes both questions.
         self.assertEqual(json.loads(answer.getvalue()),
-                         {"birth": antiphon.peers._process_birth(os.getpid())})
+                         {"birth": antiphon.peers.process_fingerprint(os.getpid()),
+                          "fingerprint_field": "process_birth"})
         self.assertEqual(peer["owner"], self.MINE)
         self.assertEqual(peer["pid"], os.getpid())
 
@@ -14955,10 +14956,38 @@ class ClaimedAliasTest(unittest.TestCase):
             with open(path, encoding="utf-8") as f:
                 record = json.load(f)
             observed = antiphon.peers._process_info(os.getpid())
-            self.assertEqual(record.get("birth"),
-                             observed[1] if observed else None)
+            self.assertEqual(record.get("process_birth"),
+                             ("v1:" + observed[1]) if observed else None)
+            self.assertNotIn("birth", record)
             self.assertEqual([p["name"] for p in
                               antiphon.peers.read_peers(project, "claude")], ["ui"])
+
+    LIVE = "Sat Aug 30 01:00:00 2026"
+
+    def test_the_bridge_answers_the_written_fingerprint_not_a_second_reading(self):
+        """`register_peer` through its real stdin/stdout, with the process
+        birth observable once and then not: the printed birth is the record's.
+        `owner_key` is pinned because it walks the process table first and
+        would otherwise consume the injected answers; the seam is
+        `_process_birth`, the one call the claim is allowed."""
+        payload = json.dumps({"kind": "claude", "name": "ui",
+                              "address": "/tmp/ui.sock", "pid": os.getpid(),
+                              "fingerprint_field": "process_birth"})
+        with tempfile.TemporaryDirectory() as project, \
+                patch.object(antiphon, "project_dir", return_value=project), \
+                patch.object(antiphon.peers, "owner_key", return_value=self.MINE), \
+                patch.object(antiphon.peers, "_process_birth",
+                             side_effect=[self.LIVE, None]) as observed, \
+                patch.object(antiphon.sys, "stdin", io.StringIO(payload)):
+            answer = io.StringIO()
+            with contextlib.redirect_stdout(answer):
+                self.assertEqual(antiphon.register_peer(), 0)
+            self.assertEqual(observed.call_count, 1)
+            record = antiphon.peers.read_peers(project, "claude")[0]
+        answer = json.loads(answer.getvalue())
+        self.assertEqual(answer, {"birth": f"v1:{self.LIVE}",
+                                  "fingerprint_field": "process_birth"})
+        self.assertEqual(record["process_birth"], answer["birth"])
 
 
 class StatusTest(unittest.TestCase):
@@ -16965,6 +16994,7 @@ class AutomaticRegistrationBridgeTest(unittest.TestCase):
                 "kind": "claude", "name": alias,
                 "address": os.path.join(project, "a.sock"),
                 "pid": os.getpid(), "identity_digest": digest,
+                "fingerprint_field": "process_birth",
             })
             self.assertEqual(code, 1, printed)
             self.assertEqual(antiphon.peers.read_peers(project, "claude"), [],
@@ -16977,12 +17007,33 @@ class AutomaticRegistrationBridgeTest(unittest.TestCase):
                 "kind": "claude", "name": alias,
                 "address": os.path.join(project, "a.sock"),
                 "pid": os.getpid(), "identity_digest": digest,
-                "mode": "initial",
+                "mode": "initial", "fingerprint_field": "process_birth",
             })
             self.assertEqual(code, 0, printed)
             self.assertEqual(
                 [p.get("name") for p in
                  antiphon.peers.read_peers(project, "claude")], [alias])
+
+    def test_automatic_registration_bridge_refuses_an_undeclared_claim(self):
+        """A listener that does not say which fingerprint field its verdict
+        reads is an older Node over a newer Python: registering it would
+        publish an endpoint its own in-memory verdict cannot govern, and a
+        sender would be told it recovered and then refused. Both modes."""
+        alias, digest = antiphon.peers.auto_identity(self.A)
+        for mode in ("initial", "reassert"):
+            with self.subTest(mode=mode), \
+                    tempfile.TemporaryDirectory() as project:
+                code, printed = self._call(project, {
+                    "kind": "claude", "name": alias,
+                    "address": os.path.join(project, "a.sock"),
+                    "pid": os.getpid(), "identity_digest": digest,
+                    "mode": mode,
+                })
+                self.assertEqual(code, 1, printed)
+                self.assertEqual(antiphon.peers.read_peers(project, "claude"), [],
+                                 "an undeclared automatic claim registers nothing")
+                self.assertRegex(printed, r"predates the registry's fingerprint field")
+                self.assertIn("reconnect the Claude session", printed)
 
     def test_automatic_registration_bridge_leaves_explicit_claims_alone(self):
         with tempfile.TemporaryDirectory() as project:
@@ -17266,6 +17317,43 @@ class ReadinessParityTest(unittest.TestCase):
             antiphon.peers.peer_dir(project, "claude", alias),
             "session.json"), drop=drop, **over)
 
+    def _endpoint_path(self, project, alias):
+        return os.path.join(antiphon.peers.peer_dir(project, "claude", alias),
+                            "endpoint.json")
+
+    def _rewrite_endpoint_text(self, project, alias, edit):
+        """Rewrite the endpoint as text, for spellings `json.dump` cannot
+        produce: `1.0`, `1e0`, an escaped key, a duplicated key, a 65,000-digit
+        token. `edit` maps the current text to the new text."""
+        path = self._endpoint_path(project, alias)
+        with open(path, encoding="utf-8") as stream:
+            text = stream.read()
+        with open(path, "w", encoding="utf-8") as stream:
+            stream.write(edit(text))
+
+    def _migration_text(self, birth):
+        """Turn a current record's text into the 0.4.0 spelling with the given
+        birth, leaving the closing brace off for a caller to append a spelling
+        of `birth_version` after."""
+        def edit(text):
+            record = json.loads(text)
+            record.pop("process_birth", None)
+            record["birth"] = birth
+            return json.dumps(record)[:-1]
+        return edit
+
+    @staticmethod
+    def _own_fingerprint():
+        """The rendered spelling a listener's claim answers with, for this
+        test process — what `listenerBirth` is compared against."""
+        render = getattr(antiphon.peers, "process_fingerprint", None)
+        if render is None:
+            # The pre-fix tree has no renderer; spell it here so the parity
+            # disagreements can be measured before the product changes.
+            birth = antiphon.peers._process_birth(os.getpid())
+            return f"v1:{birth}" if birth else ""
+        return render(os.getpid()) or ""
+
     @staticmethod
     def _snapshot(project):
         """Every path under the project with its bytes, or its mode when the
@@ -17331,7 +17419,7 @@ class ReadinessParityTest(unittest.TestCase):
         done = subprocess.run(
             ["node", "--input-type=module", "-e", script, "--",
              project, alias, digest, str(os.getpid()),
-             self._own_birth()],
+             self._own_fingerprint()],
             capture_output=True, text=True, cwd=self.ROOT)
         if done.returncode != 0:
             self.fail("node verdict failed: "
@@ -17599,7 +17687,78 @@ class ReadinessParityTest(unittest.TestCase):
             "tombstone carries an extra key": lambda p, a: (
                 self._proof(p, self.B),
                 self._withdrawn(p, a, extra=', "note": "hello"')),
+            # --- the fingerprint contract: both readers, one selector ---
+            "sibling is the listener's own birth": lambda p, a: (
+                self._proof(p, self.A),
+                self._patch_endpoint(p, a, process_birth="v1:" + self._own_birth())),
+            "migration pair, same birth": lambda p, a: (
+                self._proof(p, self.A),
+                self._patch_endpoint(p, a, drop="process_birth",
+                                     birth=self._own_birth(), birth_version=1)),
+            "migration pair, version spelled 1.0": lambda p, a: (
+                self._proof(p, self.A),
+                self._rewrite_endpoint_text(p, a, lambda t:
+                    self._migration_text(self._own_birth())(t) + ', "birth_version": 1.0}')),
+            "migration pair, version spelled 1e0": lambda p, a: (
+                self._proof(p, self.A),
+                self._rewrite_endpoint_text(p, a, lambda t:
+                    self._migration_text(self._own_birth())(t) + ', "birth_version": 1e0}')),
+            "migration pair, version key escaped": lambda p, a: (
+                self._proof(p, self.A),
+                self._rewrite_endpoint_text(p, a, lambda t:
+                    self._migration_text(self._own_birth())(t) + ', "birth\\u005fversion": 1}')),
+            "malformed sibling beside a conflicting valid pair (7)": lambda p, a: (
+                self._proof(p, self.A),
+                self._patch_endpoint(p, a, process_birth=7,
+                                     birth=self._own_birth(), birth_version=1)),
+            "malformed sibling beside a conflicting valid pair (null)": lambda p, a: (
+                self._proof(p, self.A),
+                self._patch_endpoint(p, a, process_birth=None,
+                                     birth=self._own_birth(), birth_version=1)),
+            "malformed current sibling beside a valid pair (v1:garbage)": lambda p, a: (
+                self._proof(p, self.A),
+                self._patch_endpoint(p, a, process_birth="v1:garbage",
+                                     birth=self._own_birth(), birth_version=1)),
+            "sibling of a future generation": lambda p, a: (
+                self._proof(p, self.A),
+                self._patch_endpoint(p, a, process_birth="v2:whatever")),
+            "sibling of a nine-digit generation": lambda p, a: (
+                self._proof(p, self.A),
+                self._patch_endpoint(p, a, process_birth="v999999999:" + self._own_birth())),
+            "sibling shaped but out of range": lambda p, a: (
+                self._proof(p, self.A),
+                self._patch_endpoint(p, a, process_birth="v1:Mon Jan 99 99:99:99 2026")),
+            "sibling with a trailing NEL": lambda p, a: (
+                self._proof(p, self.A),
+                self._patch_endpoint(p, a, process_birth="v1:" + self._own_birth() + "\u0085")),
+            "sibling with a leading BOM": lambda p, a: (
+                self._proof(p, self.A),
+                self._patch_endpoint(p, a, process_birth="\ufeffv1:" + self._own_birth())),
+            "migration birth with a trailing NEL": lambda p, a: (
+                self._proof(p, self.A),
+                self._patch_endpoint(p, a, drop="process_birth",
+                                     birth=self._own_birth() + "\u0085", birth_version=1)),
+            "migration birth with a leading BOM": lambda p, a: (
+                self._proof(p, self.A),
+                self._patch_endpoint(p, a, drop="process_birth",
+                                     birth="\ufeff" + self._own_birth(), birth_version=1)),
+            "no fingerprint at all": lambda p, a: (
+                self._proof(p, self.A),
+                self._patch_endpoint(p, a, drop="process_birth")),
+            # The bound is lexical and integer-only on both sides, so a long
+            # float is a valid record everywhere.
+            "an unrelated nested field holds a 21-digit float": lambda p, a: (
+                self._proof(p, self.A),
+                self._rewrite_endpoint_text(p, a, lambda t:
+                    t[:-1] + ', "extra": {"n": ' + "9" * 21 + ".0}}")),
+            "an unrelated nested field holds a 21-digit exponent": lambda p, a: (
+                self._proof(p, self.A),
+                self._rewrite_endpoint_text(p, a, lambda t:
+                    t[:-1] + ', "extra": {"n": ' + "9" * 21 + "e0}}")),
         }
+        if not self._own_birth():
+            self.skipTest("no readable process table: the fingerprint "
+                          "fixtures need this process's own birth")
         # One case cannot be compared by equality, and saying so is more
         # honest than bending either side to match. With the endpoint's digest
         # replaced, the record no longer derives its own alias: `read_peers`
@@ -17691,15 +17850,33 @@ class ReadinessParityTest(unittest.TestCase):
             # Node compared the pid alone, so an endpoint left by an earlier
             # process that happens to share this pid read as this listener's
             # own — while Python prunes it before it can be enumerated.
-            "endpoint records another process's birth": lambda p, a: (
+            "sibling names another process's birth": lambda p, a: (
                 self._proof(p, self.A),
-                self._patch_endpoint(p, a, birth="Thu Jan  1 00:00:00 1970",
-                                     birth_version=1)),
-            "rotated, endpoint records another birth": lambda p, a: (
-                self._proof(p, self.B),
-                self._withdrawn(p, a),
-                self._patch_endpoint(p, a, birth="Thu Jan  1 00:00:00 1970",
-                                     birth_version=1)),
+                self._patch_endpoint(p, a, process_birth="v1:Thu Jan 1 00:00:00 1970")),
+            "rotated, sibling names another birth": lambda p, a: (
+                self._proof(p, self.B), self._withdrawn(p, a),
+                self._patch_endpoint(p, a, process_birth="v1:Thu Jan 1 00:00:00 1970")),
+            "migration pair, other birth": lambda p, a: (
+                self._proof(p, self.A),
+                self._patch_endpoint(p, a, drop="process_birth",
+                                     birth="Thu Jan 1 00:00:00 1970", birth_version=1)),
+            "migration pair, version key duplicated": lambda p, a: (
+                self._proof(p, self.A),
+                self._rewrite_endpoint_text(p, a, lambda t:
+                    self._migration_text(self._own_birth())(t)
+                    + ', "birth_version": 2, "birth_version": 1}')),
+            "migration pair, version is a 65,000-digit token": lambda p, a: (
+                self._proof(p, self.A),
+                self._rewrite_endpoint_text(p, a, lambda t:
+                    self._migration_text(self._own_birth())(t)
+                    + ', "birth_version": ' + "9" * 65_000 + "}")),
+            # The bound has to hold at every depth on both sides. Python's
+            # parse_int sees every token; Node's lexer has to count digits
+            # in nested values too, or a record invalid here is valid there.
+            "an unrelated nested field holds a 21-digit integer": lambda p, a: (
+                self._proof(p, self.A),
+                self._rewrite_endpoint_text(p, a, lambda t:
+                    t[:-1] + ', "extra": {"n": ' + "9" * 21 + "}}")),
             "endpoint names a dead process": lambda p, a: (
                 self._proof(p, self.A),
                 self._patch_endpoint(p, a, pid=self._reaped_pid())),
