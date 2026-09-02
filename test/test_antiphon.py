@@ -5785,15 +5785,24 @@ class DoctorTest(unittest.TestCase):
         project = self.project()
         self.set_up(project)
         root = self.fake_root(time.time() - 60)
-        real = os.path.join(os.path.dirname(antiphon.__file__), "antiphon.py")
-        __import__("shutil").copy(real, os.path.join(root, "lib", "antiphon.py"))
-        __import__("shutil").copy(os.path.join(os.path.dirname(antiphon.__file__), "peers.py"),
-                                  os.path.join(root, "lib", "peers.py"))
+        # Every Python module the package has, not a fixed list: a module the
+        # code grew (`ledger.py`) left the copy unable to import itself, the
+        # child died on its first line, and whether `ps` still listed it when
+        # doctor looked was a race that the suite lost about once in three.
+        lib = os.path.dirname(antiphon.__file__)
+        for name in os.listdir(lib):
+            if name.endswith(".py"):
+                shutil.copy(os.path.join(lib, name), os.path.join(root, "lib", name))
         env = {**os.environ, "ANTIPHON_CWD": project}
         env.pop("ANTIPHON_NAME", None)
-        child = subprocess.Popen([sys.executable, os.path.join(root, "lib", "antiphon.py"), "mcp"],
-                                 stdin=subprocess.PIPE, stdout=subprocess.DEVNULL,
-                                 stderr=subprocess.DEVNULL, env=env)
+        # stderr to a file, never a pipe: a live server closes neither, and
+        # reading a pipe here would wait on it forever.
+        log = os.path.join(root, "server.stderr")
+        with open(log, "wb") as stderr:
+            child = subprocess.Popen(
+                [sys.executable, os.path.join(root, "lib", "antiphon.py"), "mcp"],
+                stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=stderr,
+                env=env)
         try:
             deadline = time.time() + 5
             while time.time() < deadline:
@@ -5809,6 +5818,11 @@ class DoctorTest(unittest.TestCase):
                 out = io.StringIO()
                 with contextlib.redirect_stdout(out):
                     antiphon.doctor()
+            if child.poll() is not None:
+                with open(log, "rb") as stderr:
+                    said = stderr.read().decode("utf-8", "replace")[-500:]
+                self.fail(f"the server under test exited {child.returncode} "
+                          f"before doctor looked: {said}")
             line = self.line_for(out.getvalue(), f"pid {child.pid}")
             self.assertTrue(line.startswith("✗ running: codex mcp"), line)
         finally:
