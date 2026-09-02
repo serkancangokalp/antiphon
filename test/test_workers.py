@@ -237,5 +237,156 @@ class AdapterTest(unittest.TestCase):
         workers.check_hop({"ANTIPHON_HOP": "1", "ANTIPHON_HOP_BUDGET": "2"})
 
 
+
+class LifecycleTest(unittest.TestCase):
+    """What becomes of a worker: seen through its exit file and its process
+    group, never guessed; killed on the task's timeout or on cancel; its
+    directory swept only after its result was collected."""
+
+    def _stub(self, root, kind, body):
+        path = os.path.join(root, kind)
+        with open(path, "w") as f:
+            f.write("#!/bin/sh\n" + body + "\n")
+        os.chmod(path, 0o755)
+        return path
+
+    def _env(self, bin_dir):
+        return dict(os.environ, PATH=bin_dir + os.pathsep + os.environ.get("PATH", ""))
+
+    def _run(self, project, bin_dir, body, kind="codex", task_class="read", timeout=900):
+        self._stub(bin_dir, kind, body)
+        record = workers.new_task(project, kind=kind, task_class=task_class, sha256=SHA,
+                                  size=5, timeout=timeout)
+        return workers.start(project, record, "do it", env=self._env(bin_dir))
+
+    def _settle(self, project, task_id, wanted, seconds=6):
+        deadline = time.time() + seconds
+        while time.time() < deadline:
+            record = workers.status(project, task_id)
+            if record["state"] == wanted:
+                return record
+            time.sleep(0.05)
+        self.fail(f"never {wanted}: {workers.read_task(project, task_id)}")
+
+    def test_an_exit_is_read_off_the_exit_file_never_guessed(self):
+        with tempfile.TemporaryDirectory() as project, tempfile.TemporaryDirectory() as bin_dir:
+            done = self._run(project, bin_dir, "echo finished; exit 0")
+            record = self._settle(project, done["id"], "completed")
+            self.assertEqual(record["exit_code"], 0)
+            self.assertIsNotNone(record["finished_at"])
+            failed = self._run(project, bin_dir, "echo boom >&2; exit 3")
+            record = self._settle(project, failed["id"], "failed")
+            self.assertEqual(record["exit_code"], 3)
+            self.assertIn("boom", open(workers.log_path(project, failed["id"])).read())
+
+    def test_a_permission_the_class_denies_is_blocked_not_failed(self):
+        with tempfile.TemporaryDirectory() as project, tempfile.TemporaryDirectory() as bin_dir:
+            started = self._run(project, bin_dir,
+                                "echo 'Bash requires approval: permission denied'; exit 2")
+            record = self._settle(project, started["id"], "blocked")
+            self.assertEqual(record["exit_code"], 2)
+
+    def test_a_worker_past_its_timeout_is_killed_and_timed_out(self):
+        with tempfile.TemporaryDirectory() as project, tempfile.TemporaryDirectory() as bin_dir:
+            started = self._run(project, bin_dir, "sleep 30", timeout=1)
+            time.sleep(1.2)
+            record = self._settle(project, started["id"], "timed_out", seconds=15)
+            with self.assertRaises(OSError):
+                os.killpg(record["pid"], 0)
+
+    def test_cancel_kills_the_worker_and_removes_its_directory(self):
+        import subprocess
+        with tempfile.TemporaryDirectory() as project, tempfile.TemporaryDirectory() as bin_dir:
+            subprocess.run(["git", "init", "-q", project], check=True)
+            subprocess.run(["git", "-C", project, "-c", "user.email=a@b", "-c", "user.name=a",
+                            "commit", "-q", "--allow-empty", "-m", "root"], check=True)
+            started = self._run(project, bin_dir, "sleep 30", task_class="write")
+            directory = workers.worker_dir(project, started["id"])
+            self.assertTrue(os.path.isdir(directory))
+            record = workers.cancel(project, started["id"])
+            self.assertEqual(record["state"], "cancelled")
+            self.assertFalse(os.path.exists(directory))
+            listed = subprocess.run(["git", "-C", project, "worktree", "list", "--porcelain"],
+                                    capture_output=True, text=True).stdout
+            self.assertNotIn(started["id"], listed, "the worktree is gone from git too")
+            with self.assertRaises(OSError):
+                os.killpg(record["pid"], 0)
+            self.assertEqual(workers.cancel(project, started["id"])["state"], "cancelled",
+                             "cancelling twice is one cancel")
+
+    def test_result_waits_boundedly_and_carries_the_evidence_of_a_write_task(self):
+        import subprocess
+        with tempfile.TemporaryDirectory() as project, tempfile.TemporaryDirectory() as bin_dir:
+            subprocess.run(["git", "init", "-q", project], check=True)
+            subprocess.run(["git", "-C", project, "-c", "user.email=a@b", "-c", "user.name=a",
+                            "commit", "-q", "--allow-empty", "-m", "root"], check=True)
+            started = self._run(project, bin_dir,
+                                "sleep 0.5; echo hello > made.txt; echo 'suite: 3 passed' > tests.txt; exit 0",
+                                task_class="write")
+            early = workers.result(project, started["id"], wait=0)
+            self.assertEqual(early["state"], "running")
+            self.assertNotIn("diff", early)
+            final = workers.result(project, started["id"], wait=10)
+            self.assertEqual(final["state"], "completed")
+            self.assertIn("+hello", final["diff"])
+            self.assertIn("made.txt", final["diff"])
+            self.assertEqual(final["tests"], "suite: 3 passed\n")
+            self.assertEqual(final["log_path"], workers.log_path(project, started["id"]))
+            self.assertEqual(final["worker"]["kind"], "codex")
+            self.assertEqual(final["worker"]["name"], f"worker-{started['id'][:8]}")
+            self.assertIsNotNone(workers.read_task(project, started["id"])["collected_at"])
+            self.assertLessEqual(workers.MAX_WAIT, 300)
+
+    def test_a_large_diff_is_a_path_not_a_payload(self):
+        import subprocess
+        with tempfile.TemporaryDirectory() as project, tempfile.TemporaryDirectory() as bin_dir:
+            subprocess.run(["git", "init", "-q", project], check=True)
+            subprocess.run(["git", "-C", project, "-c", "user.email=a@b", "-c", "user.name=a",
+                            "commit", "-q", "--allow-empty", "-m", "root"], check=True)
+            started = self._run(project, bin_dir,
+                                "head -c 400000 /dev/zero | tr '\\0' 'x' > big.txt; exit 0",
+                                task_class="write")
+            final = workers.result(project, started["id"], wait=10)
+            self.assertEqual(final["state"], "completed")
+            self.assertNotIn("diff", final)
+            self.assertTrue(os.path.isfile(final["diff_path"]))
+            self.assertGreater(os.path.getsize(final["diff_path"]), workers.DIFF_INLINE)
+
+    def test_the_sweep_removes_only_a_collected_directory(self):
+        with tempfile.TemporaryDirectory() as project, tempfile.TemporaryDirectory() as bin_dir:
+            done = self._run(project, bin_dir, "exit 0")
+            self._settle(project, done["id"], "completed")
+            failed = self._run(project, bin_dir, "exit 1")
+            self._settle(project, failed["id"], "failed")
+            live = self._run(project, bin_dir, "sleep 30")
+            workers.sweep(project, time.time())
+            self.assertTrue(os.path.isdir(workers.worker_dir(project, done["id"])),
+                            "completed but not collected: kept")
+            workers.result(project, done["id"])
+            workers.sweep(project, time.time())
+            self.assertFalse(os.path.exists(workers.worker_dir(project, done["id"])))
+            self.assertTrue(os.path.isdir(workers.worker_dir(project, failed["id"])),
+                            "failed: kept for inspection until the record expires")
+            self.assertTrue(os.path.isdir(workers.worker_dir(project, live["id"])))
+            # A sweep dated a week ahead: the failed task's record and directory
+            # expire; the running worker is first reconciled — past its timeout
+            # by then, so it is killed and timed out — and only then swept.
+            workers.sweep(project, time.time() + workers.TASK_TTL + 1)
+            self.assertFalse(os.path.exists(workers.worker_dir(project, failed["id"])))
+            self.assertIsNone(workers.read_task(project, failed["id"]))
+            self.assertIsNone(workers.read_task(project, live["id"]),
+                              "timed out by the reconciliation, then expired")
+            with self.assertRaises(OSError):
+                os.killpg(live["pid"], 0)
+
+    def test_the_sweep_never_touches_a_running_worker(self):
+        with tempfile.TemporaryDirectory() as project, tempfile.TemporaryDirectory() as bin_dir:
+            live = self._run(project, bin_dir, "sleep 30")
+            workers.sweep(project, time.time())
+            self.assertEqual(workers.read_task(project, live["id"])["state"], "running")
+            self.assertTrue(os.path.isdir(workers.worker_dir(project, live["id"])))
+            workers.cancel(project, live["id"])
+
+
 if __name__ == "__main__":
     unittest.main()
