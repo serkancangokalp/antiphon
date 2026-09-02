@@ -96,7 +96,7 @@ GENERATION       = v([0-9]{1,9}):            # anchored at the start; the token 
 
 Duplicate keys never reach the selector: both readers call the record invalid first.
 
-**Bounded integers, on both sides and at every depth.** `_read_record` parses with `parse_int=_bounded_int`, which raises `ValueError` for a token longer than `INTEGER_TOKEN_CEILING` (20) digits, so the record is `None` on every Python and no conversion of a long token ever happens — at any nesting depth, because `parse_int` sees every integer token. Node mirrors it in the lexer it already runs: `scanRecord` (`identity.mjs:21-60`) counts the integer digits of every number token it passes, top-level or nested, and reports `overlong: true` past the same ceiling; `readRecord` then answers `invalid`, exactly as it does for `duplicate`. Without the Node half, a 21-digit integer in an unrelated nested field made the record invalid here and valid there, and Node could still say READY. The ceiling is exported from both modules and compared by the contract test. A near-ceiling token, anywhere, is therefore structural on both sides: Python `NO-RECORD`, Node `UNREADY` (invalid record).
+**Bounded integers, on both sides, at every depth, and only integers.** `_read_record` parses with `parse_int=_bounded_int`, which raises `ValueError` for an *integer* token longer than `INTEGER_TOKEN_CEILING` (20) digits, so the record is `None` on every Python and no conversion of a long token ever happens — at any nesting depth, because `parse_int` sees every integer token and *only* integer tokens: `999…9.0` and `999…9e0` go to `parse_float` and stay valid. Node mirrors exactly that in the lexer it already runs: `scanRecord` (`identity.mjs:21-70`) lexes every number token, top-level or nested (today it lexes only tokens that follow a top-level key), and reports `overlong: true` only for a token matching the integer grammar `^-?(?:0|[1-9][0-9]*)$` with more than the ceiling's digits; a token with a fraction or an exponent is never overlong, however long. `readRecord` then answers `invalid`, exactly as it does for `duplicate`. Without the Node half, a 21-digit integer in an unrelated nested field made the record invalid here and valid there; with a Node half that counted every number token, a 21-digit float would have made it valid here and invalid there. The ceiling is exported from both modules and compared by the contract test. A long integer token, anywhere, is therefore structural on both sides: Python `NO-RECORD`, Node `UNREADY` (invalid record); a long float is a valid record on both.
 
 **Liveness** (`_record_alive`): no fingerprint or `("other", …)` → pid only; `("current", start)` and `ps` unreadable → live; `("current", start)` and a different observed start → dead. `_record_liveness` (scheduling) maps `None`/`other` to `unknown` and `current` to `live`/`dead` as today; its cache key becomes `(pid, fingerprint)`.
 
@@ -124,6 +124,8 @@ Bucket assignment for every new parity fixture, with the verdict pair each must 
 | migration pair, `birth_version` duplicated | ungovernable | NO-RECORD (invalid record) | UNREADY (invalid record) |
 | migration pair, `birth_version` a 65,000-digit token | ungovernable | NO-RECORD (bounded parse) | UNREADY (invalid record) |
 | an unrelated nested field holds a 21-digit integer | ungovernable | NO-RECORD (bounded parse) | UNREADY (invalid record) |
+| an unrelated nested field holds a 21-digit float `…9.0` | cases | READY | READY |
+| an unrelated nested field holds a 21-digit exponent `…9e0` | cases | READY | READY |
 | malformed sibling (`7`, `null`, `""`, `v1:`, `v1:garbage`) beside a valid conflicting pair | cases | UNREADY | UNREADY |
 | sibling of a future generation (`v2:…`, `v999999999:…`) | cases | UNREADY | UNREADY |
 | sibling shaped but out of range (`v1:Mon Jan 99 99:99:99 2026`) | cases | UNREADY | UNREADY |
@@ -145,19 +147,34 @@ If a measured pair differs from this table, the table is wrong or the code is; t
 
 - answers `{"birth": "<the fingerprint register_claim wrote, or null>", "fingerprint_field": "process_birth"}` on success — the same string, from the same observation, that went into the record.
 
-`runRegistryCall` for `register_peer` with an automatic digest requires `answer.fingerprint_field === "process_birth"`; when it is missing the listener has just been registered by a Python that wrote the old record and cannot be governed, so Node immediately runs `unregister_peer` inside the same serialised `registryMutations` step — and then *checks*, because `unregister` swallows `OSError` and returns nothing, and an owner mismatch is a silent no-op (`peers.py:1549-1565`). The check is the one already written for this question: `endpointDescribesListener`-shaped — the endpoint file is absent, or its `pid` is not `process.pid`, or its `address` is not this socket. Only then:
+`runRegistryCall` for `register_peer` with an automatic digest requires `answer.fingerprint_field === "process_birth"`; when it is missing the listener has just been registered by a Python that wrote the old record and cannot be governed, so Node immediately runs `unregister_peer` inside the same serialised `registryMutations` step — and then *classifies* what is on disk, because `unregister` swallows `OSError` and returns nothing, an owner mismatch is a silent no-op (`peers.py:1549-1565`), and `endpointDescribesListener` folds absent, torn and unreadable into one `false` (`channel.mjs:472-490`) — a torn file would have read as "withdrawn". `classifyEndpoint(path, listener)` in `identity.mjs` answers one of four:
+
+| Class | Meaning | Withdrawal |
+|---|---|---|
+| `absent` | no file | succeeded |
+| `other` | a valid record naming another pid, address or identity | succeeded — somebody else holds the name now |
+| `self` | a valid record naming this listener | failed |
+| `unknown` | unreadable, undecodable, torn, duplicate-keyed, overlong, wrong shape | not verified |
+
+Only `absent` and `other` earn:
 
 ```
 antiphon: the registry on disk predates this listener's fingerprint field; the endpoint it wrote was withdrawn. Reinstall antiphon so both sides match, then reconnect the Claude session
 ```
 
-Otherwise:
+`self`:
 
 ```
 antiphon: the registry on disk predates this listener's fingerprint field, and the endpoint it wrote could not be withdrawn; remove .antiphon/peers/claude-<alias>/endpoint.json by hand, reinstall antiphon so both sides match, then reconnect the Claude session
 ```
 
-Either way the claim returns false. Startup then takes the existing "did not get the channel" road (`channel.mjs:993`), and a reassert answers the existing `{ok:false}`. A success is never announced on the strength of a subprocess exit code.
+`unknown`:
+
+```
+antiphon: the registry on disk predates this listener's fingerprint field, and whether the endpoint it wrote was withdrawn could not be verified; check .antiphon/peers/claude-<alias>/endpoint.json by hand, reinstall antiphon so both sides match, then reconnect the Claude session
+```
+
+Every class returns false from the claim. Startup then takes the existing "did not get the channel" road (`channel.mjs:993`), and a reassert answers the existing `{ok:false}`. A success is never announced on the strength of a subprocess exit code.
 
 Scope: automatic Claude claims only. Explicit-name (`ANTIPHON_NAME`) and legacy listeners are ungoverned by the verdict (`automaticProofVerdict` returns `null` without a digest) and keep working in both directions. Codex registers from inside the Python process and never sends this payload.
 
@@ -501,6 +518,17 @@ Replace the two fingerprint assertions of `test_a_record_carries_the_fingerprint
         self.assertEqual(peers._bounded_int("9" * 20), 10 ** 20 - 1)
         with self.assertRaises(ValueError):
             peers._bounded_int("9" * 21)
+        # Integers only: json hands floats and exponents to parse_float, so a
+        # 21-digit `…9.0` is a valid record here and has to stay one in Node.
+        with tempfile.TemporaryDirectory() as project:
+            self._register(project, self.LIVE)
+            for spelled in ("9" * 21 + ".0", "9" * 21 + "e0"):
+                with self.subTest(spelled=spelled):
+                    self._raw(project, '{"kind": "claude", "name": "ui", "pid": %d, '
+                              '"address": "/tmp/ui.sock", "started_at": 1.0, '
+                              '"extra": {"n": %s}}' % (os.getpid(), spelled))
+                    self.assertIsNotNone(
+                        peers._read_record(peers._peer_file(project, "claude", "ui")))
 
     def test_the_grammar_is_the_writers_own_shape_and_in_range(self):
         for start in (self.LIVE, "Wed Sep 2 16:13:13 2026", "Thu Jan 1 00:00:00 1970"):
@@ -542,15 +570,17 @@ Replace the two fingerprint assertions of `test_a_record_carries_the_fingerprint
         fault injection — must not leave a record with a fingerprint and an
         answer without one: that pairs a Python READY with a Node UNGOVERNED."""
         with tempfile.TemporaryDirectory() as project, \
-                patch.object(peers, "_process_info",
-                             side_effect=[("1", self.LIVE, "node server.js"), None]):
+                patch.object(peers, "_process_birth",
+                             side_effect=[self.LIVE, None]) as observed:
             ok, detail, fingerprint = peers.register_claim(
                 project, "claude", "ui", "/tmp/ui.sock", pid=os.getpid())
             self.assertTrue(ok, detail)
             self.assertEqual(fingerprint, f"v1:{self.LIVE}")
             self.assertEqual(self._read(project)["process_birth"], fingerprint)
+            self.assertEqual(observed.call_count, 1,
+                             "one observation: a second call is the defect")
         with tempfile.TemporaryDirectory() as project, \
-                patch.object(peers, "_process_info", return_value=None):
+                patch.object(peers, "_process_birth", return_value=None):
             ok, _detail, fingerprint = peers.register_claim(
                 project, "claude", "ui", "/tmp/ui.sock", pid=os.getpid())
             self.assertTrue(ok)
@@ -558,24 +588,38 @@ Replace the two fingerprint assertions of `test_a_record_carries_the_fingerprint
             self.assertNotIn("process_birth", self._read(project))
 
     def test_the_bridge_answers_the_written_fingerprint_not_a_second_reading(self):
-        """`register_peer` through its real stdin/stdout, with `ps` answering
-        once and then failing: the printed birth is the record's."""
+        """`register_peer` through its real stdin/stdout, with the process
+        birth observable once and then not: the printed birth is the record's.
+        `owner_key` is pinned because it walks the process table first and
+        would otherwise consume the injected answers; the seam is
+        `_process_birth`, the one call the claim is allowed."""
         payload = json.dumps({"kind": "claude", "name": "ui",
                               "address": "/tmp/ui.sock", "pid": os.getpid(),
                               "fingerprint_field": "process_birth"})
         with tempfile.TemporaryDirectory() as project, \
-                patch.dict(os.environ, {"ANTIPHON_CWD": project}), \
-                patch.object(peers, "_process_info",
-                             side_effect=[("1", self.LIVE, "node server.js"), None]), \
-                patch("sys.stdin", io.StringIO(payload)), \
-                patch("sys.stdout", new_callable=io.StringIO) as out:
-            self.assertEqual(antiphon.register_peer(), 0)
-            answer = json.loads(out.getvalue())
-        self.assertEqual(answer["birth"], f"v1:{self.LIVE}")
-        self.assertEqual(answer["fingerprint_field"], "process_birth")
+                patch.object(antiphon, "project_dir", return_value=project), \
+                patch.object(antiphon.peers, "owner_key", return_value=self.MINE), \
+                patch.object(antiphon.peers, "_process_birth",
+                             side_effect=[self.LIVE, None]) as observed, \
+                patch.object(antiphon.sys, "stdin", io.StringIO(payload)):
+            answer = io.StringIO()
+            with contextlib.redirect_stdout(answer):
+                self.assertEqual(antiphon.register_peer(), 0)
+            self.assertEqual(observed.call_count, 1)
+            record = antiphon.peers.read_peers(project, "claude")[0]
+        answer = json.loads(answer.getvalue())
+        self.assertEqual(answer, {"birth": f"v1:{self.LIVE}",
+                                  "fingerprint_field": "process_birth"})
+        self.assertEqual(record["process_birth"], answer["birth"])
 ```
 
-The second test lives in `test/test_antiphon.py` beside the other `register_peer` tests (`grep -n "def test.*register_peer" test/test_antiphon.py`), with `import io` and the module's own way of pointing `project_dir()` at a temp project — read how the neighbouring tests do it and copy that seam rather than `ANTIPHON_CWD` if they use another.
+The second test lives in `test/test_antiphon.py` in the class that holds `test_register_peer_records_the_owner_key_it_can_see` (`:14916`), which already pins `project_dir`, `owner_key` (`self.MINE`) and `stdin` exactly this way; `LIVE = "Sat Aug 30 01:00:00 2026"` as a class constant there.
+
+**Existing contracts that pin the old shape, updated red-first in the same commit** (Codex, review 4):
+
+- `test_register_peer_records_the_owner_key_it_can_see` (`test_antiphon.py:14916-14936`) expects the answer `{"birth": _process_birth(pid)}`. Change the expectation to `{"birth": peers.process_fingerprint(os.getpid()), "fingerprint_field": "process_birth"}` — the harness's fresh observation is the right oracle *for a test*, the product answers from its own.
+- `test_register_peer_fingerprints_the_owner_itself` (`:14938-14959`) expects `record.get("birth") == observed[1]`. Change to `record.get("process_birth") == ("v1:" + observed[1] if observed else None)` and add `self.assertNotIn("birth", record)`.
+- `AutomaticRegistrationBridgeTest` (`:16961-16990`): every `_call` payload gains `"fingerprint_field": "process_birth"` so the tests keep testing what they name (mode, explicit claims). Add `test_automatic_registration_bridge_refuses_an_undeclared_claim`: the payload of `..._passes_a_valid_mode_through` *without* `fingerprint_field` → code 1, `read_peers` empty, stderr matches `predates the registry's fingerprint field`; and its twin for `"mode": "reassert"`.
 
 `RecycledPidTest.UUID` exists (`test_peers.py:570`). Add `import time` if absent. If `peers.register` refuses `address=None` for Codex, read `register`'s address handling (`peers.py:1440-1465`) and use the call the existing addressless-Codex tests use.
 
@@ -703,6 +747,19 @@ In `ungovernable`, the moved pair plus:
                 self._proof(p, self.A),
                 self._rewrite_endpoint_text(p, a, lambda t:
                     t[:-1] + ', "extra": {"n": ' + "9" * 21 + "}}")),
+```
+
+and in `cases`, beside the fingerprint fixtures — the bound is lexical and integer-only on both sides, so a long float is a valid record everywhere:
+
+```python
+            "an unrelated nested field holds a 21-digit float": lambda p, a: (
+                self._proof(p, self.A),
+                self._rewrite_endpoint_text(p, a, lambda t:
+                    t[:-1] + ', "extra": {"n": ' + "9" * 21 + ".0}}")),
+            "an unrelated nested field holds a 21-digit exponent": lambda p, a: (
+                self._proof(p, self.A),
+                self._rewrite_endpoint_text(p, a, lambda t:
+                    t[:-1] + ', "extra": {"n": ' + "9" * 21 + "e0}}")),
 ```
 
 Skip the `_own_birth()`-dependent cases with `self.skipTest` when it returns `""` (no process table), as the harness does elsewhere.
@@ -882,6 +939,40 @@ async function aCurrentListenerOverADowngradedPythonWithdrawsItsOwnEndpoint() {
   }
 }
 
+// The four answers, on real files, without a listener.
+async function anEndpointIsClassifiedNotCollapsed() {
+  const { classifyEndpoint } = await import("../lib/identity.mjs");
+  const dir = await mkdtemp(join(tmpdir(), "antiphon-classify-"));
+  const path = join(dir, "endpoint.json");
+  const me = { pid: process.pid, address: "/t/me.sock", name: "ui", identityDigest: null };
+  const record = (over) => JSON.stringify({ kind: "claude", name: "ui", pid: process.pid,
+    address: "/t/me.sock", started_at: 1, ...over });
+  try {
+    assert.equal(classifyEndpoint(path, me), "absent");
+    writeFileSync(path, record({}));
+    assert.equal(classifyEndpoint(path, me), "self");
+    writeFileSync(path, record({ pid: process.pid + 1 }));
+    assert.equal(classifyEndpoint(path, me), "other");
+    writeFileSync(path, record({ address: "/t/other.sock" }));
+    assert.equal(classifyEndpoint(path, me), "other");
+    writeFileSync(path, record({ automatic: true, identity_digest: "0".repeat(64) }));
+    assert.equal(classifyEndpoint(path, me), "other", "an automatic record is not an explicit listener's");
+    writeFileSync(path, "{");
+    assert.equal(classifyEndpoint(path, me), "unknown", "torn is not withdrawn");
+    writeFileSync(path, record({}).slice(0, -1) + ', "pid": ' + process.pid + "}");
+    assert.equal(classifyEndpoint(path, me), "unknown", "a duplicate key is not a record");
+    writeFileSync(path, "[]");
+    assert.equal(classifyEndpoint(path, me), "unknown");
+    writeFileSync(path, record({}));
+    chmodSync(path, 0o000);
+    assert.equal(process.getuid?.() === 0 ? "unknown" : classifyEndpoint(path, me), "unknown",
+      "unreadable is not withdrawn");
+    chmodSync(path, 0o600);
+  } finally {
+    await rm(dir, { recursive: true, force: true }).catch(() => {});
+  }
+}
+
 // The same stub as makeAutomaticIdentityPython, plus one lie: `unregister_peer`
 // exits 0 having removed nothing — the shape of a swallowed unlink error or a
 // silent owner mismatch. The listener must not announce a withdrawal it did
@@ -920,8 +1011,11 @@ async function aWithdrawalThatDidNotHappenIsNotAnnounced() {
 await thePublishedReaderLeavesALiveListenerRegistered();
 await anOldListenerOverAnUpgradedPythonIsRefusedNotToldItRecovered();
 await aCurrentListenerOverADowngradedPythonWithdrawsItsOwnEndpoint();
+await anEndpointIsClassifiedNotCollapsed();
 await aWithdrawalThatDidNotHappenIsNotAnnounced();
 ```
+
+`import { chmodSync, writeFileSync } from "node:fs";` if not already imported.
 
 Add `import { materialiseLib } from "./fixtures/mixed_lib.mjs";` at the top. If `sendTo`'s signature differs (`grep -n "^async function sendTo" test/channel.test.mjs`), adapt the calls only. If the current channel prints "channel ready" *before* its claim resolves, read `channel.mjs:960-1010` and assert on whichever line follows the claim instead.
 
@@ -947,7 +1041,10 @@ Expected, each for the reason that names the defect:
 - contract: missing exports and the missing payload/ack strings.
 - `thePublishedReaderLeavesALiveListenerRegistered`: `[] != ["ui"]`.
 - `anOldListenerOverAnUpgradedPythonIsRefusedNotToldItRecovered`: `reply.ok` is `true`, `action === "reasserted"` — the pre-fix Python accepts the undeclared claim. **The old-Node half of the matrix.**
-- `test_the_claim_answers_with_the_fingerprint_it_wrote` / `..._not_a_second_reading`: `AttributeError: register_claim`; on the pre-fix bridge the printed birth is from a second `ps` call and reads `null` under the fault injection — the divergence under test.
+- `test_the_claim_answers_with_the_fingerprint_it_wrote` / `..._not_a_second_reading`: `AttributeError: register_claim`; on the pre-fix bridge `_process_birth` is called twice and the printed birth reads `null` under the injection — the divergence under test.
+- the three updated existing contracts (`..._records_the_owner_key_it_can_see`, `..._fingerprints_the_owner_itself`, `AutomaticRegistrationBridgeTest.*`): fail on the new expectations; the new `..._refuses_an_undeclared_claim` pair fails because the pre-fix bridge registers the claim.
+- `anEndpointIsClassifiedNotCollapsed`: `classifyEndpoint` is not exported.
+- parity "21-digit float"/"21-digit exponent": PASS on the pre-fix tree (both readers accept the record); they exist to catch the over-eager Node bound, and Task 3's mutation row proves it.
 - parity "an unrelated nested field holds a 21-digit integer": Python enumerates it (no bound yet) — fails the `NO-RECORD` assertion.
 - `aCurrentListenerOverADowngradedPythonWithdrawsItsOwnEndpoint` and `aWithdrawalThatDidNotHappenIsNotAnnounced`: on the pre-fix tree "worktree" Node *is* f0c529f Node, so both measure old-vs-old and their message assertions fail for the trivial reason that no such messages exist yet. Its meaningful red — a *current* Node binding over an old Python — is observed in Task 3 Step 4 by removing only the acknowledgement check. **The new-Node half is proven by mutation, not by the pre-fix run**, and the commit says so.
 
@@ -1244,7 +1341,7 @@ export function renderFingerprint(fingerprint) {
 }
 ```
 
-In `scanRecord` (`identity.mjs:21-60`), where a number token is lexed (the branch at `:46` that starts on `-` or a digit): count the integer digits of *every* number token, whether or not `pending` names a top-level field, and set `overlong = true` when they exceed `INTEGER_TOKEN_CEILING`; return it beside `duplicate` and `integral`. In `readRecord`, `if (scan.duplicate || scan.overlong) return { state: "invalid" };` — the same answer Python gives when `_bounded_int` raises inside `json.loads`.
+In `scanRecord` (`identity.mjs:21-70`), the number branch today runs only when `pending !== null` (a top-level key precedes the token). Split it: lex a number token whenever the character is `-` or a digit outside a string, at any depth; keep `integral.set(pending, …)` only when `pending !== null`; and for every token set `overlong = true` when it matches `/^-?(?:0|[1-9][0-9]*)$/` **and** its digit count (sign excluded) exceeds `INTEGER_TOKEN_CEILING`. A token with `.`, `e` or `E` never sets it — Python's `parse_int` never sees those either. Return `overlong` beside `duplicate` and `integral`. In `readRecord`, `if (scan.duplicate || scan.overlong) return { state: "invalid" };` — the same answer Python gives when `_bounded_int` raises inside `json.loads`.
 
 In `automaticProofVerdict`:
 
@@ -1278,22 +1375,53 @@ In `automaticProofVerdict`:
         // when the record no longer describes this listener.
         claimedBirth = null;
         await runRegistryCall("unregister_peer", true);
-        const gone = !endpointDescribesListener({ pid: process.pid });
-        console.error(gone
-          ? "antiphon: the registry on disk predates this listener's fingerprint "
-            + "field; the endpoint it wrote was withdrawn. Reinstall antiphon so "
-            + "both sides match, then reconnect the Claude session"
-          : "antiphon: the registry on disk predates this listener's fingerprint "
-            + "field, and the endpoint it wrote could not be withdrawn; remove "
-            + `.antiphon/peers/claude-${peerId}/endpoint.json by hand, reinstall `
-            + "antiphon so both sides match, then reconnect the Claude session");
+        const held = classifyEndpoint(
+          join(projectDir, ".antiphon", "peers", `claude-${peerId}`, "endpoint.json"),
+          { pid: process.pid, address: socketPath, name: peerId,
+            identityDigest: automaticIdentityDigest });
+        const lead = "antiphon: the registry on disk predates this listener's fingerprint field";
+        const tail = "reinstall antiphon so both sides match, then reconnect the Claude session";
+        const file = `.antiphon/peers/claude-${peerId}/endpoint.json`;
+        console.error(
+          held === "absent" || held === "other"
+            ? `${lead}; the endpoint it wrote was withdrawn. R${tail.slice(1)}`
+            : held === "self"
+              ? `${lead}, and the endpoint it wrote could not be withdrawn; remove ${file} by hand, ${tail}`
+              : `${lead}, and whether the endpoint it wrote was withdrawn could not be verified; check ${file} by hand, ${tail}`);
         return false;
       }
     }
     return true;
 ```
 
-`runRegistryCall` is what `registryCall` awaits inside `registryMutations`; calling it directly here keeps the withdrawal inside the same chain step. `endpointDescribesListener(reply)` (`channel.mjs:472-490`) is a function declaration later in the file and is hoisted; it already answers "does the endpoint name this kind, this alias, this socket, this pid and this identity", which is exactly the withdrawal question. Read `channel.mjs:434-450` before editing and keep the shutdown-ordering comment true.
+`runRegistryCall` is what `registryCall` awaits inside `registryMutations`; calling it directly here keeps the withdrawal inside the same chain step. `classifyEndpoint` lives in `identity.mjs` so it is importable by tests without starting a listener:
+
+```js
+// What the endpoint file says about one listener, in four answers. Absent,
+// torn and unreadable used to collapse into one `false`, and a torn file read
+// as "withdrawn". Only a file that is not there, or a valid record naming
+// somebody else, proves a withdrawal.
+export function classifyEndpoint(path, listener) {
+  const wrapper = readRecord(path);
+  if (wrapper.state === "absent") return "absent";
+  if (wrapper.state !== "valid") return "unknown";
+  const record = wrapper.record;
+  const pid = record?.pid;
+  if (record?.kind !== "claude" || record?.name !== listener.name
+      || !Number.isInteger(pid) || pid <= 0 || pid > PID_CEILING
+      || spelledFractional(wrapper, "pid")
+      || typeof record?.address !== "string") {
+    return "unknown";                    // a record, but not one this test can read as a peer
+  }
+  const mine = pid === listener.pid && record.address === listener.address
+    && (listener.identityDigest
+      ? record.automatic === true && record.identity_digest === listener.identityDigest
+      : record.automatic !== true && !Object.hasOwn(record, "identity_digest"));
+  return mine ? "self" : "other";
+}
+```
+
+`endpointDescribesListener` in `channel.mjs` becomes `classifyEndpoint(path, {...}) === "self"` so the two questions share one reader. Read `channel.mjs:434-450` before editing and keep the shutdown-ordering comment true.
 
 - [ ] **Step 4: Green, then mutate each guard**
 
@@ -1310,9 +1438,11 @@ Run the four commands from Task 2 Step 5; expected all PASS and the parity `case
 | `automatic_verdict` fingerprint rule removed | parity "no fingerprint at all", "sibling of a future generation", NEL/BOM cases (Python READY vs Node UNREADY) |
 | `register_peer` gate removed | `anOldListenerOverAnUpgradedPythonIsRefusedNotToldItRecovered` |
 | `runRegistryCall` acknowledgement check removed | `aCurrentListenerOverADowngradedPythonWithdrawsItsOwnEndpoint` — **this is that case's red**, observed here |
-| `runRegistryCall` announces "was withdrawn" without the `endpointDescribesListener` check | `aWithdrawalThatDidNotHappenIsNotAnnounced` — **that case's red**, observed here |
+| `runRegistryCall` announces "was withdrawn" without classifying | `aWithdrawalThatDidNotHappenIsNotAnnounced` — **that case's red**, observed here |
+| `classifyEndpoint` returns `"absent"` for a non-valid wrapper | `anEndpointIsClassifiedNotCollapsed` (torn, duplicate, unreadable) |
 | `register_peer` answers `process_fingerprint(pid)` instead of `register_claim`'s value | `test_the_bridge_answers_the_written_fingerprint_not_a_second_reading` |
 | `scanRecord` digit count removed | parity ungovernable "unrelated nested field holds a 21-digit integer" (Node READY vs Python NO-RECORD) |
+| `scanRecord` counts digits of every number token, floats included | parity cases "21-digit float" / "21-digit exponent" (Node UNREADY vs Python READY) |
 | `identity.mjs` `canonicalStart` range check dropped | parity "shaped but out of range" (Node READY vs Python UNREADY) |
 | fixture `valid_owner_key` made to refuse `v1` keys (edit the copy, restore with `git checkout -- test/fixtures/peers_0_3_3.py`) | `test_the_published_reader_validates_a_versioned_owner_and_joins_on_it` |
 
@@ -1566,3 +1696,10 @@ Merge, push and publish do not follow from green. They wait for both reviews to 
 - **Doctor:** the cause replaces the bootstrap line (guarded `elif`), the test asserts the old sentence's absence, the cause note is scoped to automatic *Claude* records, and a new test pins that an automatic Codex record gets no Claude remedy.
 - **Remedy:** "until this Claude session reconnects" — the old listener's reassert is refused without writing — in Design, doctor, and BACKLOG.
 - **Gate:** `git diff --check f0c529f "$SHA"`.
+
+## Self-review against plan review 4
+
+- **Seam:** the bridge test pins `project_dir`, `owner_key` (`self.MINE`) and `stdin` as its neighbours do, injects on `_process_birth`, and asserts `call_count == 1`; the unit test on `register_claim` does the same.
+- **Lexical integers only:** Node's `overlong` is set only for tokens matching the integer grammar; floats and exponents never; parity has a 21-digit integer (ungovernable) and a 21-digit float and exponent (cases, READY/READY); Python's unit test pins that `parse_int` never sees the float forms; a mutation row catches the over-eager bound.
+- **Classified ownership:** `classifyEndpoint` → `absent | self | other | unknown` in `identity.mjs`; only `absent`/`other` announce a withdrawal; `self` and `unknown` get their own wording; unit test on real files covers absent, self, other by pid/address/identity, torn, duplicate-keyed, wrong shape, unreadable; `endpointDescribesListener` is now `=== "self"`.
+- **Existing contracts:** the two `register_peer` tests and `AutomaticRegistrationBridgeTest` are named with line numbers and updated red-first inside Task 2, with a new undeclared-claim refusal pair, so Task 3 changes no test it did not plan to.
