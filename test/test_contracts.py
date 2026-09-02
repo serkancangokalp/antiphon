@@ -576,6 +576,36 @@ class ShippedContractTest(unittest.TestCase):
         self.assertNotRegex(limits, r"(?i)acknowledgement[^.]*not part of this",
                             "the old disclaimer is gone")
 
+    def test_every_surface_teaches_same_vendor_bridging(self):
+        """A Claude session reaches another Claude session and a Codex
+        session another Codex session, always by name; every surface says the
+        form, the label and the two refusals, and none promises the passive
+        page carries it."""
+        readme = read("README.md")
+        for row in ("| Claude → Claude | `@claude:api` | `reply_to_claude(to=\"api\", text=…)` |",
+                    "| Codex → Codex | `@codex:review` | `antiphon_send(kind=\"codex\", "
+                    "to=\"review\", text=…)` |",
+                    "**Same-vendor.**", "`[Antiphon bridge] Codex:`", "`sender=\"claude\"`"):
+            self.assertIn(row, readme, row)
+        self.assertRegex(readme, r"(?i)bare\s+same-kind\s+line[^.]*refused")
+        self.assertRegex(readme, r"(?i)passive pull page does not carry same-kind")
+        self.assertRegex(section(readme, "Limits"), r"(?i)same-vendor message")
+        self.assertIn("`antiphon_send(kind=\"codex\", to=name)`", antiphon.AGENTS_RULE)
+        self.assertIn("`[Antiphon bridge] Codex:`", antiphon.AGENTS_RULE)
+        self.assertIn("always named, never on the passive page", antiphon.AGENTS_RULE)
+        self.assertIn("`reply_to_claude(to=…)`", antiphon.CLAUDE_RULE)
+        self.assertIn("`sender=\"claude\"`", antiphon.CLAUDE_RULE)
+        self.assertIn("always named, never on the passive page", antiphon.CLAUDE_RULE)
+        node = read("lib", "channel.mjs")
+        collapsed = re.sub(r'"\s*\+\s*\n\s*"', "", node)
+        self.assertIn("reply_to_claude(to=…)", collapsed)
+        self.assertIn('An event with sender=\\"claude\\" is another Claude session', collapsed)
+        self.assertIn("a same-kind message to nobody in particular has no meaning", collapsed)
+        kind = next(t for t in antiphon.TOOLS if t["name"] == "antiphon_send")
+        self.assertIn("another Codex session", kind["inputSchema"]["properties"]["kind"]["description"])
+        self.assertIn("## P1 — Same-vendor bridging: Codex ↔ Codex and Claude ↔ Claude "
+                      "(shipped 2026-09-03)", read("BACKLOG.md"))
+
     def test_every_surface_says_queued_and_names_the_receipt(self):
         """Measured 2026-09-01: the tool said "delivered" and the peer had
         received nothing. The rules, the channel instructions, the tool
@@ -1202,8 +1232,10 @@ class IdentityPrivacyContractTest(unittest.TestCase):
         # +100 each on 2026-09-03 for the read-grace clause the review asked
         # for ("or 1 hour after the bridge sees it read"): the recipient is the
         # party whose read starts that clock, and it was being told 7 days.
-        for where, text, ceiling in (("CLAUDE_RULE", antiphon.CLAUDE_RULE, 5_100),
-                                     ("AGENTS_RULE", antiphon.AGENTS_RULE, 5_600),
+        # +200 each on 2026-09-03 for the same-vendor sentence: the one road
+        # the rules did not know existed.
+        for where, text, ceiling in (("CLAUDE_RULE", antiphon.CLAUDE_RULE, 5_300),
+                                     ("AGENTS_RULE", antiphon.AGENTS_RULE, 5_800),
                                      ("channel instructions", channel, 3_500)):
             self.assertLessEqual(len(text.encode("utf-8")), ceiling,
                                  f"{where}: {len(text.encode('utf-8'))} bytes")

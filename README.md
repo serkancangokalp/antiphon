@@ -34,6 +34,8 @@ between two particular peers.
 |---|---|---|
 | Claude → Codex | `Stop` hook + `codex queue` | `reply_to_codex` tool |
 | Codex → Claude | `Stop` hook + MCP Channel | `antiphon_send` tool |
+| Claude → Claude | `Stop` hook + MCP Channel, always named | `reply_to_claude` tool |
+| Codex → Codex | `Stop` hook + `codex queue`, always named | `antiphon_send(kind="codex")` tool |
 
 A line starting with `@codex` or `@claude` in a reply reaches the other
 agent immediately, even if nobody is typing.
@@ -71,7 +73,7 @@ because the hook's own refusal reaches a debug log and not the agent.
 
 ### How identity is preserved
 
-A Claude → Codex message reaches Codex tagged either `[Antiphon bridge] Claude:` (pushed from Claude's Stop hook) or `[Antiphon channel] Claude:` (a direct reply sent through the channel, via the `reply_to_codex` tool) — either way, Codex sees these as Claude's words, not the human user's.
+A Claude → Codex message reaches Codex tagged either `[Antiphon bridge] Claude:` (pushed from Claude's Stop hook) or `[Antiphon channel] Claude:` (a direct reply sent through the channel, via the `reply_to_codex` tool) — either way, Codex sees these as Claude's words, not the human user's. A Codex → Codex message reaches the other Codex session tagged `[Antiphon bridge] Codex:` or `[Antiphon channel] Codex:`, and a Claude → Claude message arrives as a channel event with `sender="claude"` — the other session's words, never the human user's.
 
 The tag is followed by `[from=<alias> id=<uuid>]`, naming which Claude peer spoke. A session whose configured identity does not own its return channel instead carries `[from=<alias> reply_to=<unavailable> id=<uuid>]`; that exception is explained below. A session that cannot establish either an explicit or automatic identity shows `from=<unnamed>`: it has no name to be addressed by, and the angle brackets keep that apart from a peer actually called `unnamed`. The id names one delivery attempt — it is not a correlation id, and nothing routes replies by it.
 
@@ -114,9 +116,22 @@ or by the `to` argument of the tool that sends without ending the turn:
 |---|---|---|
 | Codex → Claude | `@claude:ui` | `antiphon_send(to="ui", text=…)` |
 | Claude → Codex | `@codex:build` | `reply_to_codex(to="build", text=…)` |
+| Claude → Claude | `@claude:api` | `reply_to_claude(to="api", text=…)` |
+| Codex → Codex | `@codex:review` | `antiphon_send(kind="codex", to="review", text=…)` |
 
 There is no way to reach several peers at once. A send is delivered to the one
 peer named on it, and to nobody else.
+
+**Same-vendor.** A Claude session reaches another Claude session, and a Codex
+session another Codex session, by the same machinery — always by name. A bare
+same-kind line (`@claude` from Claude, `@codex` from Codex) has no meaning and
+is refused, and so is a session's own alias; both refusals are reported on the
+sender's next page. The passive pull page does not carry same-kind activity: it
+stays the other kind's transcripts, so its size and its discovery window are
+unchanged. A same-kind receipt comes from the receiving session's own hook
+reading the tail of its own transcript, which is why a Claude-only or
+Codex-only project gets receipts too. The bridge forwards nothing
+automatically, so no message ever comes back to its author through it.
 
 ### When a bare message is refused
 
@@ -294,6 +309,7 @@ turn ends.
 - The Codex hook asks for re-approval the first time it's used and whenever the hook file changes.
 - Matching is done on the same project's absolute directory.
 - Unix sockets only — there is no Windows support.
+- A same-vendor message (`@claude:name` from Claude, `@codex:name` from Codex, `reply_to_claude`, `antiphon_send(kind="codex")`) is always addressed and never on the passive page: two same-kind sessions need names or automatic aliases, and each hears from the other only what it is sent.
 - A tool result is a statement about the transport, never about the peer. `reply_to_codex` says queued and `antiphon_send` says delivered to the channel; a queued row in a thread that never takes a turn is not read, and only the peer's transcript proves receipt — `antiphon status` shows what still waits, `antiphon doctor` notes what has waited more than ten minutes. A bare reply refused among several peers names the last unanswered sender as advice; the bridge itself still never chooses.
 
 ### Passive pull pages, and what it still cannot promise
