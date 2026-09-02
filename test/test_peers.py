@@ -797,7 +797,7 @@ class RecycledPidTest(unittest.TestCase):
         compares `birth` against its own timezone's `ps`. It must find nothing
         to compare — and so keep the record on its pid alone — rather than
         prune a live listener every time it enumerates."""
-        from test.fixtures import peers_0_3_3 as old
+        old = _old_reader()
         with tempfile.TemporaryDirectory() as project:
             self._register(project, self.LIVE)
             with self._old_ps(old, self.LIVE_LOCAL):
@@ -821,7 +821,7 @@ class RecycledPidTest(unittest.TestCase):
         the spelling, and an addressless Codex endpoint joins its session on
         it. (`read_peers` never consults the validator for an addressed Claude
         endpoint, so listing one proves nothing about owners.)"""
-        from test.fixtures import peers_0_3_3 as old
+        old = _old_reader()
         owner = f"300:v1:{self.LIVE}"
         self.assertTrue(old.valid_owner_key(owner))
         with tempfile.TemporaryDirectory() as project:
@@ -3190,6 +3190,23 @@ OLD_READER_SHA256 = "4bb3ea14ab9415f84a734b16472638c09d0acfd56eba83ee96d11d3ea29
 OLD_READER_COMMITS = ("943da8a", "a076723")   # 0.3.3 as published; the same bytes one release earlier
 
 
+def _old_reader():
+    """The 0.3.3 registry reader, loaded from the byte-exact fixture by path.
+
+    By path, not as a `test.fixtures` package: Anaconda's Python ships the
+    stdlib `test` package, and a regular package shadows a local namespace
+    package however `sys.path` is ordered — measured, three tests errored
+    under `python3` 3.14 while `/usr/bin/python3` 3.9 (no stdlib `test`)
+    passed them. `FrozenReaderFixtureTest` pins the bytes this loads."""
+    import importlib.util
+    fixture = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                           "fixtures", "peers_0_3_3.py")
+    spec = importlib.util.spec_from_file_location("peers_0_3_3", fixture)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
 class FrozenReaderFixtureTest(unittest.TestCase):
     """The cross-version tests drive the reader 0.3.3 actually shipped, not a
     model of it. The fixture is byte-exact, and when git history is at hand the
@@ -3218,7 +3235,7 @@ class FrozenReaderFixtureTest(unittest.TestCase):
                                  OLD_READER_SHA256)
 
     def test_the_fixture_imports_and_is_the_old_reader(self):
-        from test.fixtures import peers_0_3_3 as old
+        old = _old_reader()
         self.assertFalse(hasattr(old, "PROCESS_FINGERPRINT_VERSION"),
                          "0.3.3 had no fingerprint generation at all")
         self.assertTrue(callable(old._record_alive))
