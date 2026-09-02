@@ -17,6 +17,7 @@ import re
 import tempfile
 import time
 import unittest
+from unittest.mock import patch
 
 UUID = "1d5a03e0-0548-4339-87c3-45c5dbf7e9d7"
 OTHER = "2e6b14f1-1659-544a-98d4-56d6eca8fa48"
@@ -303,6 +304,116 @@ class LedgerTest(unittest.TestCase):
             self.assertIsNone(ledger.read_entry(project, UUID), "reported: pruned")
             ledger.prune(project, 1_000.0 + 2 * week + 1)
             self.assertIsNone(ledger.read_entry(project, OTHER), "a second TTL is the cap")
+
+    # ---- review 2026-09-03: what a receipt may and may not do ----
+
+    def test_a_time_beyond_the_platform_is_not_a_time(self):
+        """A validated entry could make the hook raise: `sent_at: 1e300`
+        passed validation and `_clock` overflowed `time_t` out of
+        `pending_notices`, inside the cursor lock, every turn."""
+        with tempfile.TemporaryDirectory() as project:
+            self.assertFalse(ledger.record_sent(
+                project, UUID, sender="ui", to_kind="codex", to_alias=None,
+                transport="queue", proof="live", sha256=SHA, size=1, at=1e300))
+            self._sent(project, UUID)
+            path = os.path.join(ledger.ledger_dir(project), UUID + ".json")
+            entry = json.load(open(path))
+            entry["sent_at"] = 1e300
+            json.dump(entry, open(path, "w"))
+            self.assertIsNone(ledger.read_entry(project, UUID))
+            self.assertEqual(ledger.pending_notices(project, "claude", "ui"), [])
+
+    def test_a_read_receipt_is_scoped_to_the_recipients_kind(self):
+        """The sender verifying its own parked file (`tail -n +3 | shasum`,
+        the ritual the envelope teaches) is not the recipient reading it."""
+        with tempfile.TemporaryDirectory() as project:
+            self._sent(project, UUID, attachment="a.txt")                       # to codex
+            self._sent(project, OTHER, to_kind="claude", to_alias="ui", attachment="a.txt")
+            self.assertTrue(ledger.mark_read(project, "a.txt", 5.0, to_kind="codex"))
+            self.assertEqual(ledger.read_entry(project, UUID)["read_at"], 5.0)
+            self.assertIsNone(ledger.read_entry(project, OTHER)["read_at"],
+                              "a Claude reader's transcript proves nothing about a Codex file")
+            ledger.record_receipts(project, [("read", "a.txt", 7.0)], read_by="claude")
+            self.assertEqual(ledger.read_entry(project, OTHER)["read_at"], 7.0)
+            self.assertEqual(ledger.read_entry(project, UUID)["read_at"], 5.0)
+
+    def test_a_read_attachment_is_never_reported_expired_unread(self):
+        """The sweep marks day seven; the reader, a day behind, then sees the
+        day-six read. The sender must not be told the file expired unread."""
+        with tempfile.TemporaryDirectory() as project:
+            self._sent(project, UUID, attachment="a.txt", at=1.0)
+            self.assertEqual(ledger.mark_expired_unread(project, "a.txt", 700_000.0), 1)
+            self.assertEqual([i for i, _ in ledger.pending_notices(project, "claude", "ui")],
+                             [UUID])
+            ledger.mark_read(project, "a.txt", 600_000.0, to_kind="codex")
+            entry = ledger.read_entry(project, UUID)
+            self.assertIsNone(entry["expired_unread_at"], "a read file did not expire unread")
+            self.assertEqual(entry["read_at"], 600_000.0)
+            self.assertEqual(ledger.pending_notices(project, "claude", "ui"), [])
+            # An entry written before reads cleared expiries carries both;
+            # the read still wins.
+            entry["expired_unread_at"] = 700_000.0
+            path = os.path.join(ledger.ledger_dir(project), UUID + ".json")
+            json.dump(entry, open(path, "w"))
+            self.assertEqual(ledger.pending_notices(project, "claude", "ui"), [])
+
+    def test_a_read_file_is_never_reused(self):
+        """Reusing a file the peer already read makes an envelope the next
+        sweep deletes: the read grace keys off the receipt, not the mtime."""
+        with tempfile.TemporaryDirectory() as project:
+            store = os.path.join(project, ".antiphon", "messages")
+            os.makedirs(store, mode=0o700)
+            open(os.path.join(store, "a.txt"), "w").write("[Antiphon attachment]\n\nz")
+            self._sent(project, UUID, attachment="a.txt", at=100.0)
+            self.assertEqual(ledger.reusable_attachment(project, SHA, "codex", "build", 200.0),
+                             "a.txt")
+            ledger.mark_read(project, "a.txt", 150.0, to_kind="codex")
+            self.assertIsNone(ledger.reusable_attachment(project, SHA, "codex", "build", 200.0),
+                              "a fresh file, whose receipt is its own")
+
+    def test_receipts_are_applied_once_per_key_with_one_read_of_the_ledger(self):
+        with tempfile.TemporaryDirectory() as project:
+            self._sent(project, UUID, attachment="a.txt")
+            with patch.object(ledger, "entries", wraps=ledger.entries) as reads:
+                ledger.record_receipts(project, [("read", "a.txt", 9.0), ("read", "a.txt", 5.0),
+                                                 ("read", "a.txt", 7.0)], read_by="codex")
+            self.assertEqual(ledger.read_entry(project, UUID)["read_at"], 5.0, "the earliest")
+            self.assertEqual(reads.call_count, 1, "one snapshot for the whole batch")
+
+    def test_an_update_holds_the_ledger_lock(self):
+        with tempfile.TemporaryDirectory() as project:
+            self._sent(project, UUID)
+            calls = []
+            real = ledger.fcntl.flock
+
+            def flock(fd, operation):
+                calls.append(operation)
+                return real(fd, operation)
+            with patch.object(ledger.fcntl, "flock", side_effect=flock):
+                ledger.mark_received(project, UUID, 5.0)
+            self.assertEqual(calls, [ledger.fcntl.LOCK_EX, ledger.fcntl.LOCK_UN])
+            self.assertTrue(os.path.exists(os.path.join(ledger.ledger_dir(project), ".lock")))
+            self.assertEqual([e["id"] for e in ledger.entries(project)], [UUID],
+                             "the lock file is not an entry")
+
+    def test_the_unnamed_receivers_advice_clears_when_it_writes_back(self):
+        with tempfile.TemporaryDirectory() as project:
+            self._sent(project, UUID, sender="build", to_kind="claude", to_alias=None, at=100.0)
+            self.assertEqual(ledger.last_unanswered_sender(project, "claude", None, 300.0),
+                             ("build", 200.0))
+            self._sent(project, OTHER, sender="<unnamed>", to_kind="codex", to_alias="build",
+                       at=200.0)
+            self.assertIsNone(ledger.last_unanswered_sender(project, "claude", None, 300.0),
+                              "the unnamed session wrote back")
+
+    def test_the_grammar_refuses_dot_dot_and_a_digest_that_is_not_hex(self):
+        with tempfile.TemporaryDirectory() as project:
+            self.assertFalse(ledger.record_sent(
+                project, UUID, sender="ui", to_kind="codex", to_alias=None,
+                transport="queue", proof="live", sha256=SHA, size=1, attachment=".."))
+            self.assertFalse(ledger.record_sent(
+                project, UUID, sender="ui", to_kind="codex", to_alias=None,
+                transport="queue", proof="live", sha256="g" * 64, size=1))
 
     def test_prune_removes_only_what_is_older_than_the_ttl(self):
         with tempfile.TemporaryDirectory() as project:

@@ -563,6 +563,12 @@ class ShippedContractTest(unittest.TestCase):
         self.assertRegex(limits, r"(?i)read\s+receipt", "the receipt is named")
         self.assertRegex(limits, r"(?i)one\s+hour\s+after\s+the\s+read",
                          "and the grace after it")
+        # The recipient — the party whose read starts that clock — is told the
+        # same by the envelope it opens and by the rule it works under.
+        envelope = antiphon.attachment_envelope("/p/x.txt", "0" * 64, 5, "ui")
+        self.assertIn("1 hour after this bridge sees it read", envelope)
+        for rule in (antiphon.AGENTS_RULE, antiphon.CLAUDE_RULE):
+            self.assertIn("1 hour after the bridge sees it read", rule)
         self.assertRegex(limits, r"(?i)expires\s+unread", "expiry without one")
         self.assertRegex(limits, r"(?i)hears\s+that\s+on\s+its\s+next\s+page",
                          "reaches the sender")
@@ -1193,8 +1199,11 @@ class IdentityPrivacyContractTest(unittest.TestCase):
         start = node.index("    instructions:")
         end = node.index("\n  },\n);", start)
         channel = re.sub(r'"\s*\+\s*\n\s*"', "", node[start:end])
-        for where, text, ceiling in (("CLAUDE_RULE", antiphon.CLAUDE_RULE, 5_000),
-                                     ("AGENTS_RULE", antiphon.AGENTS_RULE, 5_500),
+        # +100 each on 2026-09-03 for the read-grace clause the review asked
+        # for ("or 1 hour after the bridge sees it read"): the recipient is the
+        # party whose read starts that clock, and it was being told 7 days.
+        for where, text, ceiling in (("CLAUDE_RULE", antiphon.CLAUDE_RULE, 5_100),
+                                     ("AGENTS_RULE", antiphon.AGENTS_RULE, 5_600),
                                      ("channel instructions", channel, 3_500)):
             self.assertLessEqual(len(text.encode("utf-8")), ceiling,
                                  f"{where}: {len(text.encode('utf-8'))} bytes")
