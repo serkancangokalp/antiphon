@@ -556,10 +556,54 @@ class ShippedContractTest(unittest.TestCase):
         self.assertRegex(limits, r"(?i)eligible\s+for\s+removal",
                          "the TTL makes a file eligible, it does not delete it")
         self.assertRegex(limits, r"(?i)no\s+timer", "and the README says so")
-        # The two spec bullets this does not deliver are named as undelivered.
-        self.assertRegex(limits, r"(?i)acknowledgement[^.]*not|not[^.]*acknowledgement",
-                         "acknowledgement is named as absent")
-        self.assertRegex(limits, r"(?i)retry", "and so is retry")
+        # The two bullets that were open are what shipped: a read receipt from
+        # the peer's transcript, collection an hour after it, expiry unread
+        # that the sender hears about, and reuse on resend.
+        self.assertEqual(antiphon.ATTACHMENT_READ_GRACE, 3600)
+        self.assertRegex(limits, r"(?i)read\s+receipt", "the receipt is named")
+        self.assertRegex(limits, r"(?i)one\s+hour\s+after\s+the\s+read",
+                         "and the grace after it")
+        # The recipient — the party whose read starts that clock — is told the
+        # same by the envelope it opens and by the rule it works under.
+        envelope = antiphon.attachment_envelope("/p/x.txt", "0" * 64, 5, "ui")
+        self.assertIn("1 hour after this bridge sees it read", envelope)
+        for rule in (antiphon.AGENTS_RULE, antiphon.CLAUDE_RULE):
+            self.assertIn("1 hour after the bridge sees it read", rule)
+        self.assertRegex(limits, r"(?i)expires\s+unread", "expiry without one")
+        self.assertRegex(limits, r"(?i)hears\s+that\s+on\s+its\s+next\s+page",
+                         "reaches the sender")
+        self.assertRegex(limits, r"(?i)reused", "and a resend reuses")
+        self.assertNotRegex(limits, r"(?i)acknowledgement[^.]*not part of this",
+                            "the old disclaimer is gone")
+
+    def test_every_surface_says_queued_and_names_the_receipt(self):
+        """Measured 2026-09-01: the tool said "delivered" and the peer had
+        received nothing. The rules, the channel instructions, the tool
+        description and the README say what a result means — queued for
+        Codex, delivered to Claude's channel — and where the receipt is."""
+        self.assertIn("Its result says queued, never delivered", antiphon.CLAUDE_RULE)
+        self.assertIn("`antiphon status` shows the receipt", antiphon.CLAUDE_RULE)
+        self.assertIn("names the delivery id", antiphon.AGENTS_RULE)
+        self.assertIn("`antiphon status` shows when Claude's transcript received it",
+                      antiphon.AGENTS_RULE)
+        node = read("lib", "channel.mjs")
+        collapsed = re.sub(r'"\s*\+\s*\n\s*"', "", node)
+        self.assertIn("Its result says queued, never delivered", collapsed)
+        self.assertIn("The result says queued, never delivered.", collapsed)
+        self.assertNotIn("Channel reply delivered", collapsed,
+                         "the old success sentence is gone from the server")
+        readme = read("README.md")
+        self.assertRegex(readme, r"`reply_to_codex` answers\s+\*queued\*")
+        self.assertIn(".antiphon/deliveries/<id>.json", readme)
+        self.assertRegex(section(readme, "Limits"),
+                         r"(?i)a tool result is a statement about the transport")
+        self.assertRegex(section(readme, "Limits"), r"(?i)last unanswered sender")
+        backlog = read("BACKLOG.md")
+        self.assertIn("## P1 — `reply_to_codex` can report success while the peer "
+                      "receives nothing (fixed)", backlog)
+        self.assertIn("## P2 — Reply correlation (closed 2026-09-03: advice inside "
+                      "the refusal)", backlog)
+        self.assertIn("### What shipped (2026-09-03)", backlog)
 
     def test_both_surfaces_teach_the_attachment_envelope(self):
         """An envelope naming a path an agent has never been told about is a
@@ -752,8 +796,11 @@ class ShippedContractTest(unittest.TestCase):
         self.assertRegex(
             backlog,
             r"## P1 — Large direct-message attachments[^\n]*"
-            r"minus acknowledgement and retry",
-            "and the entry that closed it names what it left open")
+            r"acknowledgement and retry closed 2026-09-03",
+            "and the entry that closed it names what it left open, and the "
+            "day that closed too")
+        self.assertRegex(backlog, r"(?i)### Closed 2026-09-03, with the delivery ledger",
+                         "the two open items close in writing, not by deletion")
         self.assertNotRegex(limits, r"(?i)\blossless\b(?![^.]*\bBACKLOG)",
                             "Limits calls the pull path lossless while tool "
                             "detail, discovery and backward paging still lose")
@@ -1152,8 +1199,11 @@ class IdentityPrivacyContractTest(unittest.TestCase):
         start = node.index("    instructions:")
         end = node.index("\n  },\n);", start)
         channel = re.sub(r'"\s*\+\s*\n\s*"', "", node[start:end])
-        for where, text, ceiling in (("CLAUDE_RULE", antiphon.CLAUDE_RULE, 5_000),
-                                     ("AGENTS_RULE", antiphon.AGENTS_RULE, 5_500),
+        # +100 each on 2026-09-03 for the read-grace clause the review asked
+        # for ("or 1 hour after the bridge sees it read"): the recipient is the
+        # party whose read starts that clock, and it was being told 7 days.
+        for where, text, ceiling in (("CLAUDE_RULE", antiphon.CLAUDE_RULE, 5_100),
+                                     ("AGENTS_RULE", antiphon.AGENTS_RULE, 5_600),
                                      ("channel instructions", channel, 3_500)):
             self.assertLessEqual(len(text.encode("utf-8")), ceiling,
                                  f"{where}: {len(text.encode('utf-8'))} bytes")

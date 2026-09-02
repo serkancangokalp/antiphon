@@ -61,6 +61,7 @@ import time
 import uuid
 
 import peers
+import ledger
 from datetime import datetime
 
 HOME = os.path.expanduser("~")
@@ -422,6 +423,84 @@ _SELF_INJECTION_PREFIXES = tuple(
 def _is_self_injected(text):
     """True if `text` is a message this bridge itself delivered."""
     return text.lstrip().lower().startswith(_SELF_INJECTION_PREFIXES)
+
+
+# What a peer's own transcript proves about a delivery. Measured 2026-09-03
+# on the live transcripts: 180 Codex user records carry this bridge's
+# `[from=… id=…]` label; 245 Claude channel injections carry
+# `message_id="…"` in the tag (`isMeta`, `origin.kind` "channel", string
+# content); 4 Claude transcripts and 78 Codex rollouts name an attachment
+# under `.antiphon/messages/` in a tool call. Each is a receipt — received,
+# or read — for the ledger; none is an event for the page.
+UUID_TEXT = r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}"
+SELF_INJECTED_ID = re.compile(r"\[from=[^\]\n]*?\bid=(" + UUID_TEXT + r")\]")
+CHANNEL_MESSAGE_ID = re.compile(
+    r'<channel source="antiphon"[^>]*\bmessage_id="(' + UUID_TEXT + r')"')
+ATTACHMENT_REFERENCE = re.compile(
+    r"\.antiphon/messages/(" + UUID_TEXT + r"\.txt)(?![A-Za-z0-9_.-])")
+
+
+# The Claude tool arguments through which a file is read. The same three the
+# page's tool line shows.
+READING_ARGUMENTS = ("file_path", "command", "pattern")
+
+
+def _receipt_time(record):
+    stamp = iso_epoch(record.get("timestamp"))
+    return float(stamp) if stamp is not None else time.time()
+
+
+def _collect_claude_receipts(record, receipts):
+    """Append what one Claude record proves: a channel injection carrying
+    `message_id` was received; a tool call naming an attachment read it.
+
+    `isMeta` is required for the injection: a person typing the tag into a
+    prompt is not `isMeta` and proves nothing. `origin` may be absent — the
+    older measured shape — but when present it has to say `channel`."""
+    kind = record.get("type")
+    if kind == "user" and record.get("isMeta"):
+        origin = record.get("origin")
+        if isinstance(origin, dict) and origin.get("kind") != "channel":
+            return
+        message = record.get("message")
+        content = message.get("content") if isinstance(message, dict) else None
+        if isinstance(content, str):
+            found = CHANNEL_MESSAGE_ID.search(content)
+            if found:
+                receipts.append(("received", found.group(1), _receipt_time(record)))
+    elif kind == "assistant" and not record.get("isMeta"):
+        message = record.get("message")
+        content = message.get("content") if isinstance(message, dict) else None
+        for block in content if isinstance(content, list) else []:
+            if (isinstance(block, dict) and block.get("type") == "tool_use"
+                    and isinstance(block.get("input"), dict)):
+                # The arguments that read: a path, a command, a pattern. An
+                # Edit or Write whose *content* mentions the file did not read
+                # it, and a false read receipt collects undelivered words.
+                reading = " ".join(
+                    value for key in READING_ARGUMENTS
+                    for value in (block["input"].get(key),)
+                    if isinstance(value, str))
+                for name in ATTACHMENT_REFERENCE.findall(reading):
+                    receipts.append(("read", name, _receipt_time(record)))
+
+
+def _collect_codex_receipts(record, payload, receipts):
+    """Append what one Codex `response_item` proves: our own label, received;
+    an attachment named in a call's arguments, read."""
+    if payload.get("type") == "message" and payload.get("role") == "user":
+        text = _join_text_blocks(
+            (c.get("text") or c.get("input_text") or "")
+            for c in payload.get("content") or [] if isinstance(c, dict))
+        if _is_self_injected(text):
+            found = SELF_INJECTED_ID.search(text)
+            if found:
+                receipts.append(("received", found.group(1), _receipt_time(record)))
+        return
+    fields = _codex_tool_fields(payload)
+    if fields is not None:
+        for name in ATTACHMENT_REFERENCE.findall(fields[3]):
+            receipts.append(("read", name, _receipt_time(record)))
 
 
 def _join_text_blocks(blocks):
@@ -3385,12 +3464,14 @@ def claude_transcripts(cwd):
 
 
 def claude_events(cwd, positions=None, since=None, visible_record_limit=None,
-                  source_paths=None, skipped=None, horizon=None):
+                  source_paths=None, skipped=None, horizon=None, receipts=None):
     """Return visible events and the safe scanned position for each source.
 
     A completed JSONL record consumes at most one visible lookahead slot even
     when it contains several text and tool blocks. Filtered records consume no
     slot, so the scanner can pass them to EOF or to the next visible record.
+    `receipts`, when given, collects what the scanned records prove about
+    deliveries (`_collect_claude_receipts`); the page never shows them.
     """
     events = []
     reached = {}
@@ -3425,6 +3506,8 @@ def claude_events(cwd, positions=None, since=None, visible_record_limit=None,
                     d = json.loads(line)
                 except json.JSONDecodeError:
                     d = None
+                if receipts is not None and isinstance(d, dict):
+                    _collect_claude_receipts(d, receipts)
                 if isinstance(d, dict) and not d.get("isMeta"):
                     ts = iso_epoch(d.get("timestamp"))
                     kind = d.get("type")
@@ -3680,8 +3763,10 @@ def _codex_tool_shape_count(cwd, discovery=None, source_paths=None):
 
 
 def codex_events(cwd, positions=None, since=None, visible_record_limit=None,
-                 source_paths=None, skipped=None, horizon=None):
-    """Return visible events and the safe scanned position for each rollout."""
+                 source_paths=None, skipped=None, horizon=None, receipts=None):
+    """Return visible events and the safe scanned position for each rollout.
+    `receipts`, when given, collects what the scanned records prove about
+    deliveries (`_collect_codex_receipts`); the page never shows them."""
     events = []
     reached = {}
     position = itertools.count()
@@ -3719,6 +3804,8 @@ def codex_events(cwd, positions=None, since=None, visible_record_limit=None,
                     ts = iso_epoch(d.get("timestamp"))
                     kind, payload = d.get("type"), d.get("payload") or {}
                     payload = payload if isinstance(payload, dict) else {}
+                    if receipts is not None and kind == "response_item":
+                        _collect_codex_receipts(d, payload, receipts)
                     if kind == "response_item" and payload.get("type") == "message":
                         role = payload.get("role")
                         text = _join_text_blocks(
@@ -4327,7 +4414,7 @@ def _build_page(events, scanned, side, replay_reason=None, join=None,
 
 
 def build_summary(cwd, side, positions=None, since=None, replay_reason=None,
-                  catalog_degraded=False, catalog_snapshot=None):
+                  catalog_degraded=False, catalog_snapshot=None, receipts=None):
     """`side` is the side that will READ the summary ('claude' | 'codex').
     Turns what happened on the other side, and what the user said, into
     compact text.
@@ -4347,11 +4434,13 @@ def build_summary(cwd, side, positions=None, since=None, replay_reason=None,
     if side == "claude":
         events, reached = codex_events(
             cwd, positions, since, visible_record_limit=EVENT_LIMIT + 1,
-            source_paths=discovery.sources, skipped=skipped, horizon=horizon)
+            source_paths=discovery.sources, skipped=skipped, horizon=horizon,
+            receipts=receipts)
     else:
         events, reached = claude_events(
             cwd, positions, since, visible_record_limit=EVENT_LIMIT + 1,
-            source_paths=discovery.sources, skipped=skipped, horizon=horizon)
+            source_paths=discovery.sources, skipped=skipped, horizon=horizon,
+            receipts=receipts)
     expected = {
         (path.candidate.expected_source
          if isinstance(path, DiscoveredSourcePath) else source_id(path))
@@ -4424,6 +4513,8 @@ def hook(side="claude"):
         except OSError as error:
             print(f"antiphon: the attachment sweep failed: {error}",
                   file=sys.stderr)
+        # The ledger's own sweep, on the same trust.
+        _ledger_call("prune", lambda: ledger.prune(cwd, time.time()))
 
     # Every reserve and merge inside this bounded update releases the catalog
     # lock before transcript inspection. The whole update returns before any
@@ -4469,11 +4560,23 @@ def hook(side="claude"):
         cursor, cursor_state = _read_cursor_state(cwd, side)
         positions, since, replay_reason = positions_for(
             cursor, side, cursor_state)
+        # Receipts ride in the records the page scans — our own label in the
+        # peer's transcript, an attachment named in its tool call — and the
+        # cursor moves past them whether or not the page has words, so they
+        # are written wherever the cursor advances, the empty turn included.
+        receipts = []
         text, advance, _ = build_summary(
             cwd, side, positions, since, replay_reason,
             catalog_degraded=not catalog_ok,
-            catalog_snapshot=catalog_snapshot)
-        if not text:
+            catalog_snapshot=catalog_snapshot, receipts=receipts)
+        # What this session's own sends came to, if it was never told: a
+        # Stop-hook refusal reaches a debug log and not the agent (exit-0
+        # stderr, measured — the peer said "sent" for a marker that never
+        # left), and an attachment that expired unread was silent too.
+        # Reported here, once, ahead of the page.
+        notices = _ledger_call("pending notices", lambda: ledger.pending_notices(
+            cwd, side, claimed_alias(cwd, side, input_data.get("session_id")))) or []
+        if not text and not notices:
             # Nothing to deliver this turn, so the write-then-advance order
             # below does not protect anything -- there is no page to lose.
             # The parser's own high-water mark still has to move, or a
@@ -4483,8 +4586,13 @@ def hook(side="claude"):
                     cwd, side, cursor, side, positions, advance):
                 print("antiphon: nothing to show, but could not record cursor "
                       "progress", file=sys.stderr)
+            _ledger_call("receipts", lambda: ledger.record_receipts(
+                cwd, receipts, read_by=source_kind))
             return 0
 
+        context = "\n".join(words for _id, words in notices)
+        if text:
+            context = f"{context}\n\n{text}" if context else text
         # The hook prints nothing to the terminal. The counter used to say
         # "message" but it was counting the other side's transcript events;
         # incoming channel messages already show up via their own notices.
@@ -4492,13 +4600,18 @@ def hook(side="claude"):
         if not _deliver(json.dumps({
             "hookSpecificOutput": {
                 "hookEventName": "UserPromptSubmit",
-                "additionalContext": text,
+                "additionalContext": context,
             }
         }, ensure_ascii=False)):
             # The page never left this process, so it has not been delivered
-            # and the cursor stays where it was. The next turn offers it again.
+            # and the cursor stays where it was — and a notice not delivered
+            # is not reported. The next turn offers both again.
             print("antiphon: could not write this turn's context", file=sys.stderr)
             return 1
+        _ledger_call("notices", lambda: ledger.mark_reported(
+            cwd, [delivery for delivery, _words in notices], time.time()))
+        _ledger_call("receipts", lambda: ledger.record_receipts(
+            cwd, receipts, read_by=source_kind))
         if not _advance_page_cursor(
                 cwd, side, cursor, side, positions, advance):
             # The page WAS delivered, so the exit code stays 0: a non-zero
@@ -4511,6 +4624,19 @@ def hook(side="claude"):
             print("antiphon: delivered, but could not record the cursor",
                   file=sys.stderr)
         return 0
+
+
+def _ledger_call(what, action):
+    """Run one ledger call on the hook's road; a fault there is the ledger's,
+    never the reader's. The calls sit inside the cursor lock, before the page
+    is written, and a raise would cost every page until somebody deleted a
+    file — measured with a validated entry whose time overflowed the platform."""
+    try:
+        return action()
+    except Exception as error:      # noqa: BLE001 — the page must go out
+        print(f"antiphon: the delivery ledger failed ({what}): "
+              f"{type(error).__name__}: {error}", file=sys.stderr)
+        return None
 
 
 def notice_text(side, count):
@@ -4726,14 +4852,21 @@ def last_codex_reply(transcript_path, turn_id=None):
 def codex_thread_alive(session):
     """Whether a Codex thread is running, read off its writer lock.
 
-    True or False when this Codex keeps per-thread locks; None when it keeps
-    none, so a caller can fall back rather than treat every thread as dead.
-    Measured on Codex 0.151.0: `thread-writer-locks/<id>.lock` is created and
-    held under an exclusive flock when the thread opens and removed when it
-    closes — while the rollout file, which discovery reads, appears only on
-    the user's first turn (7,832 s later in the measured case). A shared
-    non-blocking probe is refused exactly while the writer holds it; the probe
-    takes nothing when it succeeds and releases at once.
+    Three answers. True: the lock is held — proven live. False: a lock file
+    exists that nobody holds — the host closed the thread without removing
+    it, proven gone. None: no lock file at all, unknown. Measured on Codex
+    0.151.0 and 0.152.1: the CLI creates `thread-writer-locks/<id>.lock`
+    under an exclusive flock when a thread opens and removes it when the
+    thread closes — while the rollout file, which discovery reads, appears
+    only on the user's first turn (7,832 s later in the measured case). But
+    a thread hosted by the ChatGPT app's app-server keeps no lock at all
+    while open (measured 2026-09-03, two open sessions, an empty directory),
+    and its rollout is indistinguishable from a closed CLI thread's. Reading
+    "no file" as dead therefore refused every bare send on that machine;
+    it is unknown, and the ledger says afterwards whether the words were
+    read. A shared non-blocking probe is refused exactly while the writer
+    holds the lock; the probe takes nothing when it succeeds and releases at
+    once.
     """
     if not os.path.isdir(CODEX_THREAD_LOCKS):
         return None
@@ -4741,7 +4874,7 @@ def codex_thread_alive(session):
         fd = os.open(os.path.join(CODEX_THREAD_LOCKS, session + ".lock"),
                      os.O_RDONLY)
     except OSError:
-        return False
+        return None
     try:
         try:
             fcntl.flock(fd, fcntl.LOCK_SH | fcntl.LOCK_NB)
@@ -4822,14 +4955,19 @@ def _codex_identity_snapshot(cwd, registered):
 
 
 def codex_session_id(cwd):
-    """The Codex session a bare message goes to.
+    """`(session, proof)` for the Codex session a bare message goes to.
 
-    The newest *running* session whose rollout records this directory. The
-    newest file alone chose wrong, measured: a session opened at 13:03 had no
-    rollout until 15:13, so a push at 15:04 was queued into the newest file's
-    thread — an empty session from 12:55 that nothing would ever drain.
-    Where this Codex keeps no thread locks, the old newest-file rule stands.
-    None when nothing can be chosen; `_legacy_target` says why.
+    The newest *proven-live* session whose rollout records this directory,
+    with proof `live`; else the newest session whose liveness is unknown —
+    no lock file, which is what an open app-hosted thread and a closed CLI
+    thread both look like — with proof `unproven`; else `(None, None)`, when
+    every candidate is proved gone or there is none. The newest file alone
+    chose wrong, measured: a session opened at 13:03 had no rollout until
+    15:13, so a push at 15:04 was queued into the newest file's thread — an
+    empty session from 12:55 that nothing would ever drain. Refusing every
+    unproven thread was measured too: it closed the road for good on a
+    machine whose Codex keeps no locks. The ledger carries the proof class,
+    and the receipt that follows says whether the words were read.
     """
     candidates = []
     for path in codex_rollout_files(cwd):
@@ -4837,14 +4975,15 @@ def codex_session_id(cwd):
         if m:
             candidates.append(m.group(1))
     if not candidates:
-        return None
+        return None, None
     alive = {sid: codex_thread_alive(sid) for sid in candidates}
-    if all(state is None for state in alive.values()):
-        return candidates[0]
     for sid in candidates:
-        if alive[sid]:
-            return sid
-    return None
+        if alive[sid] is True:
+            return sid, "live"
+    for sid in candidates:
+        if alive[sid] is None:
+            return sid, "unproven"
+    return None, None
 
 
 def _retire_park(cwd, side, key, observed):
@@ -4984,7 +5123,7 @@ def push(target="codex"):
             ok, detail = send_to_codex(
                 cwd, (f"{PUSH_LABEL} "
                       f"{queue_label(who, attempt, can_reply)} {outgoing}"),
-                recipient)
+                recipient, sender=who)
         else:
             ok, detail = send_to_claude(cwd, outgoing, recipient,
                                         sender_alias=who, message_id=attempt)
@@ -4992,6 +5131,15 @@ def push(target="codex"):
         if ok:
             print(f"antiphon: delivered to {target.title()}{named} "
                   f"({len(outgoing)} characters)", file=sys.stderr)
+            if not ledger.record_sent(
+                    cwd, attempt, sender=who or NO_ALIAS, to_kind=target,
+                    to_alias=recipient,
+                    transport="queue" if target == "codex" else "channel",
+                    proof=(detail or "registered") if target == "codex" else "channel",
+                    sha256=hashlib.sha256(outgoing.encode()).hexdigest(),
+                    size=len(outgoing.encode())):
+                print("antiphon: the delivery ledger could not record the delivery",
+                      file=sys.stderr)
         else:
             # Returning False leaves this recipient's fingerprint where it was,
             # so the line is offered again next turn instead of being recorded
@@ -5002,6 +5150,17 @@ def push(target="codex"):
             # keep clean by construction.
             print(f"antiphon: delivery failed — {redact_private(str(detail))}",
                   file=sys.stderr)
+            # This line reaches a debug log and not the agent (exit-0 hook
+            # stderr, measured), so the refusal goes on the ledger and the
+            # sender's next page says it.
+            # The preview is the sender's own line, kept beside the reason; a
+            # socket path or session id it quoted must not land on disk raw.
+            if not ledger.record_refused(
+                    cwd, attempt, sender=who or NO_ALIAS, to_kind=target,
+                    to_alias=recipient, reason=redact_private(str(detail)),
+                    preview=redact_private(outgoing[:PREVIEW_WINDOW])):
+                print("antiphon: the delivery ledger could not record the refusal",
+                      file=sys.stderr)
         return ok
 
     # The send happens here, outside any lock — reversing an earlier ruling
@@ -5129,14 +5288,35 @@ _PRIVATE_DIGEST = re.compile(
     r"(?<![0-9a-fA-F])[0-9a-fA-F]{64}(?![0-9a-fA-F])", re.ASCII)
 _PRIVATE_OWNER = re.compile(r"(?<!\d)\d+:(?:v\d+:)?[A-Z][a-z]{2} [A-Z][a-z]{2} "
                             r"[ \d]?\d \d{2}:\d{2}:\d{2} \d{4}", re.ASCII)
-_PRIVATE_ROUTE = re.compile(r"\S*antiphon-channel-[0-9a-f]+\.sock")
+# A route is the whitespace-delimited token that carries the socket name, up
+# to and including `.sock`. Matched token by token: the earlier
+# `\S*antiphon-channel-…` backtracked over every start position of a long
+# token, quadratic in its length — measured 1.8 s on 40 KB of one word, and
+# a Stop-marker preview can be hundreds of KB.
+_PRIVATE_ROUTE_CORE = re.compile(r"antiphon-channel-[0-9a-f]+\.sock")
+_TOKEN = re.compile(r"\S+")
+
+
+def _redact_routes(text):
+    def token(match):
+        found = _PRIVATE_ROUTE_CORE.search(match.group(0))
+        if found is None:
+            return match.group(0)
+        return "<route>" + match.group(0)[found.end():]
+    return _TOKEN.sub(token, text) if "antiphon-channel-" in text else text
+
+
+# The window of a refused line that a 60-character preview can show, redacted
+# whole: every private shape is shorter than the window, so a shape that
+# starts inside the preview ends inside the window.
+PREVIEW_WINDOW = 2_048
 
 
 def redact_private(text, limit=None):
     """Remove every private shape, then cut. Never the other way round."""
     if not isinstance(text, str):
         return text
-    cleaned = _PRIVATE_ROUTE.sub("<route>", text)
+    cleaned = _redact_routes(text)
     cleaned = _PRIVATE_OWNER.sub("<owner>", cleaned)
     cleaned = _PRIVATE_DIGEST.sub("<digest>", cleaned)
     cleaned = _PRIVATE_UUID.sub("<session>", cleaned)
@@ -5265,8 +5445,8 @@ def _legacy_target(cwd, kind):
     still the one Codex session in it; upgrading must not cut either off.
     """
     if kind == "claude":
-        return claude_socket_path(cwd), ""
-    session = codex_session_id(cwd)
+        return claude_socket_path(cwd), "", "legacy"
+    session, proof = codex_session_id(cwd)
     if not session:
         # Classified where it is born, so nothing downstream has to read the
         # prose to tell it apart from an addressing refusal. It says discovery
@@ -5274,17 +5454,19 @@ def _legacy_target(cwd, kind):
         # peer's ability to read: the Codex-side page is built from Claude's
         # transcripts and carries these words either way, measured.
         if codex_rollout_files(cwd):
-            # Rollouts exist and none belongs to a running thread. The one
-            # that is running may simply not have a rollout yet: Codex writes
-            # it on the first user turn, so until then it cannot be found from
-            # here, and queueing into a closed thread would strand the words.
+            # Rollouts exist and every one belongs to a thread proved gone
+            # (a lock file nobody holds). A running one may simply not have
+            # a rollout yet: Codex writes it on the first user turn, so until
+            # then it cannot be found from here.
             return None, _ClassifiedRefusal(
-                "not delivered: the Codex sessions recorded in this directory "
-                "are not running, and a running one gets a transcript only on "
-                "its first turn — until then it cannot be addressed", "no-peer")
+                "not delivered: every Codex session recorded in this "
+                "directory is proved gone (its writer lock is unheld), and a "
+                "running one gets a transcript only on its first turn — until "
+                "then it cannot be addressed", "no-peer"), None
         return None, _ClassifiedRefusal(
-            "not delivered: no Codex session found in this directory", "no-peer")
-    return session, ""
+            "not delivered: no Codex session found in this directory",
+            "no-peer"), None
+    return session, "", proof
 
 
 def _peer_states(live):
@@ -5300,11 +5482,41 @@ def _peer_states(live):
         for peer in live))
 
 
+# `proof` is how the address was shown to be a session somebody is reading:
+# `registered`/`automatic` from the registry, `live` from a held writer lock,
+# `unproven` from a rollout the host keeps no lock for. The ledger records it
+# and the tool result says it.
 ResolvedTarget = collections.namedtuple("ResolvedTarget",
-                                        "address detail origin")
+                                        "address detail origin proof",
+                                        defaults=(None,))
 
 
-def _resolve_target(cwd, kind, alias=None):
+def _age_words(seconds):
+    """`under a minute`, `5 min`, `2 h`, `3 d` — for advice, never arithmetic."""
+    if seconds < 60:
+        return "under a minute"
+    if seconds < 3600:
+        return f"{int(seconds // 60)} min"
+    if seconds < 86400:
+        return f"{int(seconds // 3600)} h"
+    return f"{int(seconds // 86400)} d"
+
+
+def _correlation_advice(cwd, kind, sender):
+    """The tail of a bare refusal: who wrote to this session last and has not
+    been written back to. The ledger's answer, offered as advice with the
+    exact argument to pass — the bridge itself still never chooses. Empty
+    when nobody is owed a reply, so the refusal stays byte-identical."""
+    mine = "claude" if kind == "codex" else "codex"
+    found = ledger.last_unanswered_sender(cwd, mine, sender, time.time())
+    if found is None:
+        return ""
+    who, age = found
+    return (f"; the last unanswered sender was {who!r} ({_age_words(age)} ago): "
+            f"pass to=\"{who}\"")
+
+
+def _resolve_target(cwd, kind, alias=None, sender=None):
     """Which peer a message goes to, including how its address was found.
 
     `address` is None when nothing can be delivered safely. The bridge does not
@@ -5365,7 +5577,7 @@ def _resolve_target(cwd, kind, alias=None):
                 return ResolvedTarget(
                     None, (f"not delivered: {alias!r} is live but not yet "
                            "routable — it has not run a turn yet"), "refusal")
-            return ResolvedTarget(match[0]["address"], "", "registered")
+            return ResolvedTarget(match[0]["address"], "", "registered", "registered")
 
     identities = (_codex_identity_snapshot(cwd, registered)
                   if kind == "codex"
@@ -5406,6 +5618,10 @@ def _resolve_target(cwd, kind, alias=None):
     if len(live) > 1:
         detail = (f"not delivered: {len(live)} {kind} peers are live "
                   f"({_peer_states(live)}); address one by name")
+        # Reached by a bare send only — an explicit alias returned above,
+        # matched or refused by name — so this is the one refusal a sender
+        # can act on by choosing, and the ledger is consulted here alone.
+        detail += _correlation_advice(cwd, kind, sender)
         if kind == "codex" and identities.automatic:
             detail = _ClassifiedRefusal(detail, "no-peer")
         return ResolvedTarget(
@@ -5416,11 +5632,11 @@ def _resolve_target(cwd, kind, alias=None):
         # before any of this. Not provably unique either, but it is the shipped
         # behaviour of every existing install and breaking it would cost far
         # more than the guess it makes.
-        address, detail = _legacy_target(cwd, kind)
-        return ResolvedTarget(address, detail, "legacy")
+        address, detail, proof = _legacy_target(cwd, kind)
+        return ResolvedTarget(address, detail, "legacy", proof)
     if kind == "codex":
         if live[0].get("automatic") is True:
-            return ResolvedTarget(live[0]["address"], "", "automatic")
+            return ResolvedTarget(live[0]["address"], "", "automatic", "automatic")
         # One named record is not proof of one session. An unnamed session has
         # no routable peer record, and one before its first hook may have no
         # observation either — delivering to the visible peer would be a guess
@@ -5431,11 +5647,12 @@ def _resolve_target(cwd, kind, alias=None):
             None, (f"not delivered: {_peer_states(live)} is the only "
                    "registered Codex peer, but unnamed Codex sessions are "
                    "not all observable and cannot be ruled out — address a "
-                   "peer by name"), "refusal")
+                   "peer by name") + _correlation_advice(cwd, kind, sender),
+            "refusal")
     # Reached only for Claude, whose live records always carry a usable address:
     # the addressless shape is Codex-only and `read_peers` skips every other
     # unusable one.
-    return ResolvedTarget(live[0]["address"], "", "registered")
+    return ResolvedTarget(live[0]["address"], "", "registered", "registered")
 
 
 def resolve_target(cwd, kind, alias=None):
@@ -5444,16 +5661,24 @@ def resolve_target(cwd, kind, alias=None):
     return target.address, target.detail
 
 
-def send_to_codex(cwd, message, alias=None):
+def send_to_codex(cwd, message, alias=None, sender=None):
     """Sends a message to a Codex peer, chosen by `alias` or by there being one.
+    `sender` is the alias this side writes under; a bare refusal uses it to
+    say who last wrote to that alias without an answer.
 
-    Returns (ok, detail). Nothing is started when the recipient cannot be
-    decided: the refusal happens before the transport is touched.
+    Returns (ok, detail): on success `detail` is the proof class the address
+    was chosen on (`registered`, `automatic`, `live`, `unproven`), which the
+    ledger records and the tool result says; on refusal it is the reason.
+    Nothing is started when the recipient cannot be decided: the refusal
+    happens before the transport is touched.
     """
-    address, detail = resolve_target(cwd, "codex", alias)
-    if address is None:
+    target = _resolve_target(cwd, "codex", alias, sender)
+    if target.address is None:
+        return False, target.detail
+    ok, detail = _queue_codex(target.address, message)
+    if not ok:
         return False, detail
-    return _queue_codex(address, message)
+    return True, target.proof or "registered"
 
 
 # The channel server refuses anything larger. Checking here too means a sender
@@ -5592,7 +5817,7 @@ def send_to_claude(cwd, text, alias=None, sender_alias=None, message_id=None):
     while True:
         # Re-resolved every attempt: a named peer can register in the meantime,
         # which moves the address from the project-wide path to its own.
-        target = _resolve_target(cwd, "claude", alias)
+        target = _resolve_target(cwd, "claude", alias, sender_alias)
         address, detail = target.address, target.detail
         if address is None:
             valid_alias = alias is not None and peers.valid_name(alias)
@@ -5706,6 +5931,10 @@ def send_to_claude(cwd, text, alias=None, sender_alias=None, message_id=None):
 ATTACHMENT_MAX = 8 * 1024 * 1024          # bytes one parked message may hold
 ATTACHMENT_QUOTA = 64 * 1024 * 1024       # bytes the whole store may hold
 ATTACHMENT_TTL = 7 * 24 * 3600            # seconds a parked message survives
+# Seconds a parked message stays after the peer's own transcript showed it
+# being read: long enough for the reader to come back to it in the same
+# turn, short enough that a read file is not a week of store.
+ATTACHMENT_READ_GRACE = 3600
 
 # The envelope's opening words. Deliberately not part of the self-injection
 # family: `_SELF_INJECTION_PREFIXES` exists so `PUSH_LABEL` and `CHANNEL_LABEL`
@@ -5907,9 +6136,10 @@ def attachment_envelope(path, digest, size, alias):
             "that, so `tail -n +3 <that path> | shasum -a 256` verifies it. "
             "The file is local to this project on this machine and holds the "
             "sender's own words, not the project's. It becomes eligible for "
-            f"removal {ATTACHMENT_TTL // 86400} days after it was written and "
-            "is removed by the next hook either side runs — there is no "
-            "timer.")
+            f"removal {ATTACHMENT_TTL // 86400} days after it was written, or "
+            f"{ATTACHMENT_READ_GRACE // 3600} hour after this bridge sees it "
+            "read, and is removed by the next hook either side runs — there is "
+            "no timer.")
 
 
 def write_attachment(cwd, text, alias, message_id):
@@ -6050,8 +6280,28 @@ def sweep_attachments(cwd, now=None):
     now = time.time() if now is None else now
     store = _sound_store(cwd)
     attachments, foreign = _attachment_entries(cwd)
+    # The ledger's read receipts, once: a file the peer's own transcript
+    # showed being read is collected ATTACHMENT_READ_GRACE after that, not a
+    # week later; a file nobody read waits out the TTL as before, and when it
+    # goes its sender is told on its next page, which is the party the old
+    # stderr line never reached.
+    reads = ledger.read_times(cwd) if attachments else {}
     for path, info in attachments:
+        name = os.path.basename(path)
         age = now - info.st_mtime
+        read_at = reads.get(name)
+        if read_at is not None:
+            since_read = now - read_at
+            if since_read <= ATTACHMENT_READ_GRACE:
+                continue
+            removed, error = _unlink_attachment(store, path)
+            if error is not None:
+                print(f"antiphon: a read attachment could not be collected: "
+                      f"{path}: {error}", file=sys.stderr)
+            elif removed:
+                print(f"antiphon: attachment read {int(since_read // 60)} "
+                      f"minutes ago and collected: {path}", file=sys.stderr)
+            continue
         if age <= ATTACHMENT_TTL:
             continue
         removed, error = _unlink_attachment(store, path)
@@ -6059,8 +6309,14 @@ def sweep_attachments(cwd, now=None):
             print(f"antiphon: an expired attachment could not be deleted: "
                   f"{path}: {error}", file=sys.stderr)
         elif removed:
-            print(f"antiphon: attachment expired after {int(age // 86400)} "
-                  f"days and was deleted: {path}", file=sys.stderr)
+            days = int(age // 86400)
+            if ledger.mark_expired_unread(cwd, name, now):
+                print(f"antiphon: attachment expired unread after {days} days "
+                      f"and was deleted: {path} — its sender will be told",
+                      file=sys.stderr)
+            else:
+                print(f"antiphon: attachment expired after {days} days and "
+                      f"was deleted: {path}", file=sys.stderr)
     if foreign:
         # Reported and left. This directory is not a namespace this code owns
         # outright, and a count says enough: a report is not a directory
@@ -6097,6 +6353,50 @@ def drop_attachment(cwd, path):
               f"{path}", file=sys.stderr)
 
 
+# Seconds a delivery may go without the peer's transcript showing it before
+# doctor mentions it: a peer mid-turn reads its queue at the next turn, and ten
+# minutes is longer than any turn measured on this project.
+RECEIPT_PATIENCE = 10 * 60
+
+
+def _delivery_report(cwd, now=None):
+    """The `status` line for the delivery ledger. A reader, never a writer.
+
+    Counts only — no id, no alias, no words: what left and was never seen in
+    the peer's transcript (and how long the oldest has waited), what was
+    seen, and what never left, with how many of those refusals the sender's
+    own page has not carried yet."""
+    now = time.time() if now is None else now
+    rows = ledger.entries(cwd)
+    if not rows:
+        return "Deliveries:         none on the ledger"
+    waiting = [now - row["sent_at"] for row in rows
+               if row["state"] == "sent" and row["received_at"] is None]
+    # A receipt sits in the peer's transcript, and the reader that finds it
+    # never looks behind the page horizon: past that age, "no receipt" is
+    # not "not read", it is unknowable, and the line says which.
+    recent = [age for age in waiting if age <= PAGE_HORIZON]
+    beyond = [age for age in waiting if age > PAGE_HORIZON]
+    received = sum(1 for row in rows
+                   if row["state"] == "sent" and row["received_at"] is not None)
+    refused = [row for row in rows if row["state"] == "refused"]
+    unreported = sum(1 for row in refused if row["reported_at"] is None)
+    parts = []
+    if recent:
+        parts.append(f"{len(recent)} awaiting receipt "
+                     f"(oldest {_age_words(max(0.0, max(recent)))})")
+    if beyond:
+        parts.append(f"{len(beyond)} sent before the {PAGE_HORIZON // 3600}-hour "
+                     "page horizon without a receipt (a receipt that old is "
+                     "never seen)")
+    if received:
+        parts.append(f"{received} received")
+    if refused:
+        parts.append(f"{len(refused)} refused" + (
+            f" ({unreported} not yet reported to the sender)" if unreported else ""))
+    return "Deliveries:         " + ", ".join(parts)
+
+
 def attachment_report(cwd, now=None):
     """The `status` line for the parked store. A reader, never a sweeper.
 
@@ -6106,6 +6406,7 @@ def attachment_report(cwd, now=None):
     because two consecutive `status` runs are pinned equal, and a duration
     derived from `now` at any finer grain would make that pin flake.
     """
+    now = time.time() if now is None else now
     parked, held, oldest, foreign = attachment_usage(cwd, now)
     if not parked:
         line = "Attachments:        none parked"
@@ -6114,6 +6415,14 @@ def attachment_report(cwd, now=None):
         aged = "today" if days == 0 else f"{days} day{'' if days == 1 else 's'} old"
         line = (f"Attachments:        {parked} parked, {held:,} bytes, "
                 f"oldest {aged}")
+        # Read receipts come from the peer's transcript through the ledger;
+        # a file without one is unread as far as anything can tell.
+        reads = ledger.read_times(cwd)
+        attachments, _foreign = _attachment_entries(cwd)
+        read = sum(1 for path, info in attachments
+                   if now - info.st_mtime <= ATTACHMENT_TTL
+                   and os.path.basename(path) in reads)
+        line += f"; {read} with a read receipt, {parked - read} without"
     if foreign:
         noun = "entry" if foreign == 1 else "entries"
         line += f"; {foreign} other {noun} left alone"
@@ -6206,11 +6515,18 @@ def _attachable(text):
     return len(text.encode()) <= ATTACHMENT_MAX
 
 
-_Attachment = collections.namedtuple("_Attachment", "envelope path size")
+# `reused`: the file was parked by an earlier send whose envelope may already
+# be in the peer's hands, so a failed resend must not remove it.
+_Attachment = collections.namedtuple("_Attachment", "envelope path size reused",
+                                     defaults=(False,))
 
 
-def _spill(cwd, text, alias, message_id):
+def _spill(cwd, text, alias, message_id, recipient=None):
     """Parks `text`; returns `(attachment, refusal)` with exactly one filled.
+
+    `recipient` is `(kind, alias)`: with it, a resend of these exact words by
+    this same sender to this same peer, within the ledger's TTL, names the
+    file that already exists instead of parking a second one.
 
     A refusal here is a plain string, never a `_ClassifiedRefusal`: an attached
     class means "the sender needs telling where its words still travel", and
@@ -6227,11 +6543,27 @@ def _spill(cwd, text, alias, message_id):
                           "attachment and did not finish within "
                           f"{ATTACHMENT_LOCK_PATIENCE:.0f} seconds; nothing "
                           "was written. Sending again is safe.")
-        return _spill_locked(cwd, text, alias, message_id, size)
+        return _spill_locked(cwd, text, alias, message_id, size, recipient)
 
 
-def _spill_locked(cwd, text, alias, message_id, size):
+def _spill_locked(cwd, text, alias, message_id, size, recipient=None):
     """The half of `_spill` that must not interleave with another peer's."""
+    digest = hashlib.sha256(text.encode()).hexdigest()
+    if recipient is not None:
+        existing = ledger.reusable_attachment(
+            cwd, digest, recipient[0], recipient[1], time.time(),
+            sender=alias or NO_ALIAS)
+        store = _sound_store(cwd) if existing else None
+        if store is not None:
+            # A retry is a retry of something: the same file, whose header
+            # keeps the first id, under a fresh envelope. The resend restarts
+            # the file's clock, so "eligible for removal 7 days after it was
+            # written" is true of this envelope too.
+            path = os.path.join(store, existing)
+            with contextlib.suppress(OSError):
+                os.utime(path, None)
+            return _Attachment(attachment_envelope(path, digest, size, alias),
+                               path, size, True), None
     parked, held, oldest, _foreign = attachment_usage(cwd)
     if held + size > ATTACHMENT_QUOTA:
         # Nothing is evicted to make room. An unexpired attachment is somebody
@@ -6291,15 +6623,17 @@ def reply(*_):
     outgoing, parked = text, None
     composed = f"{CHANNEL_LABEL} {label} {text}"
     if _oversized_for_queue(composed) and _attachable(text):
-        attachment, refusal = _spill(cwd, text, who, message_id)
+        attachment, refusal = _spill(cwd, text, who, message_id,
+                                     recipient=("codex", to))
         if refusal is not None:
             print(f"reply: {refusal}", file=sys.stderr)
             return 1
         outgoing, parked = attachment.envelope, attachment
         composed = f"{CHANNEL_LABEL} {label} {outgoing}"
-    ok, detail = send_to_codex(cwd, composed, to)
+    ok, detail = send_to_codex(cwd, composed, to, sender=who)
     if not ok:
-        if parked is not None:
+        # Never a reused file: the first envelope, already delivered, names it.
+        if parked is not None and not parked.reused:
             drop_attachment(cwd, parked.path)
         # `only a tool-name line`: measured on 123 real `reply_to_codex`
         # records, whose `text` argument no parser path can reach.
@@ -6310,7 +6644,46 @@ def reply(*_):
     # fingerprints bare marker lines, never composed ones, so parking the
     # composed string would leave the park matching nothing.
     _record_delivery(cwd, "codex", outgoing, to)
+    # What actually happened, for the ledger and for the caller. A queue
+    # accepting a row is not the peer reading it — measured, a row sat in an
+    # open app-hosted thread's queue for over an hour — so the word is
+    # "queued", the proof class travels with it, and the receipt that
+    # `status` shows later is the only "delivered" there is.
+    attachment = os.path.basename(parked.path) if parked is not None else None
+    recorded = ledger.record_sent(
+        cwd, message_id, sender=who or NO_ALIAS, to_kind="codex",
+        to_alias=to, transport="queue", proof=detail or "registered",
+        sha256=hashlib.sha256(text.encode()).hexdigest(),
+        size=len(text.encode()), attachment=attachment)
+    print(json.dumps({"queued": True, "id": message_id, "proof": detail or "registered",
+                      "to": to, "attachment": attachment, "recorded": recorded,
+                      "text": queued_words(to, message_id, detail or "registered",
+                                           attachment) + LEDGER_UNWRITTEN * (not recorded)}))
     return 0
+
+
+# Said in a tool result when the ledger refused the entry — a symlinked or
+# unwritable `.antiphon/deliveries/` — so "run antiphon status" is not advice
+# about a delivery status will never know.
+LEDGER_UNWRITTEN = (" (the delivery ledger could not be written, so status will "
+                    "not show this one)")
+
+
+def queued_words(to, message_id, proof, attachment=None):
+    """The `reply_to_codex` result, composed here so one spelling is tested.
+
+    Never "delivered": the transport accepted a row, and only the peer's own
+    transcript proves it was read."""
+    where = (f"Codex peer '{to}'" if to else "the newest Codex session")
+    text = (f"Queued for {where} (id {message_id}): Codex reads its queue at "
+            "its next turn; run antiphon status to see whether it was received.")
+    if proof == "unproven":
+        text += (" That thread is unproven: the host keeps no writer lock for "
+                 "it, so it may be open or long closed.")
+    if attachment:
+        text += (" The message was too large for the queue, so its words are "
+                 "parked as an attachment and the envelope names the file.")
+    return text
 
 
 def _record_delivery(cwd, target, text, alias=None):
@@ -6563,34 +6936,47 @@ def _send_tool(cwd, text, to=None, sender=None):
     message_id = delivery_id()
     outgoing, parked = text, None
     if _oversized_for_claude(text, who, message_id) and _attachable(text):
-        attachment, refusal = _spill(cwd, text, who, message_id)
+        attachment, refusal = _spill(cwd, text, who, message_id,
+                                     recipient=("claude", to))
         if refusal is not None:
             return _tool_error(f"Not delivered to Claude: {refusal}")
         outgoing, parked = attachment.envelope, attachment
     ok, detail = send_to_claude(cwd, outgoing, to, sender_alias=who,
                                 message_id=message_id)
     if not ok:
-        if parked is not None:
+        # Never a reused file: the first envelope, already delivered, names it.
+        if parked is not None and not parked.reused:
             drop_attachment(cwd, parked.path)
         # The real Codex call record contributes its safe name only; its input,
         # result and ids are deliberately unreachable by Claude's pull page.
         return _tool_error(f"Not delivered to Claude: "
                            f"{_guided(detail, 'only a tool-name line')}")
     _record_delivery(cwd, "claude", outgoing, to)
+    recorded = ledger.record_sent(
+        cwd, message_id, sender=who or NO_ALIAS, to_kind="claude",
+        to_alias=to, transport="channel", proof="channel",
+        sha256=hashlib.sha256(text.encode()).hexdigest(),
+        size=len(text.encode()),
+        attachment=(os.path.basename(parked.path) if parked is not None else None))
+    unwritten = LEDGER_UNWRITTEN if not recorded else ""
     # Naming the peer back is what lets the sender notice it addressed the wrong
     # one. With a single peer there is nothing to distinguish, so the old
-    # wording stands.
+    # wording stands. "Delivered" is true here — the channel server accepted
+    # the notification for the host — and the receipt `status` shows later is
+    # the peer's own transcript.
     where = f"peer {to!r}" if to else "channel"
+    receipt = ("antiphon status shows when Claude's transcript received it")
     if parked is not None:
         # Announced, never silent: the sender asked for a message to be
         # delivered and something else was, so it is told what and where.
         return {"content": [{"type": "text", "text": (
-            f"Delivered to the Claude Code {where} as an attachment: the "
-            f"message was too large for the channel, so its {parked.size} "
-            f"bytes are parked at {parked.path} and an envelope naming that "
-            "file went in its place.")}]}
+            f"Delivered to the Claude Code {where} (id {message_id}) as an "
+            f"attachment: the message was too large for the channel, so its "
+            f"{parked.size} bytes are parked at {parked.path} and an envelope "
+            f"naming that file went in its place; {receipt}.{unwritten}")}]}
     return {"content": [{"type": "text",
-                         "text": f"Delivered to the Claude Code {where}."}]}
+                         "text": f"Delivered to the Claude Code {where} "
+                                 f"(id {message_id}); {receipt}.{unwritten}"}]}
 
 
 def _retrieve_tool(cwd, public_id):
@@ -7125,9 +7511,11 @@ def _mcp_serve(cwd, alias=None):
                         cursor, cursor_state = _read_cursor_state(cwd, "codex")
                         positions, since, replay_reason = positions_for(
                             cursor, "codex", cursor_state)
+                        receipts = []
                         text, advance, _ = build_summary(
                             cwd, "codex", positions, since, replay_reason,
-                            catalog_snapshot=catalog_snapshot)
+                            catalog_snapshot=catalog_snapshot,
+                            receipts=receipts)
                         oversized = (text
                                      and len(text.encode("utf-8")) > PAGE_BUDGET)
                         if oversized:
@@ -7153,6 +7541,11 @@ def _mcp_serve(cwd, alias=None):
                         delivered = _mcp_result(mid, output)
                         if oversized:
                             continue
+                        if delivered:
+                            # The same rule as the hook: the cursor is about
+                            # to move past the records that carried these.
+                            _ledger_call("receipts", lambda: ledger.record_receipts(
+                                cwd, receipts, read_by="claude"))
                         if not text and delivered:
                             if not _advance_page_cursor(
                                     cwd, "codex", cursor, "codex", positions,
@@ -7396,8 +7789,8 @@ AGENTS_RULE = ("\n## The Antiphon bridge\n\n"
                "You work alongside Claude Code here. Its side is injected into "
                "your context at the start of each turn as one page of completed "
                "records, oldest first — project-wide awareness, not mail "
-               "addressed to you, possibly merging several Claude sessions "
-               "under one label. `has_more: true` means more is waiting: call "
+               "addressed to you, possibly several Claude sessions under one "
+               "label. `has_more: true` means more is waiting: call "
                "`antiphon_read` again, or let later turns drain it, until "
                "`has_more: false`, whose `has_more_scope: catalogued project "
                "sources` covers the durable catalog only when no `discovery: "
@@ -7407,10 +7800,9 @@ AGENTS_RULE = ("\n## The Antiphon bridge\n\n"
                "left behind is announced on the page as `skipped:`. A page with "
                "a replay notice re-delivers history after "
                "an upgrade or cursor recovery and can carry duplicates until the "
-               "notice disappears. If the single next record is larger than a "
-               "page, `antiphon_read` refuses it rather than truncating "
-               "— nothing is read or marked seen — and the next "
-               "automatic prompt hook delivers it whole. "
+               "notice disappears. If the next record is larger than a page, "
+               "`antiphon_read` refuses it rather than truncating (nothing is "
+               "marked seen) and the next prompt hook delivers it whole. "
                + TOOL_RETRIEVAL_RULE + "\n\n"
                "Claude's own words reach you as a user message starting with "
                "`[Antiphon bridge] Claude:` (its Stop hook) or "
@@ -7419,15 +7811,17 @@ AGENTS_RULE = ("\n## The Antiphon bridge\n\n"
                "Reply to that peer with `antiphon_send(to=<alias>)` or "
                "`@claude:<alias>`; a literal `from=<unnamed>` is a peer with no "
                "name that cannot be addressed back, and with one Claude peer "
-               "live you can leave the recipient out. The id names one delivery "
-               "attempt; nothing routes by it. A Claude alias is its configured "
+               "live you can leave the recipient out. The id names one attempt, "
+               "never a route. A Claude alias is its configured "
                "identity, not proof that its return channel is reachable: a "
                "refused reply is a fault `antiphon doctor` names and a restart "
                "of that Claude session repairs. " + RECOVERY_RULE + "\n\n"
                "To hand Claude a task, put `@claude` at the start of a line in "
                "your reply; only that line is sent. To reach Claude without "
-               "ending your turn, call `antiphon_send`: it delivers at once and "
-               "`antiphon_read` picks up the answer later in the same turn. "
+               "ending your turn, call `antiphon_send`: it delivers to Claude's "
+               "channel at once and names the delivery id; `antiphon status` "
+               "shows when Claude's transcript received it; `antiphon_read` "
+               "picks up the answer later in the same turn. "
                + MULTILINE_MARKER_RULE + " "
                + LONG_MARKER_RULE.format(tool="antiphon_send") + "\n\n"
                "A direct send reaches one peer and is never broadcast: write "
@@ -7444,8 +7838,9 @@ AGENTS_RULE = ("\n## The Antiphon bridge\n\n"
                "everything after the first blank line and is what the hash "
                "covers (`tail -n +3 <path> | shasum -a 256`). It becomes "
                f"eligible for removal {ATTACHMENT_TTL // 86400} days after it "
-               "was written, on the next hook either side runs; there is no "
-               "timer. Your own oversized `antiphon_send` is parked the same "
+               f"was written, or {ATTACHMENT_READ_GRACE // 3600} hour after the "
+               "bridge sees it read, on the next hook either side runs; there "
+               "is no timer. Your own oversized `antiphon_send` is parked the same "
                "way and its result names the file; an oversized `@claude` line "
                "is not parked — it is refused and its words travel with "
                "your visible reply through the passive pages.\n"
@@ -7473,7 +7868,9 @@ CLAUDE_RULE = ("\n## The Antiphon bridge\n\n"
                "when it is a name rather than the literal `<unnamed>`; a bare "
                "reply works only while no Codex peer is registered or one "
                "positively live automatic peer is the only candidate, and is "
-               "refused otherwise. `<unnamed>` means that peer has no name; "
+               "refused otherwise. Its result says queued, never delivered — "
+               "Codex reads its queue at its next turn — and `antiphon status` "
+               "shows the receipt. `<unnamed>` means that peer has no name; "
                "passing it as `to` is the same as leaving it out. Your valid "
                "`ANTIPHON_NAME` is your configured identity on outgoing "
                "messages, not proof that your return channel is reachable: if "
@@ -7495,8 +7892,9 @@ CLAUDE_RULE = ("\n## The Antiphon bridge\n\n"
                "everything after the first blank line and is what the hash "
                "covers (`tail -n +3 <path> | shasum -a 256`). It becomes "
                f"eligible for removal {ATTACHMENT_TTL // 86400} days after it "
-               "was written, on the next hook either side runs; there is no "
-               "timer. An oversized `reply_to_codex` is parked the same way; an "
+               f"was written, or {ATTACHMENT_READ_GRACE // 3600} hour after the "
+               "bridge sees it read, on the next hook either side runs; there "
+               "is no timer. An oversized `reply_to_codex` is parked the same way; an "
                "oversized `@codex` line is not parked — it is refused and "
                "its words travel with your visible reply through the passive "
                "pages.\n"
@@ -8257,6 +8655,7 @@ def status():
                else "down")
     print(f"Claude channel:     {channel}")
     print(attachment_report(cwd))
+    print(_delivery_report(cwd))
     print(_codex_census_line(live["codex"], identities))
     for line in _peer_report(displayed, identities):
         print(line)
@@ -9209,6 +9608,31 @@ def _doctor_codex(report, cwd):
     _doctor_codex_queue(report, cwd)
 
 
+def _doctor_deliveries(report, cwd):
+    """Deliveries the peer's transcript has not shown after RECEIPT_PATIENCE.
+
+    Measured: a queued row sat in an open app-hosted thread's queue for over
+    an hour while the tool had said delivered. A note, never ✗ — a peer that
+    has not taken a turn is not a fault — and read-only: the ledger is read,
+    never marked, by a diagnosis."""
+    ages = [age for _entry, age in ledger.awaiting_receipt(cwd, time.time())]
+    late = [age for age in ages if RECEIPT_PATIENCE < age <= PAGE_HORIZON]
+    beyond = [age for age in ages if age > PAGE_HORIZON]
+    horizon = (f"{len(beyond)} older than the {PAGE_HORIZON // 3600}-hour page "
+               "horizon, whose receipt can no longer be seen") if beyond else ""
+    if late:
+        count = len(late)
+        verb = "has" if count == 1 else "have"
+        noun = "delivery" if count == 1 else "deliveries"
+        report.note(f"deliveries: {count} {noun} sent more than "
+                    f"{RECEIPT_PATIENCE // 60} minutes ago {verb} no receipt (oldest "
+                    f"{_age_words(max(late))}) — the peer has not read it yet; if its "
+                    "session is closed, address another"
+                    + (f"; {horizon}" if horizon else ""))
+    elif beyond:
+        report.note(f"deliveries: {horizon} — not a fault this diagnosis can judge")
+
+
 def _doctor_codex_tool_shapes(report, cwd):
     """Expose fail-closed Codex schema drift without printing its payload."""
     count = _codex_tool_shape_count(cwd)
@@ -9264,20 +9688,22 @@ def _doctor_codex_queue(report, cwd):
             con.close()
     except (sqlite3.Error, OSError):
         return
+    # Not proved running: a lock nobody holds (proved gone) or no lock at all
+    # (unknown — an open app-hosted thread and a closed CLI thread look the
+    # same on disk). Either way the words wait until that thread takes a turn.
     stranded = [(tid, n) for tid, n in rows
                 if isinstance(tid, str) and tid in ours
-                and codex_thread_alive(tid) is False]
+                and codex_thread_alive(tid) is not True]
     if stranded:
         # Aggregate, never a thread-id prefix. A truncated prefix is still
-        # session identity, and it was never actionable anyway: nobody can
-        # address a thread that is not running. The counts are what a person
-        # can act on.
+        # session identity, and it was never actionable anyway. The counts
+        # are what a person can act on.
         waiting = sum(count for _tid, count in stranded)
         threads = len(stranded)
         noun = "thread" if threads == 1 else "threads"
         report.note(f"codex queue: {waiting} message(s) wait across {threads} "
-                    f"non-running project {noun} — they are read only if those "
-                    "threads are resumed")
+                    f"project {noun} not proved running — they are read only "
+                    "when those threads take a turn")
 
 
 def _doctor_readonly():
@@ -9305,6 +9731,7 @@ def _doctor_readonly():
     _doctor_codex_observations(report, cwd, live)
     _doctor_channel(report, cwd, live)
     _doctor_codex(report, cwd)
+    _doctor_deliveries(report, cwd)
     _doctor_sources(report, cwd)
     _doctor_codex_tool_shapes(report, cwd)
     _doctor_replay(report, cwd)

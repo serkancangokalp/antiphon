@@ -13,6 +13,7 @@
     "lib/channel.mjs",
     "lib/identity.mjs",
     "lib/peers.py",
+    "lib/ledger.py",
     "README.md",
     "BACKLOG.md",
     "LICENSE"
