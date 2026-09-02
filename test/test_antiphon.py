@@ -4021,6 +4021,166 @@ class ToolInvocationRetrievalTest(unittest.TestCase):
         self.assertEqual(json.loads(out.getvalue())["result"], answer)
 
 
+class PageHorizonTest(unittest.TestCase):
+    """A reader never lags a source by more than a day of that source's own
+    clock. Measured on the live project: a Claude reader more than 400 pages
+    behind, every page 31 August; bounded to 24 hours, 21 pages. Relative to
+    the source's newest record, not to the wall clock: an overnight run is
+    still there in the morning, and a source that stopped days ago yields its
+    last day rather than nothing or everything.
+    """
+
+    SID = "1d5a03e0-0548-4339-87c3-45c5dbf7e9d7"
+
+    def _rollout(self, times, project=None, filler=0):
+        """One real Codex rollout with an assistant record at each ISO time;
+        `filler` pads every message so a window can span several pages."""
+        root = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, root, ignore_errors=True)
+        path = os.path.join(root, f"rollout-2026-08-28T00-00-00-{self.SID}.jsonl")
+        with open(path, "w", encoding="utf-8") as stream:
+            stream.write(json.dumps({"timestamp": times[0], "type": "session_meta",
+                                     "payload": {"cwd": project or "/tmp/project"}})
+                         + "\n")
+            for index, when in enumerate(times):
+                stream.write(json.dumps({
+                    "timestamp": when, "type": "response_item",
+                    "payload": {"type": "message", "role": "assistant",
+                                "content": [{"type": "output_text",
+                                             "text": f"message {index}"
+                                                     + (" x" * filler)}]}}) + "\n")
+        return path
+
+    @staticmethod
+    def _hourly(hours):
+        return [f"2026-08-{28 + hour // 24:02d}T{hour % 24:02d}:00:00.000Z"
+                for hour in range(hours)]
+
+    def _drain(self, project, path, positions):
+        pages = []
+        with patch.object(antiphon, "codex_rollout_files", return_value=[path]):
+            while len(pages) < 50:
+                text, advance, _ = antiphon.build_summary(
+                    project, "claude", positions, None, None)
+                if not text:
+                    break
+                pages.append(text)
+                sources = dict(positions)
+                for sid, raw in advance.sources.items():
+                    sources[sid] = dict(raw)
+                positions = antiphon.RuntimePositions(
+                    sources, adopting={}, next_lane=advance.next_lane)
+                if not advance.has_more:
+                    break
+        return pages
+
+    def _at_byte_zero(self, path):
+        return antiphon.RuntimePositions(
+            {self.SID: {"gen": antiphon.source_generation(path),
+                        "offset": 0, "anchor": None}})
+
+    def test_a_positioned_reader_skips_what_is_older_than_a_day_of_the_source(self):
+        # Three days of records, one per hour; the reader is positioned at the
+        # very start. Only the last 24 hours of the source's own clock arrive.
+        with tempfile.TemporaryDirectory() as project:
+            path = self._rollout(self._hourly(72), project, filler=300)
+            pages = self._drain(project, path, self._at_byte_zero(path))
+        joined = "\n".join(pages)
+        self.assertNotIn("message 46 ", joined, "older than a day of the newest")
+        self.assertIn("message 47 ", joined, "exactly 24 hours before the newest")
+        self.assertIn("message 71 ", joined)
+        self.assertGreater(len(pages), 1, "the window spans pages, so 'once' means something")
+        self.assertRegex(pages[0], r"skipped: [\d,]+ raw bytes of Codex activity "
+                                   r"older than 24 hours in 1 source\(s\) — not "
+                                   r"delivered; the transcripts keep it")
+        self.assertEqual(sum("skipped:" in page for page in pages), 1,
+                         "announced once, where it happened")
+
+    def test_a_source_within_the_horizon_is_never_skipped(self):
+        with tempfile.TemporaryDirectory() as project:
+            path = self._rollout(self._hourly(23), project)
+            pages = self._drain(project, path, self._at_byte_zero(path))
+        joined = "\n".join(pages)
+        self.assertIn("message 0\n", joined + "\n")
+        self.assertNotIn("skipped:", joined)
+
+    def test_the_skip_lands_on_a_record_boundary_the_anchor_can_prove(self):
+        path = self._rollout(self._hourly(72))
+        with antiphon._PathSource(path, "codex") as source:
+            start, skipped = antiphon._apply_horizon(source, 0)
+            self.assertGreater(skipped, 0)
+            record = source.first_record_at(start)
+            self.assertEqual(record[0], start, "a boundary")
+            self.assertIn("message 47", record[2])
+            self.assertIsNotNone(source.anchor_at(start))
+            self.assertEqual(antiphon._apply_horizon(source, start), (start, 0),
+                             "idempotent")
+
+    def test_first_record_at_reads_boundaries_and_mid_lines_alike(self):
+        path = self._rollout(self._hourly(3))
+        with antiphon._PathSource(path, "codex") as source:
+            first = source.first_record_at(0)
+            self.assertEqual(first[0], 0)
+            self.assertIn("session_meta", first[2])
+            second = source.first_record_at(first[1])
+            self.assertEqual(second[0], first[1], "a boundary starts the record there")
+            inside = source.first_record_at(first[1] + 5)
+            self.assertEqual(inside[0], second[1], "an offset inside a line skips to the next")
+            self.assertIsNone(source.first_record_at(source.size()))
+            self.assertIsNone(source.first_record_at(source.size() + 10))
+
+    def test_bisection_agrees_with_the_linear_scan_on_a_large_source(self):
+        # Enough bytes that the bisecting road is taken; the answer must be the
+        # linear scan's answer, record for record — also with one record near
+        # the boundary stamped out of order, which the slack absorbs.
+        times = [f"2026-08-{28 + hour // 24:02d}T{hour % 24:02d}:{minute:02d}:00.000Z"
+                 for hour in range(72) for minute in range(0, 60, 2)]
+        boundary = times.index("2026-08-30T00:00:00.000Z")
+        # One record stamped after the boundary sits thirty records before
+        # it: the bisection's monotone view steps over it, the slack must not.
+        times[boundary - 30] = "2026-08-30T00:00:30.000Z"
+        path = self._rollout(times, filler=250)
+        with antiphon._PathSource(path, "codex") as source:
+            self.assertGreater(source.size(), antiphon.HORIZON_BISECT_ABOVE)
+            newest = antiphon._source_newest_time(source)
+            horizon = newest - antiphon.PAGE_HORIZON
+            linear = next(start for start, _end, line in source.read_records(0)
+                          if (antiphon._record_time(line) or 0) >= horizon)
+            self.assertEqual(antiphon._first_offset_at_or_after(source, horizon, 0),
+                             linear)
+
+    def test_an_unparseable_newest_record_disables_the_horizon(self):
+        path = self._rollout(self._hourly(72))
+        with open(path, "a", encoding="utf-8") as stream:
+            stream.write('{"type": "event_msg", "payload": {}}\n')
+        with antiphon._PathSource(path, "codex") as source:
+            self.assertIsNone(antiphon._source_newest_time(source))
+            self.assertEqual(antiphon._apply_horizon(source, 0), (0, 0))
+        self.assertIsNone(antiphon._record_time("not json"))
+        self.assertIsNone(antiphon._record_time('{"timestamp": ""}'))
+        self.assertIsNone(antiphon._record_time("[1, 2]"))
+
+    def test_status_counts_what_the_horizon_will_skip(self):
+        with tempfile.TemporaryDirectory() as project:
+            path = self._rollout(self._hourly(72), project)
+            cursor = {"claude_pages_v4": {"v": 4, "sources": {
+                self.SID: {"gen": antiphon.source_generation(path),
+                           "offset": 0, "anchor": None}},
+                "adopting_v3": {}, "next_lane": "active"}}
+            with patch.object(antiphon, "codex_rollout_files", return_value=[path]):
+                unread, positioned, unpositioned, replay, skipped = \
+                    antiphon.reader_backlog(project, "claude", cursor)
+        self.assertGreater(skipped, 0)
+        self.assertGreater(unread, 0)
+        self.assertEqual(positioned, 1)
+        line = antiphon._backlog_line(
+            "claude_pages", (unread, positioned, unpositioned, replay, skipped))
+        self.assertIn(f"{skipped:,} raw bytes older than the 24-hour horizon "
+                      "will be skipped", line)
+        self.assertNotIn("horizon", antiphon._backlog_line(
+            "claude_pages", (unread, positioned, unpositioned, replay, 0)))
+
+
 class LiveCodexTargetTest(unittest.TestCase):
     """A bare `@codex` push goes to a *running* Codex session, never to the
     newest transcript file. Measured on Codex 0.151.0: a thread opened at
@@ -4422,24 +4582,29 @@ class CatchUpTest(unittest.TestCase):
             with self.subTest(case="numeric v1 before its first page"):
                 antiphon.write_cursor(project, {"claude_seen": future}, "claude")
                 cursor, state = antiphon._read_cursor_state(project, "claude")
-                unread, positioned, unpositioned, replay = antiphon.reader_backlog(
+                unread, positioned, unpositioned, replay, _skipped = antiphon.reader_backlog(
                     project, "claude", cursor, state)
                 self.assertEqual(unread, total - size, "only the record at/after the v1 time")
                 self.assertEqual((positioned, unpositioned, replay), (0, 1, "legacy_upgrade"))
 
+            # From here on the page horizon is part of the start rule too: the
+            # 2030 record makes everything before it older than a day of the
+            # source's newest, so a byte-zero restart reads `total` bytes as
+            # `skipped` + `unread`, and only the 2030 record is unread.
             with self.subTest(case="offset past EOF restarts at byte zero"):
-                unread, positioned, unpositioned, _ = self.backlog_after(project, {
+                unread, positioned, unpositioned, _, skipped = self.backlog_after(project, {
                     "v": 3, "sources": {self.SID_CODEX: {"gen": gen, "offset": total + 500}}})
-                self.assertEqual((unread, positioned, unpositioned), (total, 0, 1))
+                self.assertEqual((unread + skipped, positioned, unpositioned), (total, 0, 1))
+                self.assertEqual(skipped, size, "the horizon leaves the 2026 records behind")
 
             with self.subTest(case="generation mismatch restarts at byte zero"):
-                unread, positioned, unpositioned, _ = self.backlog_after(project, {
+                unread, positioned, unpositioned, _, skipped = self.backlog_after(project, {
                     "v": 3, "sources": {self.SID_CODEX: {"gen": "other:gen:0000", "offset": 10}}})
-                self.assertEqual((unread, positioned, unpositioned), (total, 0, 1))
+                self.assertEqual((unread + skipped, positioned, unpositioned), (total, 0, 1))
 
             with self.subTest(case="an anchored v4 position counts the remainder"):
                 first_end = list(antiphon.read_records(codex))[0][1]
-                unread, positioned, unpositioned, _ = self.backlog_after(
+                unread, positioned, unpositioned, _, skipped = self.backlog_after(
                     project, {
                         "v": 4,
                         "sources": {self.SID_CODEX: {
@@ -4450,13 +4615,13 @@ class CatchUpTest(unittest.TestCase):
                         "adopting_v3": {},
                         "next_lane": "active",
                     }, key=antiphon.anchored_page_cursor_key("claude"))
-                self.assertEqual((unread, positioned, unpositioned),
+                self.assertEqual((unread + skipped, positioned, unpositioned),
                                  (total - first_end, 1, 0))
 
             with self.subTest(case="a malformed page key recovers from byte zero: the whole file"):
-                unread, positioned, unpositioned, replay = self.backlog_after(
+                unread, positioned, unpositioned, replay, skipped = self.backlog_after(
                     project, {"v": 999, "sources": {"x": "bad"}})
-                self.assertEqual((unread, positioned, unpositioned, replay),
+                self.assertEqual((unread + skipped, positioned, unpositioned, replay),
                                  (total, 0, 1, "cursor_recovery"))
 
             with self.subTest(case="an unreadable cursor file is unknown, never zero"):
@@ -7646,7 +7811,7 @@ class CatalogDiscoveryTest(unittest.TestCase):
         held = {"gen": "unresolved-generation", "offset": 123}
         cursor = {"codex_pages": {"v": antiphon.PAGE_CURSOR_VERSION,
                                   "sources": {"unresolved": held}}}
-        unread, positioned, unpositioned, replay = antiphon.reader_backlog(
+        unread, positioned, unpositioned, replay, _skipped = antiphon.reader_backlog(
             self.project, "codex", cursor)
         self.assertEqual(unread, sum(os.path.getsize(path)
                                      for _sid, path in sources))

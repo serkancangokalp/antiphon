@@ -334,6 +334,16 @@ only when it has no `discovery: building` or `discovery: degraded` line. Either
 marker makes the incomplete discovery boundary explicit instead of allowing a
 newest-file fallback to masquerade as project completeness.
 
+A page never carries a record older than 24 hours of its source's newest
+complete record. A reader that fell further behind skips to that point: the
+page says `skipped: N raw bytes of … activity older than 24 hours …` once,
+where it happened, `status` counts what the next page will skip, and the
+transcripts keep what was skipped. Measured before the horizon existed, a
+reader more than 400 pages behind delivered a day-old page on every turn;
+bounded to a day it delivers 21. A brand-new reader still starts 6 hours
+back, and `antiphon catch-up` remains the way to skip to the live edge at
+once.
+
 The catalog lives under `.antiphon/sources/` as small state, immutable
 generation manifests and partitioned per-candidate records; it stores paths and
 fingerprints, never transcript content. Each hook records its own current

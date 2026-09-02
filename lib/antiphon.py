@@ -79,7 +79,19 @@ TAIL_BYTES = 300_000      # amount to read from the tail of each transcript file
 EVENT_LIMIT = 40          # completed source records per page
 PAGE_BUDGET = 8_000       # UTF-8 bytes in an ordinary complete page envelope
 RECENT_FILES = 3          # bounded fallback/current-window discovery per side
-LOOKBACK = 6 * 3600       # anything older than this doesn't count as part of "this session"
+LOOKBACK = 6 * 3600       # a new reader starts this far back
+# A positioned reader never lags a source by more than this much of the
+# source's own clock: undelivered records older than the source's newest
+# complete record minus this are skipped, counted and announced. Relative to
+# the source, not to the wall: an overnight run is still there in the
+# morning, and a source that stopped days ago yields its last day. Measured
+# before this existed: a reader more than 400 pages behind, every page a
+# day old, 2,000 tokens per turn spent on history nobody asked for; bounded
+# to a day, 21 pages.
+PAGE_HORIZON = 24 * 3600
+HORIZON_BISECT_ABOVE = 1024 * 1024     # bytes of unread span before bisecting
+HORIZON_BISECT_STEP = 4096             # the bisection converges to this span
+HORIZON_BISECT_SLACK = 256 * 1024      # then the linear scan resumes this far back
 CATALOG_VERSION = 1
 CATALOG_BATCH = 8
 ANCHOR_HASH_CHUNK = 64 * 1024
@@ -1479,6 +1491,31 @@ def _anchor_from_stream(stream, offset):
     return {"start": start, "sha256": digest.hexdigest()}
 
 
+def _first_record_from_stream(stream, offset):
+    """The first complete record starting at or after `offset` in a binary
+    stream, as `(start, end, line)`, or None.
+
+    An offset inside a line skips to the next line; an offset that is a
+    boundary — byte zero, or one just after a newline — starts the record
+    there. The byte before `offset` decides which, so a trusted cursor
+    position is never mistaken for the middle of the record it begins.
+    """
+    if not isinstance(offset, int) or isinstance(offset, bool) or offset < 0:
+        return None
+    position = offset
+    stream.seek(max(0, offset - 1))
+    if offset > 0:
+        if stream.read(1) != b"\n":
+            rest = stream.readline()
+            if not rest.endswith(b"\n"):
+                return None
+            position = offset + len(rest)
+    raw = stream.readline()
+    if not raw.endswith(b"\n"):
+        return None
+    return position, position + len(raw), raw[:-1].decode("utf-8", "replace")
+
+
 def _retrieval_records_from_stream(stream):
     """Yield the raw bytes of every record in one captured complete prefix.
 
@@ -1646,6 +1683,13 @@ class SafeSource:
         except OSError:
             return None
 
+    def first_record_at(self, offset):
+        try:
+            with self._reader() as stream:
+                return _first_record_from_stream(stream, offset)
+        except OSError:
+            return None
+
     def size(self):
         try:
             return os.fstat(self.fd).st_size
@@ -1796,6 +1840,13 @@ class _PathSource:
         try:
             with open(self.path, "rb") as stream:
                 return _anchor_from_stream(stream, offset)
+        except OSError:
+            return None
+
+    def first_record_at(self, offset):
+        try:
+            with open(self.path, "rb") as stream:
+                return _first_record_from_stream(stream, offset)
         except OSError:
             return None
 
@@ -2955,6 +3006,89 @@ def _source_offset_at_or_after(source, timestamp):
     return end
 
 
+def _record_time(line):
+    """The record's own timestamp as an epoch float, or None.
+
+    Both hosts stamp every record at the top level. A record without one, or
+    with one that does not parse, has no time — never zero, which would read
+    as 1970 and skip it."""
+    try:
+        record = json.loads(line)
+    except ValueError:
+        return None
+    if not isinstance(record, dict):
+        return None
+    stamp = record.get("timestamp")
+    if not isinstance(stamp, str) or not stamp:
+        return None
+    return iso_epoch(stamp) or None
+
+
+def _source_newest_time(source):
+    """The timestamp of the source's last complete record, or None when it
+    has none or that record carries none — and then there is no horizon."""
+    end = source.complete_prefix_end()
+    if not end:
+        return None
+    anchor = source.anchor_at(end)
+    if anchor is None:
+        return None
+    record = source.first_record_at(anchor["start"])
+    return _record_time(record[2]) if record else None
+
+
+def _first_offset_at_or_after(source, timestamp, start):
+    """The start of the first record at or after `timestamp`, searching from
+    the record boundary `start`; the complete-prefix end when there is none.
+
+    Bisects over record boundaries when the span is large — a reader can be
+    a hundred megabytes behind — then scans the last slack linearly, so a
+    local misorder of timestamps costs a few repeated records rather than
+    skipped ones. Both hosts append records in time order; a misorder wider
+    than the slack is the stated residual."""
+    size = source.complete_prefix_end()
+    lo, hi = start, size
+    if hi - lo > HORIZON_BISECT_ABOVE:
+        while hi - lo > HORIZON_BISECT_STEP:
+            mid = (lo + hi) // 2
+            record = source.first_record_at(mid)
+            if record is None or record[0] >= hi:
+                hi = mid
+                continue
+            when = _record_time(record[2])
+            if when is not None and when >= timestamp:
+                hi = record[0]
+            else:
+                lo = record[1]
+        lo = max(start, lo - HORIZON_BISECT_SLACK)
+        boundary = source.first_record_at(lo)
+        lo = boundary[0] if boundary else lo
+    for record_start, _end, line in source.read_records(lo):
+        when = _record_time(line)
+        if when is not None and when >= timestamp:
+            return record_start
+    return size
+
+
+def _apply_horizon(source, start):
+    """`(start, skipped)`: a trusted start moved forward to the first record
+    within PAGE_HORIZON of the source's newest complete record, and how many
+    raw bytes that left behind. Nothing moves when the source has no readable
+    newest time or the next record is already inside the window."""
+    newest = _source_newest_time(source)
+    if newest is None:
+        return start, 0
+    horizon = newest - PAGE_HORIZON
+    first = source.first_record_at(start)
+    if first is None:
+        return start, 0
+    when = _record_time(first[2])
+    if when is None or when >= horizon:
+        return start, 0
+    landing = _first_offset_at_or_after(source, horizon, start)
+    return landing, max(0, landing - start)
+
+
 def _source_size(path):
     """The file's size, or None when it could not be measured at all.
 
@@ -3211,7 +3345,7 @@ def claude_transcripts(cwd):
 
 
 def claude_events(cwd, positions=None, since=None, visible_record_limit=None,
-                  source_paths=None):
+                  source_paths=None, skipped=None):
     """Return visible events and the safe scanned position for each source.
 
     A completed JSONL record consumes at most one visible lookahead slot even
@@ -3231,6 +3365,12 @@ def claude_events(cwd, positions=None, since=None, visible_record_limit=None,
             visible_records = 0
             sid, gen = source.source, source.generation
             offset = _start_source_offset(source, positions, since)
+            # The horizon, after every start rule: a reader never lags this
+            # source by more than PAGE_HORIZON of its own clock, and what it
+            # leaves behind is counted for the page to say so.
+            offset, cut = _apply_horizon(source, offset)
+            if cut and skipped is not None:
+                skipped[sid] = skipped.get(sid, 0) + cut
             previous_anchor = source.anchor_at(offset) if offset else None
             if gen is not None:
                 reached[sid] = {
@@ -3498,7 +3638,7 @@ def _codex_tool_shape_count(cwd, discovery=None, source_paths=None):
 
 
 def codex_events(cwd, positions=None, since=None, visible_record_limit=None,
-                 source_paths=None):
+                 source_paths=None, skipped=None):
     """Return visible events and the safe scanned position for each rollout."""
     events = []
     reached = {}
@@ -3513,6 +3653,12 @@ def codex_events(cwd, positions=None, since=None, visible_record_limit=None,
             visible_records = 0
             sid, gen = source.source, source.generation
             offset = _start_source_offset(source, positions, since)
+            # The horizon, after every start rule: a reader never lags this
+            # source by more than PAGE_HORIZON of its own clock, and what it
+            # leaves behind is counted for the page to say so.
+            offset, cut = _apply_horizon(source, offset)
+            if cut and skipped is not None:
+                skipped[sid] = skipped.get(sid, 0) + cut
             previous_anchor = source.anchor_at(offset) if offset else None
             if gen is not None:
                 reached[sid] = {
@@ -3954,7 +4100,7 @@ def _append_page_section(text, section):
 
 
 def _render_page(side, records, has_more, replay_reason, join=None,
-                 discovery=None):
+                 discovery=None, skipped=None):
     """Render the exact visible envelope whose UTF-8 size is page-bounded."""
     # Over the SELECTED records, never the candidates. The measured shape of a
     # real page is two sources discovered and one delivered — 55 of 60 — and a
@@ -3987,6 +4133,13 @@ def _render_page(side, records, has_more, replay_reason, join=None,
     if discovery is not None and discovery.state != "complete":
         text = _append_page_section(
             text, f"discovery: {discovery.state} — {discovery.reason}")
+    if skipped:
+        # Once, on the page where it happened; the cursor then stands past
+        # what was skipped and the next page has nothing to announce.
+        text = _append_page_section(text, (
+            f"skipped: {sum(skipped.values()):,} raw bytes of {name} activity "
+            f"older than {PAGE_HORIZON // 3600} hours in {len(skipped)} "
+            "source(s) — not delivered; the transcripts keep it"))
     if replay_reason is not None:
         text = _append_page_section(text, REPLAY_NOTICES[replay_reason])
     for record in records:
@@ -4061,7 +4214,7 @@ def _page_frontier(records, selected, scanned):
 
 
 def _build_page(events, scanned, side, replay_reason=None, join=None,
-                discovery=None, next_lane="active"):
+                discovery=None, next_lane="active", skipped=None):
     """Build one bounded, whole-record page and its safe source frontier."""
     if replay_reason not in REPLAY_NOTICES and replay_reason is not None:
         raise ValueError("unknown replay reason")
@@ -4074,13 +4227,20 @@ def _build_page(events, scanned, side, replay_reason=None, join=None,
                 return text, None, 0
             return "", None, 0
         if replay_reason is None:
+            if skipped:
+                # Nothing left inside the window, but something was skipped
+                # to get here: a page that says so, never a silent advance.
+                text = _render_page(side, [], False, None, NO_SESSION_JOIN,
+                                    discovery, skipped)
+                return text, PageAdvance(
+                    dict(scanned), False, None, next_lane), 0
             return "", PageAdvance(
                 dict(scanned), False, None, next_lane), 0
         # No records, so no sources and nothing to label. The join this
         # replay would have used says the same thing; passing the empty one
         # says it where a reader can see it.
         text = _render_page(side, [], False, replay_reason, NO_SESSION_JOIN,
-                            discovery)
+                            discovery, skipped)
         return text, PageAdvance(
             dict(scanned), False, replay_reason, next_lane), 0
 
@@ -4103,7 +4263,7 @@ def _build_page(events, scanned, side, replay_reason=None, join=None,
             dead if scheduled == "active" else active))
         candidate = _render_page(
             side, candidates[:length], has_more, replay_reason,
-            join, discovery)
+            join, discovery, skipped)
         if len(candidate.encode("utf-8")) <= PAGE_BUDGET:
             selected = length
             text = candidate
@@ -4113,7 +4273,7 @@ def _build_page(events, scanned, side, replay_reason=None, join=None,
         has_more = selected < len(candidates) or mixed
         text = _render_page(
             side, candidates[:selected], has_more,
-            replay_reason, join, discovery)
+            replay_reason, join, discovery, skipped)
 
     chosen = candidates[:selected]
     has_more = selected < len(candidates) or mixed
@@ -4141,14 +4301,15 @@ def build_summary(cwd, side, positions=None, since=None, replay_reason=None,
         discovery = discovery._replace(
             state="degraded", refusals=max(1, discovery.refusals),
             reason="some project sources could not be proved")
+    skipped = {}
     if side == "claude":
         events, reached = codex_events(
             cwd, positions, since, visible_record_limit=EVENT_LIMIT + 1,
-            source_paths=discovery.sources)
+            source_paths=discovery.sources, skipped=skipped)
     else:
         events, reached = claude_events(
             cwd, positions, since, visible_record_limit=EVENT_LIMIT + 1,
-            source_paths=discovery.sources)
+            source_paths=discovery.sources, skipped=skipped)
     expected = {
         (path.candidate.expected_source
          if isinstance(path, DiscoveredSourcePath) else source_id(path))
@@ -4171,7 +4332,7 @@ def build_summary(cwd, side, positions=None, since=None, replay_reason=None,
     join = _session_join(cwd, OTHER_SIDE[side][0])
     return _build_page(
         events, reached, side, replay_reason, join, discovery,
-        getattr(positions, "next_lane", "active"))
+        getattr(positions, "next_lane", "active"), skipped)
 
 
 # ---------- hook (both sides share the same contract) ----------
@@ -7982,12 +8143,15 @@ def _backlog_line(key, backlog):
     if backlog is None:
         return (f"unread {key}: unknown (the cursor could not be trusted; "
                 "the next turn replays)")
-    unread, positioned, unpositioned, replay = backlog
+    unread, positioned, unpositioned, replay, skipped = backlog
     line = (f"unread {key}: {unread:,} raw bytes across "
             f"{positioned + unpositioned} "
             f"source{'' if positioned + unpositioned == 1 else 's'}")
     if unpositioned:
         line += f"; {unpositioned} not yet positioned"
+    if skipped:
+        line += (f"; {skipped:,} raw bytes older than the "
+                 f"{PAGE_HORIZON // 3600}-hour horizon will be skipped")
     if replay:
         line += " — replaying history; `antiphon catch-up` skips it"
     return line
@@ -9214,10 +9378,12 @@ CATCH_UP_SOURCES = {"claude": "codex", "codex": "claude"}
 def reader_backlog(cwd, side, cursor, cursor_state="valid"):
     """How far one side's page reader is behind, in the unit that is true.
 
-    `(unread, positioned, unpositioned, replay)`: raw transcript bytes the
-    reader has still to read across the discovered sources — each counted
-    from where `_resolve_start` says the reader will actually start, the
-    same rule the reader runs — how many of those sources start from a
+    `(unread, positioned, unpositioned, replay, skipped)`: raw transcript
+    bytes the reader has still to read across the discovered sources — each
+    counted from where `_resolve_start` says the reader will actually start
+    and the page horizon then moves it, the same rules the reader runs —
+    `skipped` being the raw bytes the horizon leaves behind; how many of
+    those sources start from a
     trusted recorded position, how many do not (placed by time, restarted at
     byte zero for a replaced generation or an offset past EOF, or never
     positioned), and the replay marker if any. Raw bytes, never pages: a
@@ -9233,7 +9399,7 @@ def reader_backlog(cwd, side, cursor, cursor_state="valid"):
     positions, since, replay = positions_for(cursor, side, cursor_state)
     kind = CATCH_UP_SOURCES[side]
     discovery = _discover_sources(cwd, kind, side, positions, since)
-    unread, positioned, unpositioned = 0, 0, 0
+    unread, positioned, unpositioned, skipped = 0, 0, 0, 0
     for path in discovery.sources:
         opened = _open_discovered_source(path, cwd, kind)
         if isinstance(opened, SourceRefusal):
@@ -9243,12 +9409,14 @@ def reader_backlog(cwd, side, cursor, cursor_state="valid"):
             if size is None:
                 continue
             start, reason = _resolve_source_start(source, positions, since)
+            start, cut = _apply_horizon(source, start)
+            skipped += cut
             unread += max(0, size - start)
             if reason == "positioned":
                 positioned += 1
             else:
                 unpositioned += 1
-    return unread, positioned, unpositioned, replay
+    return unread, positioned, unpositioned, replay, skipped
 
 
 def catch_up(side=None):

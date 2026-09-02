@@ -450,6 +450,8 @@ class ShippedContractTest(unittest.TestCase):
         self.assertEqual(antiphon.PAGE_BUDGET, 8_000)
         self.assertEqual(antiphon.EVENT_LIMIT, 40)
         self.assertEqual(antiphon.RECENT_FILES, 3)
+        self.assertEqual(antiphon.PAGE_HORIZON, 24 * 3600)
+        self.assertEqual(antiphon.LOOKBACK, 6 * 3600)
         self.assertEqual(antiphon.PAGE_CURSOR_VERSION, 3)
         for side in ("claude", "codex"):
             self.assertEqual(antiphon.page_cursor_key(side), side + "_pages")
@@ -472,7 +474,11 @@ class ShippedContractTest(unittest.TestCase):
                 ("the catalog hook batch",
                  (str(antiphon.CATALOG_BATCH), "candidate", "records", "per", "hook")),
                 ("the direct-channel cap",
-                 (str(antiphon.MAX_CHANNEL_BYTES // 1024), "KiB"))):
+                 (str(antiphon.MAX_CHANNEL_BYTES // 1024), "KiB")),
+                ("the page horizon",
+                 ("older", "than", str(antiphon.PAGE_HORIZON // 3600), "hours")),
+                ("the new-reader lookback",
+                 (str(antiphon.LOOKBACK // 3600), "hours", "back"))):
             self.assertRegex(limits, r"\s+".join(map(re.escape, words)), what)
         self.assertRegex(
             limits, r"(?i)8,000 UTF-8 bytes[^.]*measured[^.]*not a\s+permanent",
