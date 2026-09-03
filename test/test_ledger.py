@@ -47,7 +47,8 @@ class LedgerTest(unittest.TestCase):
             path = os.path.join(ledger.ledger_dir(project), UUID + ".json")
             self.assertEqual(os.stat(path).st_mode & 0o777, 0o600)
             self.assertEqual(os.stat(ledger.ledger_dir(project)).st_mode & 0o777, 0o700)
-            raw = open(path, "rb").read().decode()
+            with open(path, "rb") as stream:
+                raw = stream.read().decode()
             self.assertNotIn("run the suite", raw, "never the content")
             self.assertNotIn("antiphon-channel-", raw, "never a route")
             uuids = set(re.findall(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}", raw))
@@ -100,6 +101,19 @@ class LedgerTest(unittest.TestCase):
             self.assertEqual(ledger.last_unanswered_sender(project, "claude", "ui", 200.0),
                              ("api", 100.0), "unfiltered, the newest of any kind")
 
+    def test_an_update_that_would_break_the_entry_is_refused_not_written(self):
+        """Round-2 review 2026-09-03: `_update` wrote whatever a mutate left
+        behind. No caller leaves an invalid entry today; if one did, the file
+        would be one the next reader skips — the delivery gone from the
+        ledger without a word."""
+        with tempfile.TemporaryDirectory() as project:
+            self._sent(project)
+            self.assertFalse(ledger._update(project, UUID,
+                                            lambda entry: entry.update(read_at="soon")))
+            entry = ledger.read_entry(project, UUID)
+            self.assertIsNotNone(entry, "the file is still an entry")
+            self.assertIsNone(entry["read_at"])
+
     def test_a_malformed_entry_is_skipped_never_raised(self):
         with tempfile.TemporaryDirectory() as project:
             self._sent(project)
@@ -123,10 +137,18 @@ class LedgerTest(unittest.TestCase):
             self.assertIsNone(ledger.read_entry(project, OTHER))
             self.assertIsNone(ledger.read_entry(project, THIRD))
             self.assertIsNone(ledger.read_entry(project, deep))
+            # 3.14's parser takes that nesting as a list, so the guard is
+            # exercised there only when the parser is made to raise what
+            # 3.9's did: pinned on every interpreter (round-2 review).
+            with patch.object(ledger.json, "loads",
+                              side_effect=RecursionError("maximum recursion depth exceeded")):
+                self.assertIsNone(ledger.read_entry(project, UUID))
+                self.assertEqual(ledger.entries(project), [])
             # Well-formed JSON that is not an entry: every one is refused by
             # the validator, not by the parser, so a validator that stopped
             # looking would let each of them onto the ledger.
-            good = json.load(open(os.path.join(directory, UUID + ".json")))
+            with open(os.path.join(directory, UUID + ".json")) as stream:
+                good = json.load(stream)
             for label, mutate in (
                     ("wrong kind", lambda e: e.update(to_kind="gemini")),
                     ("future version", lambda e: e.update(version=2)),
@@ -326,9 +348,11 @@ class LedgerTest(unittest.TestCase):
                 transport="queue", proof="live", sha256=SHA, size=1, at=1e300))
             self._sent(project, UUID)
             path = os.path.join(ledger.ledger_dir(project), UUID + ".json")
-            entry = json.load(open(path))
+            with open(path) as stream:
+                entry = json.load(stream)
             entry["sent_at"] = 1e300
-            json.dump(entry, open(path, "w"))
+            with open(path, "w") as stream:
+                json.dump(entry, stream)
             self.assertIsNone(ledger.read_entry(project, UUID))
             self.assertEqual(ledger.pending_notices(project, "claude", "ui"), [])
 
@@ -365,7 +389,8 @@ class LedgerTest(unittest.TestCase):
             # the read still wins.
             entry["expired_unread_at"] = 700_000.0
             path = os.path.join(ledger.ledger_dir(project), UUID + ".json")
-            json.dump(entry, open(path, "w"))
+            with open(path, "w") as stream:
+                json.dump(entry, stream)
             self.assertEqual(ledger.pending_notices(project, "claude", "ui"), [])
 
     def test_a_read_file_is_never_reused(self):
@@ -374,7 +399,8 @@ class LedgerTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as project:
             store = os.path.join(project, ".antiphon", "messages")
             os.makedirs(store, mode=0o700)
-            open(os.path.join(store, "a.txt"), "w").write("[Antiphon attachment]\n\nz")
+            with open(os.path.join(store, "a.txt"), "w") as stream:
+                stream.write("[Antiphon attachment]\n\nz")
             self._sent(project, UUID, attachment="a.txt", at=100.0)
             self.assertEqual(ledger.reusable_attachment(project, SHA, "codex", "build", 200.0),
                              "a.txt")
@@ -457,7 +483,8 @@ class LedgerTest(unittest.TestCase):
             store = os.path.join(project, ".antiphon", "messages")
             os.makedirs(store, mode=0o700)
             for name in ("a.txt", "b.txt"):
-                open(os.path.join(store, name), "w").write("[Antiphon attachment]\n\nz")
+                with open(os.path.join(store, name), "w") as stream:
+                    stream.write("[Antiphon attachment]\n\nz")
             self._sent(project, UUID, sender="ui", sender_kind="claude", attachment="a.txt",
                        at=100.0)
             self._sent(project, OTHER, sender="ui", sender_kind="codex", attachment="b.txt",

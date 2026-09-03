@@ -5419,6 +5419,20 @@ class DeliveryReceiptTest(unittest.TestCase):
             self.assertNotIn("more notice", context)
             self.assertEqual(self._hook(project, "claude"), (0, ""), "all told")
 
+    def test_one_waiting_notice_is_said_in_the_singular(self):
+        with tempfile.TemporaryDirectory() as project:
+            ids = [f"{index:08x}-0000-4000-8000-000000000000" for index in range(9)]
+            now = time.time()
+            for index, delivery in enumerate(ids):
+                ledger.record_refused(project, delivery, sender="<unnamed>", to_kind="codex",
+                                      to_alias=None, reason="not delivered: nobody",
+                                      preview=f"line {index}", at=now - 100 + index)
+            code, out = self._hook(project, "claude")
+            self.assertEqual(code, 0)
+            context = self._context(out)
+            self.assertTrue(context.endswith(
+                "Antiphon: 1 more notice waits; the next turn carries it"), context)
+
     def test_a_read_by_the_wrong_peer_of_the_right_kind_is_not_the_recipients(self):
         """Review 2026-09-03: Claude parks words for Codex `build`; Codex
         `review` opens the file, which sits in the shared project
@@ -5439,20 +5453,58 @@ class DeliveryReceiptTest(unittest.TestCase):
             self._session(project, "codex", "review", review_sid)
             self._session(project, "codex", "build", self.CODEX_SID)
             reading = self._codex_call(json.dumps({"command": ["cat", store]}))
-            review = self._codex_rollout(project, [reading], sid=review_sid)
+            # The words themselves, injected into review's thread by mistake
+            # or quoted there: a `received` receipt is scoped like a read.
+            injected = [self._codex_message(
+                "user", f"{antiphon.PUSH_LABEL} [from=ui id={mid}] words")
+                for mid in (self.MID, other)]
+            review = self._codex_rollout(project, [reading, *injected], sid=review_sid)
             self.assertEqual(self._hook(project, "claude", codex=[review])[0], 0)
             self.assertIsNone(ledger.read_entry(project, self.MID)["read_at"],
                               "review is not build")
+            self.assertIsNone(ledger.read_entry(project, self.MID)["received_at"],
+                              "received is scoped like read: review is not build")
             self.assertIsNotNone(ledger.read_entry(project, other)["read_at"],
                                  "a bare delivery: any Codex")
+            self.assertIsNotNone(ledger.read_entry(project, other)["received_at"])
             stranger = self._codex_rollout(project, [reading], sid=stranger_sid)
             self.assertEqual(self._hook(project, "claude", codex=[stranger])[0], 0)
             self.assertIsNone(ledger.read_entry(project, self.MID)["read_at"],
                               "a rollout nobody can name is not build either")
-            build = self._codex_rollout(project, [reading])
+            build = self._codex_rollout(project, [reading, injected[0]])
             self.assertEqual(self._hook(project, "claude", codex=[build])[0], 0)
             self.assertIsNotNone(ledger.read_entry(project, self.MID)["read_at"],
                                  "the receiver, off its own rollout")
+            self.assertIsNotNone(ledger.read_entry(project, self.MID)["received_at"])
+
+    def test_a_delivery_to_an_automatic_codex_alias_keeps_its_receipt_after_the_session_exits(self):
+        """Round-2 review 2026-09-03: an automatic Codex alias is a digest of
+        the host id the hook observed, so that session's rollout names its
+        writer whether or not a writer lock still proves it live. Measured
+        before this: Codex `readers` came from session records — none carries
+        the automatic name — and from the positively live projection alone,
+        so the receipt off an exited session's rollout credited nothing,
+        `status` awaited forever and the parked file's read grace never
+        started."""
+        alias = antiphon.peers.auto_identity(self.CODEX_SID)[0]
+        with tempfile.TemporaryDirectory() as project:
+            store = os.path.join(project, ".antiphon", "messages", self.ATTACHMENT)
+            ledger.record_sent(project, self.MID, sender="ui", to_kind="codex", to_alias=alias,
+                               transport="queue", proof="live", sha256="a" * 64, size=5,
+                               attachment=self.ATTACHMENT)
+            self.assertTrue(antiphon.peers.write_observation(project, self.CODEX_SID))
+            rollout = self._codex_rollout(project, [
+                self._codex_call(json.dumps({"command": ["cat", store]})),
+                self._codex_message("user", f"{antiphon.PUSH_LABEL} [from=ui id={self.MID}] words")])
+            # No lock: the session has exited (or was never proved live).
+            with patch.object(antiphon, "codex_thread_alive", return_value=None):
+                self.assertEqual(self._hook(project, "claude", codex=[rollout])[0], 0)
+            entry = ledger.read_entry(project, self.MID)
+            self.assertIsNotNone(entry["read_at"], "the observation names the writer, live or not")
+            self.assertIsNotNone(entry["received_at"])
+            self.assertNotIn("awaiting receipt", antiphon._delivery_report(project, time.time()))
+            self.assertEqual(ledger.read_times(project), {self.ATTACHMENT: entry["read_at"]},
+                             "the parked file's read grace starts")
 
     def test_a_ledger_that_cannot_be_written_is_said_in_the_result(self):
         with tempfile.TemporaryDirectory() as project:
@@ -5960,14 +6012,45 @@ class PageHorizonTest(unittest.TestCase):
             self.assertEqual(antiphon._first_offset_at_or_after(source, horizon, 0),
                              linear)
 
-    def test_an_unparseable_newest_record_disables_the_horizon(self):
+    def test_the_newest_time_is_the_last_dated_records_and_none_without_one(self):
+        """Round-2 review 2026-09-03: the last record alone decided, so a
+        source ending on undated bookkeeping — `file-history-snapshot`, 101
+        of 526 measured Claude transcripts — fell out of the horizon and was
+        delivered whole. The newest time is the last dated record's, sought
+        backwards within NEWEST_TIME_WINDOW; a source with no dated record in
+        that window has none, and then there is no horizon from it."""
         path = self._rollout(self._hourly(72))
+        with antiphon._PathSource(path, "codex") as source:
+            dated = antiphon._source_newest_time(source)
+        self.assertIsNotNone(dated)
         with open(path, "a", encoding="utf-8") as stream:
             stream.write('{"type": "event_msg", "payload": {}}\n')
+            stream.write('{"type": "file-history-snapshot", "timestamp": ""}\n')
         with antiphon._PathSource(path, "codex") as source:
+            self.assertEqual(antiphon._source_newest_time(source), dated)
+        self.assertEqual(antiphon._reader_horizon("/tmp/project", "codex", [path]),
+                         dated - antiphon.PAGE_HORIZON)
+        bare = os.path.join(os.path.dirname(path),
+                            "rollout-2026-08-29T00-00-00-2e6b14f1-1659-544a-98d4-56d6eca8fa48.jsonl")
+        with open(bare, "w", encoding="utf-8") as stream:
+            stream.write('{"type": "event_msg", "payload": {}}\n' * 3)
+        with antiphon._PathSource(bare, "codex") as source:
             self.assertIsNone(antiphon._source_newest_time(source))
-            self.assertIsNone(antiphon._reader_horizon("/tmp/project", "codex", [path]))
+            self.assertIsNone(antiphon._reader_horizon("/tmp/project", "codex", [bare]))
             self.assertEqual(antiphon._apply_horizon(source, 0, None), (0, 0))
+        # The window bounds the walk: a dated record further back than it
+        # is not sought, and the source then has no readable newest time.
+        with open(path, "a", encoding="utf-8") as stream:
+            for _ in range(64):
+                stream.write('{"type": "event_msg", "payload": {"pad": "%s"}}\n' % ("x" * 80))
+        with patch.object(antiphon, "NEWEST_TIME_WINDOW", 4096), \
+             patch.object(antiphon, "NEWEST_TIME_CHUNK", 1024), \
+             antiphon._PathSource(path, "codex") as source:
+            self.assertIsNone(antiphon._source_newest_time(source))
+        with patch.object(antiphon, "NEWEST_TIME_CHUNK", 1024), \
+             antiphon._PathSource(path, "codex") as source:
+            self.assertEqual(antiphon._source_newest_time(source), dated,
+                             "chunk by chunk, past a record longer than a chunk")
         self.assertIsNone(antiphon._record_time("not json"))
         self.assertIsNone(antiphon._record_time('{"timestamp": ""}'))
         self.assertIsNone(antiphon._record_time("[1, 2]"))
@@ -6173,6 +6256,53 @@ class PageHorizonTest(unittest.TestCase):
                  patch.object(antiphon, "HORIZON_BISECT_SLACK", 256):
                 self.assertGreater(source.complete_prefix_end(), 2048)
                 self.assertEqual(antiphon._apply_horizon(source, 0, horizon), linear)
+
+    def test_the_bisection_keeps_its_slack_when_the_probe_walks_to_a_dated_record(self):
+        """Round-2 review 2026-09-03: `lo` moved to the end of the dated
+        record an undated probe walked to, so the slack the linear scan
+        resumes from was measured from there, and a dated record inside the
+        horizon up to a slack before the undated one was skipped. Synthetic
+        — the stated residual shape, a misorder straddling the horizon, never
+        observed — kept from getting worse than stated: the landing is the
+        linear scan's."""
+        horizon = antiphon.iso_epoch("2026-09-02T00:00:00.000Z")
+
+        def dated(stamp, size):
+            record = {"timestamp": stamp, "type": "response_item",
+                      "payload": {"type": "message", "role": "user",
+                                  "content": [{"type": "input_text", "text": ""}]}}
+            record["payload"]["content"][0]["text"] = "x" * (size - len(json.dumps(record)) - 1)
+            line = json.dumps(record)
+            self.assertEqual(len(line) + 1, size)
+            return line + "\n"
+
+        def undated(size):
+            record = {"type": "event_msg", "payload": {"type": "token_count", "note": ""}}
+            record["payload"]["note"] = "x" * (size - len(json.dumps(record)) - 1)
+            line = json.dumps(record)
+            self.assertEqual(len(line) + 1, size)
+            return line + "\n"
+
+        before, inside = "2026-09-01T00:00:00.000Z", "2026-09-02T01:00:00.000Z"
+        body = "".join(dated(before, 200) for _ in range(20))   # 0–4000: before the horizon
+        body += dated(inside, 200)                               # 4000: inside it — the landing
+        body += undated(200)                                     # 4200: the probe
+        body += dated("2026-09-01T23:00:00.000Z", 200)           # 4400: dated, before the horizon
+        body += "".join(dated(inside, 200) for _ in range(18))   # 4600–8200: inside
+        root = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, root, ignore_errors=True)
+        path = os.path.join(root, f"rollout-2026-09-02T00-00-00-{self.SID}.jsonl")
+        with open(path, "w", encoding="utf-8") as stream:
+            stream.write(body)
+        with antiphon._PathSource(path, "codex") as source:
+            self.assertEqual(source.complete_prefix_end(), 8200)
+            self.assertEqual(antiphon._first_offset_at_or_after(source, horizon, 0), 4000,
+                             "the linear scan")
+            with patch.object(antiphon, "HORIZON_BISECT_ABOVE", 4096), \
+                 patch.object(antiphon, "HORIZON_BISECT_STEP", 256), \
+                 patch.object(antiphon, "HORIZON_BISECT_SLACK", 512):
+                self.assertEqual(antiphon._first_offset_at_or_after(source, horizon, 0), 4000,
+                                 "the bisection, whose first probe is the undated record")
 
     def test_a_degraded_page_without_records_still_announces_the_skip(self):
         degraded = antiphon.Discovery((), "degraded", 0, 1, 0,

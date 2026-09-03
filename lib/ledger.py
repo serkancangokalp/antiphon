@@ -321,6 +321,10 @@ def _locked(cwd):
 
 
 def _update(cwd, delivery_id, mutate):
+    """Read, `mutate`, validate, write, under the lock. A mutate that leaves
+    the entry invalid is refused, never written: the next reader would skip
+    the file and the delivery would be gone from the ledger without a word
+    (round-2 review, 2026-09-03; no caller does it today)."""
     with _locked(cwd):
         entry = read_entry(cwd, delivery_id)
         if entry is None:
@@ -330,6 +334,8 @@ def _update(cwd, delivery_id, mutate):
             return False
         if changed == entry:
             return True
+        if not _valid(changed, delivery_id):
+            return False
         return _write(cwd, changed)
 
 
