@@ -4,12 +4,19 @@ Last reviewed: 2026-09-02
 
 ## Start here
 
-**Where this stands.** `main` carries **0.4.0** with the automatic-identity
-repair merged and certified — full suite, statics and `fresh-user.sh` all green
-on the commit `main` points at. **npm still serves 0.3.3**, and the hold is
-deliberate: see *P1 — 0.4.0 is on `main` and held back from npm* below for the
-reason and for what resuming would take. Nothing is half-applied and nothing is
-waiting on a decision inside the code.
+**Where this stands (2026-09-03).** `main` carries **0.5.0**: the final
+campaign of 2026-09-02/03 melted every open item — the mixed-version endpoint
+pruning (P0), the token cost of the passive page and the static surfaces, the
+delivery truth (a ledger, receipts from the peer's own transcript, "queued"
+where a queue is all there is), same-vendor bridging (Claude ↔ Claude, Codex ↔
+Codex, always by name) and the managed-worker MVP — each in its own worktree,
+each merged after an independent read-only review closed on it, each certified
+by both Python suites, the Node suite, the statics and `fresh-user.sh` from a
+temporary worktree at the exact commit. **npm still serves 0.3.3**: nothing
+here was pushed or published; that is the person's own step, after the Codex
+review over the bridge — which was attempted and is still queued in a Codex
+thread that has not taken a turn (the queue measurement of the delivery-truth
+entry, live).
 
 **Mixed-version pruning** (a 0.3.x reader deleting current endpoints; a
 listener whose in-memory Node and on-disk Python disagree being told it
