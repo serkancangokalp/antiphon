@@ -7004,6 +7004,42 @@ class DoctorTest(unittest.TestCase):
         self.assertTrue(self.line_for(printed, "CLAUDE.md").startswith(
             "✗ CLAUDE.md: the Antiphon section has no end marker"), printed)
 
+    def test_a_persons_note_that_quotes_a_shipped_sentence_is_not_the_sections_end(self):
+        """Round 2 of the release gate: a bound guessed from a closing
+        sentence took the person's own line that quoted it — after an edited
+        section (B) and after a 0.1.0 section, where the quoted sentence is
+        newer than the section's own (C). The section is a wording that
+        shipped, paragraph for paragraph, or it is nobody's to rewrite."""
+        quoted_030 = ("My note: remember that a session without a name is live "
+                      "but unaddressable, and nothing can be sent back to it.\n")
+        edited = ("## The Antiphon bridge\n\nSome edited text with no known "
+                  "ending.\n\n" + quoted_030 + "More of my notes.\n")
+        new_text, word, refusal = antiphon._update_instructions(
+            edited, antiphon.CLAUDE_RULE)
+        self.assertEqual((new_text, word), (edited, "left alone"))
+        self.assertIn("word for word", refusal)
+        quoted_033 = ("Note to self: while an oversized `@codex` line is not "
+                      "parked — it is refused, and its words travel with your "
+                      "visible reply through the passive pages instead.\n")
+        current = ("# Mine\n" + self.legacy_rule("0.1.0-CLAUDE") + "\n"
+                   + quoted_033 + "keep this\n")
+        new_text, word, refusal = antiphon._update_instructions(
+            current, antiphon.CLAUDE_RULE)
+        self.assertIsNone(refusal)
+        self.assertEqual(new_text, "# Mine" + antiphon.CLAUDE_RULE + "\n"
+                         + quoted_033 + "keep this\n")
+        # An edited closing sentence is an edited wording: left alone, not
+        # rewritten up to the older sentence inside it with the rest kept as
+        # if it were the person's.
+        touched = self.legacy_rule("0.3.3-CLAUDE").replace(
+            "passive pages instead.", "passive pages instead (I changed this).")
+        self.assertEqual(antiphon._rule_section(touched).state, "unbounded")
+        # Re-wrapped by an editor, the wording still matches.
+        wrapped = self.legacy_rule("0.3.3-CLAUDE").replace(" the ", "\nthe ")
+        self.assertEqual(antiphon._rule_section(wrapped).state, "legacy")
+        self.assertEqual(antiphon._update_instructions(
+            wrapped, antiphon.CLAUDE_RULE)[0], antiphon.CLAUDE_RULE)
+
     def test_the_heading_counts_only_as_a_whole_line(self):
         """Quoted at the end of a sentence it is prose: the section starts at
         the real heading, and a file that only mentions it has no section."""

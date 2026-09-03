@@ -7339,7 +7339,7 @@ TOOLS = [{
                                        "cancel: stop the worker and remove its directory — "
                                        "refused for a handed task, which has no worker here.")},
             "wait": {"type": "integer",
-                     "description": "For result: seconds to wait for the task to finish (0 to 300)."},
+                     "description": "For result: seconds to wait for the task to finish — at most 5 through this server (`antiphon task result <id> <seconds>` waits up to 300)."},
         },
         "required": ["id", "action"],
     },
@@ -8251,32 +8251,37 @@ SECTION_END = "<!-- antiphon: end of the generated section -->"
 SECTION_HEADING_LINE = re.compile(r"(?m)^" + re.escape(SECTION_HEADING)
                                   + r"[ \t]*\r?$")
 ANY_HEADING_LINE = re.compile(r"(?m)^#{1,6}[ \t]")
-# The closing sentence of every generated section shipped before the end
-# marker existed — npm 0.1.0 to 0.3.3 and the unpublished 0.4.0 — newest
-# first, because a newer wording carries an older one in its middle. A
-# section without the marker is rewritten only up to the end of the line
-# holding the newest of these it contains; a section that ends no known way
-# is left alone and named, because what follows may be the person's own words.
-LEGACY_SECTION_FOOTERS = (
-    "while an oversized `@codex` line is not parked — it is refused, and its "
-    "words travel with your visible reply through the passive pages instead.",
-    "while an oversized `@claude` line is not parked — it is refused, and its "
-    "words travel with your visible reply through the passive pages instead.",
-    "and one that exists unseen is why a bare message to Codex is refused.",
-    "a session without a name is live but unaddressable, and nothing can be "
-    "sent back to it.",
-    "Use the `reply_to_codex` tool to answer them.",
-    "only that line is sent to the running Claude session as an MCP Channel "
-    "event.",
-)
+# Every generated section that shipped before the end marker existed — npm
+# 0.1.0 to 0.3.3 and the unpublished 0.4.0, both files — as the SHA-256 of
+# its paragraphs after the heading, each collapsed to single spaces and joined
+# by newlines (`_legacy_section_end` computes the same over a rules file, so a
+# re-wrapped paragraph still matches). A section without the marker is
+# rewritten only when the text after its heading is, paragraph for paragraph,
+# one of these; the rewrite ends where that wording ends. Anything else — an
+# edited wording, or a person's own lines that quote one of ours — is left
+# alone and named, because a bound guessed from a sentence took a person's
+# note that quoted it (measured at the release gate, round 2).
+LEGACY_SECTION_DIGESTS = frozenset((
+    "2e3b21fad689386133a126875cdff33a71306e29f67ccabc794491b76d4e954e",  # 0.1.0 AGENTS
+    "1125a51cb4d1b6e94ef251c2ae219766211536a85738ff0ea9732e85ee629e86",  # 0.1.0 CLAUDE
+    "63f24cd5aea0c77bb2e3bbc2db1a64becc1fed9330c488abfdf079e0037f0c44",  # 0.3.0 AGENTS
+    "e661a43417344d71bf19c9ea90c63477f173caa58548a9d82760162bb6a1df21",  # 0.3.0 CLAUDE
+    "8390d95d520f8a6c97222b1f1c7f53e60e0a9b70ad5ea0402a4f0ed4b3f762dc",  # 0.3.1–0.3.3 AGENTS
+    "78b2d4f237556d194e08a7e12bc04f3b25017278ea27bbe9a4cb5353947ecb88",  # 0.3.1 CLAUDE
+    "a8ef277c58a67d51f439c1e4d7f250b45df44682e1f5c6ee7dd2de14363dbb15",  # 0.3.2–0.3.3 CLAUDE
+    "2b854e3fd18632699c3157638906d83766c06198ec74f5eb1071eddacfa4215c",  # 0.4.0 AGENTS
+    "f9a0498f8d297a345a58d0039bcef1b55925063f0a7aa73869250e9614cdaeb4",  # 0.4.0 CLAUDE
+))
+PARAGRAPH_GAP = re.compile(r"\n[ \t\r]*\n")
 RuleSection = collections.namedtuple("RuleSection", "start end text state")
 # A section in one of these states is never rewritten. The sentence is the
 # remedy, and setup and doctor print the same one.
 SECTION_REFUSALS = {
-    "unbounded": ("the Antiphon section has no end marker and does not end "
-                  "with a wording setup knows, so it was left alone — put the "
-                  f"line `{SECTION_END}` after its last Antiphon paragraph, or "
-                  "delete the section, then run `antiphon setup` again"),
+    "unbounded": ("the Antiphon section has no end marker and is not, word "
+                  "for word, a wording setup knows, so it was left alone — put "
+                  f"the line `{SECTION_END}` after its last Antiphon "
+                  "paragraph, or delete the section, then run `antiphon "
+                  "setup` again"),
     "heading inside": ("a heading of your own sits inside the Antiphon "
                        "section, so it was left alone — move it below the "
                        "section, then run `antiphon setup` again"),
@@ -8695,18 +8700,25 @@ def _add_hook(hooks, command, legacy_commands=None, label=None):
     return True
 
 
-def _legacy_footer_end(current, body_start):
-    """Offset just past the line holding the newest known closing sentence
-    after `body_start`, or None. Whitespace-tolerant: a person's editor may
-    have re-wrapped the paragraph."""
-    for footer in LEGACY_SECTION_FOOTERS:
-        pattern = re.compile(r"\s+".join(re.escape(word)
-                                        for word in footer.split()))
-        match = pattern.search(current, body_start)
-        if match:
-            newline = current.find("\n", match.end())
-            return len(current) if newline == -1 else newline + 1
-    return None
+def _legacy_section_end(current, body_start):
+    """Offset just past the last paragraph at which the text after the
+    heading is, paragraph for paragraph and whitespace-collapsed, one of the
+    wordings that shipped (`LEGACY_SECTION_DIGESTS`); None when it never is.
+    The longest match wins: a newer wording begins with an older one."""
+    paragraphs, end, position = [], None, body_start
+    while position < len(current):
+        gap = PARAGRAPH_GAP.search(current, position)
+        # Through the newline that ends the paragraph's last line, so the
+        # tail the rewrite keeps starts on the blank line.
+        stop = len(current) if gap is None else gap.start() + 1
+        paragraph = " ".join(current[position:stop].split())
+        if paragraph:
+            paragraphs.append(paragraph)
+            digest = hashlib.sha256("\n".join(paragraphs).encode()).hexdigest()
+            if digest in LEGACY_SECTION_DIGESTS:
+                end = stop
+        position = len(current) if gap is None else gap.end()
+    return end
 
 
 def _rule_section(current):
@@ -8715,10 +8727,10 @@ def _rule_section(current):
     holding its own idea of where the section ends is the drift this
     arrangement exists to prevent.
 
-    `state` is `marked` (ends at its own marker), `legacy` (no marker; ends
-    after a known closing sentence), or one of `SECTION_REFUSALS` — a section
-    the writer must not touch, with `end` None and `text` running to the end
-    of the file. The heading is matched as a whole line, and a heading of any
+    `state` is `marked` (ends at its own marker), `legacy` (no marker; the
+    text after the heading is a wording that shipped, and ends where it
+    ends), or one of `SECTION_REFUSALS` — a section the writer must not
+    touch, with `end` None and `text` running to the end of the file. The heading is matched as a whole line, and a heading of any
     level inside the section, or a second Antiphon heading, is a refusal:
     the words the rewrite would take are somebody's own. Measured before this
     reader: an unanchored heading and a `## `-only boundary let `setup` and
@@ -8738,7 +8750,7 @@ def _rule_section(current):
                  if ANY_HEADING_LINE.search(current, body_start, marker)
                  else "marked")
         return RuleSection(start, end, current[start:end], state)
-    end = _legacy_footer_end(current, body_start)
+    end = _legacy_section_end(current, body_start)
     if end is None:
         return RuleSection(start, None, current[start:], "unbounded")
     if ANY_HEADING_LINE.search(current, body_start, end):

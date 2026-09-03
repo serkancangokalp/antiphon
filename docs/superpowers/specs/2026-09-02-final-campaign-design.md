@@ -99,7 +99,9 @@ permission it already reports; `setup` and `doctor --fix` rewrite it in place.
 One ledger, `.antiphon/deliveries/<id>.json`, written by every direct send
 (Stop-hook push, `reply_to_codex`, `antiphon_send`): id, sender alias, target
 kind and alias, transport, content SHA-256 and size, attachment path if parked,
-`sent_at`. No content, no route, no session id.
+`sent_at`. No content, no route, no session id. (Outcome: a refused entry
+keeps the line's first 60 characters, redacted, so the sender can recognise
+which line failed — README §How it works says so.)
 
 - **Receipts come from the peer's own transcript.** The page readers already
   walk it. A Codex user record `[Antiphon bridge|channel] Claude: [from=… id=X]`

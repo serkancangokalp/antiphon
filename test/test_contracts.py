@@ -631,20 +631,23 @@ class ShippedContractTest(unittest.TestCase):
             self.assertIn("at HEAD", read_half, "the read task's worktree is named")
             self.assertIn("at HEAD", write_half)
         self.assertRegex(readme, r"(?i)nothing\s+uncommitted[^.]*visible")
-        # And a worker is followed by its task id, not as a peer: the claim
-        # that its hooks register it and the page names it was false — its
-        # worktree carries no bridge configuration.
+        # And a worker is followed by its task id; it is a peer only where
+        # its directory carries the bridge's configuration (round 2 of the
+        # gate: the worktree road registers nothing, the in-place road is a
+        # live named peer for its duration — the absolute claim either way
+        # was false).
         self.assertRegex(readme, r"(?i)followed\s+by\s+its\s+task\s+id")
-        self.assertRegex(readme, r"(?i)not\s+as\s+a\s+peer")
+        self.assertRegex(readme, r"(?i)a\s+peer\s+only\s+where")
+        self.assertRegex(readme, r"(?i)registers\s+nothing")
         self.assertNotIn("the name the page shows", readme)
-        self.assertNotIn("live named peer", readme)
+        self.assertNotIn("need the host's own trust", readme)
         self.assertRegex(readme, r"(?i)bounds\s+a\s+cooperating\s+chain")
         self.assertIn("antiphon task list", readme)
         backlog = read("BACKLOG.md")
         self.assertIn("## P2 — Cross-vendor managed workers (shipped 2026-09-03, MVP)", backlog)
         self.assertNotIn("its registry name `worker-<id8>` on the page", backlog)
         self.assertRegex(backlog, r"(?i)followed\s+by\s+its\s+task\s+id")
-        self.assertRegex(backlog, r"(?i)seeding\s+the\s+worktree[^.]*follow-up")
+        self.assertRegex(backlog, r"(?i)seeding\s+(?:the|a)\s+worktree[^.]*follow-up")
         self.assertTrue(os.path.exists(os.path.join(
             ROOT, "docs", "superpowers", "specs", "2026-09-03-managed-workers-design.md")))
         for flag in antiphon.workers.FORBIDDEN_FLAGS:

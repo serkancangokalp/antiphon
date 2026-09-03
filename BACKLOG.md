@@ -31,8 +31,8 @@ is read, the AGENTS.md fence needs its closer, a shallow clone skips the
 mixed-version Node tests by name), the ledger (0dd25df — a receipt is the
 named receiver's, a malformed file takes nothing down, the refused recipient
 and reason are redacted, notices bounded, a reader never repairs the store),
-the words (a350d05), the workers (09c435c — followed by its task id and not
-a peer, the hop fails closed on the CLI road, admission is one locked step,
+the words (a350d05), the workers (09c435c — followed by its task id, a peer only
+where its directory carries the bridge's configuration, the hop fails closed on the CLI road, admission is one locked step,
 the evidence lives in the sandbox, a handed task is refused what it cannot
 do, the E2E takes the worktree road with a real write worker), and the
 words that follow them. `v0.5.0` was re-pointed to the final commit; nothing
@@ -1911,12 +1911,18 @@ a documented, configurable limit is exactly the shape the hop budget above takes
 the hop budget), `antiphon task`, `antiphon_delegate` and `antiphon_task` on
 both servers, the label `[Antiphon worker <kind>:<id>]` in every worker's
 prompt, the sweep on the hook. A worker is followed by its task id — status,
-result, log — and not as a peer: its worktree carries the checkout and not the
-bridge's project-local hooks or MCP servers, so it registers nothing and
-appears on no page; it is started as `worker-<id8>` with `ANTIPHON_CWD` at the
-project, so any bridge call it does make lands in the project's store. Seeding
-the worktree with the bridge's configuration is the follow-up, not built — a
-fresh directory's hooks and servers need the host's own trust. Exit
+result, log. It is a peer only where its working directory carries the
+bridge's configuration: in a worktree without it (the usual case — the
+generated files are not committed) it registers nothing and appears on no
+page; run in place, or in a checkout that commits `.codex/config.toml` and
+`.claude/settings.json`, it is a live named peer `worker-<id8>` for its
+duration, on the page under that name, with a bare send of its kind refused
+while it runs. It is started as `worker-<id8>` with `ANTIPHON_CWD` at the
+project, so whatever it records lands in the project's store. Seeding a
+worktree with the bridge's configuration on purpose is the follow-up, not
+built (round 2 of the release gate corrected the earlier claim that a fresh
+directory's hooks need the host's trust: the E2E shows `codex exec` running
+the project hooks in an untrusted directory). Exit
 codes come from the worker's own exit file (a shell wrapper writes it; the
 asking process never started the worker), liveness from the pid and its start
 time, timeouts by SIGTERM then SIGKILL on the worker's session. Measured on
@@ -2118,9 +2124,8 @@ beginning `# AGENTS.md instructions for ` with a complete `<INSTRUCTIONS>` fence
 is a host record; a Codex assistant record beginning
 `[external_agent_tool_call: NAME]` or `[external_agent_tool_result]` — the
 ChatGPT app relaying an external agent's tool traffic, which is that agent's own
-activity and already in its own transcript — is filtered whole (rendered as
-name-only tool lines instead, 1,022 of them sat inside one day's horizon on the
-live project); a Claude user record with `isCompactSummary: true` is a host
+activity and already in its own transcript — is filtered whole (1,022 of them sat inside one day's horizon on the
+live project; the name-only tool line the spec proposed was not built); a Claude user record with `isCompactSummary: true` is a host
 record; a Claude user record that is exactly `[Request interrupted by user]`
 or `[Request interrupted by user for tool use]` is a host record, by equality
 and never by prefix. The Codex Stop reader skips relays too, so an `@claude`

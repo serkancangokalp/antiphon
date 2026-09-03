@@ -77,11 +77,14 @@ directory or its worktree, which is catalogued as a worker source and labelled).
 
 *Outcome (2026-09-03, at the release gate):* the paragraph above was not built,
 and the MVP does not claim it. A worker's worktree holds no hooks and no MCP
-server — the bridge's files are generated and gitignored, and a fresh directory
-needs the host's own trust before it runs project hooks — so a managed worker
-registers nothing, is not a peer, and appears on no page; it is followed by its
-task id through `status`, `result`, `list` and its log. Seeding the worktree
-with the bridge's configuration is the follow-up, named in BACKLOG.
+server when the bridge's files are generated and not committed (the usual
+case), so there a managed worker registers nothing, is not a peer, and appears
+on no page; it is followed by its task id through `status`, `result`, `list`
+and its log. Where its working directory carries the bridge's configuration —
+a task run in place, or a checkout that commits the generated files — the
+project's hooks and servers are its own and it is a live named peer
+`worker-<id8>` for its duration (round 2 of the gate). Seeding a worktree with
+the bridge's configuration on purpose is the follow-up, named in BACKLOG.
 
 Hop budget: `ANTIPHON_HOP_BUDGET` (default 1). A worker is started with
 `ANTIPHON_HOP=<parent hop + 1>`; a session whose hop is at the budget has its

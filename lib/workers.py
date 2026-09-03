@@ -16,12 +16,14 @@ worktree at `work/.antiphon/tests.txt`, where a write task's sandbox can
 reach it and where git ignores it. A read task in a project that is not a
 checkout runs in the project, under the host's read-only class.
 
-A worker is followed by its task id — status, result, log — and not as a
-peer: its worktree carries the checkout, not the bridge's project-local
-hooks or MCP servers, so it registers nothing and appears on no page. It is
-started with `ANTIPHON_NAME=worker-<id8>` and `ANTIPHON_CWD=<project>`, so
-the bridge call it may still make (a read task run in the project itself)
-lands in the project's own store under that name.
+A worker is followed by its task id — status, result, log. It is a peer
+only where its working directory carries the bridge's configuration: a
+worktree without it (the generated files are not committed) registers
+nothing and appears on no page; a task run in place, or a checkout that
+commits the generated files, makes it a live named peer `worker-<id8>` for
+its duration. It is started with `ANTIPHON_NAME=worker-<id8>` and
+`ANTIPHON_CWD=<project>`, so whatever it records lands in the project's own
+store under that name.
 
 Nothing here merges a patch, forwards a task or guesses a peer; see
 docs/superpowers/specs/2026-09-03-managed-workers-design.md.

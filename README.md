@@ -8,7 +8,7 @@ With one terminal per side there is nothing to configure beyond `antiphon setup`
 
 ## How it works
 
-No shared log is kept. Both CLIs already write their own transcripts; Antiphon reads and derives from them, recording which messages each peer has already seen. An unnamed peer keeps its cursor at `.antiphon/cursor.json`; a named one owns `.antiphon/peers/<side>-<name>/cursor.json`, so two sessions on the same side never advance each other's place. Every direct send leaves one small file on a delivery ledger at `.antiphon/deliveries/<id>.json` — who sent, to whom, over what, the words' digest — and, for a refused line, its first 60 characters so the sender can recognise it; never the words otherwise — kept for a week, two for an entry with a notice its sender has not heard; receipts come from the peer's own transcript, read by the same reader that builds the pull page, which never looks behind the 24-hour page horizon, so a receipt older than that is never seen and `status` says so. An automatic Claude identity also records which session its owner runs now, one small file per owner under `.antiphon/identity/claude/`, named from a digest rather than from anything about the session. `doctor` reports that a proof could not be read or could not be trusted without naming the file; this is the directory it means, and removing the unreadable one costs nothing — the next turn writes it again.
+No shared log is kept. Both CLIs already write their own transcripts; Antiphon reads and derives from them, recording which messages each peer has already seen. An unnamed peer keeps its cursor at `.antiphon/cursor.json`; a named one owns `.antiphon/peers/<side>-<name>/cursor.json`, so two sessions on the same side never advance each other's place. Every direct send leaves one small file on a delivery ledger at `.antiphon/deliveries/<id>.json` — who sent, to whom, over what, the words' digest — and, for a refused line, its first 60 characters so the sender can recognise it; never the words otherwise — kept for a week, two for an entry with a notice its sender has not heard; receipts come from the peer's own transcript, read by the same reader that builds the pull page, which never looks behind the 24-hour page horizon, so a receipt older than that is never seen there and `status` says so; each session's own hook also reads the tail of its own transcript for the receipts it owes, horizon or not. An automatic Claude identity also records which session its owner runs now, one small file per owner under `.antiphon/identity/claude/`, named from a digest rather than from anything about the session. `doctor` reports that a proof could not be read or could not be trusted without naming the file; this is the directory it means, and removing the unreadable one costs nothing — the next turn writes it again.
 
 ### Pull — shared context, no wake
 
@@ -118,14 +118,20 @@ collected — its worktree forgotten by its own entry, never by a prune of your
 repository's other worktrees. Every worker is asked to keep `[Antiphon worker
 <kind>:<id>]` at the start of its final message, so nothing it says reads as
 the parent's own. A worker is followed by its task id — `status`, `result`,
-the log — and not as a peer: its worktree carries the checkout, not the
-bridge's project-local hooks or MCP servers (a fresh directory's hooks and
-servers need the host's own trust), so it registers nothing, appears on no
-page and makes no bare send refused. It is started as
-`ANTIPHON_NAME=worker-<id8>` with `ANTIPHON_CWD` pointing at the project, so
-the bridge call it may still make — a read task run in the project itself —
-lands in the project's own store under that name; seeding the worktree with
-the bridge's configuration is the follow-up, not built. One side effect is
+the log. Whether it is also a peer depends on where it runs. In a worktree
+that carries no bridge configuration — the usual case, since the files
+`setup` writes are generated and not committed — it registers nothing,
+appears on no page and makes no bare send refused. Where its working
+directory does carry that configuration — a task run in place because the
+project is not a checkout or has no commit, or a checkout that commits
+`.codex/config.toml` and `.claude/settings.json` — the project's hooks and
+servers are its own for the duration: it is a live named peer
+`worker-<id8>` (it is started as `ANTIPHON_NAME=worker-<id8>` with
+`ANTIPHON_CWD` pointing at the project, so everything it records lands in
+the project's own store under that name), its words are on the page under
+that name, and a bare send of its kind is refused while it runs. Seeding a
+worktree with the bridge's configuration on purpose is the follow-up, not
+built. One side effect is
 Codex's own, measured with Codex CLI 0.152.1: `codex exec -s workspace-write`
 records the repository root as trusted in `~/.codex/config.toml` (a read
 worker does not, and a transient `-c` trust override does not prevent it), so
@@ -275,11 +281,11 @@ where it comes from. Then, in the project the two agents share:
 
 `setup` writes `.claude/settings.json`, `.codex/hooks.json`,
 `.codex/config.toml`, `.mcp.json`, `.claude/settings.local.json`,
-`AGENTS.md` and `CLAUDE.md` for that project. The hook commands resolve
+`AGENTS.md`, `CLAUDE.md` and `.antiphon/.gitignore` for that project. The hook commands resolve
 `antiphon` through your `PATH` rather than hardcoding an install path, so
 they keep working after a reinstall or a move; `.mcp.json` and
 `.codex/config.toml` still record this project's own absolute directory,
-so each side can find the right channel socket. None of the seven files
+so each side can find the right channel socket. None of the eight files
 live in this repository — they are generated per project. Approve the
 Codex hooks once when Codex first shows them.
 
@@ -357,10 +363,11 @@ the Claude channel *answers* — a connect and a one-line reply,
 not a file that exists. `✓` fine, `·` nothing to do here, `✗` broken; only
 a `✗` makes it exit non-zero, so a set-up project with no session running
 exits 0. It never takes a lock, never writes, and never removes the stale
-record it is explaining.
+record it is explaining; `doctor --fix` is the one exception, and it is
+`setup` followed by the same read-only check.
 
-`setup` registers Codex's MCP tools — `antiphon_read`, `antiphon_send` and
-`antiphon_retrieve`
+`setup` registers Codex's MCP tools — `antiphon_read`, `antiphon_send`,
+`antiphon_retrieve`, `antiphon_delegate` and `antiphon_task`
 — in this project's `.codex/config.toml`, so there is nothing to add by
 hand. Note the entry
 names `args = ["mcp"]`: the `channel` server is Claude's side and hands out
@@ -368,11 +375,12 @@ names `args = ["mcp"]`: the `channel` server is Claude's side and hands out
 Codex publish messages
 labelled as Claude's — exactly what this bridge exists to prevent — so
 `setup` rewrites that table whenever it is wrong, leaving the rest of the
-file alone. The same table forwards `ANTIPHON_NAME` into the tool process,
-because Codex does not pass the parent environment through on its own.
+file alone. The same table forwards `ANTIPHON_NAME`, `ANTIPHON_HOP` and
+`ANTIPHON_HOP_BUDGET` into the tool process, because Codex does not pass the
+parent environment through on its own.
 
 Without this entry the pull hook still delivers Claude's context at the start
-of each Codex turn, but Codex loses all three tools: it can no longer check the
+of each Codex turn, but Codex loses all five tools: it can no longer check the
 bridge by hand, retrieve a complete invocation, nor reach Claude before its
 turn ends.
 
@@ -385,7 +393,7 @@ turn ends.
 - Matching is done on the same project's absolute directory.
 - Unix sockets only — there is no Windows support.
 - A same-vendor message (`@claude:name` from Claude, `@codex:name` from Codex, `reply_to_claude`, `antiphon_send(kind="codex")`) is always addressed, and the passive page gains no same-kind lane — two same-kind sessions need names or automatic aliases, and a session of one kind is told nothing of another's work unless it is sent. It is addressed, not confidential: a Stop-marker line is part of the sender's visible reply, which the other kind's page shows, and a same-kind tool call's arguments stay retrievable by their public id.
-- A managed worker is a subprocess of the other CLI (`claude -p` / `codex exec`), never a host-native subagent: it needs that CLI installed and logged in, is stopped at its timeout (at most an hour) by the next `status`, `result` or hook sweep rather than by a clock of its own, appears in neither host's own agent UI, and its patch is evidence, never a merge. A worker cannot be resumed; a follow-up is a new task. It inherits the environment of the session that started it, as any subprocess of that session would. It is not a peer: it registers nothing, its words are not on the passive page, and a bare send is not refused on its account — it is followed by its task id alone. Measured on Codex CLI 0.152.1: `codex exec -s workspace-write` (a write task) records the project's root as trusted in `~/.codex/config.toml`, the way an interactive `codex` would after its own prompt; `-s read-only` does not. The bridge does not undo that in your projects — it is the host's own record of your project — and says so here.
+- A managed worker is a subprocess of the other CLI (`claude -p` / `codex exec`), never a host-native subagent: it needs that CLI installed and logged in, is stopped at its timeout (at most an hour) by the next `status`, `result` or hook sweep rather than by a clock of its own, appears in neither host's own agent UI, and its patch is evidence, never a merge. A worker cannot be resumed; a follow-up is a new task. It inherits the environment of the session that started it, as any subprocess of that session would. It is followed by its task id, and it is a peer only where its working directory carries the bridge's configuration — a task run in place, or a checkout that commits the generated files — and then a live named one, `worker-<id8>`, for its duration; in a worktree without that configuration it registers nothing and appears on no page. Measured on Codex CLI 0.152.1: `codex exec -s workspace-write` (a write task) records the project's root as trusted in `~/.codex/config.toml`, the way an interactive `codex` would after its own prompt; `-s read-only` does not. The bridge does not undo that in your projects — it is the host's own record of your project — and says so here.
 - A tool result is a statement about the transport, never about the peer. `reply_to_codex` says queued and `antiphon_send` says delivered to the channel; a queued row in a thread that never takes a turn is not read, and only the peer's transcript proves receipt — `antiphon status` shows what still waits, `antiphon doctor` notes what has waited more than ten minutes. A bare reply refused among several peers names the last unanswered sender as advice; the bridge itself still never chooses.
 
 ### Passive pull pages, and what it still cannot promise
