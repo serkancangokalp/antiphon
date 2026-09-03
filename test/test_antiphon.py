@@ -2161,7 +2161,9 @@ class AntiphonTest(unittest.TestCase):
             with open(os.path.join(project, ".codex", "config.toml"), "rb") as f:
                 config = tomllib.load(f)
         server = config["mcp_servers"]["antiphon"]
-        self.assertEqual(server["env_vars"], ["ANTIPHON_NAME"])
+        self.assertEqual(server["env_vars"],
+                         ["ANTIPHON_NAME", "ANTIPHON_HOP", "ANTIPHON_HOP_BUDGET"],
+                         "the name, then the worker hop and its budget")
         self.assertEqual(server["env"]["ANTIPHON_CWD"], project,
                          "the forward is additive: the directory is still set")
 
