@@ -97,6 +97,8 @@ PAGE_HORIZON = 24 * 3600
 HORIZON_BISECT_ABOVE = 1024 * 1024     # bytes of unread span before bisecting
 HORIZON_BISECT_STEP = 4096             # the bisection converges to this span
 HORIZON_BISECT_SLACK = 256 * 1024      # then the linear scan resumes this far back
+NEWEST_TIME_WINDOW = 1024 * 1024       # how far back a source's newest time is sought
+NEWEST_TIME_CHUNK = 16 * 1024          # a chunk of that walk, parsed newest-first
 CATALOG_VERSION = 1
 CATALOG_BATCH = 8
 ANCHOR_HASH_CHUNK = 64 * 1024
@@ -3175,16 +3177,44 @@ def _record_time(line):
 
 
 def _source_newest_time(source):
-    """The timestamp of the source's last complete record, or None when it
-    has none or that record carries none — and then there is no horizon."""
+    """The timestamp of the source's last dated complete record, or None
+    when no record in its last NEWEST_TIME_WINDOW bytes carries one — and
+    then there is no horizon from this source.
+
+    The last record alone was not enough: a Claude transcript ends on
+    undated bookkeeping (`file-history-snapshot`) in 101 of 526 measured
+    files, and a source whose last record carried no time fell out of the
+    horizon entirely — the reader took the horizon from an older source's
+    clock, or had none, and delivered that source whole (round-2 review,
+    2026-09-03). The walk goes backwards a chunk at a time, so the ordinary
+    case parses the few records of one chunk; the window bounds a source
+    that is undated for a megabyte, which then has no readable newest time.
+    """
     end = source.complete_prefix_end()
     if not end:
         return None
-    anchor = source.anchor_at(end)
-    if anchor is None:
-        return None
-    record = source.first_record_at(anchor["start"])
-    return _record_time(record[2]) if record else None
+    stop = end
+    while stop > 0 and end - stop < NEWEST_TIME_WINDOW:
+        chunk = max(0, stop - NEWEST_TIME_CHUNK)
+        first = source.first_record_at(chunk)
+        if first is None or first[0] >= stop:
+            # A record longer than a chunk straddles this one: step back
+            # without parsing, and its own start is found the same way.
+            if chunk == 0:
+                return None
+            stop = chunk
+            continue
+        newest = None
+        for start, _finish, line in source.read_records(first[0]):
+            if start >= stop:
+                break
+            when = _record_time(line)
+            if when is not None:
+                newest = when
+        if newest is not None:
+            return newest
+        stop = first[0]
+    return None
 
 
 def _first_offset_at_or_after(source, timestamp, start):
@@ -3200,12 +3230,14 @@ def _first_offset_at_or_after(source, timestamp, start):
     misorder wider than the slack that also straddles the horizon is the
     stated residual, unobserved.
 
-    A record without a readable time is not a record before the horizon. It
-    stays behind when a dated record before the horizon follows it — the
-    measured shape, host bookkeeping between dated records — and is the
-    landing when none does, so a source whose readable times stop before the
-    horizon, or that has none at all, is read from there rather than skipped
-    whole. Measured 2026-09-03: 11,077 of 95,089 Claude records carry no
+    A record without a readable time is not a record before the horizon,
+    and it is not the landing either while any dated record follows it: the
+    landing is then that dated record if it is inside the horizon, or nothing
+    yet if it is before it — the measured shape, host bookkeeping between
+    dated records, goes with the dated record after it. Only an undated
+    record that no dated record follows — the start of an undated tail — is
+    the landing, so a source whose readable times stop before the horizon,
+    or that has none at all, is read from there rather than skipped whole. Measured 2026-09-03: 11,077 of 95,089 Claude records carry no
     time and every one is bookkeeping the reader filters, so landing on one
     costs nothing visible; an undated record that is speech — a stamp this
     interpreter cannot parse, a host that stopped stamping — is the shape
@@ -3219,9 +3251,15 @@ def _first_offset_at_or_after(source, timestamp, start):
             if record is None or record[0] >= hi:
                 hi = mid
                 continue
-            when, dated_end = _dated_probe(source, record, hi)
+            when = _dated_probe(source, record, hi)
             if when is not None and when < timestamp:
-                lo = dated_end
+                # Past the probe record only, never past the dated record
+                # the probe walked to: the slack is measured from `lo`, and
+                # a walk that also moved `lo` shrank it — a dated record
+                # inside the horizon up to a slack before an undated one was
+                # skipped (round-2 review, synthetic; the stated residual
+                # shape, kept from getting worse than stated).
+                lo = record[1]
             else:
                 hi = record[0]
         lo = max(start, lo - HORIZON_BISECT_SLACK)
@@ -3242,23 +3280,20 @@ def _first_offset_at_or_after(source, timestamp, start):
 
 def _dated_probe(source, record, limit):
     """The time of the first dated record from `record` on — within
-    HORIZON_BISECT_SLACK bytes and before `limit` — and the end of the record
-    that carried it; `(None, end)` when nothing there carries one. The
-    bisection then treats the span as possibly inside the horizon rather
-    than before it: the direction that loses nothing, at the price of a
-    longer linear scan in a shape never measured."""
+    HORIZON_BISECT_SLACK bytes and before `limit` — or None when nothing
+    there carries one. The bisection then treats the span as possibly inside
+    the horizon rather than before it: the direction that loses nothing, at
+    the price of a longer linear scan in a shape never measured."""
     when = _record_time(record[2])
-    end = record[1]
     if when is not None:
-        return when, end
-    for next_start, next_end, line in source.read_records(end):
+        return when
+    for next_start, next_end, line in source.read_records(record[1]):
         if next_start >= limit or next_end - record[0] > HORIZON_BISECT_SLACK:
             break
         when = _record_time(line)
-        end = next_end
         if when is not None:
-            return when, end
-    return None, end
+            return when
+    return None
 
 
 def _reader_horizon(cwd, kind, paths):
@@ -4160,6 +4195,7 @@ def _source_activity(cwd, kind, identities=None):
     # one live endpoint/session join and drops a multiply claimed source.
     label_claims = {}
     unnamed = False
+    automatic_readers = {}
     for record in endpoints:
         if not peers._record_alive(record):
             continue
@@ -4193,6 +4229,25 @@ def _source_activity(cwd, kind, identities=None):
         for record in identities.automatic:
             label_claims.setdefault(record["address"], set()).add(
                 record["name"])
+        # Receipt provenance for an automatic session: the observation the
+        # hook wrote names the writer — the alias is a digest of the host
+        # id — whether or not a lock still proves it live. A session record
+        # (an explicit name) claims the id first, and a derived name an
+        # explicit endpoint occupies is nobody's. Measured at the release
+        # gate (round 2, 2026-09-03): a named delivery to `auto-…` lost its
+        # receipt the moment that session exited — no session record
+        # carries the automatic name and the projection is positive-live
+        # only — so `status` awaited forever and a parked file's read grace
+        # never started.
+        occupied = {record.get("name") for record in endpoints
+                    if peers.valid_name(record.get("name"))}
+        for source in (*identities.live_sessions, *identities.unknown):
+            if source in claims:
+                continue
+            identity = peers.auto_identity(source)
+            if (identity and identity[0] not in occupied
+                    and identity[0] not in identities.conflicts):
+                automatic_readers[source] = identity[0]
     aliases = {source: next(iter(names))
                for source, names in label_claims.items()
                if len(names) == 1}
@@ -4209,6 +4264,8 @@ def _source_activity(cwd, kind, identities=None):
                  if peers.valid_name(name)}
         if len(names) == 1:
             readers[source] = next(iter(names))
+    for source, alias in automatic_readers.items():
+        readers.setdefault(source, alias)
     for source, alias in aliases.items():
         if readers.get(source, alias) != alias:
             readers.pop(source, None)
@@ -4774,8 +4831,10 @@ def hook(side="claude"):
         waiting = len(notices) - len(shown)
         lines = [words for _id, words in shown]
         if waiting:
-            lines.append(f"Antiphon: {waiting} more notice"
-                         f"{'s' if waiting != 1 else ''} wait; the next turns carry them")
+            lines.append("Antiphon: 1 more notice waits; the next turn carries it"
+                         if waiting == 1 else
+                         f"Antiphon: {waiting} more notices wait; the next turns "
+                         "carry them")
         context = "\n".join(lines)
         if text:
             context = f"{context}\n\n{text}" if context else text
