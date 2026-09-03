@@ -170,7 +170,37 @@ cursor_digest() {
   shasum -a 256 "$path" | cut -d' ' -f1
 }
 
+# Undo the one trust entry Codex writes for this run's project, byte-exact
+# against the copy taken at the start; anything else in that file is the
+# person's and is never touched. Called from the write step and again from the
+# EXIT trap before the copy goes with $TMP, so an interrupted run leaves no
+# entry behind (review 2026-09-03). Prints unchanged | undone | other | unreadable.
+undo_trust() {
+  if [ -z "${PROJECT:-}" ] || [ ! -f "${CODEX_CONFIG_COPY:-}" ]; then echo "unchanged"; return 0; fi
+  python3 - "$CODEX_CONFIG_COPY" "$HOME/.codex/config.toml" "$PROJECT" <<'PY'
+import os, sys
+copy, live, project = sys.argv[1:4]
+try:
+    with open(copy, encoding="utf-8") as f: before = f.read()
+    with open(live, encoding="utf-8") as f: after = f.read()
+except OSError:
+    print("unreadable"); raise SystemExit
+if after == before:
+    print("unchanged"); raise SystemExit
+table = '[projects."%s"]\ntrust_level = "trusted"\n' % os.path.realpath(project)
+for candidate in (table + "\n", "\n" + table, table):
+    if after.count(candidate) == 1 and after.replace(candidate, "", 1) == before:
+        with open(live, "w", encoding="utf-8") as f: f.write(before)
+        print("undone"); raise SystemExit
+print("other")
+PY
+}
+
 cleanup() {
+  # First, whatever else happens: the copy lives under $TMP.
+  case "$(undo_trust 2>/dev/null)" in
+    undone) echo "undone at exit: the trust entry Codex wrote for $PROJECT" ;;
+  esac
   if [ "$KEEP" = "1" ]; then
     echo; echo "korunuyor: $TMP"; echo "korunuyor: $CLAUDE_DIR"
     return
@@ -424,26 +454,8 @@ if [ -e "$PROJECT/WORKER-WROTE.txt" ]; then fail "the write worker edited the pr
 # Codex's own side effect, measured on 0.152.1: `codex exec -s workspace-write`
 # records the repository root as trusted in ~/.codex/config.toml (a read
 # worker does not, and a transient `-c` trust override does not prevent it).
-# This run undoes exactly its own entry, byte-exact against the copy taken at
-# the start; anything else in that file is the person's and is never touched.
-UNDONE="$(python3 - "$CODEX_CONFIG_COPY" "$HOME/.codex/config.toml" "$PROJECT" <<'PY'
-import os, sys
-copy, live, project = sys.argv[1:4]
-try:
-    with open(copy, encoding="utf-8") as f: before = f.read()
-    with open(live, encoding="utf-8") as f: after = f.read()
-except OSError:
-    print("unreadable"); raise SystemExit
-if after == before:
-    print("unchanged"); raise SystemExit
-table = '[projects."%s"]\ntrust_level = "trusted"\n' % os.path.realpath(project)
-for candidate in (table + "\n", "\n" + table, table):
-    if after.count(candidate) == 1 and after.replace(candidate, "", 1) == before:
-        with open(live, "w", encoding="utf-8") as f: f.write(before)
-        print("undone"); raise SystemExit
-print("other")
-PY
-)"
+# This run undoes exactly its own entry, here and again from the EXIT trap.
+UNDONE="$(undo_trust)"
 case "$UNDONE" in
   undone) pass "the trust entry Codex wrote for this run's project was undone byte-exact" ;;
   unchanged) pass "Codex wrote no trust entry for this run's project" ;;

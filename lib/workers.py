@@ -300,9 +300,19 @@ def update_task(cwd, task_id, mutate):
         return True
 
 
+def _diff_path(cwd, task_id):
+    """A completed write task's diff too large to inline, beside its record:
+    evidence that outlives the worker's directory and goes with the record.
+    Review 2026-09-03: it was written inside the directory that its own
+    collection made sweepable, so the path the result named died on the next
+    hook."""
+    return os.path.join(tasks_dir(cwd), task_id + ".diff")
+
+
 def _discard_record(cwd, task_id):
-    with contextlib.suppress(OSError):
-        os.unlink(_path(cwd, task_id))
+    for path in (_path(cwd, task_id), _diff_path(cwd, task_id)):
+        with contextlib.suppress(OSError):
+            os.unlink(path)
 
 
 def prune(cwd, now):
@@ -404,7 +414,7 @@ def check_hop(env, alias=None):
         raise Refused(f"not delegated: ANTIPHON_HOP={value!r} is not a hop count; "
                       "the bridge sets it to a non-negative integer, so a session "
                       "carrying anything else may not delegate")
-    if is_worker_name(alias) and "ANTIPHON_HOP" not in env:
+    if is_worker_name(alias) and value is None:
         raise Refused(f"not delegated: this session is a managed worker ({alias}) "
                       "whose hop is not visible to its server, so it may not "
                       "delegate; a deeper chain needs ANTIPHON_HOP forwarded and "
@@ -486,8 +496,20 @@ def adapter(kind, task_class, text, task_id, tests=None):
     else:
         sandbox = "read-only" if task_class == "read" else "workspace-write"
         argv = ["codex", "exec", "-s", sandbox, "--color", "never", prompt]
-    assert not any(flag in argv for flag in FORBIDDEN_FLAGS)
+    assert widening(argv) is None
     return argv
+
+
+def widening(argv):
+    """The option, if any, that widens the worker's class — by flag or by
+    value, on either side of an `=` (review 2026-09-03: `--sandbox=danger-full-
+    access` is one element, and an element match saw only the two halves).
+    The prompt, last, is the task's own words and is never read for one."""
+    for option in argv[:-1]:
+        for piece in option.split("=", 1):
+            if piece in FORBIDDEN_FLAGS:
+                return option
+    return None
 
 
 def _git(cwd, *args, timeout=60):
@@ -527,8 +549,13 @@ def _process_start(pid):
 def _ignored_store(work):
     """`work/.antiphon/`, ignored by git there, for the one file the worker
     writes for the bridge. Never overwrites a `.gitignore` the checkout
-    itself carries at that path."""
+    itself carries at that path, and refuses a `.antiphon` the checkout
+    carries as a link or a file: a link would carry the worker's file
+    outside its worktree (review 2026-09-03), a file cannot hold it."""
     store = os.path.join(work, WORK_STORE)
+    if os.path.islink(store) or (os.path.lexists(store) and not os.path.isdir(store)):
+        raise OSError(f"{WORK_STORE} in the checkout is not a directory of the "
+                      "worktree's own")
     os.makedirs(store, exist_ok=True)
     ignore = os.path.join(store, ".gitignore")
     if not os.path.lexists(ignore):
@@ -559,7 +586,11 @@ def start(cwd, record, text, env=None):
     if _sound_dir(workers_dir(cwd), create=True) is None:
         _refuse(cwd, record, f"not delegated: {workers_dir(cwd)} cannot be used")
     directory = worker_dir(cwd, task_id)
-    os.makedirs(directory, mode=0o700, exist_ok=True)
+    try:
+        os.makedirs(directory, mode=0o700, exist_ok=True)
+    except OSError as error:
+        _refuse(cwd, record, f"not delegated: the worker's directory could not be "
+                             f"created: {error}")
     work = work_dir(cwd, task_id)
     base = None
     # A checkout with no commit yet (measured: the E2E's own `git init`
@@ -577,7 +608,14 @@ def start(cwd, record, text, env=None):
                                  f"created: {(done.stderr if done else '').strip()[:200]}")
         base = _head(work)
         run_in = work
-        _ignored_store(work)
+        try:
+            _ignored_store(work)
+        except OSError as error:
+            # A refusal leaves no record, no directory, no worktree entry:
+            # measured before this, a tracked file named `.antiphon` raised
+            # out of here with all three in place (review 2026-09-03).
+            _refuse(cwd, record, f"not delegated: the worker's store could not be "
+                                 f"made in its worktree: {error}")
     elif record["task_class"] == "write":
         _refuse(cwd, record, "not delegated: a write task needs a git checkout "
                              "to give its worker a worktree of its own")
@@ -767,9 +805,13 @@ def _worktree_diff(cwd, record):
     base = record["base"]
     if base is None or not os.path.isdir(work):
         return None
-    if _git(work, "add", "-A", "--intent-to-add", timeout=30) is None:
+    # The bridge's own store is excluded by pathspec, not by the `.gitignore`
+    # written there: a checkout that tracks a `.antiphon/.gitignore` of its
+    # own would otherwise carry the test summary into the diff.
+    outside_store = ("--", ".", f":!{WORK_STORE}")
+    if _git(work, "add", "-A", "--intent-to-add", *outside_store, timeout=30) is None:
         return None
-    done = _git(work, "diff", "--no-color", base, timeout=60)
+    done = _git(work, "diff", "--no-color", base, *outside_store, timeout=60)
     if done is None or done.returncode != 0:
         return None
     return done.stdout.encode("utf-8", "surrogateescape") if isinstance(done.stdout, str) \
@@ -777,7 +819,10 @@ def _worktree_diff(cwd, record):
 
 
 def _bounded_wait(wait):
-    """`wait` as seconds between 0 and MAX_WAIT; anything else is 0."""
+    """`wait` as seconds between 0 and MAX_WAIT; anything else is 0 — a
+    bool included, which `float` would read as a second."""
+    if isinstance(wait, bool):
+        return 0.0
     try:
         seconds = float(wait or 0)
     except (TypeError, ValueError):
@@ -800,8 +845,8 @@ def result(cwd, task_id, wait=0):
     """The task's state and evidence, after waiting up to `wait` seconds
     (at most MAX_WAIT) for it to finish. A completed write task carries its
     diff against the base it started from — inline up to DIFF_INLINE bytes,
-    else as a file beside the work — and the worker's test summary when it
-    wrote one. The task counts as collected only when the evidence its state
+    else as a file beside the task's record, which outlives the work — and
+    the worker's test summary when it wrote one. The task counts as collected only when the evidence its state
     promises was actually returned; until then its directory is kept. A
     handed task is refused: nothing is collected by id."""
     wait = _bounded_wait(wait)
@@ -832,8 +877,9 @@ def result(cwd, task_id, wait=0):
         elif len(diff) <= DIFF_INLINE:
             answer["diff"] = diff.decode("utf-8", "replace")
         else:
-            path = os.path.join(worker_dir(cwd, task_id), DIFF_FILE)
-            with open(path, "wb") as f:
+            path = _diff_path(cwd, task_id)
+            fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+            with os.fdopen(fd, "wb") as f:
                 f.write(diff)
             answer["diff_path"] = path
     try:

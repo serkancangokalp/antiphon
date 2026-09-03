@@ -40,7 +40,8 @@ class TaskStoreTest(unittest.TestCase):
             path = os.path.join(workers.tasks_dir(project), record["id"] + ".json")
             self.assertEqual(os.stat(path).st_mode & 0o777, 0o600)
             self.assertEqual(os.stat(workers.tasks_dir(project)).st_mode & 0o777, 0o700)
-            self.assertNotIn("review the diff", open(path).read())
+            with open(path) as f:
+                self.assertNotIn("review the diff", f.read())
             self.assertEqual([t["id"] for t in workers.tasks(project)], [record["id"]])
 
     def test_the_timeout_and_the_class_are_bounded(self):
@@ -161,6 +162,16 @@ class AdapterTest(unittest.TestCase):
         # through a flag, and the module's own assert must know both.
         for widening in ("--yolo", "danger-full-access", "bypassPermissions"):
             self.assertIn(widening, workers.FORBIDDEN_FLAGS, widening)
+        # Round 2, 2026-09-03: `--sandbox=danger-full-access` is one element,
+        # and an element match saw neither half. Either side of the `=`
+        # counts; the prompt, last, is never read for one.
+        for argv in (["codex", "exec", "--sandbox=danger-full-access", "the task"],
+                     ["claude", "-p", "--permission-mode=bypassPermissions", "the task"],
+                     ["claude", "-p", "--permission-mode", "bypassPermissions", "the task"],
+                     ["codex", "exec", "--yolo", "the task"]):
+            self.assertIsNotNone(workers.widening(argv), argv)
+        self.assertIsNone(workers.widening(["codex", "exec", "the task says =--yolo"]))
+        self.assertIsNone(workers.widening(["codex", "exec", "-s", "read-only", "x=--yolo"]))
         for argv in (claude_read, codex_read, codex_write,
                      workers.adapter("claude", "write", "do it", "t1")):
             joined = " ".join(argv)
@@ -183,7 +194,8 @@ class AdapterTest(unittest.TestCase):
             deadline = time.time() + 5
             while time.time() < deadline and not os.path.exists(stub + ".env"):
                 time.sleep(0.05)
-            argv = open(stub + ".argv").read()
+            with open(stub + ".argv") as f:
+                argv = f.read()
             self.assertIn("exec -s read-only", argv)
             self.assertIn("review the diff", argv)
             with open(stub + ".env") as f:
@@ -380,6 +392,13 @@ class AdapterTest(unittest.TestCase):
             self.assertIn("is not a hop count", str(refused.exception))
         workers.check_hop({"ANTIPHON_HOP": "  "}, alias="ui")
         self.assertEqual(workers.current_hop({"ANTIPHON_HOP": ""}), 0, "blank is unset")
+        # Round 2, 2026-09-03: unset and blank are one thing to a worker's
+        # server, so a blank `ANTIPHON_HOP=` beside a worker's name is the
+        # same fail-closed as no variable at all.
+        with self.assertRaises(workers.Refused) as refused:
+            workers.check_hop({"ANTIPHON_HOP": "", "ANTIPHON_HOP_BUDGET": "9"},
+                              alias="worker-abc12345")
+        self.assertIn("managed worker", str(refused.exception))
 
 
 
@@ -422,7 +441,8 @@ class LifecycleTest(unittest.TestCase):
             failed = self._run(project, bin_dir, "echo boom >&2; exit 3")
             record = self._settle(project, failed["id"], "failed")
             self.assertEqual(record["exit_code"], 3)
-            self.assertIn("boom", open(workers.log_path(project, failed["id"])).read())
+            with open(workers.log_path(project, failed["id"])) as f:
+                self.assertIn("boom", f.read())
 
     def test_a_permission_the_class_denies_is_blocked_not_failed(self):
         with tempfile.TemporaryDirectory() as project, tempfile.TemporaryDirectory() as bin_dir:
@@ -593,6 +613,102 @@ class LifecycleTest(unittest.TestCase):
             self.assertIn("+x", final["diff"])
             self.assertIsNotNone(workers.read_task(project, started["id"])["collected_at"])
 
+    def _rooted(self, project, *paths):
+        """A checkout with one commit carrying `paths` (a path may be a
+        symlink or a file); the project's own `.antiphon` is then a real
+        directory, as the bridge's store would be."""
+        import subprocess
+        subprocess.run(["git", "init", "-q", project], check=True)
+        subprocess.run(["git", "-C", project, "add", "-A"], check=True)
+        subprocess.run(["git", "-C", project, "-c", "user.email=a@b", "-c", "user.name=a",
+                        "commit", "-q", "--allow-empty", "-m", "root"], check=True)
+        store = os.path.join(project, ".antiphon")
+        if os.path.lexists(store) and not (os.path.isdir(store) and not os.path.islink(store)):
+            os.unlink(store)
+        os.makedirs(store, exist_ok=True)
+
+    def test_a_checkout_carrying_the_store_as_a_link_or_a_file_is_refused_cleanly(self):
+        """Round 2, 2026-09-03: a `.antiphon` the checkout carries as a link
+        sent the worker's file through it to a directory outside its
+        worktree, and one it carries as a file raised out of `start` with
+        the record, the directory and the worktree entry all left behind.
+        Both are refusals, and a refusal leaves nothing."""
+        import subprocess
+        for shape in ("link", "file"):
+            with tempfile.TemporaryDirectory() as project, \
+                 tempfile.TemporaryDirectory() as bin_dir, \
+                 tempfile.TemporaryDirectory() as elsewhere:
+                store = os.path.join(project, ".antiphon")
+                if shape == "link":
+                    os.symlink(elsewhere, store)
+                else:
+                    with open(store, "w") as f:
+                        f.write("not a directory\n")
+                self._rooted(project)
+                self._stub(bin_dir, "codex", "exit 0")
+                record = workers.new_task(project, kind="codex", task_class="write",
+                                          sha256=SHA, size=5)
+                with self.assertRaises(workers.Refused, msg=shape) as refused:
+                    workers.start(project, record, "do it", env=self._env(bin_dir))
+                self.assertIn("not delegated", str(refused.exception))
+                self.assertEqual(workers.tasks(project), [], "a refusal leaves no record")
+                self.assertFalse(os.path.exists(workers.worker_dir(project, record["id"])),
+                                 "nor a directory")
+                listed = subprocess.run(["git", "-C", project, "worktree", "list"],
+                                        capture_output=True, text=True).stdout
+                self.assertNotIn(record["id"], listed, "nor a worktree entry")
+                self.assertEqual(os.listdir(elsewhere), [], "nothing written through the link")
+
+    def test_the_summary_stays_out_of_the_diff_whatever_gitignore_the_checkout_tracks(self):
+        """Round 2, 2026-09-03: a tracked `.antiphon/.gitignore` of the
+        checkout's own is not overwritten, so it did not ignore the test
+        summary and the diff carried it. The store is excluded by pathspec."""
+        with tempfile.TemporaryDirectory() as project, tempfile.TemporaryDirectory() as bin_dir:
+            os.makedirs(os.path.join(project, ".antiphon"))
+            with open(os.path.join(project, ".antiphon", ".gitignore"), "w") as f:
+                f.write("cursor.json\n")
+            self._rooted(project)
+            started = self._run(project, bin_dir,
+                                "echo hello > made.txt; "
+                                "echo 'suite: 1 passed' > \"$ANTIPHON_WORKER_TESTS\"; exit 0",
+                                task_class="write")
+            final = workers.result(project, started["id"], wait=10)
+            self.assertEqual(final["state"], "completed", final)
+            self.assertIn("made.txt", final["diff"])
+            self.assertEqual(final["tests"], "suite: 1 passed\n")
+            self.assertNotIn("tests.txt", final["diff"], "the summary is evidence, not a change")
+            self.assertNotIn(".antiphon", final["diff"])
+
+    def test_an_oversized_diff_outlives_the_workers_directory_and_goes_with_the_record(self):
+        """Round 2, 2026-09-03: a diff too large to inline was written inside
+        the worker's directory, which its own collection made sweepable, so
+        the path the result named died on the next hook. It lives beside the
+        record now and goes with it at the TTL."""
+        from unittest.mock import patch
+        with tempfile.TemporaryDirectory() as project, tempfile.TemporaryDirectory() as bin_dir:
+            self._rooted(project)
+            started = self._run(project, bin_dir, "echo hello > made.txt; exit 0",
+                                task_class="write")
+            with patch.object(workers, "DIFF_INLINE", 8):
+                final = workers.result(project, started["id"], wait=10)
+            self.assertEqual(final["state"], "completed", final)
+            self.assertNotIn("diff", final)
+            path = final["diff_path"]
+            self.assertEqual(os.path.dirname(path), workers.tasks_dir(project), "beside the record")
+            self.assertEqual(os.stat(path).st_mode & 0o777, 0o600)
+            with open(path, "rb") as f:
+                self.assertIn(b"+hello", f.read())
+            self.assertIsNotNone(workers.read_task(project, started["id"])["collected_at"])
+            workers.sweep(project, time.time())
+            self.assertFalse(os.path.isdir(workers.worker_dir(project, started["id"])),
+                             "the directory goes with the collection")
+            self.assertTrue(os.path.exists(path), "the evidence stays")
+            self.assertEqual([t["id"] for t in workers.tasks(project)], [started["id"]],
+                             "the diff file is not a record")
+            workers.sweep(project, time.time() + workers.TASK_TTL + 1)
+            self.assertFalse(os.path.exists(path), "and goes with the record at the TTL")
+            self.assertEqual(workers.tasks(project), [])
+
     def test_four_finished_workers_do_not_refuse_a_fifth(self):
         """Review 2026-09-03: a worker that had exited kept its slot until
         somebody asked after it, and the refusal named four finished tasks.
@@ -638,6 +754,8 @@ class LifecycleTest(unittest.TestCase):
         self.assertEqual(workers._bounded_wait("soon"), 0.0)
         self.assertEqual(workers._bounded_wait(float("nan")), 0.0)
         self.assertEqual(workers._bounded_wait(2.5), 2.5)
+        self.assertEqual(workers._bounded_wait(True), 0.0, "a bool is not a second")
+        self.assertEqual(workers._bounded_wait(False), 0.0)
         with tempfile.TemporaryDirectory() as project, tempfile.TemporaryDirectory() as bin_dir:
             started = self._run(project, bin_dir, "sleep 30")
             began = time.perf_counter()

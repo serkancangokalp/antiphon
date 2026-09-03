@@ -646,6 +646,23 @@ class ShippedContractTest(unittest.TestCase):
         backlog = read("BACKLOG.md")
         self.assertIn("## P2 — Cross-vendor managed workers (shipped 2026-09-03, MVP)", backlog)
         self.assertNotIn("its registry name `worker-<id8>` on the page", backlog)
+        # Round 2, 2026-09-03: the task description said "read-only except
+        # cancel" (status stops a timed-out worker, result records the
+        # collection) and "swept a week after the task" (the directory goes
+        # on the next hook after collection; a diff too large to inline now
+        # lives beside the record). Both servers say one true sentence.
+        node_task_tool = re.search(r'name: "antiphon_task",\s*description:\s*'
+                                   r'((?:"[^"]*"\s*\+?\s*)+),', node)
+        self.assertIsNotNone(node_task_tool, "the channel server's antiphon_task description")
+        node_description = "".join(re.findall(r'"([^"]*)"', node_task_tool.group(1)))
+        self.assertEqual(node_description, antiphon.TASK_DESCRIPTION)
+        for words in ("stop a worker past its timeout",
+                      "on the next hook after its result was collected",
+                      "written beside it", "nothing goes while the worker runs"):
+            self.assertIn(words, antiphon.TASK_DESCRIPTION, words)
+        self.assertNotIn("Read-only except cancel", antiphon.TASK_DESCRIPTION)
+        self.assertNotIn("swept a week after", antiphon.TASK_DESCRIPTION)
+        self.assertIn("admission stop a worker past its timeout", readme)
         self.assertRegex(backlog, r"(?i)followed\s+by\s+its\s+task\s+id")
         self.assertRegex(backlog, r"(?i)seeding\s+(?:the|a)\s+worktree[^.]*follow-up")
         self.assertTrue(os.path.exists(os.path.join(
