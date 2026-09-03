@@ -400,8 +400,11 @@ SWEPT="$(cd "$PROJECT" && ANTIPHON_NAME= antiphon status 2>&1)"; contains "statu
 
 step "T3 — Codex's first turn reads what the refused push could not carry"
 BEFORE_ROLLOUTS="$(mktemp)"; find "$HOME/.codex/sessions" -name 'rollout-*.jsonl' 2>/dev/null | sort > "$BEFORE_ROLLOUTS"
-CODEX_OUT="$(cd "$PROJECT" && codex exec -s read-only --color never 'Reply with exactly: E2E-OK' 2>&1)" \
-  && pass "codex exec exits 0" || fail "codex exec failed"
+# Bounded: twice in seven runs this `codex exec` never returned (the worker
+# step before it had passed; not reproduced under a process watchdog in five
+# further runs). A hang here must be a FAIL with a name, not a stalled run.
+CODEX_OUT="$(cd "$PROJECT" && perl -e 'alarm 240; exec @ARGV' codex exec -s read-only --color never 'Reply with exactly: E2E-OK' 2>&1)"; CODEX_CODE=$?
+if [ "$CODEX_CODE" -eq 0 ]; then pass "codex exec exits 0"; elif [ "$CODEX_CODE" -ge 128 ]; then fail "codex exec did not return within 240 s (killed by the alarm)"; else fail "codex exec failed ($CODEX_CODE)"; fi
 contains "codex exec ran the SessionStart hook" "$CODEX_OUT" "hook: SessionStart"
 # Two answers, deliberately: what the package's own discovery returns, and
 # what this run provably created. They must agree — that is the assertion —
