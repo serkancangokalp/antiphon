@@ -112,9 +112,17 @@ class LedgerTest(unittest.TestCase):
                 f.write("{}")
             with open(os.path.join(directory, "note.txt"), "w") as f:
                 f.write("x")
+            # Nested brackets well under RECORD_CEILING: RecursionError out
+            # of the parser on Python 3.9 (review 2026-09-03: it reached the
+            # hook's exit code, `status` and `doctor`), a list that is not an
+            # entry on 3.14. Either way not an entry, never a raise.
+            deep = "4a9e1c3b-5d2f-4e6a-8b7c-9d0e1f2a3b4c"
+            with open(os.path.join(directory, deep + ".json"), "w") as f:
+                f.write("[" * 30_000 + "]" * 30_000)
             self.assertEqual([e["id"] for e in ledger.entries(project)], [UUID])
             self.assertIsNone(ledger.read_entry(project, OTHER))
             self.assertIsNone(ledger.read_entry(project, THIRD))
+            self.assertIsNone(ledger.read_entry(project, deep))
             # Well-formed JSON that is not an entry: every one is refused by
             # the validator, not by the parser, so a validator that stopped
             # looking would let each of them onto the ledger.
@@ -140,11 +148,11 @@ class LedgerTest(unittest.TestCase):
     def test_a_receipt_keeps_the_earliest_time_and_is_idempotent(self):
         with tempfile.TemporaryDirectory() as project:
             self._sent(project)
-            self.assertTrue(ledger.mark_received(project, UUID, 2_000.0))
-            self.assertTrue(ledger.mark_received(project, UUID, 1_500.0))
-            self.assertTrue(ledger.mark_received(project, UUID, 3_000.0))
+            self.assertTrue(ledger.mark_received(project, UUID, 2_000.0, reader_alias="build"))
+            self.assertTrue(ledger.mark_received(project, UUID, 1_500.0, reader_alias="build"))
+            self.assertTrue(ledger.mark_received(project, UUID, 3_000.0, reader_alias="build"))
             self.assertEqual(ledger.read_entry(project, UUID)["received_at"], 1_500.0)
-            self.assertFalse(ledger.mark_received(project, OTHER, 2_000.0),
+            self.assertFalse(ledger.mark_received(project, OTHER, 2_000.0, reader_alias="build"),
                              "a receipt for nothing on the ledger is not an entry")
             self.assertEqual([e["id"] for e in ledger.entries(project)], [UUID])
 
@@ -153,7 +161,7 @@ class LedgerTest(unittest.TestCase):
             self._sent(project, UUID, attachment="a.txt")
             self._sent(project, OTHER, attachment="a.txt", at=1_100.0)
             self._sent(project, THIRD, attachment="b.txt", at=1_200.0)
-            self.assertTrue(ledger.mark_read(project, "a.txt", 5_000.0))
+            self.assertTrue(ledger.mark_read(project, "a.txt", 5_000.0, reader_alias="build"))
             self.assertEqual(ledger.read_entry(project, UUID)["read_at"], 5_000.0)
             self.assertEqual(ledger.read_entry(project, OTHER)["read_at"], 5_000.0)
             self.assertIsNone(ledger.read_entry(project, THIRD)["read_at"])
@@ -165,7 +173,7 @@ class LedgerTest(unittest.TestCase):
             self._sent(project, OTHER, attachment="a.txt", at=1_100.0)
             self._sent(project, THIRD, attachment="b.txt", at=1_200.0)
             self.assertEqual(ledger.read_times(project), {})
-            ledger.mark_read(project, "a.txt", 5_000.0)
+            ledger.mark_read(project, "a.txt", 5_000.0, reader_alias="build")
             self.assertEqual(ledger.read_times(project), {"a.txt": 5_000.0})
             self.assertEqual(ledger.mark_expired_unread(project, "b.txt", 9_000.0), 1)
             self.assertEqual(ledger.mark_expired_unread(project, "b.txt", 9_500.0), 0,
@@ -181,7 +189,8 @@ class LedgerTest(unittest.TestCase):
             ledger.record_receipts(project, [("received", UUID, 2_000.0),
                                              ("read", "a.txt", 2_500.0),
                                              ("received", OTHER, 2_000.0),
-                                             ("bogus", UUID, 1.0)])
+                                             ("bogus", UUID, 1.0), ("read",)],
+                                   reader_alias="build")
             entry = ledger.read_entry(project, UUID)
             self.assertEqual((entry["received_at"], entry["read_at"]), (2_000.0, 2_500.0))
 
@@ -226,9 +235,9 @@ class LedgerTest(unittest.TestCase):
             self.assertEqual([i for i, _ in notices], [UUID])
             self.assertIn("the attachment you sent to Codex at 21:44 expired unread", notices[0][1])
             self.assertIn("7 days", notices[0][1])
-            ledger.mark_read(project, "a.txt", 4_000.0)
+            ledger.mark_read(project, "a.txt", 4_000.0, reader_alias="build")
             self._sent(project, OTHER, attachment="b.txt", at=2.0)
-            ledger.mark_read(project, "b.txt", 3.0)
+            ledger.mark_read(project, "b.txt", 3.0, reader_alias="build")
             ledger.mark_expired_unread(project, "b.txt", 4.0)
             self.assertIsNone(ledger.read_entry(project, OTHER)["expired_unread_at"],
                               "a read attachment never expires unread")
@@ -237,7 +246,7 @@ class LedgerTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as project:
             self._sent(project, UUID, at=100.0)
             self._sent(project, OTHER, at=200.0)
-            ledger.mark_received(project, OTHER, 250.0)
+            ledger.mark_received(project, OTHER, 250.0, reader_alias="build")
             ledger.record_refused(project, THIRD, sender="ui", to_kind="codex",
                                   to_alias=None, reason="r", preview="p", at=300.0)
             waiting = ledger.awaiting_receipt(project, 1_000.0)
@@ -329,11 +338,13 @@ class LedgerTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as project:
             self._sent(project, UUID, attachment="a.txt")                       # to codex
             self._sent(project, OTHER, to_kind="claude", to_alias="ui", attachment="a.txt")
-            self.assertTrue(ledger.mark_read(project, "a.txt", 5.0, to_kind="codex"))
+            self.assertTrue(ledger.mark_read(project, "a.txt", 5.0, to_kind="codex",
+                                             reader_alias="build"))
             self.assertEqual(ledger.read_entry(project, UUID)["read_at"], 5.0)
             self.assertIsNone(ledger.read_entry(project, OTHER)["read_at"],
                               "a Claude reader's transcript proves nothing about a Codex file")
-            ledger.record_receipts(project, [("read", "a.txt", 7.0)], read_by="claude")
+            ledger.record_receipts(project, [("read", "a.txt", 7.0)], read_by="claude",
+                                   reader_alias="ui")
             self.assertEqual(ledger.read_entry(project, OTHER)["read_at"], 7.0)
             self.assertEqual(ledger.read_entry(project, UUID)["read_at"], 5.0)
 
@@ -345,7 +356,7 @@ class LedgerTest(unittest.TestCase):
             self.assertEqual(ledger.mark_expired_unread(project, "a.txt", 700_000.0), 1)
             self.assertEqual([i for i, _ in ledger.pending_notices(project, "claude", "ui")],
                              [UUID])
-            ledger.mark_read(project, "a.txt", 600_000.0, to_kind="codex")
+            ledger.mark_read(project, "a.txt", 600_000.0, to_kind="codex", reader_alias="build")
             entry = ledger.read_entry(project, UUID)
             self.assertIsNone(entry["expired_unread_at"], "a read file did not expire unread")
             self.assertEqual(entry["read_at"], 600_000.0)
@@ -367,7 +378,7 @@ class LedgerTest(unittest.TestCase):
             self._sent(project, UUID, attachment="a.txt", at=100.0)
             self.assertEqual(ledger.reusable_attachment(project, SHA, "codex", "build", 200.0),
                              "a.txt")
-            ledger.mark_read(project, "a.txt", 150.0, to_kind="codex")
+            ledger.mark_read(project, "a.txt", 150.0, to_kind="codex", reader_alias="build")
             self.assertIsNone(ledger.reusable_attachment(project, SHA, "codex", "build", 200.0),
                               "a fresh file, whose receipt is its own")
 
@@ -376,7 +387,8 @@ class LedgerTest(unittest.TestCase):
             self._sent(project, UUID, attachment="a.txt")
             with patch.object(ledger, "entries", wraps=ledger.entries) as reads:
                 ledger.record_receipts(project, [("read", "a.txt", 9.0), ("read", "a.txt", 5.0),
-                                                 ("read", "a.txt", 7.0)], read_by="codex")
+                                                 ("read", "a.txt", 7.0)], read_by="codex",
+                                       reader_alias="build")
             self.assertEqual(ledger.read_entry(project, UUID)["read_at"], 5.0, "the earliest")
             self.assertEqual(reads.call_count, 1, "one snapshot for the whole batch")
 
@@ -390,7 +402,7 @@ class LedgerTest(unittest.TestCase):
                 calls.append(operation)
                 return real(fd, operation)
             with patch.object(ledger.fcntl, "flock", side_effect=flock):
-                ledger.mark_received(project, UUID, 5.0)
+                ledger.mark_received(project, UUID, 5.0, reader_alias="build")
             self.assertEqual(calls, [ledger.fcntl.LOCK_EX, ledger.fcntl.LOCK_UN])
             self.assertTrue(os.path.exists(os.path.join(ledger.ledger_dir(project), ".lock")))
             self.assertEqual([e["id"] for e in ledger.entries(project)], [UUID],
@@ -424,14 +436,17 @@ class LedgerTest(unittest.TestCase):
                        to_alias="api", attachment="a.txt")
             self._sent(project, OTHER, sender="build", to_kind="claude", to_alias="ui",
                        attachment="a.txt")
-            self.assertTrue(ledger.mark_read(project, "a.txt", 5.0, to_kind="claude"))
+            self.assertFalse(ledger.mark_read(project, "a.txt", 5.0, to_kind="claude"),
+                             "a reader with no alias is nobody's named receiver")
             self.assertIsNone(ledger.read_entry(project, UUID)["read_at"],
                               "a reader with no alias cannot be the named receiver")
-            self.assertEqual(ledger.read_entry(project, OTHER)["read_at"], 5.0,
-                             "a cross-kind delivery: the kind is the receiver")
+            self.assertIsNone(ledger.read_entry(project, OTHER)["read_at"],
+                              "a named cross-kind delivery is its named receiver's too")
             ledger.mark_read(project, "a.txt", 6.0, to_kind="claude", reader_alias="ui")
             self.assertIsNone(ledger.read_entry(project, UUID)["read_at"],
                               "the sender's own verification")
+            self.assertEqual(ledger.read_entry(project, OTHER)["read_at"], 6.0,
+                             "the cross-kind delivery's named receiver")
             ledger.mark_read(project, "a.txt", 7.0, to_kind="claude", reader_alias="api")
             self.assertEqual(ledger.read_entry(project, UUID)["read_at"], 7.0, "the receiver")
             ledger.record_receipts(project, [("read", "a.txt", 8.0)], read_by="claude",
@@ -471,6 +486,78 @@ class LedgerTest(unittest.TestCase):
                 transport="queue", proof="live", sha256=SHA, size=1, at=1.0))
             self.assertEqual(os.listdir(elsewhere), [], "nothing was written elsewhere")
             self.assertEqual(ledger.entries(project), [])
+
+    def test_a_cross_kind_receipt_is_the_named_receivers_or_a_bare_deliverys(self):
+        """Review 2026-09-03: Claude parks words for Codex `build`; Codex
+        `review` opens the file, which sits in the shared project directory.
+        That is not `build` reading it — the file would be collected an hour
+        later, the resend refused reuse, `build`'s expired-unread notice
+        suppressed. A transcript nobody can name proves nothing about a
+        named delivery, only about a bare one."""
+        with tempfile.TemporaryDirectory() as project:
+            self._sent(project, UUID, attachment="a.txt")                       # to codex build
+            self._sent(project, OTHER, to_alias=None, attachment="a.txt")       # to codex, bare
+            self.assertTrue(ledger.mark_read(project, "a.txt", 5.0, to_kind="codex",
+                                             reader_alias="review"))
+            self.assertIsNone(ledger.read_entry(project, UUID)["read_at"],
+                              "the wrong peer of the right kind")
+            self.assertEqual(ledger.read_entry(project, OTHER)["read_at"], 5.0,
+                             "a bare delivery: any reader of its kind")
+            ledger.mark_read(project, "a.txt", 6.0, to_kind="codex")
+            self.assertIsNone(ledger.read_entry(project, UUID)["read_at"],
+                              "a reader nobody can name is not the named receiver")
+            ledger.mark_read(project, "a.txt", 7.0, to_kind="codex", reader_alias="build")
+            self.assertEqual(ledger.read_entry(project, UUID)["read_at"], 7.0, "the receiver")
+            # `received` is scoped the same way, and a receipt may carry its
+            # own reader: the page road names each transcript it walked.
+            self.assertFalse(ledger.mark_received(project, UUID, 8.0, to_kind="codex",
+                                                  reader_alias="review"))
+            self.assertFalse(ledger.mark_received(project, UUID, 8.0, to_kind="claude",
+                                                  reader_alias="build"),
+                             "a Claude transcript proves nothing about a Codex delivery")
+            self.assertIsNone(ledger.read_entry(project, UUID)["received_at"])
+            ledger.record_receipts(project, [("received", UUID, 9.0, "review"),
+                                             ("received", UUID, 10.0, "build"),
+                                             ("received", OTHER, 11.0, None)],
+                                   read_by="codex")
+            self.assertEqual(ledger.read_entry(project, UUID)["received_at"], 10.0)
+            self.assertEqual(ledger.read_entry(project, OTHER)["received_at"], 11.0)
+
+    def test_a_reader_never_repairs_the_store_a_writer_does(self):
+        """`status` and `doctor` read the ledger. A directory somebody
+        loosened is tightened by the next write, not by a report that says
+        it only reads."""
+        with tempfile.TemporaryDirectory() as project:
+            self._sent(project, UUID)
+            directory = ledger.ledger_dir(project)
+            os.chmod(directory, 0o755)
+            self.assertEqual([e["id"] for e in ledger.entries(project)], [UUID])
+            ledger.read_times(project)
+            ledger.awaiting_receipt(project, 2_000.0)
+            ledger.pending_notices(project, "claude", "ui")
+            self.assertEqual(os.stat(directory).st_mode & 0o777, 0o755,
+                             "a read leaves the mode as it found it")
+            self._sent(project, OTHER)
+            self.assertEqual(os.stat(directory).st_mode & 0o777, 0o700, "a write repairs it")
+
+    def test_a_refusals_reason_is_bounded_when_it_is_written(self):
+        """The notices ride ahead of the page, outside its budget; a reason
+        is a transport's own words, bounded only here."""
+        with tempfile.TemporaryDirectory() as project:
+            self.assertTrue(ledger.record_refused(
+                project, UUID, sender="ui", to_kind="codex", to_alias=None,
+                reason="not delivered: " + "x" * 10_000, preview="p", at=1_000.0))
+            entry = ledger.read_entry(project, UUID)
+            self.assertEqual(ledger.REASON_LENGTH, 400)
+            self.assertEqual(len(entry["reason"]), ledger.REASON_LENGTH)
+            notice = ledger.pending_notices(project, "claude", "ui")[0][1]
+            self.assertLess(len(notice), ledger.REASON_LENGTH + 120)
+            # An entry from before the bound is bounded where it is rendered.
+            entry["reason"] = "not delivered: " + "y" * 10_000
+            with open(os.path.join(ledger.ledger_dir(project), UUID + ".json"), "w") as f:
+                json.dump(entry, f)
+            notice = ledger.pending_notices(project, "claude", "ui")[0][1]
+            self.assertLess(len(notice), ledger.REASON_LENGTH + 120)
 
 
 if __name__ == "__main__":

@@ -18,9 +18,14 @@ of a new entry is one atomic replace of its own file and needs no lock.
 
 An entry holds no message content, no route, no session id and no socket
 path: public aliases, kinds, a transport, a proof class, times, a content
-digest and size, an attachment file name, a state, a redacted reason and a
-short preview of the sender's own marker line (their own words, in their own
-project).
+digest and size, an attachment file name, a state, a redacted reason (bounded
+to `REASON_LENGTH`) and a short preview of the sender's own marker line (their
+own words, in their own project).
+
+A receipt is credited to the session whose transcript proved it: a delivery to
+a named recipient is marked only from that recipient's own transcript, and a
+transcript nobody can name proves a bare delivery alone. The readers say whose
+transcript they walked; the ledger never guesses.
 """
 
 import contextlib
@@ -41,6 +46,10 @@ TRANSPORTS = ("queue", "channel")
 PROOFS = ("live", "unproven", "registered", "automatic", "legacy", "channel")
 KINDS = ("claude", "codex")
 PREVIEW_LENGTH = 60
+# A refusal's reason on the record and in the notice it becomes: the notices
+# ride ahead of the page, outside its budget, and a reason is bounded only
+# here (a transport's refusal is its own words, not this side's).
+REASON_LENGTH = 400
 LABEL = {"claude": "Claude", "codex": "Codex"}
 
 DELIVERY_ID = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}")
@@ -77,11 +86,15 @@ def ledger_dir(cwd):
     return os.path.join(cwd, ".antiphon", "deliveries")
 
 
-def _sound_dir(cwd, create=False):
+def _sound_dir(cwd, create=False, repair=False):
     """The ledger directory when it is a directory this code owns, else None.
 
     Never through a symlink: a link at somebody else's directory would have
     this bridge writing its bookkeeping there and counting it as here.
+
+    A writer (`create` or `repair`) tightens a directory somebody loosened; a
+    reader leaves the mode as it found it, so `status` and `doctor` are
+    read-only in the file system's terms as well as the ledger's.
     """
     directory = ledger_dir(cwd)
     try:
@@ -101,7 +114,7 @@ def _sound_dir(cwd, create=False):
         return None
     if stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode):
         return None
-    if info.st_mode & 0o077:
+    if (create or repair) and info.st_mode & 0o077:
         with contextlib.suppress(OSError):
             os.chmod(directory, 0o700)
     return directory
@@ -188,7 +201,12 @@ def read_entry(cwd, delivery_id):
         entry = json.loads(raw.decode("utf-8"),
                            object_pairs_hook=_no_duplicate_keys,
                            parse_int=_bounded_int)
-    except (OSError, ValueError, UnicodeDecodeError):
+    except Exception:       # noqa: BLE001 — a malformed file is skipped, never raised
+        # Not only the parser's ValueError: a file of nested brackets well
+        # under RECORD_CEILING raised RecursionError out of `json.loads`, and
+        # through every caller — the hook's exit code, `status` and `doctor`
+        # together (review 2026-09-03). Whatever a file does to the parser,
+        # it is not an entry.
         return None
     return entry if _valid(entry, delivery_id) else None
 
@@ -266,7 +284,7 @@ def record_refused(cwd, delivery_id, *, sender, to_kind, to_alias, reason,
     entry = _new(delivery_id, sender, to_kind, to_alias, "queue"
                  if to_kind == "codex" else "channel", "unproven", "refused",
                  time.time() if at is None else at, sender_kind)
-    entry["reason"] = str(reason)
+    entry["reason"] = str(reason)[:REASON_LENGTH]
     entry["preview"] = " ".join(str(preview).split())[:PREVIEW_LENGTH]
     if not _valid(entry, delivery_id):
         return False
@@ -282,7 +300,7 @@ def _locked(cwd):
     vanish; a lost receipt is permanent, because the record that carried it
     was consumed when the cursor advanced. The section is microseconds and a
     process that dies releases its flock, so a plain blocking lock is safe."""
-    directory = _sound_dir(cwd)
+    directory = _sound_dir(cwd, repair=True)
     if directory is None:
         yield False
         return
@@ -308,15 +326,39 @@ def _update(cwd, delivery_id, mutate):
         if entry is None:
             return False
         changed = dict(entry)
-        mutate(changed)
+        if mutate(changed) is False:
+            return False
         if changed == entry:
             return True
         return _write(cwd, changed)
 
 
-def mark_received(cwd, delivery_id, at):
-    """The peer's transcript shows the delivery; the earliest sighting wins."""
+def _for_reader(entry, to_kind, reader_alias):
+    """Whether a receipt read off a transcript — of a session of `to_kind`
+    named `reader_alias`, or None when the reader could not say — is this
+    entry's recipient's.
+
+    The transcript that proves a receipt belongs to one session. A delivery
+    to a named recipient is that session's alone: Codex `review` opening a
+    file parked for Codex `build` is not `build` reading it, and a transcript
+    nobody can name proves nothing about a named delivery — it proves a bare
+    one, sent to nobody in particular of that kind. A same-kind delivery
+    shares the sender's kind with its recipient, so only the named
+    recipient's own transcript can prove it read."""
+    if to_kind is not None and entry["to_kind"] != to_kind:
+        return False
+    if sender_kind_of(entry) == entry["to_kind"]:
+        return reader_alias is not None and entry["to_alias"] == reader_alias
+    return entry["to_alias"] in (None, reader_alias)
+
+
+def mark_received(cwd, delivery_id, at, to_kind=None, reader_alias=None):
+    """The peer's transcript shows the delivery; the earliest sighting wins.
+    Scoped like a read (`_for_reader`): the transcript belongs to a session of
+    `to_kind` named `reader_alias`, and only its own deliveries are its."""
     def mutate(entry):
+        if not _for_reader(entry, to_kind, reader_alias):
+            return False
         if entry["received_at"] is None or at < entry["received_at"]:
             entry["received_at"] = float(at)
     return _update(cwd, delivery_id, mutate)
@@ -329,27 +371,23 @@ def _entries_naming(cwd, attachment):
 def mark_read(cwd, attachment, at, to_kind=None, snapshot=None, reader_alias=None):
     """A transcript shows the attachment file being read.
 
-    Scoped to the recipient: with `to_kind`, only deliveries *to* that kind
-    are marked, because the transcript that proved the read belongs to a
-    session of that kind — the sender verifying its own parked file (the
-    `tail -n +3 | shasum` ritual the envelope teaches) is not the recipient
-    reading it. A same-kind delivery shares the sender's kind with its
-    recipient, so the kind cannot tell them apart: such an entry is marked
-    only when `reader_alias` — the alias of the session whose own transcript
-    proved the read — is the entry's named recipient. A cross-kind reader,
-    which walks every transcript of the other kind without knowing whose,
-    never marks a same-kind entry. A read clears an expiry marked in the
-    meantime: a file that was read did not expire unread, whichever the
-    sweep saw first."""
+    Scoped to the recipient (`_for_reader`): with `to_kind`, only deliveries
+    *to* that kind are marked, because the transcript that proved the read
+    belongs to a session of that kind — the sender verifying its own parked
+    file (the `tail -n +3 | shasum` ritual the envelope teaches) is not the
+    recipient reading it. A named delivery is marked only when
+    `reader_alias` — the alias of the session whose transcript proved the
+    read — is its named recipient; a bare delivery, by any reader of its
+    kind. A same-kind delivery shares the sender's kind with its recipient,
+    so only the named recipient's own transcript proves it. A read clears an
+    expiry marked in the meantime: a file that was read did not expire
+    unread, whichever the sweep saw first."""
     found = False
     rows = entries(cwd) if snapshot is None else snapshot
     for entry in rows:
         if entry["attachment"] != attachment:
             continue
-        if to_kind is not None and entry["to_kind"] != to_kind:
-            continue
-        if sender_kind_of(entry) == entry["to_kind"] and (
-                reader_alias is None or entry["to_alias"] != reader_alias):
+        if not _for_reader(entry, to_kind, reader_alias):
             continue
         found = True
 
@@ -398,29 +436,39 @@ def mark_reported(cwd, delivery_ids, at):
 
 
 def record_receipts(cwd, receipts, read_by=None, reader_alias=None):
-    """Apply `("received", id, at)` / `("read", basename, at)` triples.
+    """Apply `("received", id, at)` / `("read", basename, at)` receipts, each
+    optionally carrying a fourth element: the alias of the session whose
+    transcript proved it, or None when the reader could not say.
 
-    `read_by` is the kind of session whose transcript the reads came from;
-    a read marks only deliveries to that kind, and a same-kind delivery only
-    when `reader_alias` is its named recipient. Receipts are folded to one
-    per key (the earliest time) and the reads share one snapshot of the
-    ledger, so a page naming a file several times costs one read of the
-    directory, not one per mention."""
+    `read_by` is the kind of session whose transcript the receipts came from,
+    and `reader_alias` the alias a three-element receipt is credited to (a
+    session reading its own transcript passes its own). A receipt marks only
+    deliveries to that kind, and a named delivery only when the reader is its
+    named recipient (`_for_reader`). Receipts are folded to one per key (the
+    earliest time) and the reads share one snapshot of the ledger, so a page
+    naming a file several times costs one read of the directory, not one per
+    mention."""
     earliest = {}
-    for kind, key, at in receipts:
+    for receipt in receipts:
+        if len(receipt) == 3:
+            (kind, key, at), alias = receipt, reader_alias
+        elif len(receipt) == 4:
+            kind, key, at, alias = receipt
+        else:
+            continue
         if kind not in ("received", "read"):
             continue
-        if (kind, key) not in earliest or at < earliest[(kind, key)]:
-            earliest[(kind, key)] = at
+        if (kind, key, alias) not in earliest or at < earliest[(kind, key, alias)]:
+            earliest[(kind, key, alias)] = at
     snapshot = None
-    for (kind, key), at in earliest.items():
+    for (kind, key, alias), at in earliest.items():
         if kind == "received":
-            mark_received(cwd, key, at)
+            mark_received(cwd, key, at, to_kind=read_by, reader_alias=alias)
         else:
             if snapshot is None:
                 snapshot = entries(cwd)
             mark_read(cwd, key, at, to_kind=read_by, snapshot=snapshot,
-                      reader_alias=reader_alias)
+                      reader_alias=alias)
 
 
 def _clock(stamp):
@@ -451,8 +499,9 @@ def pending_notices(cwd, side, alias):
             named = f":{entry['to_alias']}" if entry["to_alias"] else ""
             # Every refusal the senders write starts "not delivered: "; the
             # notice says that once.
-            reason = re.sub(r"^\s*not delivered:\s*", "",
-                            entry["reason"] or "") or "no reason recorded"
+            reason = (re.sub(r"^\s*not delivered:\s*", "",
+                             entry["reason"] or "")[:REASON_LENGTH]
+                      or "no reason recorded")
             notices.append((entry["id"], (
                 f"Antiphon: your @{entry['to_kind']}{named} line at "
                 f"{_clock(entry['sent_at'])} (\"{entry['preview'] or ''}\") "
@@ -540,7 +589,7 @@ def prune(cwd, now):
     unread expiry not yet reported — is kept for a second TTL: the
     attachment TTL and this one are the same week, so the expiry a sweep
     marks on day seven would otherwise be pruned in the same hook, unheard."""
-    directory = _sound_dir(cwd)
+    directory = _sound_dir(cwd, repair=True)
     if directory is None:
         return
     for entry in entries(cwd):
