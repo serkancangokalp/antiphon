@@ -618,9 +618,18 @@ class ShippedContractTest(unittest.TestCase):
         # so uncommitted work is not visible to it — every surface says so.
         delegate = next(t for t in antiphon.TOOLS if t["name"] == "antiphon_delegate")
         task_argument = delegate["inputSchema"]["properties"]["task"]["description"]
-        for surface in (antiphon.DELEGATE_DESCRIPTION, task_argument, collapsed):
+        node_task = re.search(r'task: \{\s*type: "string", enum: \["read", "write"\],'
+                              r'\s*description: "([^"]*)"', node)
+        self.assertIsNotNone(node_task, "the channel server's task argument")
+        for surface in (antiphon.DELEGATE_DESCRIPTION, task_argument, collapsed,
+                        node_task.group(1)):
             self.assertNotIn("runs read-only in the project", surface)
             self.assertIn("at HEAD", surface)
+        # The read half on its own: the write task always had a worktree.
+        for argument in (task_argument, node_task.group(1)):
+            read_half, _, write_half = argument.partition("write:")
+            self.assertIn("at HEAD", read_half, "the read task's worktree is named")
+            self.assertIn("at HEAD", write_half)
         self.assertRegex(readme, r"(?i)nothing\s+uncommitted[^.]*visible")
         # And a worker is followed by its task id, not as a peer: the claim
         # that its hooks register it and the page names it was false — its
