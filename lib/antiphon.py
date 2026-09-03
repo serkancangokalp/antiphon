@@ -656,14 +656,18 @@ def _is_host_record(text, wrappers, prompt_source=None):
 # a session: `# AGENTS.md instructions for <cwd>`, a blank line, then an
 # `<INSTRUCTIONS>` fence. Measured 2026-09-02: 18 records, 32 KB, every one
 # host-written — and the rule inside is this bridge's own text, relayed back
-# to the other side at 8 KB a session. Both halves are required: a heading
-# alone could be a person's document, a fence alone could be quoted.
+# to the other side at 8 KB a session. Both halves are required, and the
+# fence must close: a heading alone could be a person's document, a fence
+# alone could be quoted, and a fence that opens and never closes is a draft
+# somebody is still writing — the host writes the whole file at once.
 AGENTS_INJECTION_HEAD = "# AGENTS.md instructions for "
 
 
 def _is_codex_host_block(text):
-    return (isinstance(text, str) and text.startswith(AGENTS_INJECTION_HEAD)
-            and "\n<INSTRUCTIONS>" in text)
+    if not isinstance(text, str) or not text.startswith(AGENTS_INJECTION_HEAD):
+        return False
+    opening = text.find("\n<INSTRUCTIONS>")
+    return opening >= 0 and "</INSTRUCTIONS>" in text[opening:]
 
 
 def sender_alias(candidate):
@@ -3177,7 +3181,18 @@ def _first_offset_at_or_after(source, timestamp, start):
     inversions in 108,801 records); Claude has sub-second reorderings (2,751
     in 95,089 records, 2 of them beyond the slack and both 0 s wide). A
     misorder wider than the slack that also straddles the horizon is the
-    stated residual, unobserved."""
+    stated residual, unobserved.
+
+    A record without a readable time is not a record before the horizon. It
+    stays behind when a dated record before the horizon follows it — the
+    measured shape, host bookkeeping between dated records — and is the
+    landing when none does, so a source whose readable times stop before the
+    horizon, or that has none at all, is read from there rather than skipped
+    whole. Measured 2026-09-03: 11,077 of 95,089 Claude records carry no
+    time and every one is bookkeeping the reader filters, so landing on one
+    costs nothing visible; an undated record that is speech — a stamp this
+    interpreter cannot parse, a host that stopped stamping — is the shape
+    the rule keeps."""
     size = source.complete_prefix_end()
     lo, hi = start, size
     if hi - lo > HORIZON_BISECT_ABOVE:
@@ -3187,19 +3202,46 @@ def _first_offset_at_or_after(source, timestamp, start):
             if record is None or record[0] >= hi:
                 hi = mid
                 continue
-            when = _record_time(record[2])
-            if when is not None and when >= timestamp:
-                hi = record[0]
+            when, dated_end = _dated_probe(source, record, hi)
+            if when is not None and when < timestamp:
+                lo = dated_end
             else:
-                lo = record[1]
+                hi = record[0]
         lo = max(start, lo - HORIZON_BISECT_SLACK)
         boundary = source.first_record_at(lo)
         lo = boundary[0] if boundary else lo
+    landing = None
     for record_start, _end, line in source.read_records(lo):
         when = _record_time(line)
-        if when is not None and when >= timestamp:
+        if when is None:
+            if landing is None:
+                landing = record_start
+        elif when >= timestamp:
             return record_start
-    return size
+        else:
+            landing = None
+    return size if landing is None else landing
+
+
+def _dated_probe(source, record, limit):
+    """The time of the first dated record from `record` on — within
+    HORIZON_BISECT_SLACK bytes and before `limit` — and the end of the record
+    that carried it; `(None, end)` when nothing there carries one. The
+    bisection then treats the span as possibly inside the horizon rather
+    than before it: the direction that loses nothing, at the price of a
+    longer linear scan in a shape never measured."""
+    when = _record_time(record[2])
+    end = record[1]
+    if when is not None:
+        return when, end
+    for next_start, next_end, line in source.read_records(end):
+        if next_start >= limit or next_end - record[0] > HORIZON_BISECT_SLACK:
+            break
+        when = _record_time(line)
+        end = next_end
+        if when is not None:
+            return when, end
+    return None, end
 
 
 def _reader_horizon(cwd, kind, paths):
@@ -3244,7 +3286,10 @@ def _apply_horizon(source, start, horizon):
     bookkeeping — `last-prompt`, `file-history-snapshot`, …) and 101 of 526
     transcripts end on one; none of those shapes is visible to a reader, so
     the landing is the first timestamped record inside the horizon and the
-    bookkeeping before it goes with the rest."""
+    bookkeeping before it goes with the rest. Where no timestamped record
+    is inside the horizon, the landing is the first undated record after the
+    last dated one — a source is never skipped whole on the strength of
+    records that carry no time (`_first_offset_at_or_after`)."""
     if horizon is None:
         return start, 0
     first = source.first_record_at(start)

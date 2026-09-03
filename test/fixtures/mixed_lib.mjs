@@ -6,6 +6,55 @@ import { tmpdir } from "node:os";
 
 const NODE_FILES = ["channel.mjs", "identity.mjs"];
 
+function git(repoRoot, args) {
+  return execFileSync("git", args, { cwd: repoRoot, stdio: ["ignore", "pipe", "pipe"] })
+    .toString().trim();
+}
+
+// What history this checkout carries: "complete", "shallow" (a `--depth`
+// clone), or "none" (an extracted tarball, no repository at all). Only a
+// complete history can be expected to hold a pinned commit.
+export function checkoutHistory(repoRoot = process.cwd()) {
+  try {
+    return git(repoRoot, ["rev-parse", "--is-shallow-repository"]) === "true" ? "shallow" : "complete";
+  } catch (error) {
+    if (error?.code === "ENOENT") return "none";           // no git binary
+    return "none";                                          // not a repository
+  }
+}
+
+// Whether a pinned commit can be materialised from this checkout, and why
+// not when it cannot. A shallow clone and a tarball cannot hold it and say
+// so — the tests that need it skip, by name, and the rest of the suite runs.
+// A checkout with complete history that lacks it has a rewritten history,
+// which throws: after a squash the mixed-version contract must not pass by
+// skipping.
+const availability = new Map();
+export function pinnedAvailability(source, repoRoot = process.cwd()) {
+  if (source === "worktree") return { available: true };
+  const key = `${repoRoot}\0${source}`;
+  if (availability.has(key)) return availability.get(key);
+  let verdict;
+  try {
+    git(repoRoot, ["cat-file", "-e", `${source}^{commit}`]);
+    verdict = { available: true };
+  } catch (error) {
+    if (error?.code === "ENOENT") {
+      verdict = { available: false, skip: "no git" };
+    } else {
+      const history = checkoutHistory(repoRoot);
+      if (history === "complete") {
+        throw new Error(`commit ${source} is not in this checkout, whose history is complete: `
+          + String(error?.stderr || error?.message || error).trim());
+      }
+      verdict = { available: false,
+                  skip: `commit ${source} unavailable: ${history === "shallow" ? "shallow clone" : "not a git checkout"}` };
+    }
+  }
+  availability.set(key, verdict);
+  return verdict;
+}
+
 // The Python half is every `lib/*.py` the source has — a fixed list would
 // leave a module a newer commit added (`ledger.py`) behind, and the upgraded
 // `antiphon.py` would then fail on its own import under the old listener.
@@ -62,14 +111,20 @@ function place(repoRoot, lib, source, names) {
 
 // A lib/ whose Node and Python halves come from two sources. `swapPython`
 // replaces only the Python files in place — the upgrade or downgrade a
-// running listener lives through. Returns null only when there is no git
-// binary; a commit that cannot be shown throws.
+// running listener lives through. Returns `{ skipped }` naming the reason
+// when a source cannot be materialised here — no git binary, or a pinned
+// commit this checkout cannot hold (`pinnedAvailability`); a commit that a
+// complete history cannot show throws.
 export async function materialiseLib({ node, python }, repoRoot = process.cwd()) {
+  for (const source of [node, python]) {
+    const pin = pinnedAvailability(source, repoRoot);
+    if (!pin.available) return { skipped: pin.skip };
+  }
   const dir = await mkdtemp(join(tmpdir(), "antiphon-mixed-lib-"));
   const lib = join(dir, "lib");
   mkdirSync(lib);
-  if (!place(repoRoot, lib, node, NODE_FILES)) return null;
-  if (!placePython(repoRoot, lib, python)) return null;
+  if (!place(repoRoot, lib, node, NODE_FILES)) return { skipped: "no git" };
+  if (!placePython(repoRoot, lib, python)) return { skipped: "no git" };
   symlinkSync(resolve(repoRoot, "node_modules"), join(dir, "node_modules"), "dir");
   return {
     dir, lib,
