@@ -122,9 +122,13 @@ page and makes no bare send refused. It is started as
 `ANTIPHON_NAME=worker-<id8>` with `ANTIPHON_CWD` pointing at the project, so
 the bridge call it may still make — a read task run in the project itself —
 lands in the project's own store under that name; seeding the worktree with
-the bridge's configuration is the follow-up, not built. The same lifecycle is
-on the command line as `antiphon task`, and `antiphon task list` names every
-task on record.
+the bridge's configuration is the follow-up, not built. One side effect is
+Codex's own, measured with Codex CLI 0.152.1: `codex exec -s workspace-write`
+records the repository root as trusted in `~/.codex/config.toml` (a read
+worker does not, and a transient `-c` trust override does not prevent it), so
+a Codex write worker leaves that entry behind, which the bridge neither asks
+for nor undoes. The same lifecycle is on the command line as `antiphon task`,
+and `antiphon task list` names every task on record.
 
 ### How identity is preserved
 
