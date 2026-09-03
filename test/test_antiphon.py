@@ -1522,7 +1522,8 @@ class AntiphonTest(unittest.TestCase):
              patch.object(antiphon, "read_cursor", return_value={}), \
              patch.object(antiphon, "write_cursor",
                           side_effect=lambda cwd, data, kind: written.append(dict(data)) or True), \
-             patch.object(antiphon.sys, "stdin", io.StringIO(json.dumps({"text": "hello"}))):
+             patch.object(antiphon.sys, "stdin", io.StringIO(json.dumps({"text": "hello"}))), \
+             contextlib.redirect_stdout(io.StringIO()):
             self.assertEqual(antiphon.reply(), 0)
         self.assertEqual(written, [{"last_pushed_codex": {antiphon.MID_TURN_SLOT:
                                     {"": antiphon.batch_fingerprint(["hello"])}}}])
@@ -2497,8 +2498,9 @@ class AntiphonTest(unittest.TestCase):
     def test_codex_agents_md_injection_is_a_host_record(self):
         """Codex injects the project's AGENTS.md as its first user message —
         the bridge's own rule relayed back to the other side, 8 KB a session.
-        Both halves are required: a heading alone could be a person's document
-        and a fence alone could be quoted."""
+        Both halves are required, and the fence must close: a heading alone
+        could be a person's document, a fence alone could be quoted, and a
+        fence that never closes is a draft somebody is still writing."""
         block = ("# AGENTS.md instructions for /Users/x/project\n\n"
                  "<INSTRUCTIONS>\n\n## The Antiphon bridge\n...\n</INSTRUCTIONS>\n"
                  "<environment_context>\n  <cwd>/Users/x/project</cwd>\n"
@@ -2511,6 +2513,13 @@ class AntiphonTest(unittest.TestCase):
         self.assertFalse(antiphon._is_codex_host_block(""))
         self.assertFalse(antiphon._is_codex_host_block(None))
         self.assertEqual(self._codex_events_for([self._codex_line("user", block)]), [])
+        unclosed = ("# AGENTS.md instructions for /Users/x/project\n\n"
+                    "<INSTRUCTIONS>\nthe rule I am still drafting — not the host's")
+        self.assertFalse(antiphon._is_codex_host_block(unclosed),
+                         "a fence that never closes is a person's draft")
+        self.assertEqual([text for _kind, text, _id in
+                          self._codex_events_for([self._codex_line("user", unclosed)])],
+                         [unclosed])
 
     def test_codex_external_agent_relays_are_filtered_whole(self):
         """The ChatGPT app records an external agent's tool traffic — Claude
@@ -4830,6 +4839,15 @@ class SameVendorTest(unittest.TestCase):
         self.assertEqual([(kind, key) for kind, key, _at in receipts], [("received", self.MID)])
 
 
+def _file_bytes(directory):
+    """Every file in `directory` by name, read and closed."""
+    snapshot = {}
+    for name in sorted(os.listdir(directory)):
+        with open(os.path.join(directory, name), "rb") as stream:
+            snapshot[name] = stream.read()
+    return snapshot
+
+
 class DeliveryReceiptTest(unittest.TestCase):
     """A delivery is received when the peer's own transcript shows it, and
     only then. Measured 2026-09-03 across the live transcripts: 180 Codex
@@ -4921,9 +4939,7 @@ class DeliveryReceiptTest(unittest.TestCase):
 
     @staticmethod
     def _ledger_bytes(project):
-        directory = ledger.ledger_dir(project)
-        return {name: open(os.path.join(directory, name), "rb").read()
-                for name in sorted(os.listdir(directory))}
+        return _file_bytes(ledger.ledger_dir(project))
 
     # ---- the readers report, and never show ----
 
@@ -5244,6 +5260,22 @@ class DeliveryReceiptTest(unittest.TestCase):
             events, _ = antiphon.codex_events(project, source_paths=[path])
         self.assertEqual([e.text for e in events], ["done"])
 
+    def test_a_person_quoting_the_bridges_label_is_heard_and_is_no_receipt(self):
+        """The Codex mirror of the `isMeta` rule on the Claude side: the label
+        is a receipt only where the bridge writes it, at the start of the
+        record. Quoted mid-prompt it is a person's words, and the id inside
+        them proves nothing — a receipt there would mark a delivery received
+        that the peer never saw."""
+        text = (f"why did this arrive twice: {antiphon.PUSH_LABEL_CODEX} "
+                f"[from=build id={self.MID}] ship it")
+        with tempfile.TemporaryDirectory() as project:
+            path = self._codex_rollout(project, [self._codex_message("user", text)])
+            receipts = []
+            events, _ = antiphon.codex_events(project, source_paths=[path],
+                                              receipts=receipts)
+        self.assertEqual(receipts, [], "a quoted label is not a delivery")
+        self.assertEqual([e.text for e in events], [text], "and it is heard")
+
     # ---- the hook writes receipts and carries notices ----
 
     def test_a_hook_marks_the_delivery_received_even_when_the_page_is_empty(self):
@@ -5413,13 +5445,14 @@ class PageHorizonTest(unittest.TestCase):
     """
 
     SID = "1d5a03e0-0548-4339-87c3-45c5dbf7e9d7"
+    OTHER_SID = "5bddf676-4e16-4fe4-b79b-cb70a00afd27"
 
-    def _rollout(self, times, project=None, filler=0):
+    def _rollout(self, times, project=None, filler=0, sid=None, word="message"):
         """One real Codex rollout with an assistant record at each ISO time;
         `filler` pads every message so a window can span several pages."""
         root = tempfile.mkdtemp()
         self.addCleanup(shutil.rmtree, root, ignore_errors=True)
-        path = os.path.join(root, f"rollout-2026-08-28T00-00-00-{self.SID}.jsonl")
+        path = os.path.join(root, f"rollout-2026-08-28T00-00-00-{sid or self.SID}.jsonl")
         with open(path, "w", encoding="utf-8") as stream:
             stream.write(json.dumps({"timestamp": times[0], "type": "session_meta",
                                      "payload": {"cwd": project or "/tmp/project"}})
@@ -5429,21 +5462,51 @@ class PageHorizonTest(unittest.TestCase):
                     "timestamp": when, "type": "response_item",
                     "payload": {"type": "message", "role": "assistant",
                                 "content": [{"type": "output_text",
-                                             "text": f"message {index}"
+                                             "text": f"{word} {index}"
                                                      + (" x" * filler)}]}}) + "\n")
         return path
+
+    def _transcript(self, times, project=None, filler=0):
+        """The mirror fixture: one Claude transcript with an assistant record
+        at each ISO time, for the Codex reader."""
+        root = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, root, ignore_errors=True)
+        path = os.path.join(root, f"{self.OTHER_SID}.jsonl")
+        with open(path, "w", encoding="utf-8") as stream:
+            for index, when in enumerate(times):
+                stream.write(json.dumps({
+                    "type": "assistant", "timestamp": when,
+                    "cwd": project or "/tmp/project",
+                    "message": {"role": "assistant", "content": [
+                        {"type": "text",
+                         "text": f"message {index}" + (" x" * filler)}]}}) + "\n")
+        return path
+
+    @staticmethod
+    def _undate(path):
+        """Strip every timestamp from a source, in place: a shape no
+        interpreter parses, where the nine-digit stamp Python 3.9 refuses
+        and 3.14 reads would split the suite."""
+        with open(path, encoding="utf-8") as stream:
+            records = [json.loads(line) for line in stream]
+        with open(path, "w", encoding="utf-8") as stream:
+            for record in records:
+                record.pop("timestamp", None)
+                stream.write(json.dumps(record) + "\n")
 
     @staticmethod
     def _hourly(hours):
         return [f"2026-08-{28 + hour // 24:02d}T{hour % 24:02d}:00:00.000Z"
                 for hour in range(hours)]
 
-    def _drain(self, project, path, positions):
+    def _drain(self, project, paths, positions, side="claude"):
         pages = []
-        with patch.object(antiphon, "codex_rollout_files", return_value=[path]):
+        paths = [paths] if isinstance(paths, str) else list(paths)
+        lister = "codex_rollout_files" if side == "claude" else "claude_transcripts"
+        with patch.object(antiphon, lister, return_value=paths):
             while len(pages) < 50:
                 text, advance, _ = antiphon.build_summary(
-                    project, "claude", positions, None, None)
+                    project, side, positions, None, None)
                 if not text:
                     break
                 pages.append(text)
@@ -5456,10 +5519,11 @@ class PageHorizonTest(unittest.TestCase):
                     break
         return pages
 
-    def _at_byte_zero(self, path):
+    def _at_byte_zero(self, *paths):
         return antiphon.RuntimePositions(
-            {self.SID: {"gen": antiphon.source_generation(path),
-                        "offset": 0, "anchor": None}})
+            {antiphon.source_id(path): {"gen": antiphon.source_generation(path),
+                                        "offset": 0, "anchor": None}
+             for path in paths})
 
     def test_a_positioned_reader_skips_what_is_older_than_a_day_of_the_source(self):
         # Three days of records, one per hour; the reader is positioned at the
@@ -5662,6 +5726,91 @@ class PageHorizonTest(unittest.TestCase):
             start, skipped = antiphon._apply_horizon(source, 0, horizon)
             self.assertGreater(skipped, 0)
             self.assertIn("message 47", source.first_record_at(start)[2])
+
+    def test_a_codex_reader_skips_what_is_older_than_a_day_of_a_claude_transcript(self):
+        """The same bound on the other road. The Codex hook and `antiphon_read`
+        page Claude's transcripts through `claude_events`; a horizon that held
+        for the Claude reader alone would leave Codex hundreds of pages behind
+        on an old transcript, and every fixture above reads the other way."""
+        with tempfile.TemporaryDirectory() as project:
+            path = self._transcript(self._hourly(72), project, filler=300)
+            pages = self._drain(project, path, self._at_byte_zero(path), side="codex")
+        joined = "\n".join(pages)
+        self.assertNotIn("message 46 ", joined, "older than a day of the newest")
+        self.assertIn("message 47 ", joined, "exactly 24 hours before the newest")
+        self.assertIn("message 71 ", joined)
+        self.assertGreater(len(pages), 1, "the window spans pages")
+        self.assertRegex(pages[0], r"skipped: [\d,]+ raw bytes of Claude activity "
+                                   r"older than 24 hours in 1 source\(s\) — not "
+                                   r"delivered; the transcripts keep it")
+        self.assertEqual(sum("skipped:" in page for page in pages), 1)
+
+    def test_a_source_without_a_readable_time_is_read_rather_than_skipped_whole(self):
+        """A record without a time is not a record before the horizon. The
+        horizon comes from the other, dated source; the undated one has
+        nothing to land on and used to be skipped whole, visible words
+        included. Measured, every undated record is bookkeeping — the shape
+        this keeps is a stamp this interpreter cannot parse or a host that
+        stopped stamping, and it holds on every interpreter because no stamp
+        at all parses on none of them."""
+        with tempfile.TemporaryDirectory() as project:
+            dated = self._rollout(self._hourly(72), project, filler=300)
+            undated = self._rollout(self._hourly(6), project, sid=self.OTHER_SID,
+                                    word="undated")
+            self._undate(undated)
+            pages = self._drain(project, [dated, undated],
+                                self._at_byte_zero(dated, undated))
+        joined = "\n".join(pages)
+        for index in range(6):
+            self.assertIn(f"undated {index}", joined, "read, not skipped")
+        self.assertNotIn("message 46 ", joined, "the dated source is still bounded")
+        self.assertIn("message 47 ", joined)
+        self.assertRegex(joined, r"skipped: [\d,]+ raw bytes of Codex activity "
+                                 r"older than 24 hours in 1 source\(s\)")
+
+    def test_a_source_without_a_readable_time_is_not_moved(self):
+        path = self._rollout(self._hourly(72))
+        self._undate(path)
+        horizon = antiphon.iso_epoch("2026-08-30T00:00:00.000Z")
+        with antiphon._PathSource(path, "codex") as source:
+            self.assertLess(source.complete_prefix_end(), antiphon.HORIZON_BISECT_ABOVE,
+                            "the linear road")
+            self.assertEqual(antiphon._apply_horizon(source, 0, horizon), (0, 0))
+
+    def test_the_bisection_lands_a_source_without_a_readable_time_at_its_start(self):
+        """Above HORIZON_BISECT_ABOVE the scan bisects on record times. A probe
+        without one read as 'before the horizon' would converge to the end of
+        an undated source and skip all of it; unknown is not before."""
+        path = self._rollout(self._hourly(72))
+        self._undate(path)
+        horizon = antiphon.iso_epoch("2026-08-30T00:00:00.000Z")
+        with patch.object(antiphon, "HORIZON_BISECT_ABOVE", 2048), \
+             patch.object(antiphon, "HORIZON_BISECT_STEP", 128), \
+             patch.object(antiphon, "HORIZON_BISECT_SLACK", 256), \
+             antiphon._PathSource(path, "codex") as source:
+            self.assertGreater(source.complete_prefix_end(), 2048, "the bisecting road")
+            self.assertEqual(antiphon._apply_horizon(source, 0, horizon), (0, 0))
+
+    def test_the_bisection_walks_past_undated_bookkeeping_to_the_linear_landing(self):
+        """The measured shape — bookkeeping without a time between dated
+        records — lands where the linear scan lands, on either road."""
+        path = self._rollout(self._hourly(72))
+        with open(path, encoding="utf-8") as stream:
+            lines = stream.readlines()
+        with open(path, "w", encoding="utf-8") as stream:
+            for index, line in enumerate(lines):
+                stream.write(line)
+                if index % 5 == 0:
+                    stream.write('{"type": "event_msg", "payload": {"type": "token_count"}}\n')
+        with antiphon._PathSource(path, "codex") as source:
+            horizon = antiphon._source_newest_time(source) - antiphon.PAGE_HORIZON
+            linear = antiphon._apply_horizon(source, 0, horizon)
+            self.assertIn("message 47", source.first_record_at(linear[0])[2])
+            with patch.object(antiphon, "HORIZON_BISECT_ABOVE", 2048), \
+                 patch.object(antiphon, "HORIZON_BISECT_STEP", 128), \
+                 patch.object(antiphon, "HORIZON_BISECT_SLACK", 256):
+                self.assertGreater(source.complete_prefix_end(), 2048)
+                self.assertEqual(antiphon._apply_horizon(source, 0, horizon), linear)
 
     def test_a_degraded_page_without_records_still_announces_the_skip(self):
         degraded = antiphon.Discovery((), "degraded", 0, 1, 0,
@@ -6325,8 +6474,7 @@ class DoctorTest(unittest.TestCase):
                                to_alias="build", transport="queue", proof="live",
                                sha256="a" * 64, size=2, at=now - age)
         directory = ledger.ledger_dir(project)
-        before = {name: open(os.path.join(directory, name), "rb").read()
-                  for name in os.listdir(directory)}
+        before = _file_bytes(directory)
         code, printed = self.run_doctor(project)
         line = self.line_for(printed, "deliveries:")
         self.assertTrue(line.startswith("· deliveries: 1 delivery sent more than 10 minutes "
@@ -6334,8 +6482,7 @@ class DoctorTest(unittest.TestCase):
         self.assertIn("the peer has not read it yet; if its session is closed, "
                       "address another", line)
         self.assertEqual(antiphon.RECEIPT_PATIENCE, 600)
-        self.assertEqual({name: open(os.path.join(directory, name), "rb").read()
-                          for name in os.listdir(directory)}, before, "read-only")
+        self.assertEqual(_file_bytes(directory), before, "read-only")
         ledger.mark_received(project, late, now)
         _code, printed = self.run_doctor(project)
         self.assertEqual(self.line_for(printed, "deliveries:"), "",
@@ -15797,6 +15944,7 @@ class ToolRecipientTest(unittest.TestCase):
         err = io.StringIO()
         with patch.object(antiphon, "project_dir", return_value=project), \
              patch.object(antiphon.sys, "stdin", io.StringIO(json.dumps(payload))), \
+             contextlib.redirect_stdout(io.StringIO()), \
              contextlib.redirect_stderr(err):
             code = antiphon.reply()
         return code, err.getvalue()
