@@ -464,11 +464,24 @@ READING_ARGUMENTS = ("file_path", "command", "pattern")
 
 
 def _receipt_time(record):
-    stamp = iso_epoch(record.get("timestamp"))
-    return float(stamp) if stamp is not None else time.time()
+    """When the record was written, or now when it does not say. `iso_epoch`
+    answers 0.0 for a missing, unparseable or non-string stamp — never None —
+    and a receipt stamped at the epoch is `ATTACHMENT_READ_GRACE` old at
+    once, so the parked file went on the same sweep (review 2026-09-03)."""
+    when = iso_epoch(record.get("timestamp"))
+    return float(when) if when > 0 else time.time()
 
 
-def _collect_claude_receipts(record, receipts):
+def _receipt(kind, key, record, source):
+    """One receipt: what was proved and when, and — on the page road — off
+    which transcript (`source`, the session id the reader is walking), so
+    `build_summary` can say whose it was and the ledger credits it to that
+    session and no other."""
+    at = _receipt_time(record)
+    return (kind, key, at) if source is None else (kind, key, at, source)
+
+
+def _collect_claude_receipts(record, receipts, source=None):
     """Append what one Claude record proves: a channel injection carrying
     `message_id` was received; a tool call naming an attachment read it.
 
@@ -485,7 +498,7 @@ def _collect_claude_receipts(record, receipts):
         if isinstance(content, str):
             found = CHANNEL_MESSAGE_ID.search(content)
             if found:
-                receipts.append(("received", found.group(1), _receipt_time(record)))
+                receipts.append(_receipt("received", found.group(1), record, source))
     elif kind == "assistant" and not record.get("isMeta"):
         message = record.get("message")
         content = message.get("content") if isinstance(message, dict) else None
@@ -500,10 +513,10 @@ def _collect_claude_receipts(record, receipts):
                     for value in (block["input"].get(key),)
                     if isinstance(value, str))
                 for name in ATTACHMENT_REFERENCE.findall(reading):
-                    receipts.append(("read", name, _receipt_time(record)))
+                    receipts.append(_receipt("read", name, record, source))
 
 
-def _collect_codex_receipts(record, payload, receipts):
+def _collect_codex_receipts(record, payload, receipts, source=None):
     """Append what one Codex `response_item` proves: our own label, received;
     an attachment named in a call's arguments, read."""
     if payload.get("type") == "message" and payload.get("role") == "user":
@@ -513,12 +526,12 @@ def _collect_codex_receipts(record, payload, receipts):
         if _is_self_injected(text):
             found = SELF_INJECTED_ID.search(text)
             if found:
-                receipts.append(("received", found.group(1), _receipt_time(record)))
+                receipts.append(_receipt("received", found.group(1), record, source))
         return
     fields = _codex_tool_fields(payload)
     if fields is not None:
         for name in ATTACHMENT_REFERENCE.findall(fields[3]):
-            receipts.append(("read", name, _receipt_time(record)))
+            receipts.append(_receipt("read", name, record, source))
 
 
 def _join_text_blocks(blocks):
@@ -2947,7 +2960,10 @@ def _discover_sources(cwd, kind, reader_side, positions, since,
 
 
 def iso_epoch(s):
-    if not s:
+    """Seconds since the epoch for an ISO-8601 stamp; 0.0 for anything that
+    is not one — absent, empty, unparseable, or not a string at all (a
+    record's `timestamp` is host-written and was never promised a type)."""
+    if not s or not isinstance(s, str):
         return 0.0
     try:
         return datetime.fromisoformat(s.replace("Z", "+00:00")).timestamp()
@@ -3525,7 +3541,7 @@ def claude_events(cwd, positions=None, since=None, visible_record_limit=None,
                 except json.JSONDecodeError:
                     d = None
                 if receipts is not None and isinstance(d, dict):
-                    _collect_claude_receipts(d, receipts)
+                    _collect_claude_receipts(d, receipts, sid)
                 if isinstance(d, dict) and not d.get("isMeta"):
                     ts = iso_epoch(d.get("timestamp"))
                     kind = d.get("type")
@@ -3823,7 +3839,7 @@ def codex_events(cwd, positions=None, since=None, visible_record_limit=None,
                     kind, payload = d.get("type"), d.get("payload") or {}
                     payload = payload if isinstance(payload, dict) else {}
                     if receipts is not None and kind == "response_item":
-                        _collect_codex_receipts(d, payload, receipts)
+                        _collect_codex_receipts(d, payload, receipts, sid)
                     if kind == "response_item" and payload.get("type") == "message":
                         role = payload.get("role")
                         text = _join_text_blocks(
@@ -4006,13 +4022,15 @@ OTHER_SIDE = {
 
 # What one page build knows about the sessions behind the other side's peers.
 # The first two fields preserve the existing label contract; ``states`` is the
-# conservative scheduler classification for source ids known to the registry.
+# conservative scheduler classification for source ids known to the registry;
+# ``readers`` is receipt provenance — which session writes a transcript, live
+# or not — for the ledger to credit a named delivery to its named recipient.
 SessionJoin = collections.namedtuple(
-    "SessionJoin", "aliases unnamed states", defaults=({},))
+    "SessionJoin", "aliases unnamed states readers", defaults=({}, {}))
 
 # A page with nothing to join against: no source is labelled, no envelope line
 # fires, and every byte is what it was before any of this existed.
-NO_SESSION_JOIN = SessionJoin({}, False, {})
+NO_SESSION_JOIN = SessionJoin({}, False, {}, {})
 
 
 def _source_activity(cwd, kind, identities=None):
@@ -4101,7 +4119,25 @@ def _source_activity(cwd, kind, identities=None):
     aliases = {source: next(iter(names))
                for source, names in label_claims.items()
                if len(names) == 1}
-    return SessionJoin(aliases, unnamed, states)
+    # Receipt provenance: which session wrote a transcript. A session that
+    # finished its turn and left is still the session that read the words,
+    # so the hook's own session record says it whatever its endpoint's
+    # liveness now; a label needs a live endpoint, a receipt needs the
+    # writer. Two names claiming one session, or a session record and a live
+    # label that disagree, is nobody: the ledger then credits a bare
+    # delivery only, never a guess.
+    readers = {}
+    for source, source_claims in claims.items():
+        names = {name for name, _state, _joined in source_claims
+                 if peers.valid_name(name)}
+        if len(names) == 1:
+            readers[source] = next(iter(names))
+    for source, alias in aliases.items():
+        if readers.get(source, alias) != alias:
+            readers.pop(source, None)
+        else:
+            readers[source] = alias
+    return SessionJoin(aliases, unnamed, states, readers)
 
 
 def _session_join(cwd, kind):
@@ -4431,6 +4467,23 @@ def _build_page(events, scanned, side, replay_reason=None, join=None,
         frontier, has_more, replay_reason, following), count
 
 
+def _name_receipts(receipts, join):
+    """Turn the source id each page-road receipt carries into the alias of
+    the session that writes that transcript — None when the registry cannot
+    say. The ledger credits a named delivery only to its named recipient, so
+    a receipt off a transcript nobody can name counts for a bare delivery
+    alone (review 2026-09-03: Codex `review` opening a file parked for Codex
+    `build` was taken for `build`'s read, and the file collected an hour
+    later)."""
+    named = []
+    for receipt in receipts:
+        if len(receipt) == 4:
+            kind, key, at, source = receipt
+            receipt = (kind, key, at, join.readers.get(source))
+        named.append(receipt)
+    receipts[:] = named
+
+
 def build_summary(cwd, side, positions=None, since=None, replay_reason=None,
                   catalog_degraded=False, catalog_snapshot=None, receipts=None):
     """`side` is the side that will READ the summary ('claude' | 'codex').
@@ -4479,12 +4532,21 @@ def build_summary(cwd, side, positions=None, since=None, replay_reason=None,
     # walks the registry, `ps` and all: measured, 343 ms per turn if it were
     # built there, against a 46 ms whole-page build.
     join = _session_join(cwd, OTHER_SIDE[side][0])
+    if receipts:
+        _name_receipts(receipts, join)
     return _build_page(
         events, reached, side, replay_reason, join, discovery,
         getattr(positions, "next_lane", "active"), skipped)
 
 
 # ---------- hook (both sides share the same contract) ----------
+
+# Notices ride ahead of the page, outside its budget: fifty refusals during
+# one outage measured at about 2,050 tokens on a single page. The oldest
+# NOTICE_LIMIT go now, one line counts the rest, and the rest stay
+# unreported for the next turns to carry.
+NOTICE_LIMIT = 8
+
 
 def hook(side="claude"):
     """Injects the other side's summary into the context, and on the Codex side
@@ -4528,9 +4590,15 @@ def hook(side="claude"):
     if stated_cwd:
         try:
             sweep_attachments(cwd)
-        except OSError as error:
-            print(f"antiphon: the attachment sweep failed: {error}",
-                  file=sys.stderr)
+        except Exception as error:      # noqa: BLE001 — the page must go out
+            # Not only OSError: the sweep consults the ledger, and a ledger
+            # file that overflowed the JSON parser raised RecursionError
+            # through an OSError guard here — into the exit code of every
+            # hook, and of `status` and `doctor` beside it (review
+            # 2026-09-03). The ledger now skips such a file itself; this
+            # guard is the second wall.
+            print(f"antiphon: the attachment sweep failed: "
+                  f"{type(error).__name__}: {error}", file=sys.stderr)
         # The ledger's own sweep, on the same trust; and the workers' —
         # collected results and expired tasks go, a running worker never.
         _ledger_call("prune", lambda: ledger.prune(cwd, time.time()))
@@ -4625,7 +4693,13 @@ def hook(side="claude"):
                 cwd, receipts, read_by=source_kind))
             return 0
 
-        context = "\n".join(words for _id, words in notices)
+        shown = notices[:NOTICE_LIMIT]
+        waiting = len(notices) - len(shown)
+        lines = [words for _id, words in shown]
+        if waiting:
+            lines.append(f"Antiphon: {waiting} more notice"
+                         f"{'s' if waiting != 1 else ''} wait; the next turns carry them")
+        context = "\n".join(lines)
         if text:
             context = f"{context}\n\n{text}" if context else text
         # The hook prints nothing to the terminal. The counter used to say
@@ -4644,7 +4718,7 @@ def hook(side="claude"):
             print("antiphon: could not write this turn's context", file=sys.stderr)
             return 1
         _ledger_call("notices", lambda: ledger.mark_reported(
-            cwd, [delivery for delivery, _words in notices], time.time()))
+            cwd, [delivery for delivery, _words in shown], time.time()))
         _ledger_call("receipts", lambda: ledger.record_receipts(
             cwd, receipts, read_by=source_kind))
         if not _advance_page_cursor(
@@ -5208,8 +5282,8 @@ def _push_batches(cwd, side, target, key, reply_text, turn_key, input_data):
             print(f"antiphon: {reason}", file=sys.stderr)
             if not ledger.record_refused(
                     cwd, delivery_id(), sender=who or NO_ALIAS, to_kind=target,
-                    to_alias=recipient, reason=reason,
-                    preview=redact_private(outgoing[:PREVIEW_WINDOW]),
+                    to_alias=redact_private(recipient), reason=reason,
+                    preview=redact_private(outgoing),
                     sender_kind=side):
                 print("antiphon: the delivery ledger could not record the refusal",
                       file=sys.stderr)
@@ -5258,11 +5332,15 @@ def _push_batches(cwd, side, target, key, reply_text, turn_key, input_data):
             # stderr, measured), so the refusal goes on the ledger and the
             # sender's next page says it.
             # The preview is the sender's own line, kept beside the reason; a
-            # socket path or session id it quoted must not land on disk raw.
+            # socket path or session id it quoted must not land on disk raw —
+            # nor may the name it addressed: a session id typed as one is
+            # private however it arrived, and a refused entry's `to_alias`
+            # is rendered on the sender's page (review 2026-09-03).
             if not ledger.record_refused(
                     cwd, attempt, sender=who or NO_ALIAS, to_kind=target,
-                    to_alias=recipient, reason=redact_private(str(detail)),
-                    preview=redact_private(outgoing[:PREVIEW_WINDOW]),
+                    to_alias=redact_private(recipient),
+                    reason=redact_private(str(detail)),
+                    preview=redact_private(outgoing),
                     sender_kind=side):
                 print("antiphon: the delivery ledger could not record the refusal",
                       file=sys.stderr)
@@ -5409,12 +5487,6 @@ def _redact_routes(text):
             return match.group(0)
         return "<route>" + match.group(0)[found.end():]
     return _TOKEN.sub(token, text) if "antiphon-channel-" in text else text
-
-
-# The window of a refused line that a 60-character preview can show, redacted
-# whole: every private shape is shorter than the window, so a shape that
-# starts inside the preview ends inside the window.
-PREVIEW_WINDOW = 2_048
 
 
 def redact_private(text, limit=None):

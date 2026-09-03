@@ -4453,9 +4453,12 @@ class SameVendorTest(unittest.TestCase):
             self.assertEqual(kwargs["sender_kind"], "claude")
             self.assertRegex(kwargs["message_id"], r"^[0-9a-f-]{36}$")
             entry = ledger.entries(project)[0]
-            self.assertEqual((entry["sender"], entry["to_kind"], entry["to_alias"],
-                              entry["transport"], entry["state"]),
-                             ("ui", "claude", "api", "channel", "sent"))
+            self.assertEqual((entry["sender"], entry["sender_kind"], entry["to_kind"],
+                              entry["to_alias"], entry["transport"], entry["state"]),
+                             ("ui", "claude", "claude", "api", "channel", "sent"),
+                             "filed as this side's send: left to the default, the entry "
+                             "would say Codex sent it, and the advice for a Codex refusal "
+                             "would name a Claude peer")
             self.assertIn("antiphon: delivered to Claude:api", err)
             cursor = antiphon.read_cursor(project, "claude")
             self.assertIn("@api", cursor["last_pushed_claude_same"],
@@ -4474,9 +4477,22 @@ class SameVendorTest(unittest.TestCase):
             self.assertEqual(args[2], "review")
             self.assertEqual(kwargs["sender"], "build")
             entry = ledger.entries(project)[0]
-            self.assertEqual((entry["sender"], entry["to_kind"], entry["to_alias"],
-                              entry["transport"], entry["proof"]),
-                             ("build", "codex", "review", "queue", "live"))
+            self.assertEqual((entry["sender"], entry["sender_kind"], entry["to_kind"],
+                              entry["to_alias"], entry["transport"], entry["proof"]),
+                             ("build", "codex", "codex", "review", "queue", "live"))
+
+    def test_a_refused_same_kind_recipient_is_redacted_before_it_is_kept(self):
+        """The own-alias refusal records the name the line addressed. A
+        registry alias is never a session id, so this is the defensive half
+        of the rule the transport refusal proves for real (review
+        2026-09-03): whatever stands where a name should, it is redacted."""
+        sid = "4eecac24-1c21-47ad-ab11-a650708f3098"
+        with tempfile.TemporaryDirectory() as project:
+            code, err, sends = self._stop(project, "claude", f"@claude:{sid} hi", who=sid)
+            self.assertEqual((code, sends), (0, []), err)
+            self.assertIn("is this session's own alias", err)
+            entry = ledger.entries(project)[0]
+            self.assertEqual((entry["state"], entry["to_alias"]), ("refused", "<session>"))
 
     def test_a_bare_same_kind_marker_is_refused_and_reported(self):
         with tempfile.TemporaryDirectory() as project:
@@ -4827,7 +4843,7 @@ class SameVendorTest(unittest.TestCase):
             events, _ = antiphon.codex_events(project, source_paths=[path], receipts=receipts)
         self.assertEqual([e.text for e in events], ["shipping"],
                          "another Codex session's words to this one are not this page's news")
-        self.assertEqual([(kind, key) for kind, key, _at in receipts], [("received", self.MID)])
+        self.assertEqual([(kind, key) for kind, key, _at, _source in receipts], [("received", self.MID)])
 
 
 class DeliveryReceiptTest(unittest.TestCase):
@@ -4850,8 +4866,9 @@ class DeliveryReceiptTest(unittest.TestCase):
 
     # ---- fixtures in the measured shapes ----
 
-    def _codex_rollout(self, project, records):
-        path = os.path.join(project, f"rollout-2026-09-03T00-00-00-{self.CODEX_SID}.jsonl")
+    def _codex_rollout(self, project, records, sid=None):
+        sid = sid or self.CODEX_SID
+        path = os.path.join(project, f"rollout-2026-09-03T00-00-00-{sid}.jsonl")
         with open(path, "w", encoding="utf-8") as f:
             f.write(json.dumps({"timestamp": self.now, "type": "session_meta",
                                 "payload": {"cwd": project}}) + "\n")
@@ -4901,6 +4918,15 @@ class DeliveryReceiptTest(unittest.TestCase):
                            proof="live" if to_kind == "codex" else "channel",
                            sha256="a" * 64, size=13)
 
+    @staticmethod
+    def _session(project, kind, alias, sid):
+        """The hook's half of a registry record: session `sid` is named
+        `alias` — what a page-road receipt off that transcript is credited
+        to, whether or not the peer is still live."""
+        ok, detail = antiphon.peers.write_session(project, kind, alias, sid,
+                                                  f"/t/{alias}.jsonl", "300:x")
+        assert ok, detail
+
     def _hook(self, project, side, codex=(), claude=(), transcript=None):
         out = io.StringIO()
         payload = {"cwd": project, "hook_event_name": "UserPromptSubmit"}
@@ -4938,9 +4964,11 @@ class DeliveryReceiptTest(unittest.TestCase):
             ])
             receipts = []
             events, _ = antiphon.codex_events(project, source_paths=[path], receipts=receipts)
-        self.assertEqual([(kind, key) for kind, key, _at in receipts],
+        self.assertEqual([(kind, key) for kind, key, _at, _source in receipts],
                          [("received", self.MID), ("read", self.ATTACHMENT)])
-        self.assertTrue(all(isinstance(at, float) and at > 0 for _k, _key, at in receipts))
+        self.assertTrue(all(isinstance(at, float) and at > 0 for _k, _key, at, _s in receipts))
+        self.assertEqual({source for *_, source in receipts}, {self.CODEX_SID},
+                         "each receipt says which transcript proved it")
         self.assertEqual([e.text for e in events if e.kind != "tool"], ["done"],
                          "our own delivery is a receipt, never an event")
 
@@ -4955,9 +4983,10 @@ class DeliveryReceiptTest(unittest.TestCase):
             ])
             receipts = []
             events, _ = antiphon.claude_events(project, source_paths=[path], receipts=receipts)
-        self.assertEqual([(kind, key) for kind, key, _at in receipts],
+        self.assertEqual([(kind, key) for kind, key, _at, _source in receipts],
                          [("received", self.MID), ("read", self.ATTACHMENT),
                           ("read", self.ATTACHMENT)])
+        self.assertEqual({source for *_, source in receipts}, {self.CLAUDE_SID})
         self.assertEqual([e.text for e in events if e.kind == "claude"], ["done"])
         self.assertNotIn("<channel", " ".join(e.text for e in events))
 
@@ -4972,7 +5001,7 @@ class DeliveryReceiptTest(unittest.TestCase):
                 self._claude_channel(self.MID, origin=False), typed])
             receipts = []
             antiphon.claude_events(project, source_paths=[path], receipts=receipts)
-        self.assertEqual([(kind, key) for kind, key, _at in receipts],
+        self.assertEqual([(kind, key) for kind, key, _at, _source in receipts],
                          [("received", self.MID)])
 
     def test_a_read_receipt_marks_only_deliveries_to_the_readers_kind(self):
@@ -4992,6 +5021,7 @@ class DeliveryReceiptTest(unittest.TestCase):
             path = self._claude_transcript(project, [
                 self._claude_tool_use("Bash", {"command": f"tail -n +3 {store} | shasum -a 256"}),
                 self._claude_assistant("verified")])
+            self._session(project, "claude", "ui", self.CLAUDE_SID)
             code, out = self._hook(project, "codex", claude=[path])
             self.assertEqual(code, 0)
             self.assertIn("verified", self._context(out))
@@ -5019,7 +5049,7 @@ class DeliveryReceiptTest(unittest.TestCase):
             ])
             receipts = []
             antiphon.claude_events(project, source_paths=[path], receipts=receipts)
-        self.assertEqual([(kind, key) for kind, key, _at in receipts],
+        self.assertEqual([(kind, key) for kind, key, _at, _source in receipts],
                          [("read", self.ATTACHMENT)],
                          "one Read of the file itself; not an Edit's content, not a "
                          "Write's, not a prefix of another name")
@@ -5066,9 +5096,14 @@ class DeliveryReceiptTest(unittest.TestCase):
         self.assertEqual(cleaned, f"{long_word} <route>, then {long_word}")
         self.assertEqual(antiphon.redact_private("no route here"), "no route here")
 
-    def test_a_refusal_preview_is_redacted_before_it_is_kept(self):
+    def test_a_refusals_preview_and_reason_are_redacted_before_they_are_kept(self):
+        """The preview is the sender's own line; the reason is the transport's
+        words, which may quote the route it failed to reach or the session it
+        looked for. Neither lands on disk raw."""
         with tempfile.TemporaryDirectory() as project:
-            refusal = antiphon._ClassifiedRefusal("not delivered: nobody", "no-peer")
+            refusal = antiphon._ClassifiedRefusal(
+                f"not delivered: nobody at /tmp/antiphon-channel-{'b' * 20}.sock "
+                f"(session {self.CLAUDE_SID})", "no-peer")
             private = f"look at /tmp/antiphon-channel-{'a' * 20}.sock and {self.CLAUDE_SID}"
             with patch.object(antiphon, "send_to_codex", return_value=(False, refusal)), \
                  patch.object(antiphon, "claimed_alias", return_value=None):
@@ -5078,6 +5113,145 @@ class DeliveryReceiptTest(unittest.TestCase):
             self.assertNotIn("antiphon-channel-", entry["preview"])
             self.assertNotIn(self.CLAUDE_SID, entry["preview"])
             self.assertIn("look at", entry["preview"])
+            self.assertNotIn("antiphon-channel-", entry["reason"])
+            self.assertNotIn(self.CLAUDE_SID, entry["reason"])
+            self.assertIn("nobody at <route> (session <session>)", entry["reason"])
+
+    def test_a_refused_lines_recipient_is_redacted_before_it_is_kept(self):
+        """Review 2026-09-03: `@codex:<session id> words` was refused with
+        the raw id as `to_alias` — on disk, and in the notice on the sender's
+        page, which folds every unnamed session of a side into one. The
+        marker grammar accepts the shape; the send refuses it; the record
+        redacts it like the words."""
+        with tempfile.TemporaryDirectory() as project:
+            refusal = antiphon._ClassifiedRefusal("not delivered: nobody", "no-peer")
+            with patch.object(antiphon, "send_to_codex", return_value=(False, refusal)), \
+                 patch.object(antiphon, "claimed_alias", return_value=None):
+                code, err = self._push(project, f"@codex:{self.CODEX_SID} secret plan")
+            self.assertEqual(code, 0, err)
+            entries = ledger.entries(project)
+            self.assertEqual(len(entries), 1, entries)
+            self.assertEqual(entries[0]["to_alias"], "<session>")
+            self.assertNotIn(self.CODEX_SID, json.dumps(entries[0]))
+            notice = ledger.pending_notices(project, "claude", None)[0][1]
+            self.assertNotIn(self.CODEX_SID, notice)
+            self.assertIn("your @codex:<session> line", notice)
+
+    def test_a_ledger_file_that_overflows_the_parser_takes_down_neither_the_hook_nor_status_nor_doctor(self):
+        """Review 2026-09-03: a 60 KB file of nested brackets, well under
+        RECORD_CEILING, raised RecursionError out of `json.loads` — through
+        the sweep's OSError guard into the hook's exit code (the page
+        suppressed), and through `status` and `doctor`, the two commands
+        that would have explained the outage. On Python 3.14 the parser
+        takes the file; either way it is not an entry."""
+        deep = "4a9e1c3b-5d2f-4e6a-8b7c-9d0e1f2a3b4c"
+        with tempfile.TemporaryDirectory() as project:
+            self._sent(project)
+            antiphon.write_attachment(project, "words", "ui", self.MID)
+            with open(os.path.join(ledger.ledger_dir(project), deep + ".json"), "w") as f:
+                f.write("[" * 30_000 + "]" * 30_000)
+            path = self._codex_rollout(project, [self._codex_message("assistant", "still here")])
+            code, out = self._hook(project, "claude", codex=[path])
+            self.assertEqual(code, 0)
+            self.assertIn("still here", self._context(out))
+            printed = io.StringIO()
+            with patch.object(antiphon, "project_dir", return_value=project), \
+                 patch.object(antiphon, "codex_rollout_files", return_value=[]), \
+                 patch.object(antiphon, "claude_transcripts", return_value=[]), \
+                 contextlib.redirect_stdout(printed), contextlib.redirect_stderr(io.StringIO()):
+                self.assertEqual(antiphon.status(), 0)
+            self.assertIn("Deliveries:         1 awaiting receipt", printed.getvalue())
+            report = antiphon._Report()
+            with patch.object(antiphon, "project_dir", return_value=project), \
+                 contextlib.redirect_stdout(io.StringIO()):
+                antiphon._doctor_deliveries(report, project)
+            # The guard around the sweep is the second wall: whatever the
+            # ledger raises there, the page goes out.
+            with open(path, "a", encoding="utf-8") as f:
+                f.write(json.dumps(self._codex_message("assistant", "and again")) + "\n")
+            with patch.object(antiphon.ledger, "read_times", side_effect=RuntimeError("boom")):
+                code, out = self._hook(project, "claude", codex=[path])
+            self.assertEqual(code, 0)
+            self.assertIn("and again", self._context(out))
+
+    def test_a_receipt_without_a_parseable_time_is_stamped_now_not_at_the_epoch(self):
+        """Review 2026-09-03: `iso_epoch` answers 0.0 for a missing or
+        unparseable stamp, never None, so `_receipt_time`'s fallback never
+        ran — a receipt at the epoch is past ATTACHMENT_READ_GRACE at once,
+        and the parked file went on the same sweep. A non-string stamp
+        raised AttributeError out of every reader."""
+        before = time.time()
+        for stamp in (None, "", "garbage", 12345, ["2026"]):
+            record = {} if stamp is None else {"timestamp": stamp}
+            self.assertGreaterEqual(antiphon._receipt_time(record), before, repr(stamp))
+        self.assertEqual(antiphon.iso_epoch(12345), 0.0)
+        self.assertEqual(antiphon._receipt_time({"timestamp": "1970-01-01T00:00:05Z"}), 5.0)
+
+    def test_a_page_carries_at_most_eight_notices_and_says_how_many_wait(self):
+        """Review 2026-09-03: fifty refusals during one outage measured at
+        about 2,050 tokens ahead of a page, outside the budget the page
+        keeps. The oldest eight go now; the rest wait for the next turns."""
+        with tempfile.TemporaryDirectory() as project:
+            ids = [f"{index:08x}-0000-4000-8000-000000000000" for index in range(11)]
+            now = time.time()
+            for index, delivery in enumerate(ids):
+                ledger.record_refused(project, delivery, sender="<unnamed>", to_kind="codex",
+                                      to_alias=None, reason="not delivered: nobody",
+                                      preview=f"line {index}", at=now - 100 + index)
+            self.assertEqual(antiphon.NOTICE_LIMIT, 8)
+            code, out = self._hook(project, "claude")
+            self.assertEqual(code, 0)
+            context = self._context(out)
+            self.assertEqual(context.count("was not delivered"), 8)
+            self.assertIn('("line 0")', context)
+            self.assertIn('("line 7")', context)
+            self.assertNotIn('("line 8")', context)
+            self.assertTrue(context.endswith(
+                "Antiphon: 3 more notices wait; the next turns carry them"), context)
+            reported = [delivery for delivery in ids
+                        if ledger.read_entry(project, delivery)["reported_at"] is not None]
+            self.assertEqual(reported, ids[:8], "only what was carried is reported")
+            code, out = self._hook(project, "claude")
+            self.assertEqual(code, 0)
+            context = self._context(out)
+            self.assertEqual(context.count("was not delivered"), 3)
+            self.assertNotIn("more notice", context)
+            self.assertEqual(self._hook(project, "claude"), (0, ""), "all told")
+
+    def test_a_read_by_the_wrong_peer_of_the_right_kind_is_not_the_recipients(self):
+        """Review 2026-09-03: Claude parks words for Codex `build`; Codex
+        `review` opens the file, which sits in the shared project
+        directory. The Claude reader walking `review`'s rollout must not
+        mark the delivery to `build` read. A rollout nobody can name credits
+        a bare delivery alone; `build`'s own rollout is the receipt."""
+        review_sid = "5b8d2e1f-6c3a-4d7b-9e8f-0a1b2c3d4e5f"
+        stranger_sid = "6c9e3f20-7d4b-4e8c-af90-1b2c3d4e5f60"
+        other = "2e6b14f1-1659-544a-98d4-56d6eca8fa48"
+        with tempfile.TemporaryDirectory() as project:
+            store = os.path.join(project, ".antiphon", "messages", self.ATTACHMENT)
+            ledger.record_sent(project, self.MID, sender="ui", to_kind="codex", to_alias="build",
+                               transport="queue", proof="live", sha256="a" * 64, size=5,
+                               attachment=self.ATTACHMENT)
+            ledger.record_sent(project, other, sender="ui", to_kind="codex", to_alias=None,
+                               transport="queue", proof="live", sha256="a" * 64, size=5,
+                               attachment=self.ATTACHMENT)
+            self._session(project, "codex", "review", review_sid)
+            self._session(project, "codex", "build", self.CODEX_SID)
+            reading = self._codex_call(json.dumps({"command": ["cat", store]}))
+            review = self._codex_rollout(project, [reading], sid=review_sid)
+            self.assertEqual(self._hook(project, "claude", codex=[review])[0], 0)
+            self.assertIsNone(ledger.read_entry(project, self.MID)["read_at"],
+                              "review is not build")
+            self.assertIsNotNone(ledger.read_entry(project, other)["read_at"],
+                                 "a bare delivery: any Codex")
+            stranger = self._codex_rollout(project, [reading], sid=stranger_sid)
+            self.assertEqual(self._hook(project, "claude", codex=[stranger])[0], 0)
+            self.assertIsNone(ledger.read_entry(project, self.MID)["read_at"],
+                              "a rollout nobody can name is not build either")
+            build = self._codex_rollout(project, [reading])
+            self.assertEqual(self._hook(project, "claude", codex=[build])[0], 0)
+            self.assertIsNotNone(ledger.read_entry(project, self.MID)["read_at"],
+                                 "the receiver, off its own rollout")
 
     def test_a_ledger_that_cannot_be_written_is_said_in_the_result(self):
         with tempfile.TemporaryDirectory() as project:
@@ -5216,7 +5390,8 @@ class DeliveryReceiptTest(unittest.TestCase):
                 self.assertEqual(antiphon.hook("claude"), 0)
             self.assertIsNone(ledger.read_entry(project, self.MID)["received_at"],
                               "a SessionStart proves nothing new")
-            self.assertEqual(self._hook(project, "claude", transcript=own)[0], 0)
+            with patch.object(antiphon, "claimed_alias", return_value="ui"):
+                self.assertEqual(self._hook(project, "claude", transcript=own)[0], 0)
             self.assertIsNotNone(ledger.read_entry(project, self.MID)["received_at"])
 
     def test_a_codex_hook_reads_receipts_off_its_own_rollout(self):
@@ -5226,7 +5401,8 @@ class DeliveryReceiptTest(unittest.TestCase):
                                sha256="a" * 64, size=4, sender_kind="codex")
             own = self._codex_rollout(project, [self._codex_message(
                 "user", f"{antiphon.PUSH_LABEL_CODEX} [from=build id={self.MID}] ship it")])
-            code, _out = self._hook(project, "codex", transcript=own)
+            with patch.object(antiphon, "claimed_alias", return_value="review"):
+                code, _out = self._hook(project, "codex", transcript=own)
             self.assertEqual(code, 0)
             self.assertIsNotNone(ledger.read_entry(project, self.MID)["received_at"])
 
@@ -5336,6 +5512,7 @@ class DeliveryReceiptTest(unittest.TestCase):
     def test_antiphon_read_marks_a_channel_delivery_received(self):
         with tempfile.TemporaryDirectory() as project:
             self._sent(project, to_kind="claude", to_alias="ui")
+            self._session(project, "claude", "ui", self.CLAUDE_SID)
             path = self._claude_transcript(project, [
                 self._claude_channel(self.MID), self._claude_assistant("done")])
             request = {"jsonrpc": "2.0", "id": 1, "method": "tools/call",
@@ -5375,7 +5552,7 @@ class DeliveryReceiptTest(unittest.TestCase):
             ledger.record_sent(project, other, sender="ui", to_kind="codex", to_alias="build",
                                transport="queue", proof="live", sha256="a" * 64, size=2,
                                at=now - 60)
-            ledger.mark_received(project, other, now - 30)
+            ledger.mark_received(project, other, now - 30, reader_alias="build")
             ledger.record_refused(project, third, sender="<unnamed>", to_kind="codex",
                                   to_alias=None, reason="not delivered: nobody", preview="x",
                                   at=now - 40)
@@ -6336,7 +6513,7 @@ class DoctorTest(unittest.TestCase):
         self.assertEqual(antiphon.RECEIPT_PATIENCE, 600)
         self.assertEqual({name: open(os.path.join(directory, name), "rb").read()
                           for name in os.listdir(directory)}, before, "read-only")
-        ledger.mark_received(project, late, now)
+        ledger.mark_received(project, late, now, reader_alias="build")
         _code, printed = self.run_doctor(project)
         self.assertEqual(self.line_for(printed, "deliveries:"), "",
                          "five minutes without a receipt is not news")
@@ -18642,7 +18819,7 @@ class AttachmentReceiptTest(unittest.TestCase):
                 first = json.loads(self._reply(
                     project, {"text": text, "to": "build", "sender_alias": "ui"})[1])
                 ledger.mark_read(project, first["attachment"], time.time() - 7200,
-                                 to_kind="codex")
+                                 to_kind="codex", reader_alias="build")
                 second = json.loads(self._reply(
                     project, {"text": text, "to": "build", "sender_alias": "ui"})[1])
             self.assertNotEqual(second["attachment"], first["attachment"],
@@ -18656,8 +18833,8 @@ class AttachmentReceiptTest(unittest.TestCase):
             self._entry(project, self.UUID, os.path.basename(fresh))
             self._entry(project, self.OTHER, os.path.basename(old))
             now = time.time()
-            ledger.mark_read(project, os.path.basename(fresh), now - 600)
-            ledger.mark_read(project, os.path.basename(old), now - 2 * 3600)
+            ledger.mark_read(project, os.path.basename(fresh), now - 600, reader_alias="build")
+            ledger.mark_read(project, os.path.basename(old), now - 2 * 3600, reader_alias="build")
             said = self._sweep(project, now)
             self.assertTrue(os.path.exists(fresh), "ten minutes after its read receipt")
             self.assertFalse(os.path.exists(old), "two hours after its read receipt")
@@ -18711,7 +18888,8 @@ class AttachmentReceiptTest(unittest.TestCase):
             unread, _ = antiphon.write_attachment(project, "other", "ui", self.OTHER)
             self._entry(project, self.UUID, os.path.basename(read))
             self._entry(project, self.OTHER, os.path.basename(unread))
-            ledger.mark_read(project, os.path.basename(read), time.time() - 7200)
+            ledger.mark_read(project, os.path.basename(read), time.time() - 7200,
+                             reader_alias="build")
             line = antiphon.attachment_report(project)
             self.assertIn("2 parked", line)
             self.assertIn("; 1 with a read receipt, 1 without", line)
