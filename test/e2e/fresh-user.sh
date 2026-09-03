@@ -65,6 +65,18 @@ fail() { FAILED=$((FAILED + 1)); printf '  \033[31mFAIL\033[0m %s\n' "$1"; }
 step() { printf '\n== %s\n' "$1"; }
 check() { if [ "$2" = "$3" ]; then pass "$1"; else fail "$1 (beklenen: $3, ölçülen: $2)"; fi; }
 contains() { case "$2" in *"$3"*) pass "$1" ;; *) fail "$1 — bulunamadı: $3" ;; esac; }
+# A worker that did not complete is explained before it is cancelled: its
+# state and the tail of its log, so a reader can tell a transient Codex
+# failure from a regression. Measured once without this: three FAILs and no
+# way to say which.
+explain_worker() {  # $1 = the result JSON, $2 = the worker's log path
+  printf '  evidence: %s\n' "$(printf '%s' "$1" | python3 -c 'import sys, json
+try:
+    r = json.load(sys.stdin); print("state=%s exit=%s stopped=%s" % (r.get("state"), r.get("exit_code"), r.get("stopped")))
+except Exception as e:
+    print("unparseable result: %r" % (sys.stdin.read()[:200],))' 2>&1)"
+  if [ -s "$2" ]; then printf '  evidence: log tail —\n'; tail -n 12 "$2" | sed 's/^/    | /'; else printf '  evidence: no log at %s\n' "$2"; fi
+}
 # An absence proves nothing about a text that is not there: an empty page
 # lacks every word, and a check reading "the page does not replay" would pass
 # for a page that was never produced.
@@ -434,7 +446,7 @@ contains "the answer names a fresh codex worker" "$DELEGATED" "to a fresh codex 
 TASK_ID="$(printf '%s' "$DELEGATED" | python3 -c 'import sys, json; print(json.load(sys.stdin)["task_id"])' 2>/dev/null)"
 RESULT="$(cd "$PROJECT" && antiphon task result "$TASK_ID" 240 2>&1)"
 contains "the worker completed within the wait" "$RESULT" '"state": "completed"'
-case "$RESULT" in *'"state": "completed"'*) : ;; *) (cd "$PROJECT" && antiphon task cancel "$TASK_ID" >/dev/null 2>&1) ;; esac
+case "$RESULT" in *'"state": "completed"'*) : ;; *) explain_worker "$RESULT" "$PROJECT/.antiphon/workers/$TASK_ID/log"; (cd "$PROJECT" && antiphon task cancel "$TASK_ID" >/dev/null 2>&1) ;; esac
 contains "the result names the worker" "$RESULT" "worker-"
 contains "the read worker ran in a worktree of its own" "$RESULT" "workers/$TASK_ID/work\""
 WORKER_LOG="$PROJECT/.antiphon/workers/$TASK_ID/log"
@@ -447,7 +459,7 @@ WRITE_DELEGATED="$(cd "$PROJECT" && printf '%s' '{"text":"Create a file named WO
 WRITE_ID="$(printf '%s' "$WRITE_DELEGATED" | python3 -c 'import sys, json; print(json.load(sys.stdin)["task_id"])' 2>/dev/null)"
 WRITE_RESULT="$(cd "$PROJECT" && antiphon task result "$WRITE_ID" 240 2>&1)"
 contains "the write worker completed within the wait" "$WRITE_RESULT" '"state": "completed"'
-case "$WRITE_RESULT" in *'"state": "completed"'*) : ;; *) (cd "$PROJECT" && antiphon task cancel "$WRITE_ID" >/dev/null 2>&1) ;; esac
+case "$WRITE_RESULT" in *'"state": "completed"'*) : ;; *) explain_worker "$WRITE_RESULT" "$PROJECT/.antiphon/workers/$WRITE_ID/log"; (cd "$PROJECT" && antiphon task cancel "$WRITE_ID" >/dev/null 2>&1) ;; esac
 contains "its diff carries the file it made" "$WRITE_RESULT" "WORKER-WROTE.txt"
 contains "and the line it wrote" "$WRITE_RESULT" "+OK"
 if [ -e "$PROJECT/WORKER-WROTE.txt" ]; then fail "the write worker edited the project's own tree"; else pass "the write worker never touched the project's tree"; fi
