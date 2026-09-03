@@ -12,12 +12,15 @@ where a queue is all there is), same-vendor bridging (Claude ↔ Claude, Codex �
 Codex, always by name) and the managed-worker MVP — each in its own worktree,
 each merged after an independent read-only review closed on it, each certified
 by both Python suites, the Node suite, the statics and `fresh-user.sh` from a
-temporary worktree at the exact commit. **npm still serves 0.3.3**: `main`
-and `v0.5.0` (94d80f2) were pushed to origin on 2026-09-03 at the person's
-word; publishing is the person's own step, after the Codex review over the
-bridge — which was attempted and is still queued in a Codex
-thread that has not taken a turn (the queue measurement of the delivery-truth
-entry, live).
+temporary worktree at the exact commit. `main` and `v0.5.0` (94d80f2) were
+pushed to origin on 2026-09-03 and **`antiphon@0.5.0` was published to npm on
+2026-09-04** (shasum c26ab63e, 11 files, byte-identical to the tag), both at
+the person's word. The Codex review over the bridge — this file's own gate
+for publishing — had not closed: four requests sat unread on the ledger for a
+day, and the person chose to publish on the three Claude-side review rounds
+alone; said here so the next reader does not infer a Codex verdict that was
+never given (the four unread requests are the queue measurement of the
+delivery-truth entry, live).
 
 **The release gate (2026-09-03, after the 0.5.0 tag).** The independent
 read-only review of the tagged commit (14dd179) failed the gate: two Criticals
@@ -2266,6 +2269,8 @@ behind to notice it happened. When the evidence is thin, leave the tag out.
 
 `main` carries version 0.4.0 with the automatic-identity repair merged, and
 npm still serves 0.3.3. The hold is deliberate and this is the reason.
+(Superseded 2026-09-04: `antiphon@0.5.0` is on npm; Start here says how the
+hold ended.)
 
 Eight independent review rounds ran against the exact release commit — some by
 the Codex peer, some by read-only agents — and **every one of them found
