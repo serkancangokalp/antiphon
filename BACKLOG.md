@@ -18,6 +18,29 @@ review over the bridge — which was attempted and is still queued in a Codex
 thread that has not taken a turn (the queue measurement of the delivery-truth
 entry, live).
 
+**The release gate (2026-09-03, after the 0.5.0 tag).** The independent
+read-only review of the tagged commit (14dd179) failed the gate: two Criticals
+— `setup` and `doctor --fix` could delete a person's own sections below a
+rules section from before the end marker, and the same-vendor second marker
+pass delivered a block's body lines and an unclosed block's trailing words to
+the other family — thirteen Importants and a page of minors, every one
+reproduced. All of them are closed on `main`, each under a named test with a
+mutation gate: the two Criticals (4de73d7), the readers (aa972f0 — the Codex
+reader's horizon under test, a quoted label is no receipt, an undated source
+is read, the AGENTS.md fence needs its closer, a shallow clone skips the
+mixed-version Node tests by name), the ledger (0dd25df — a receipt is the
+named receiver's, a malformed file takes nothing down, the refused recipient
+and reason are redacted, notices bounded, a reader never repairs the store),
+the words (a350d05), the workers (09c435c — followed by its task id and not
+a peer, the hop fails closed on the CLI road, admission is one locked step,
+the evidence lives in the sandbox, a handed task is refused what it cannot
+do, the E2E takes the worktree road with a real write worker), and the
+words that follow them. `v0.5.0` was re-pointed to the final commit; nothing
+was pushed or published. Two things the gate measured and this file keeps:
+`codex exec -s workspace-write` records the project as trusted in
+`~/.codex/config.toml` (README §Limits), and the surfaces measure 5,335 /
+5,936 / 3,627 bytes (the token-cost entry).
+
 **Mixed-version pruning** (a 0.3.x reader deleting current endpoints; a
 listener whose in-memory Node and on-disk Python disagree being told it
 recovered) is closed by the `process_birth` sibling, the two-way
@@ -1943,6 +1966,11 @@ forbidden list names the widening values beside the flags; `setup` writes
 staged; `antiphon task list` and a `Workers:` line in `status`; the E2E
 project has a commit, so the real `codex exec` worker runs in a worktree of
 its own, and a real write task returns the diff of what it made.
+
+The task text travels to the worker in its argv, where any process of the
+same user can read it — as it can read the worker's log and worktree; the
+storage rule (no text in the task record) is about what the bridge keeps, not
+a boundary between processes.
 
 No claim is made yet that a Claude worker can appear in Codex's native agent UI,
 or that a Codex worker can appear in Claude Code's native subagent UI. That UX
