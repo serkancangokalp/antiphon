@@ -10,7 +10,7 @@ import { join } from "node:path";
 
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
-import { materialiseLib } from "./fixtures/mixed_lib.mjs";
+import { checkoutHistory, materialiseLib, pinnedAvailability } from "./fixtures/mixed_lib.mjs";
 
 // The socket name derives from the project directory. Using process.cwd() here
 // would mean stealing the socket of a live session running in the repo dir: the
@@ -2902,7 +2902,7 @@ async function anOldListenerOverAnUpgradedPythonIsRefusedNotToldItRecovered() {
   // refuses its initial claim too), then the Python files are replaced under
   // it, the endpoint is pruned, and a reassert is requested.
   const mixed = await materialiseLib({ node: "f0c529f", python: "f0c529f" });
-  if (!mixed) { console.log("old listener over upgraded python: skipped (no git)"); return; }
+  if (mixed.skipped) { console.log(`old listener over upgraded python: skipped (${mixed.skipped})`); return; }
   const dir = await mkdtemp(join(tmpdir(), "antiphon-old-node-"));
   const stub = await makeAutomaticIdentityPython({
     alias: STALE_A_ALIAS, identity_digest: STALE_A_DIGEST, session_id: STALE_A,
@@ -2950,7 +2950,7 @@ async function aCurrentListenerOverADowngradedPythonWithdrawsItsOwnEndpoint() {
   // acknowledgement; the listener must withdraw what was written and say why,
   // rather than bind and then refuse every delivery.
   const mixed = await materialiseLib({ node: "worktree", python: "f0c529f" });
-  if (!mixed) { console.log("current listener over downgraded python: skipped (no git)"); return; }
+  if (mixed.skipped) { console.log(`current listener over downgraded python: skipped (${mixed.skipped})`); return; }
   const dir = await mkdtemp(join(tmpdir(), "antiphon-new-node-"));
   const stub = await makeAutomaticIdentityPython({
     alias: STALE_A_ALIAS, identity_digest: STALE_A_DIGEST, session_id: STALE_A,
@@ -2979,7 +2979,7 @@ async function aCurrentListenerOverADowngradedPythonWithdrawsItsOwnEndpoint() {
 // the sentence Python would have composed — queued, never delivered.
 async function aNewListenerOverAnOldPythonSaysQueuedInItsOwnWords() {
   const mixed = await materialiseLib({ node: "worktree", python: "f0c529f" });
-  if (!mixed) { console.log("new listener over old python: skipped (no git)"); return; }
+  if (mixed.skipped) { console.log(`new listener over old python: skipped (${mixed.skipped})`); return; }
   const dir = await mkdtemp(join(tmpdir(), "antiphon-new-node-words-"));
   liveCodexPeer(dir, "review", "301:review", CODEX_SESSION);
   // Its own `codex` stub: the module's was removed with the main client's
@@ -3058,7 +3058,7 @@ async function makeSwallowingUnregisterPython(identity) {
 
 async function aWithdrawalThatDidNotHappenIsNotAnnounced() {
   const mixed = await materialiseLib({ node: "worktree", python: "f0c529f" });
-  if (!mixed) { console.log("unverified withdrawal: skipped (no git)"); return; }
+  if (mixed.skipped) { console.log(`unverified withdrawal: skipped (${mixed.skipped})`); return; }
   const dir = await mkdtemp(join(tmpdir(), "antiphon-no-withdraw-"));
   const stub = await makeSwallowingUnregisterPython({
     alias: STALE_A_ALIAS, identity_digest: STALE_A_DIGEST, session_id: STALE_A,
@@ -3132,8 +3132,10 @@ async function aMidLifeDowngradeIsRefusedOnceNotChurned() {
   // enumerates a record no listener governs, and a remedy printed forever.
   // The first unacknowledged answer is remembered; later claims refuse
   // before shelling out.
+  const pin = pinnedAvailability("f0c529f");
+  if (!pin.available) { console.log(`mid-life downgrade: skipped (${pin.skip})`); return; }
   const mixed = await materialiseLib({ node: "worktree", python: "worktree" });
-  if (!mixed) { console.log("mid-life downgrade: skipped (no git)"); return; }
+  if (mixed.skipped) { console.log(`mid-life downgrade: skipped (${mixed.skipped})`); return; }
   const dir = await mkdtemp(join(tmpdir(), "antiphon-midlife-"));
   const stub = await makeAutomaticIdentityPython({
     alias: STALE_A_ALIAS, identity_digest: STALE_A_DIGEST, session_id: STALE_A,
@@ -3184,14 +3186,25 @@ peers.write_identity_proof(${JSON.stringify(dir)}, owner, ${JSON.stringify(STALE
 async function aMissingCommitFailsTheMixedLibLoudly() {
   // "No git" and "no such object" were one `null`, and the two rolling-
   // upgrade tests print `skipped (no git)` on it — after a rewritten history
-  // the whole mixed-version contract would have passed by skipping.
-  await assert.rejects(
-    materialiseLib({ node: "0000000000000000000000000000000000000000", python: "worktree" }),
-    /0000000000000000000000000000000000000000/);
+  // the whole mixed-version contract would have passed by skipping. A
+  // checkout that cannot hold the commit — a shallow clone, a tarball — is
+  // the one case that skips, and it names the commit and the reason, so a
+  // skipped mixed-version test is never silent.
+  const missing = "0000000000000000000000000000000000000000";
+  const history = checkoutHistory();
+  if (history === "complete") {
+    await assert.rejects(
+      materialiseLib({ node: missing, python: "worktree" }), /0000000000000000000000000000000000000000/);
+  } else {
+    const outcome = await materialiseLib({ node: missing, python: "worktree" });
+    assert.match(outcome.skipped, /^commit 0{40} unavailable: (shallow clone|not a git checkout)$/);
+    const pin = pinnedAvailability("f0c529f");
+    assert.ok(!pin.available && /f0c529f/.test(pin.skip), `the pin says why: ${JSON.stringify(pin)}`);
+  }
   const real = await materialiseLib({ node: "worktree", python: "worktree" });
-  assert.ok(real, "the working tree is always materialisable");
+  assert.ok(real.lib, "the working tree is always materialisable");
   await rm(real.dir, { recursive: true, force: true }).catch(() => {});
-  console.log("a missing commit fails the mixed lib loudly: ok");
+  console.log(`a missing commit fails the mixed lib loudly: ok (${history} history)`);
 }
 
 await aMissingCommitFailsTheMixedLibLoudly();
