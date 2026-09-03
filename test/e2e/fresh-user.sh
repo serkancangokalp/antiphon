@@ -153,6 +153,10 @@ SLUG="$(printf '%s' "$PROJECT" | sed 's|[^A-Za-z0-9]|-|g')"
 CLAUDE_DIR="$HOME/.claude/projects/$SLUG"
 QUEUE="$HOME/.codex/queue_1.sqlite"
 CODEX_CONFIG_BEFORE="$(shasum -a 256 "$HOME/.codex/config.toml" 2>/dev/null | cut -d' ' -f1)"
+# A byte copy beside the digest: the write worker's `codex exec` records this
+# run's project as trusted in that file (Codex's own doing), and the run undoes
+# exactly that against this copy.
+CODEX_CONFIG_COPY="$TMP/codex-config-before.toml"; cp "$HOME/.codex/config.toml" "$CODEX_CONFIG_COPY" 2>/dev/null || :
 # Read-only, and absent is its own answer: a plain `sqlite3` call creates the
 # file it was asked to read, so a first-ever run would leave a database behind
 # and call the machine unchanged.
@@ -234,7 +238,7 @@ mkdir -p "$PROJECT"; (cd "$PROJECT" && git init -q)
 export ANTIPHON_CWD="$PROJECT"
 (cd "$PROJECT" && antiphon setup >/dev/null 2>&1) \
   && pass "setup exits 0" || fail "setup exited non-zero"
-for f in .claude/settings.json .claude/settings.local.json .codex/hooks.json .codex/config.toml .mcp.json CLAUDE.md AGENTS.md; do
+for f in .claude/settings.json .claude/settings.local.json .codex/hooks.json .codex/config.toml .mcp.json CLAUDE.md AGENTS.md .antiphon/.gitignore; do
   [ -f "$PROJECT/$f" ] && pass "setup wrote $f" || fail "setup did not write $f"
 done
 check "~/.codex/config.toml untouched" "$(shasum -a 256 "$HOME/.codex/config.toml" 2>/dev/null | cut -d' ' -f1)" "$CODEX_CONFIG_BEFORE"
@@ -368,7 +372,11 @@ pass "the second exact assistant marker landed on attempt $MARKER_ATTEMPT"
 # Stronger than "newest": this is the exact transcript whose assistant block
 # passed the second-marker predicate, and it is the only transcript T2 pushes.
 TRANSCRIPT="$MARKER_TRANSCRIPT"
-[ -d "$PROJECT/.antiphon" ] && pass "the hooks ran (.antiphon exists)" || fail "the hooks never ran"
+# `.antiphon/` itself is setup's now (its .gitignore); the hooks' own files say
+# they ran — measured on a quiet project: the cursor lock, the peers and the
+# identity directories, and no cursor.json until there is a page to record.
+{ [ -e "$PROJECT/.antiphon/cursor.json.lock" ] || [ -d "$PROJECT/.antiphon/peers" ]; } \
+  && pass "the hooks ran (.antiphon/cursor.json.lock or peers/ exists)" || fail "the hooks never ran"
 e2e_once push || { fail "the T2 push stage attempted to run twice"; exit 1; }
 PUSH="$(printf '{"cwd":"%s","hook_event_name":"Stop","transcript_path":"%s","session_id":"%s"}' \
         "$PROJECT" "$TRANSCRIPT" "$(basename "$TRANSCRIPT" .jsonl)" | (cd "$PROJECT" && antiphon push codex 2>&1))"
@@ -386,17 +394,66 @@ else
 fi
 
 step "T3a — a managed worker: delegate one read task to a fresh codex exec, collect it by id"
+# A commit, so the worker gets the worktree road — the one a real checkout
+# takes — rather than the run-in-place road of a bare `git init`.
+(cd "$PROJECT" && git -c user.email=e2e@antiphon -c user.name=e2e commit -q --allow-empty -m root) \
+  && pass "the project has a commit for a worker's worktree" || fail "the empty root commit failed"
 DELEGATED="$(cd "$PROJECT" && printf '%s' '{"text":"Reply with exactly: WORKER-OK","kind":"codex","timeout":300}' | antiphon task delegate 2>/dev/null)" \
   && pass "antiphon task delegate exits 0" || fail "antiphon task delegate failed: $DELEGATED"
 contains "the answer names a fresh codex worker" "$DELEGATED" "to a fresh codex worker"
 TASK_ID="$(printf '%s' "$DELEGATED" | python3 -c 'import sys, json; print(json.load(sys.stdin)["task_id"])' 2>/dev/null)"
 RESULT="$(cd "$PROJECT" && antiphon task result "$TASK_ID" 240 2>&1)"
 contains "the worker completed within the wait" "$RESULT" '"state": "completed"'
+case "$RESULT" in *'"state": "completed"'*) : ;; *) (cd "$PROJECT" && antiphon task cancel "$TASK_ID" >/dev/null 2>&1) ;; esac
 contains "the result names the worker" "$RESULT" "worker-"
+contains "the read worker ran in a worktree of its own" "$RESULT" "workers/$TASK_ID/work\""
 WORKER_LOG="$PROJECT/.antiphon/workers/$TASK_ID/log"
 if [ -s "$WORKER_LOG" ]; then pass "the worker's log exists and is not empty"; else fail "no worker log at $WORKER_LOG"; fi
 contains "the worker answered in its own log" "$(cat "$WORKER_LOG" 2>/dev/null)" "WORKER-OK"
+# One real write task: the worker edits in its worktree, never the project,
+# and its diff is the evidence — bounded by the same wait as the read task.
+WRITE_DELEGATED="$(cd "$PROJECT" && printf '%s' '{"text":"Create a file named WORKER-WROTE.txt in the current directory containing the single line OK (nothing else), do not commit, then reply with exactly: WORKER-WROTE","kind":"codex","task":"write","timeout":300}' | antiphon task delegate 2>/dev/null)" \
+  && pass "a write task is delegated" || fail "the write delegation failed: $WRITE_DELEGATED"
+WRITE_ID="$(printf '%s' "$WRITE_DELEGATED" | python3 -c 'import sys, json; print(json.load(sys.stdin)["task_id"])' 2>/dev/null)"
+WRITE_RESULT="$(cd "$PROJECT" && antiphon task result "$WRITE_ID" 240 2>&1)"
+contains "the write worker completed within the wait" "$WRITE_RESULT" '"state": "completed"'
+case "$WRITE_RESULT" in *'"state": "completed"'*) : ;; *) (cd "$PROJECT" && antiphon task cancel "$WRITE_ID" >/dev/null 2>&1) ;; esac
+contains "its diff carries the file it made" "$WRITE_RESULT" "WORKER-WROTE.txt"
+contains "and the line it wrote" "$WRITE_RESULT" "+OK"
+if [ -e "$PROJECT/WORKER-WROTE.txt" ]; then fail "the write worker edited the project's own tree"; else pass "the write worker never touched the project's tree"; fi
+# Codex's own side effect, measured on 0.152.1: `codex exec -s workspace-write`
+# records the repository root as trusted in ~/.codex/config.toml (a read
+# worker does not, and a transient `-c` trust override does not prevent it).
+# This run undoes exactly its own entry, byte-exact against the copy taken at
+# the start; anything else in that file is the person's and is never touched.
+UNDONE="$(python3 - "$CODEX_CONFIG_COPY" "$HOME/.codex/config.toml" "$PROJECT" <<'PY'
+import os, sys
+copy, live, project = sys.argv[1:4]
+try:
+    with open(copy, encoding="utf-8") as f: before = f.read()
+    with open(live, encoding="utf-8") as f: after = f.read()
+except OSError:
+    print("unreadable"); raise SystemExit
+if after == before:
+    print("unchanged"); raise SystemExit
+table = '[projects."%s"]\ntrust_level = "trusted"\n' % os.path.realpath(project)
+for candidate in (table + "\n", "\n" + table, table):
+    if after.count(candidate) == 1 and after.replace(candidate, "", 1) == before:
+        with open(live, "w", encoding="utf-8") as f: f.write(before)
+        print("undone"); raise SystemExit
+print("other")
+PY
+)"
+case "$UNDONE" in
+  undone) pass "the trust entry Codex wrote for this run's project was undone byte-exact" ;;
+  unchanged) pass "Codex wrote no trust entry for this run's project" ;;
+  *) fail "~/.codex/config.toml changed beyond this run's own trust entry ($UNDONE); remove [projects.\"$PROJECT\"] by hand" ;;
+esac
+LISTED="$(cd "$PROJECT" && antiphon task list 2>&1)"
+contains "task list names the read task" "$LISTED" "$TASK_ID"
+contains "task list names the write task" "$LISTED" "$WRITE_ID"
 SWEPT="$(cd "$PROJECT" && ANTIPHON_NAME= antiphon status 2>&1)"; contains "status still runs with a task on file" "$SWEPT" "Deliveries:"
+contains "status counts the workers on record" "$SWEPT" "Workers:"
 
 step "T3 — Codex's first turn reads what the refused push could not carry"
 BEFORE_ROLLOUTS="$(mktemp)"; find "$HOME/.codex/sessions" -name 'rollout-*.jsonl' 2>/dev/null | sort > "$BEFORE_ROLLOUTS"

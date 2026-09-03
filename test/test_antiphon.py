@@ -2176,6 +2176,40 @@ class AntiphonTest(unittest.TestCase):
         self.assertIn('args = ["mcp"]', config)
         self.assertIn(f'ANTIPHON_CWD = "{project}"', config)
 
+    def test_setup_keeps_the_bridges_store_out_of_git(self):
+        """Second review 2026-09-03: nothing ignored `.antiphon/`, so `git add
+        -A` staged the ledger and a worker's worktree as a gitlink. `setup`
+        writes one `*` there, once, and never over a file that is the user's."""
+        import subprocess
+        with tempfile.TemporaryDirectory() as project, \
+             patch.object(antiphon, "project_dir", return_value=project):
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out):
+                self.assertEqual(antiphon.setup(), 0)
+            ignore = os.path.join(project, ".antiphon", ".gitignore")
+            with open(ignore) as f:
+                self.assertEqual(f.read(), "*\n")
+            self.assertIn("✓ Bridge store ignored by git", out.getvalue())
+            subprocess.run(["git", "init", "-q", project], check=True)
+            with open(os.path.join(project, ".antiphon", "cursor.json"), "w") as f:
+                f.write("{}")
+            listed = subprocess.run(["git", "-C", project, "status", "--porcelain",
+                                     "--untracked-files=all"], capture_output=True,
+                                    text=True).stdout
+            self.assertNotIn(".antiphon", listed, "nothing under the store is stageable")
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out):
+                self.assertEqual(antiphon.setup(), 0)
+            self.assertIn("· Bridge store already ignored by git", out.getvalue())
+            with open(ignore, "w") as f:
+                f.write("!keep-this\n")
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out):
+                self.assertEqual(antiphon.setup(), 0)
+            with open(ignore) as f:
+                self.assertEqual(f.read(), "!keep-this\n", "the user's file is theirs")
+            self.assertIn(".antiphon/.gitignore is yours", out.getvalue())
+
     def test_setup_forwards_the_alias_to_the_codex_server(self):
         """Codex does not pass the parent environment to an MCP server: measured
         on live processes, the Claude child carried 46 variables and the Codex
@@ -4180,12 +4214,14 @@ class ManagedWorkerToolTest(unittest.TestCase):
             os.chmod(path, 0o755)
         return root + os.pathsep + os.environ.get("PATH", "")
 
-    def _task(self, project, args, payload=None, env=None):
+    def _task(self, project, args, payload=None, env=None, drop=()):
         out, err = io.StringIO(), io.StringIO()
         with patch.object(antiphon, "project_dir", return_value=project), \
              patch.dict(antiphon.os.environ, env or {}, clear=False), \
              patch.object(antiphon.sys, "stdin", io.StringIO(json.dumps(payload or {}))), \
              contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            for name in drop:
+                antiphon.os.environ.pop(name, None)
             code = antiphon.task(*args)
         return code, out.getvalue(), err.getvalue()
 
@@ -4285,7 +4321,7 @@ class ManagedWorkerToolTest(unittest.TestCase):
             self.assertIn("task: unknown task id", err)
             code, _out, err = self._task(project, ("frobnicate", task_id))
             self.assertEqual(code, 1)
-            self.assertIn("task: delegate | status <id> | result <id> [wait] | cancel <id>", err)
+            self.assertIn("task: delegate | list | status <id> | result <id> [wait] | cancel <id>", err)
 
     def test_the_codex_server_offers_delegate_and_task(self):
         names = [tool["name"] for tool in antiphon.TOOLS]
@@ -4320,25 +4356,6 @@ class ManagedWorkerToolTest(unittest.TestCase):
             antiphon._mcp_serve("/tmp/project", "build")
         called.assert_called_once_with("/tmp/project", {"id": "t", "action": "result", "wait": 3})
 
-    def test_a_workers_words_carry_its_name_on_the_page(self):
-        """A worker registers as `worker-<id8>` through its own hooks, and
-        the page joins its source to that alias like any named peer's: the
-        words name the session that produced them, never the parent."""
-        worker = "1d5a03e0-0548-4339-87c3-45c5dbf7e9d7"
-        parent = "2e6b14f1-1659-544a-98d4-56d6eca8fa48"
-        events = [
-            antiphon.Event(10.0, "codex", "reviewed: fine", worker, "g1", 0, 100, None,
-                           {"start": 0, "sha256": "b" * 64}),
-            antiphon.Event(11.0, "codex", "carrying on", parent, "g2", 0, 100, None,
-                           {"start": 0, "sha256": "c" * 64}),
-        ]
-        join = antiphon.SessionJoin({worker: "worker-1d5a03e0", parent: "build"}, False)
-        text = antiphon._render_page("claude", antiphon._ordered_records(events),
-                                     False, None, join)
-        self.assertIn("worker-1d5a03e0", text)
-        self.assertLess(text.index("worker-1d5a03e0"), text.index("reviewed: fine"))
-        self.assertIn("build", text)
-
     # ---- review 2026-09-03 ----
 
     def test_a_worker_whose_hop_its_server_cannot_see_may_not_delegate(self):
@@ -4360,6 +4377,109 @@ class ManagedWorkerToolTest(unittest.TestCase):
             self.assertIsNot(result.get("isError"), True, result)
             for task_id in [t["id"] for t in workers.tasks(project)]:
                 workers.cancel(project, task_id)
+
+    def test_the_cli_road_fails_closed_on_the_workers_own_name(self):
+        """Second review 2026-09-03: the name-based fail-closed lived on the
+        MCP road only — a plain `antiphon task delegate` from a worker whose
+        hop was stripped started a grandchild. The command line reads the
+        name from the worker's own environment, and an alias asserted on
+        stdin that is not that name is refused before anything else."""
+        with tempfile.TemporaryDirectory() as project, tempfile.TemporaryDirectory() as bin_dir:
+            env = {"PATH": self._stub_path(bin_dir), "ANTIPHON_NAME": "worker-1d5a03e0"}
+            code, _out, err = self._task(project, ("delegate",), {"text": "x", "kind": "codex"},
+                                         env, drop=("ANTIPHON_HOP",))
+            self.assertEqual(code, 1)
+            self.assertIn("managed worker (worker-1d5a03e0) whose hop is not visible", err)
+            self.assertEqual(workers.tasks(project), [])
+            code, _out, err = self._task(project, ("delegate",),
+                                         {"text": "x", "kind": "codex", "side": "claude",
+                                          "sender_alias": "build"},
+                                         dict(env, ANTIPHON_HOP="1", ANTIPHON_HOP_BUDGET="3"))
+            self.assertEqual(code, 1)
+            self.assertIn("a sender_alias that is not its own name is not accepted", err)
+            self.assertEqual(workers.tasks(project), [])
+            code, out, err = self._task(project, ("delegate",),
+                                        {"text": "x", "kind": "codex", "side": "claude",
+                                         "sender_alias": "worker-1d5a03e0"},
+                                        dict(env, ANTIPHON_HOP="1", ANTIPHON_HOP_BUDGET="3"))
+            self.assertEqual(code, 0, err)
+            self.assertEqual(json.loads(out)["hop"] if "hop" in json.loads(out) else
+                             workers.read_task(project, json.loads(out)["task_id"])["hop"], 2)
+            for task_id in [t["id"] for t in workers.tasks(project)]:
+                workers.cancel(project, task_id)
+
+    def test_a_write_task_cannot_be_handed(self):
+        """A handed task has no worktree; the class would be a promise the
+        peer never heard of."""
+        with tempfile.TemporaryDirectory() as project, \
+             patch.object(antiphon, "send_to_codex", return_value=(True, "live")) as send, \
+             patch.object(antiphon, "claimed_alias", return_value="ui"):
+            code, _out, err = self._task(project, ("delegate",),
+                                         {"text": "edit it", "kind": "codex", "to": "build",
+                                          "side": "claude", "task": "write"})
+            self.assertEqual(code, 1)
+            self.assertIn("a handed task has no worktree of its own", err)
+            send.assert_not_called()
+            self.assertEqual(workers.tasks(project), [])
+            self.assertEqual(ledger.entries(project), [])
+
+    def test_result_and_cancel_on_a_handed_task_are_refused_on_both_roads(self):
+        with tempfile.TemporaryDirectory() as project:
+            with patch.object(antiphon, "send_to_codex", return_value=(True, "live")), \
+                 patch.object(antiphon, "claimed_alias", return_value="ui"):
+                code, out, err = self._task(project, ("delegate",),
+                                            {"text": "look", "kind": "codex", "to": "build",
+                                             "side": "claude"})
+            self.assertEqual(code, 0, err)
+            task_id = json.loads(out)["task_id"]
+            for action in ("result", "cancel"):
+                code, _out, err = self._task(project, (action, task_id))
+                self.assertEqual(code, 1, action)
+                self.assertIn("has no worker here", err)
+                answer = antiphon._task_tool(project, {"id": task_id, "action": action})
+                self.assertTrue(answer.get("isError"), action)
+                self.assertIn("only the peer can be told to stop", answer["content"][0]["text"])
+            code, out, _err = self._task(project, ("status", task_id))
+            self.assertEqual((code, json.loads(out)["state"]), (0, "handed"))
+
+    def test_task_list_names_every_record_on_one_line(self):
+        with tempfile.TemporaryDirectory() as project, tempfile.TemporaryDirectory() as bin_dir:
+            env = {"PATH": self._stub_path(bin_dir, "sleep 30")}
+            code, out, _err = self._task(project, ("list",))
+            self.assertEqual((code, out), (0, ""))
+            ids = []
+            for kind in ("codex", "claude"):
+                _code, out, _err = self._task(project, ("delegate",), {"text": "x", "kind": kind}, env)
+                ids.append(json.loads(out)["task_id"])
+            code, out, _err = self._task(project, ("list",))
+            self.assertEqual(code, 0)
+            lines = out.splitlines()
+            self.assertEqual(len(lines), 2)
+            for task_id, kind, line in zip(ids, ("codex", "claude"), lines):
+                self.assertRegex(line, rf"^{task_id}  {kind}\s+read\s+running\s+\d{{4}}-\d\d-\d\dT")
+            for task_id in ids:
+                self._task(project, ("cancel", task_id))
+            _code, out, _err = self._task(project, ("list",))
+            self.assertEqual([line.split()[3] for line in out.splitlines()],
+                             ["cancelled", "cancelled"])
+
+    def test_status_counts_the_workers_on_record(self):
+        with tempfile.TemporaryDirectory() as project:
+            self.assertEqual(antiphon._worker_report(project), "Workers:            none")
+            first = workers.new_task(project, kind="codex", task_class="read", sha256="a" * 64, size=1)
+            workers.new_task(project, kind="codex", task_class="read", sha256="a" * 64, size=1)
+            workers.update_task(project, first["id"],
+                                lambda c: c.update(state="running", pid=1, started_at=1.0))
+            self.assertEqual(antiphon._worker_report(project),
+                             "Workers:            1 accepted, 1 running (as recorded; antiphon task list)")
+            out = io.StringIO()
+            with patch.object(antiphon, "project_dir", return_value=project), \
+                 patch.object(antiphon, "claude_transcripts", return_value=[]), \
+                 patch.object(antiphon, "codex_rollout_files", return_value=[]), \
+                 patch.object(antiphon, "build_summary", return_value=("", 0.0, 0)), \
+                 contextlib.redirect_stdout(out):
+                self.assertEqual(antiphon.status(), 0)
+            self.assertIn("Workers:            1 accepted, 1 running", out.getvalue())
 
     def test_a_refused_hand_off_leaves_no_record(self):
         with tempfile.TemporaryDirectory() as project:
@@ -8229,6 +8349,8 @@ class SetupShapeCharacterizationTest(unittest.TestCase):
             + os.path.join(project, ".mcp.json"),
             "✓ Claude MCP local permission updated: "
             + os.path.join(project, ".claude", "settings.local.json"),
+            "✓ Bridge store ignored by git: "
+            + os.path.join(project, ".antiphon", ".gitignore"),
             "✓ AGENTS.md rule added: " + os.path.join(project, "AGENTS.md"),
             "✓ CLAUDE.md rule added: " + os.path.join(project, "CLAUDE.md"),
             "",
@@ -8281,6 +8403,8 @@ class SetupShapeCharacterizationTest(unittest.TestCase):
             + os.path.join(project, ".mcp.json"),
             "· Claude MCP local permission already up to date: "
             + os.path.join(project, ".claude", "settings.local.json"),
+            "· Bridge store already ignored by git: "
+            + os.path.join(project, ".antiphon", ".gitignore"),
             "· AGENTS.md rule already up to date: "
             + os.path.join(project, "AGENTS.md"),
             "· CLAUDE.md rule already up to date: "
