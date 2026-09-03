@@ -71,6 +71,43 @@ was received and what was refused. A `@codex` or `@claude` line the Stop hook
 could not deliver is reported on the sender's next page, with the reason,
 because the hook's own refusal reaches a debug log and not the agent.
 
+### Managed workers — one task, one worker of the other kind
+
+`antiphon_delegate(text, kind?, to?, task?, timeout?)`, on both servers, starts
+a fresh `claude -p` or `codex exec` session for one task and returns at once
+with a task id; `antiphon_task(id, action, wait?)` reports its `status`,
+collects its `result` after a bounded wait (the log tail, and for a completed
+write task the diff against the base it started from and its `tests.txt`), or
+`cancel`s it. Whenever the project is a git checkout the worker works in a
+detached worktree of its own under `.antiphon/workers/<id>/work/`, so nothing
+it does touches your tree; the bridge's own files — the log, the exit code,
+the test summary, a large diff — sit beside that worktree, never inside it. A
+read task (the default) runs under the host's read-only class
+(`--permission-mode plan` for Claude, `-s read-only` for Codex); in a project
+that is not a checkout it runs in the project under that class. A write task
+runs under the host's default class in its worktree and returns a diff the
+bridge never applies — the parent agent or the human does, after `git apply
+--check`. No worker is ever started with `--dangerously-skip-permissions` or
+`--full-auto`; it carries `ANTIPHON_HOP` one deeper than its parent and is
+refused a delegation of its own at the hop budget (`ANTIPHON_HOP_BUDGET`,
+default 1) — and, because Codex hands its MCP server only the variables its
+config names, a worker whose server cannot see its hop is refused on its name
+alone — so a chain cannot become an invisible loop. On the Codex side the two
+tools are the only ones that ask first: `setup` writes a per-tool
+`approval_mode = "prompt"` for them beneath the server's blanket approval of
+the read tools. With `to`, the task is handed to a running named peer of that
+kind over the ordinary addressed send instead (parked as an attachment when
+too large, like any direct send), marked `[Antiphon task <id>]` and recorded
+on the ledger. At most four workers run per project; a worker is stopped at
+its timeout by the next `status`, `result` or hook sweep; a task record lives
+a week under `.antiphon/tasks/`, and a worker's directory is swept once its
+evidence was collected. Every worker is asked to keep `[Antiphon worker
+<kind>:<id>]` at the start of its final message, and its own hooks register it
+as `worker-<id8>` — the name the page shows — so nothing it says is ever the
+parent's own; while it runs it is a live named peer, so a bare `reply_to_codex`
+or `antiphon_send` is refused until it finishes. The same lifecycle is on the
+command line as `antiphon task`.
+
 ### How identity is preserved
 
 A Claude → Codex message reaches Codex tagged either `[Antiphon bridge] Claude:` (pushed from Claude's Stop hook) or `[Antiphon channel] Claude:` (a direct reply sent through the channel, via the `reply_to_codex` tool) — either way, Codex sees these as Claude's words, not the human user's. A Codex → Codex message reaches the other Codex session tagged `[Antiphon bridge] Codex:` or `[Antiphon channel] Codex:`, and a Claude → Claude message arrives as a channel event with `sender="claude"` — the other session's words, never the human user's.
@@ -252,6 +289,8 @@ antiphon catch-up [side]   # skip undelivered history: page cursors jump to the 
 antiphon sources scan      # finish or refresh the durable source catalog
 antiphon sources compact   # retire aged gone sources proved consumed by every relevant reader
 antiphon retrieve <id>     # print one complete tool invocation (never its result)
+antiphon task delegate     # start a managed worker for one task (JSON on stdin: text, kind, to, task, timeout)
+antiphon task status|result|cancel <id> [wait]   # follow a delegated task by id
 antiphon --version         # the installed version
 npm test                   # Python unit tests + real MCP protocol test
 test/e2e/fresh-user.sh     # what a new user gets, with the real CLIs (not in npm test)
@@ -314,6 +353,7 @@ turn ends.
 - Matching is done on the same project's absolute directory.
 - Unix sockets only — there is no Windows support.
 - A same-vendor message (`@claude:name` from Claude, `@codex:name` from Codex, `reply_to_claude`, `antiphon_send(kind="codex")`) is always addressed, and the passive page gains no same-kind lane — two same-kind sessions need names or automatic aliases, and a session of one kind is told nothing of another's work unless it is sent. It is addressed, not confidential: a Stop-marker line is part of the sender's visible reply, which the other kind's page shows, and a same-kind tool call's arguments stay retrievable by their public id.
+- A managed worker is a subprocess of the other CLI (`claude -p` / `codex exec`), never a host-native subagent: it needs that CLI installed and logged in, is stopped at its timeout (at most an hour) by the next `status`, `result` or hook sweep rather than by a clock of its own, appears in neither host's own agent UI, and its patch is evidence, never a merge. A worker cannot be resumed; a follow-up is a new task. It inherits the environment of the session that started it, as any subprocess of that session would.
 - A tool result is a statement about the transport, never about the peer. `reply_to_codex` says queued and `antiphon_send` says delivered to the channel; a queued row in a thread that never takes a turn is not read, and only the peer's transcript proves receipt — `antiphon status` shows what still waits, `antiphon doctor` notes what has waited more than ten minutes. A bare reply refused among several peers names the last unanswered sender as advice; the bridge itself still never chooses.
 
 ### Passive pull pages, and what it still cannot promise

@@ -44,7 +44,7 @@
 ### Task 4: The CLI and the two MCP tools
 
 - [ ] `antiphon task delegate|status|result|cancel` (JSON on stdin for delegate: `{text, kind, to?, task, timeout}`; JSON on stdout) in `COMMANDS`; `to=` hands the task to a running named peer through `send_to_*` with the task id in the label and records the task as `handed`.
-- [ ] Codex server: `antiphon_delegate(text, kind?, to?, task?, timeout?)`, `antiphon_task(id, action, wait?)`; Claude server: the same two, calling `antiphon.py task …`; both refuse with the spec's sentences (neither/both of `to`/`kind`; hop budget; four running).
+- [ ] Codex server: `antiphon_delegate(text, kind?, to?, task?, timeout?)`, `antiphon_task(id, action, wait?)`; Claude server: the same two, calling `antiphon.py task …`; both refuse with the spec's sentences (no kind that can be known; a worker whose server cannot see its hop; the hop budget; four running).
 - [ ] Tests: `_mcp_serve` dispatch; Node tools listed and forwarded; refusals verbatim. Mutations: hop check dropped; both-modes check dropped.
 
 ### Task 5: Labels, receipts and the passive page

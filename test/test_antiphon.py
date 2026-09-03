@@ -2,6 +2,7 @@ import sys, os
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "lib"))
 import antiphon
 import ledger
+import workers
 
 import contextlib
 import errno
@@ -1457,7 +1458,8 @@ class AntiphonTest(unittest.TestCase):
 
     def test_mcp_offers_codex_read_send_and_retrieve_tools(self):
         self.assertEqual(sorted(t["name"] for t in antiphon.TOOLS),
-                         ["antiphon_read", "antiphon_retrieve", "antiphon_send"])
+                         ["antiphon_delegate", "antiphon_read", "antiphon_retrieve",
+                          "antiphon_send", "antiphon_task"])
 
     def test_antiphon_send_delivers_the_text_to_the_claude_channel(self):
         sent = []
@@ -2122,7 +2124,8 @@ class AntiphonTest(unittest.TestCase):
             with open(os.path.join(project, ".codex", "config.toml"),
                       encoding="utf-8") as f:
                 config = f.read()
-        self.assertIn('env_vars = ["ANTIPHON_NAME"]', config)
+        self.assertIn('env_vars = ["ANTIPHON_NAME", "ANTIPHON_HOP", "ANTIPHON_HOP_BUDGET"]',
+                      config)
 
     def test_setup_adds_the_forward_to_a_config_that_predates_it(self):
         """An existing install gets it on the next `setup`, exactly once."""
@@ -4087,6 +4090,296 @@ class ToolInvocationRetrievalTest(unittest.TestCase):
         self.assertEqual(json.loads(out.getvalue())["result"], answer)
 
 
+class ManagedWorkerToolTest(unittest.TestCase):
+    """`antiphon task` and the two MCP tools over lib/workers.py: a task is
+    delegated to a fresh worker of a kind, or handed to a running named peer
+    of that kind; its lifecycle is asked by id; every refusal names its
+    reason; nothing is merged or forwarded."""
+
+    def _stub_path(self, root, body="exit 0"):
+        for kind in ("claude", "codex"):
+            path = os.path.join(root, kind)
+            with open(path, "w") as f:
+                f.write("#!/bin/sh\n" + body + "\n")
+            os.chmod(path, 0o755)
+        return root + os.pathsep + os.environ.get("PATH", "")
+
+    def _task(self, project, args, payload=None, env=None):
+        out, err = io.StringIO(), io.StringIO()
+        with patch.object(antiphon, "project_dir", return_value=project), \
+             patch.dict(antiphon.os.environ, env or {}, clear=False), \
+             patch.object(antiphon.sys, "stdin", io.StringIO(json.dumps(payload or {}))), \
+             contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            code = antiphon.task(*args)
+        return code, out.getvalue(), err.getvalue()
+
+    def test_delegate_starts_a_fresh_worker_and_says_so(self):
+        with tempfile.TemporaryDirectory() as project, tempfile.TemporaryDirectory() as bin_dir:
+            env = {"PATH": self._stub_path(bin_dir)}
+            code, out, err = self._task(project, ("delegate",),
+                                        {"text": "review the diff", "kind": "codex"}, env)
+            self.assertEqual(code, 0, err)
+            answer = json.loads(out)
+            self.assertEqual(answer["state"], "running")
+            self.assertEqual(answer["worker"]["kind"], "codex")
+            self.assertEqual(answer["worker"]["name"], f"worker-{answer['task_id'][:8]}")
+            self.assertEqual(answer["task_class"], "read")
+            self.assertIn(f"Delegated task {answer['task_id']} to a fresh codex worker", answer["text"])
+            self.assertIn("antiphon_task", answer["text"])
+            record = workers.read_task(project, answer["task_id"])
+            self.assertEqual((record["kind"], record["task_class"], record["hop"],
+                              record["sha256"]),
+                             ("codex", "read", 1, hashlib.sha256(b"review the diff").hexdigest()))
+            code, out, _err = self._task(project, ("result", answer["task_id"], "5"))
+            self.assertEqual(code, 0)
+            self.assertEqual(json.loads(out)["state"], "completed")
+
+    def test_delegate_refuses_without_a_kind_at_the_hop_budget_and_at_the_cap(self):
+        with tempfile.TemporaryDirectory() as project, tempfile.TemporaryDirectory() as bin_dir:
+            env = {"PATH": self._stub_path(bin_dir, "sleep 30")}
+            code, _out, err = self._task(project, ("delegate",), {"text": "x"}, env)
+            self.assertEqual(code, 1)
+            self.assertIn("task: not delegated: name a kind (claude or codex)", err)
+            code, _out, err = self._task(project, ("delegate",), {"text": "", "kind": "codex"}, env)
+            self.assertEqual(code, 1)
+            self.assertIn("task: not delegated: the task text is empty", err)
+            code, _out, err = self._task(project, ("delegate",),
+                                         {"text": "x", "kind": "codex"},
+                                         dict(env, ANTIPHON_HOP="1"))
+            self.assertEqual(code, 1)
+            self.assertIn("hop budget 1 reached", err)
+            self.assertEqual(workers.tasks(project), [], "a refusal leaves no record")
+            ids = []
+            for _ in range(4):
+                code, out, err = self._task(project, ("delegate",),
+                                            {"text": "x", "kind": "codex"}, env)
+                self.assertEqual(code, 0, err)
+                ids.append(json.loads(out)["task_id"])
+            code, _out, err = self._task(project, ("delegate",),
+                                         {"text": "x", "kind": "codex"}, env)
+            self.assertEqual(code, 1)
+            self.assertIn("4 workers already run", err)
+            for task_id in ids:
+                self._task(project, ("cancel", task_id))
+
+    def test_delegate_hands_a_task_to_a_running_named_peer(self):
+        with tempfile.TemporaryDirectory() as project:
+            sends = []
+            with patch.object(antiphon, "send_to_codex",
+                              side_effect=lambda cwd, message, to=None, sender=None:
+                                  sends.append((message, to, sender)) or (True, "live")), \
+                 patch.object(antiphon, "claimed_alias", return_value="ui"):
+                code, out, err = self._task(project, ("delegate",),
+                                            {"text": "review the diff", "kind": "codex",
+                                             "to": "build", "side": "claude"})
+            self.assertEqual(code, 0, err)
+            answer = json.loads(out)
+            self.assertEqual(answer["state"], "handed")
+            self.assertIn(f"Handed task {answer['task_id']} to Codex peer 'build'", answer["text"])
+            self.assertIn("queued", answer["text"].lower())
+            message, to, sender = sends[0]
+            self.assertEqual((to, sender), ("build", "ui"))
+            self.assertIn(f"[Antiphon task {answer['task_id']}]", message)
+            self.assertIn("review the diff", message)
+            self.assertTrue(message.startswith(antiphon.CHANNEL_LABEL), message[:60])
+            record = workers.read_task(project, answer["task_id"])
+            self.assertEqual((record["state"], record["to"], record["kind"]),
+                             ("handed", "build", "codex"))
+            entry = ledger.read_entry(project, answer["task_id"])
+            self.assertEqual((entry["to_kind"], entry["to_alias"], entry["sender_kind"]),
+                             ("codex", "build", "claude"))
+            code, _out, err = self._task(project, ("delegate",),
+                                         {"text": "x", "kind": "codex", "to": "build",
+                                          "side": "claude"})
+            self.assertEqual(code, 1, "no transport: refused")
+
+    def test_status_result_and_cancel_by_id(self):
+        with tempfile.TemporaryDirectory() as project, tempfile.TemporaryDirectory() as bin_dir:
+            env = {"PATH": self._stub_path(bin_dir, "sleep 30")}
+            code, out, _err = self._task(project, ("delegate",), {"text": "x", "kind": "claude"}, env)
+            task_id = json.loads(out)["task_id"]
+            code, out, _err = self._task(project, ("status", task_id))
+            self.assertEqual((code, json.loads(out)["state"]), (0, "running"))
+            code, out, _err = self._task(project, ("result", task_id))
+            self.assertEqual((code, json.loads(out)["state"]), (0, "running"))
+            code, out, _err = self._task(project, ("cancel", task_id))
+            self.assertEqual((code, json.loads(out)["state"]), (0, "cancelled"))
+            code, _out, err = self._task(project, ("status", "2e6b14f1-1659-544a-98d4-56d6eca8fa48"))
+            self.assertEqual(code, 1)
+            self.assertIn("task: unknown task id", err)
+            code, _out, err = self._task(project, ("frobnicate", task_id))
+            self.assertEqual(code, 1)
+            self.assertIn("task: delegate | status <id> | result <id> [wait] | cancel <id>", err)
+
+    def test_the_codex_server_offers_delegate_and_task(self):
+        names = [tool["name"] for tool in antiphon.TOOLS]
+        self.assertIn("antiphon_delegate", names)
+        self.assertIn("antiphon_task", names)
+        delegate = next(t for t in antiphon.TOOLS if t["name"] == "antiphon_delegate")
+        self.assertEqual(delegate["inputSchema"]["required"], ["text"])
+        self.assertEqual(delegate["inputSchema"]["properties"]["kind"]["enum"], ["claude", "codex"])
+        self.assertEqual(delegate["inputSchema"]["properties"]["task"]["enum"], ["read", "write"])
+        self.assertIn("never merges", delegate["description"])
+        task = next(t for t in antiphon.TOOLS if t["name"] == "antiphon_task")
+        self.assertEqual(task["inputSchema"]["required"], ["id", "action"])
+        self.assertEqual(task["inputSchema"]["properties"]["action"]["enum"],
+                         ["status", "result", "cancel"])
+        request = {"jsonrpc": "2.0", "id": 5, "method": "tools/call",
+                   "params": {"name": "antiphon_delegate",
+                              "arguments": {"text": "x", "kind": "claude", "task": "write",
+                                            "timeout": 60}}}
+        answer = {"content": [{"type": "text", "text": "delegated"}]}
+        with patch.object(antiphon.sys, "stdin", io.StringIO(json.dumps(request) + "\n")), \
+             patch.object(antiphon, "_delegate_tool", return_value=answer) as called, \
+             contextlib.redirect_stdout(io.StringIO()):
+            antiphon._mcp_serve("/tmp/project", "build")
+        called.assert_called_once_with("/tmp/project", {"text": "x", "kind": "claude",
+                                                        "task": "write", "timeout": 60},
+                                       "build", "codex")
+        request["params"] = {"name": "antiphon_task",
+                             "arguments": {"id": "t", "action": "result", "wait": 3}}
+        with patch.object(antiphon.sys, "stdin", io.StringIO(json.dumps(request) + "\n")), \
+             patch.object(antiphon, "_task_tool", return_value=answer) as called, \
+             contextlib.redirect_stdout(io.StringIO()):
+            antiphon._mcp_serve("/tmp/project", "build")
+        called.assert_called_once_with("/tmp/project", {"id": "t", "action": "result", "wait": 3})
+
+    def test_a_workers_words_carry_its_name_on_the_page(self):
+        """A worker registers as `worker-<id8>` through its own hooks, and
+        the page joins its source to that alias like any named peer's: the
+        words name the session that produced them, never the parent."""
+        worker = "1d5a03e0-0548-4339-87c3-45c5dbf7e9d7"
+        parent = "2e6b14f1-1659-544a-98d4-56d6eca8fa48"
+        events = [
+            antiphon.Event(10.0, "codex", "reviewed: fine", worker, "g1", 0, 100, None,
+                           {"start": 0, "sha256": "b" * 64}),
+            antiphon.Event(11.0, "codex", "carrying on", parent, "g2", 0, 100, None,
+                           {"start": 0, "sha256": "c" * 64}),
+        ]
+        join = antiphon.SessionJoin({worker: "worker-1d5a03e0", parent: "build"}, False)
+        text = antiphon._render_page("claude", antiphon._ordered_records(events),
+                                     False, None, join)
+        self.assertIn("worker-1d5a03e0", text)
+        self.assertLess(text.index("worker-1d5a03e0"), text.index("reviewed: fine"))
+        self.assertIn("build", text)
+
+    # ---- review 2026-09-03 ----
+
+    def test_a_worker_whose_hop_its_server_cannot_see_may_not_delegate(self):
+        """Codex hands its MCP server a curated environment (measured: ten
+        variables and what the config names). A worker's name is forwarded;
+        without a visible hop that name alone closes the road."""
+        with tempfile.TemporaryDirectory() as project, tempfile.TemporaryDirectory() as bin_dir:
+            env = {"PATH": self._stub_path(bin_dir)}
+            with patch.dict(antiphon.os.environ, env, clear=False):
+                antiphon.os.environ.pop("ANTIPHON_HOP", None)
+                result = antiphon._delegate_tool(project, {"text": "x"}, "worker-abcdef12", "codex")
+            self.assertTrue(result.get("isError"), result)
+            self.assertIn("managed worker (worker-abcdef12) whose hop is not visible",
+                          result["content"][0]["text"])
+            self.assertEqual(workers.tasks(project), [])
+            with patch.dict(antiphon.os.environ, dict(env, ANTIPHON_HOP="1",
+                                                      ANTIPHON_HOP_BUDGET="2")):
+                result = antiphon._delegate_tool(project, {"text": "x"}, "worker-abcdef12", "codex")
+            self.assertIsNot(result.get("isError"), True, result)
+            for task_id in [t["id"] for t in workers.tasks(project)]:
+                workers.cancel(project, task_id)
+
+    def test_a_refused_hand_off_leaves_no_record(self):
+        with tempfile.TemporaryDirectory() as project:
+            with patch.object(antiphon, "send_to_codex", return_value=(
+                    False, antiphon._ClassifiedRefusal("not delivered: nobody", "no-peer"))), \
+                 patch.object(antiphon, "claimed_alias", return_value="ui"):
+                code, _out, err = self._task(project, ("delegate",),
+                                             {"text": "x", "kind": "codex", "to": "build",
+                                              "side": "claude"})
+            self.assertEqual(code, 1)
+            self.assertIn("task: not delegated: not delivered: nobody", err)
+            self.assertEqual(workers.tasks(project), [])
+            self.assertEqual(ledger.entries(project), [])
+
+    def test_an_oversized_handed_task_is_parked_like_any_direct_send(self):
+        text = "y" * 4_000
+        with tempfile.TemporaryDirectory() as project:
+            sends = []
+            with patch.object(antiphon, "send_to_codex",
+                              side_effect=lambda cwd, m, to=None, sender=None:
+                                  sends.append(m) or (True, "live")), \
+                 patch.object(antiphon, "_oversized_for_queue",
+                              side_effect=lambda message: len(message) > 500), \
+                 patch.object(antiphon, "claimed_alias", return_value="ui"):
+                code, out, err = self._task(project, ("delegate",),
+                                            {"text": text, "kind": "codex", "to": "build",
+                                             "side": "claude"})
+            self.assertEqual(code, 0, err)
+            self.assertIn(antiphon.ATTACHMENT_LABEL, sends[0])
+            self.assertIn("[Antiphon task", sends[0])
+            answer = json.loads(out)
+            entry = ledger.read_entry(project, answer["task_id"])
+            self.assertRegex(entry["attachment"], r"^[0-9a-f-]{36}\.txt$")
+            self.assertEqual(workers.read_task(project, answer["task_id"])["state"], "handed")
+
+    def test_the_cli_needs_a_side_to_hand_a_task(self):
+        with tempfile.TemporaryDirectory() as project, \
+             patch.object(antiphon, "send_to_codex", return_value=(True, "live")) as send:
+            code, _out, err = self._task(project, ("delegate",),
+                                         {"text": "x", "kind": "codex", "to": "build"})
+            self.assertEqual(code, 1)
+            self.assertIn("pass side", err)
+            send.assert_not_called()
+            self.assertEqual(workers.tasks(project), [])
+
+    def test_the_codex_servers_result_wait_is_capped(self):
+        """The Codex MCP server answers requests one at a time; a five-minute
+        wait would freeze antiphon_read for five minutes."""
+        with tempfile.TemporaryDirectory() as project:
+            record = workers.new_task(project, kind="codex", task_class="read", sha256="a" * 64,
+                                      size=1)
+            waits = []
+
+            def fake_result(cwd, task_id, wait=0):
+                waits.append(wait)
+                return {"state": "accepted"}
+            with patch.object(antiphon.workers, "result", side_effect=fake_result):
+                answer = antiphon._task_tool(project, {"id": record["id"], "action": "result",
+                                                       "wait": 300})
+            self.assertEqual(waits, [antiphon.SERVER_WAIT_CAP])
+            self.assertLessEqual(antiphon.SERVER_WAIT_CAP, 5)
+            self.assertIn("poll", answer["content"][0]["text"].lower())
+
+    def test_a_tool_that_raises_does_not_end_the_codex_server(self):
+        requests = [{"jsonrpc": "2.0", "id": 7, "method": "tools/call",
+                     "params": {"name": "antiphon_delegate", "arguments": {"text": "x"}}},
+                    {"jsonrpc": "2.0", "id": 8, "method": "tools/call",
+                     "params": {"name": "antiphon_task",
+                                "arguments": {"id": "nope", "action": "status"}}}]
+        out = io.StringIO()
+        with patch.object(antiphon.sys, "stdin",
+                          io.StringIO("".join(json.dumps(r) + "\n" for r in requests))), \
+             patch.object(antiphon, "_delegate_tool", side_effect=RuntimeError("boom")), \
+             contextlib.redirect_stdout(out), contextlib.redirect_stderr(io.StringIO()):
+            antiphon._mcp_serve("/tmp/project", "build")
+        answers = [json.loads(line) for line in out.getvalue().splitlines() if line.strip()]
+        self.assertEqual([a["id"] for a in answers], [7, 8], "the second request was answered")
+        self.assertTrue(answers[0]["result"].get("isError"))
+        self.assertIn("RuntimeError", answers[0]["result"]["content"][0]["text"])
+
+    def test_help_lists_task(self):
+        self.assertIn("antiphon task", antiphon.__doc__)
+
+    def test_the_delegate_tool_defaults_the_kind_to_the_other_side(self):
+        with tempfile.TemporaryDirectory() as project, tempfile.TemporaryDirectory() as bin_dir:
+            with patch.dict(antiphon.os.environ, {"PATH": self._stub_path(bin_dir)}):
+                result = antiphon._delegate_tool(project, {"text": "look"}, "build", "codex")
+            self.assertIsNot(result.get("isError"), True, result)
+            self.assertIn("to a fresh claude worker", result["content"][0]["text"])
+            result = antiphon._delegate_tool(project, {"text": ""}, "build", "codex")
+            self.assertTrue(result.get("isError"))
+            self.assertIn("the task text is empty", result["content"][0]["text"])
+            for task_id in [t["id"] for t in workers.tasks(project)]:
+                workers.cancel(project, task_id)
+
+
 class SameVendorTest(unittest.TestCase):
     """A Claude session reaches another Claude session and a Codex session
     another Codex session, always by name, over the transports that already
@@ -5997,6 +6290,23 @@ class DoctorTest(unittest.TestCase):
         self.assertTrue(line.startswith("✗ AGENTS.md: the Antiphon section is missing"), line)
         self.assertIn("run `antiphon setup`", line)
 
+    def test_doctor_names_a_config_without_the_worker_approvals(self):
+        """An install from before the worker tools pre-approves them: `setup`
+        writes the per-tool prompt and doctor names a config lacking it."""
+        project = self.project()
+        self.set_up(project)
+        path = os.path.join(project, ".codex", "config.toml")
+        with open(path, encoding="utf-8") as f:
+            config = f.read()
+        head = config.index("\n[mcp_servers.antiphon.tools.antiphon_delegate]")
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(config[:head] + "\n")
+        code, printed = self.run_doctor(project)
+        self.assertEqual(code, 1)
+        line = self.line_for(printed, "config.toml")
+        self.assertTrue(line.startswith("✗"), line)
+        self.assertIn("[mcp_servers.antiphon.tools.antiphon_delegate]", line)
+
     def test_doctor_notes_deliveries_without_a_receipt_after_ten_minutes(self):
         """Measured: a queued row sat in an open app-hosted thread for over an
         hour while the tool had said delivered. Doctor reads the ledger and
@@ -7337,13 +7647,20 @@ class SetupShapeCharacterizationTest(unittest.TestCase):
                          '[mcp_servers.antiphon]\n'
                          'command = "antiphon"\n'
                          'args = ["mcp"]\n'
-                         '# read-only local bridge; no need to ask on every turn\n'
+                         '# the read tools need no prompt; the two worker tools below do\n'
                          'default_tools_approval_mode = "approve"\n'
-                         '# forwarded, not set: the peer name comes from the terminal that\n'
-                         '# started this session, and Codex does not pass it down otherwise\n'
-                         'env_vars = ["ANTIPHON_NAME"]\n'
+                         '# forwarded, not set: the peer name and the hop come from the\n'
+                         '# terminal (or the worker) that started this session, and Codex\n'
+                         '# does not pass them down otherwise\n'
+                         'env_vars = ["ANTIPHON_NAME", "ANTIPHON_HOP", "ANTIPHON_HOP_BUDGET"]\n'
                          '\n[mcp_servers.antiphon.env]\n'
-                         f'ANTIPHON_CWD = "{project}"\n')
+                         f'ANTIPHON_CWD = "{project}"\n'
+                         '\n[mcp_servers.antiphon.tools.antiphon_delegate]\n'
+                         '# starts a process of the other kind; asks first\n'
+                         'approval_mode = "prompt"\n'
+                         '\n[mcp_servers.antiphon.tools.antiphon_task]\n'
+                         '# may stop one; asks first\n'
+                         'approval_mode = "prompt"\n')
 
     def test_setup_writes_the_whole_mcp_channel_entry(self):
         """`args = ["channel"]`, not `["mcp"]`: the two servers hand out

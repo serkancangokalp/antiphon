@@ -9,13 +9,15 @@ BACKLOG entry says "designed, not built" and points here.
 ## The five decisions
 
 1. **`delegate` exposes both modes, explicitly, and never guesses.**
-   `delegate(text, to=<alias>)` hands a task to an already-running named peer of
-   the other kind over the addressed send that exists today, and records the
-   task on the ledger under a task id. `delegate(text, kind=<claude|codex>)`
-   without `to` creates a fresh managed worker: a subprocess of that kind's CLI
-   in its own worktree. Neither `to` nor `kind` → refused ("name a peer or a
-   kind; a task to nobody in particular has no meaning"). Both → refused
-   ("one or the other").
+   `kind` names the worker's kind — the other side by default on the two
+   servers, required on the command line. With `to`, the task is handed to
+   that already-running named peer of `kind` over the addressed send that
+   exists today (parked when too large), marked `[Antiphon task <id>]` and
+   recorded on the ledger under the task id; without `to`, a fresh managed
+   worker of `kind` starts: a subprocess of that kind's CLI in a worktree of
+   its own. No kind that can be known → refused ("name a kind (claude or
+   codex)"). (An earlier draft refused `to` and `kind` together; the shipped
+   rule needs `kind` to pick the transport, so both is the handed case.)
 2. **Managed workers are one-task, ephemeral sessions.** A worker runs one task
    and exits. There is no resume: a follow-up is a new task that names the
    previous task id as `parent`, and the new worker starts from the previous

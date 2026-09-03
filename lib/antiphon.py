@@ -18,6 +18,8 @@ Usage:
   antiphon sources scan        # finish or refresh the durable source catalog
   antiphon sources compact     # retire aged gone sources proved safe by every reader
   antiphon retrieve <id>       # print one complete tool invocation (never its result)
+  antiphon task delegate       # start a managed worker for one task (stdin JSON)
+  antiphon task status|result|cancel <id> [wait]   # follow a delegated task by id
   antiphon --version           # the installed version (also -V, version)
 
 Design: NO SHARED MESSAGE LOG IS KEPT. Both CLIs already write transcripts;
@@ -62,6 +64,7 @@ import uuid
 
 import peers
 import ledger
+import workers
 from datetime import datetime
 
 HOME = os.path.expanduser("~")
@@ -4528,8 +4531,10 @@ def hook(side="claude"):
         except OSError as error:
             print(f"antiphon: the attachment sweep failed: {error}",
                   file=sys.stderr)
-        # The ledger's own sweep, on the same trust.
+        # The ledger's own sweep, on the same trust; and the workers' —
+        # collected results and expired tasks go, a running worker never.
         _ledger_call("prune", lambda: ledger.prune(cwd, time.time()))
+        _ledger_call("workers sweep", lambda: workers.sweep(cwd, time.time()))
 
     # Every reserve and merge inside this bounded update releases the catalog
     # lock before transcript inspection. The whole update returns before any
@@ -7054,6 +7059,22 @@ TO_DESCRIPTION = ("Alias of the peer to send to. Required whenever the recipient
                   "refused rather than guessed — so pass it whenever you know "
                   "which peer you mean.")
 
+DELEGATE_DESCRIPTION = (
+    "Delegates one task to a worker of the other kind (or of a kind you name) "
+    "and returns at once with a task id: a fresh `claude -p` / `codex exec` "
+    "session in this project, read-only by default, in a git worktree of its "
+    "own for a write task — or, with `to`, the task handed to a running named "
+    "peer over the ordinary addressed send. Every result names the worker; the "
+    "bridge never merges its work, never widens its permissions, and refuses a "
+    "delegation from a session already at the hop budget (ANTIPHON_HOP_BUDGET, "
+    "default 1). Collect with antiphon_task(id, \"result\", wait).")
+
+TASK_DESCRIPTION = (
+    "The lifecycle of a delegated task by id: status, result (with a bounded "
+    "wait and the evidence — log tail, a completed write task's diff and its "
+    "tests.txt), or cancel. Read-only except cancel; a task's record and the "
+    "worker's directory are swept a week after the task, never while it runs.")
+
 RETRIEVE_DESCRIPTION = (
     "Read-only, write-free retrieval of the complete tool invocation named by a "
     "tc1 id from the original project transcript. It returns the invocation only, "
@@ -7097,6 +7118,47 @@ TOOLS = [{
                                      "queued.")},
         },
         "required": ["text"],
+    },
+}, {
+    "name": "antiphon_delegate",
+    "description": DELEGATE_DESCRIPTION,
+    "inputSchema": {
+        "type": "object",
+        "properties": {
+            "text": {"type": "string", "description": "The task, in full."},
+            "kind": {"type": "string", "enum": ["claude", "codex"],
+                     "description": ("The worker's kind; the other side by default. "
+                                     "A fresh worker of that kind runs the task, "
+                                     "unless `to` names a running peer of that kind.")},
+            "to": {"type": "string",
+                   "description": ("Hand the task to this running named peer of `kind` "
+                                   "instead of starting a worker.")},
+            "task": {"type": "string", "enum": ["read", "write"],
+                     "description": ("read (default): review, explain, search — the "
+                                     "worker runs in the project read-only. write: the "
+                                     "worker edits in a git worktree of its own and "
+                                     "returns a diff; nothing is merged.")},
+            "timeout": {"type": "integer",
+                        "description": "Seconds before the worker is stopped (default 900, at most 3600)."},
+        },
+        "required": ["text"],
+    },
+}, {
+    "name": "antiphon_task",
+    "description": TASK_DESCRIPTION,
+    "inputSchema": {
+        "type": "object",
+        "properties": {
+            "id": {"type": "string", "description": "The task id `antiphon_delegate` returned."},
+            "action": {"type": "string", "enum": ["status", "result", "cancel"],
+                       "description": ("status: the record now. result: the state and the "
+                                       "evidence (log tail; a completed write task's diff "
+                                       "and tests.txt), after waiting up to `wait` seconds. "
+                                       "cancel: stop the worker and remove its directory.")},
+            "wait": {"type": "integer",
+                     "description": "For result: seconds to wait for the task to finish (0 to 300)."},
+        },
+        "required": ["id", "action"],
     },
 }, {
     "name": "antiphon_retrieve",
@@ -7810,6 +7872,14 @@ def _mcp_serve(cwd, alias=None):
                 _mcp_result(mid, _send_tool(cwd, arguments.get("text"),
                                             arguments.get("to"), alias,
                                             kind=arguments.get("kind") or "claude"))
+            elif name == "antiphon_delegate":
+                arguments = p.get("arguments")
+                arguments = arguments if isinstance(arguments, dict) else {}
+                _mcp_result(mid, _guarded(lambda: _delegate_tool(cwd, arguments, alias, "codex")))
+            elif name == "antiphon_task":
+                arguments = p.get("arguments")
+                arguments = arguments if isinstance(arguments, dict) else {}
+                _mcp_result(mid, _guarded(lambda: _task_tool(cwd, arguments)))
             elif name == "antiphon_retrieve":
                 arguments = p.get("arguments")
                 arguments = arguments if isinstance(arguments, dict) else {}
@@ -7883,11 +7953,31 @@ CODEX_TABLE_ASSIGNMENTS = (
     ('command = "antiphon"', ""),
     ('args = ["mcp"]', ""),
     ('default_tools_approval_mode = "approve"',
-     "# read-only local bridge; no need to ask on every turn\n"),
-    ('env_vars = ["ANTIPHON_NAME"]',
-     "# forwarded, not set: the peer name comes from the terminal that\n"
-     "# started this session, and Codex does not pass it down otherwise\n"),
+     "# the read tools need no prompt; the two worker tools below do\n"),
+    ('env_vars = ["ANTIPHON_NAME", "ANTIPHON_HOP", "ANTIPHON_HOP_BUDGET"]',
+     "# forwarded, not set: the peer name and the hop come from the\n"
+     "# terminal (or the worker) that started this session, and Codex\n"
+     "# does not pass them down otherwise\n"),
 )
+
+# The two tools that start or stop a process ask first, whatever the table's
+# default says. `[mcp_servers.<name>.tools.<tool>] approval_mode` is Codex's
+# own shape — measured on the ChatGPT app's app-server argv, which declares
+# its bundled tools exactly so. Each entry: the tool, the comment before it.
+CODEX_TOOL_APPROVALS = (
+    ("antiphon_delegate", "# starts a process of the other kind; asks first\n"),
+    ("antiphon_task", "# may stop one; asks first\n"),
+)
+
+
+def codex_tool_approval_lines():
+    """The `[mcp_servers.antiphon.tools.*]` sections, header lines and
+    assignments, in written order — the same list `doctor` looks up."""
+    lines = []
+    for tool, _comment in CODEX_TOOL_APPROVALS:
+        lines.append(f"[{CODEX_MCP_TABLE}.tools.{tool}]")
+        lines.append('approval_mode = "prompt"')
+    return lines
 
 HookShape = collections.namedtuple("HookShape", "path event command label")
 
@@ -8058,7 +8148,9 @@ AGENTS_RULE = ("\n## The Antiphon bridge\n\n"
                "reach you as `[Antiphon bridge] Codex:` (its Stop hook) or "
                "`[Antiphon channel] Codex:` (its direct send); reach one with "
                "`@codex:name` or `antiphon_send(kind=\"codex\", to=name)` — "
-               "always named, not a lane of the passive page. "
+               "always named, not a lane of the passive page. To hand one task to a "
+               "fresh worker of either kind, call `antiphon_delegate` and follow "
+               "it with `antiphon_task`; the bridge never merges its work. "
                + RECOVERY_RULE + "\n\n"
                "To hand Claude a task, put `@claude` at the start of a line in "
                "your reply; only that line is sent. To reach Claude without "
@@ -8116,7 +8208,10 @@ CLAUDE_RULE = ("\n## The Antiphon bridge\n\n"
                "Codex reads its queue at its next turn — and `antiphon status` "
                "shows the receipt. An event with `sender=\"claude\"` is another "
                "Claude session's words; answer it with `reply_to_claude(to=…)` "
-               "or `@claude:name` — always named, not a lane of the passive page. "
+               "or `@claude:name` — always named, not a lane of the passive page. To "
+               "hand one task to a fresh worker of either kind, call "
+               "`antiphon_delegate` and follow it with `antiphon_task`; the "
+               "bridge never merges its work. "
                "`<unnamed>` means that peer has no name; "
                "passing it as `to` is the same as leaving it out. Your valid "
                "`ANTIPHON_NAME` is your configured identity on outgoing "
@@ -8438,8 +8533,10 @@ def _codex_config_block(cwd):
     table = "".join(f"{comment}{line}\n"
                     for line, comment in CODEX_TABLE_ASSIGNMENTS)
     env = "".join(f"{line}\n" for line in codex_env_assignments(cwd))
+    tools = "".join(f'\n[{CODEX_MCP_TABLE}.tools.{tool}]\n{comment}approval_mode = "prompt"\n'
+                    for tool, comment in CODEX_TOOL_APPROVALS)
     return (f'[{CODEX_MCP_TABLE}]\n{table}'
-            f'\n[{CODEX_MCP_ENV_TABLE}]\n{env}')
+            f'\n[{CODEX_MCP_ENV_TABLE}]\n{env}{tools}')
 
 
 def _strip_toml_table(text, table):
@@ -9604,7 +9701,7 @@ def _doctor_config(report, cwd, states):
     toml = states[CODEX_CONFIG_FILE].data
     present = set(_toml_table_text(toml or "", CODEX_MCP_TABLE))
     expected = ([line for line, _comment in CODEX_TABLE_ASSIGNMENTS]
-                + codex_env_assignments(cwd))
+                + codex_env_assignments(cwd) + codex_tool_approval_lines())
     verdict(CODEX_CONFIG_FILE,
             [f"[{CODEX_MCP_TABLE}]"] if not present
             else [f"`{line}`" for line in expected if line not in present])
@@ -11103,8 +11200,224 @@ def print_summary(side="claude"):
     return 0
 
 
+# ---------- managed workers: delegate, and follow a task by id ----------
+
+TASK_MARK = "[Antiphon task {task_id}]"
+
+
+def _delegate(cwd, payload, sender=None, side=None, env=None):
+    """`(True, answer)` or `(False, reason)` for one delegation.
+
+    `side` is the delegating session's kind when known (the MCP servers know
+    theirs; the CLI does not); `kind` defaults to the other side. With `to`,
+    the task is handed to that running named peer of `kind` over the ordinary
+    addressed send and recorded as `handed`; without it a fresh worker of
+    `kind` is started (lib/workers.py). Every refusal names its reason and
+    leaves no record."""
+    env = os.environ if env is None else env
+    text = payload.get("text")
+    if not isinstance(text, str) or not text.strip():
+        return False, "not delegated: the task text is empty"
+    text = text.strip()
+    kind = payload.get("kind")
+    if kind is None and side in OTHER_SIDE:
+        kind = OTHER_SIDE[side][0]
+    if kind not in workers.KINDS:
+        return False, "not delegated: name a kind (claude or codex)"
+    task_class = payload.get("task") or "read"
+    if task_class not in workers.CLASSES:
+        return False, "not delegated: task must be read or write"
+    to = payload.get("to")
+    if to is not None and (not isinstance(to, str) or not to.strip() or to == NO_ALIAS):
+        return False, "not delegated: to must name a running peer"
+    timeout = payload.get("timeout")
+    timeout = timeout if isinstance(timeout, (int, float)) and not isinstance(timeout, bool) \
+        else workers.DEFAULT_TIMEOUT
+    if to and side is None:
+        return False, ("not delegated: the command line cannot tell which kind you "
+                       "are; pass side (claude or codex) beside to")
+    try:
+        # The alias closes the road for a worker whose server cannot see its
+        # hop: Codex forwards a curated environment, and the name is in it.
+        workers.check_hop(env, alias=sender)
+    except workers.Refused as refusal:
+        return False, str(refusal)
+    sender_side = side or OTHER_SIDE[kind][0]
+    who = sender_alias(sender) if sender is not None else claimed_alias(cwd, sender_side, None)
+    digest = hashlib.sha256(text.encode()).hexdigest()
+    size = len(text.encode())
+    hop = workers.current_hop(env) + 1
+    if to:
+        # Sent first, recorded after: a refusal leaves no record. The task id
+        # is on the message and on the ledger, so the peer's receipt names it.
+        task_id = delivery_id()
+        mark = TASK_MARK.format(task_id=task_id)
+        # The mark stays outside the parked file: an envelope names the task
+        # too, so the peer knows what it is before it reads the words.
+        outgoing, parked = f"{mark} {text}", None
+        if kind == "codex":
+            composed = (f"{SIDE_LABELS[sender_side][1]} "
+                        f"{queue_label(who, task_id, True)} {outgoing}")
+            if _oversized_for_queue(composed) and _attachable(text):
+                attachment, refusal = _spill(cwd, text, who, task_id,
+                                             recipient=(kind, to, sender_side))
+                if refusal is not None:
+                    return False, f"not delegated: {refusal}"
+                outgoing, parked = f"{mark} {attachment.envelope}", attachment
+                composed = (f"{SIDE_LABELS[sender_side][1]} "
+                            f"{queue_label(who, task_id, True)} {outgoing}")
+            ok, detail = send_to_codex(cwd, composed, to, sender=who)
+            transport, proof = "queue", (detail or "registered")
+            how = "queued for it; Codex reads its queue at its next turn"
+        else:
+            if (_oversized_for_claude(outgoing, who, task_id, sender_kind=sender_side)
+                    and _attachable(text)):
+                attachment, refusal = _spill(cwd, text, who, task_id,
+                                             recipient=(kind, to, sender_side))
+                if refusal is not None:
+                    return False, f"not delegated: {refusal}"
+                outgoing, parked = f"{mark} {attachment.envelope}", attachment
+            ok, detail = send_to_claude(cwd, outgoing, to, sender_alias=who,
+                                        message_id=task_id, sender_kind=sender_side)
+            transport, proof = "channel", "channel"
+            how = "delivered to its channel"
+        if not ok:
+            if parked is not None and not parked.reused:
+                drop_attachment(cwd, parked.path)
+            return False, f"not delegated: {redact_private(str(detail))}"
+        try:
+            workers.new_task(cwd, kind=kind, task_class=task_class, sha256=digest,
+                             size=size, timeout=timeout, hop=hop, to=to, task_id=task_id)
+            workers.update_task(cwd, task_id, lambda changed: changed.update(state="handed"))
+        except (ValueError, OSError) as error:
+            print(f"antiphon: the task was handed but not recorded: {error}", file=sys.stderr)
+        ledger.record_sent(cwd, task_id, sender=who or NO_ALIAS, to_kind=kind, to_alias=to,
+                           transport=transport, proof=proof, sha256=digest, size=size,
+                           attachment=(os.path.basename(parked.path) if parked else None),
+                           sender_kind=sender_side)
+        words = (f"Handed task {task_id} to {ledger.LABEL[kind]} peer {to!r} ({how}); "
+                 "antiphon status shows the receipt, and the peer answers in its own "
+                 "words — nothing is collected by id.")
+        return True, {"task_id": task_id, "state": "handed", "to": to, "kind": kind,
+                      "task_class": task_class, "text": words}
+    try:
+        workers.admit(cwd)
+        record = workers.new_task(cwd, kind=kind, task_class=task_class, sha256=digest,
+                                  size=size, timeout=timeout, hop=hop)
+    except (workers.Refused, ValueError, OSError) as error:
+        return False, str(error) if isinstance(error, workers.Refused) else f"not delegated: {error}"
+    try:
+        started = workers.start(cwd, record, text, env=dict(env))
+    except (workers.Refused, OSError) as refusal:
+        return False, (str(refusal) if isinstance(refusal, workers.Refused)
+                       else f"not delegated: {refusal}")
+    if started is None:
+        return False, "not delegated: the task record could not be read back"
+    task_id = record["id"]
+    worker = {"kind": kind, "name": f"worker-{task_id[:8]}",
+              "directory": workers.worker_dir(cwd, task_id)}
+    words = (f"Delegated task {task_id} to a fresh {kind} worker ({worker['name']}, "
+             f"{task_class} task, timeout {record['timeout']} s) in {worker['directory']}; "
+             f"antiphon_task(id, \"result\", wait) collects it and antiphon_task(id, "
+             "\"cancel\") stops it. Its words carry the label "
+             f"{workers.WORKER_LABEL.format(kind=kind, task_id=task_id)}; the bridge "
+             "never merges its work.")
+    return True, {"task_id": task_id, "state": started["state"], "kind": kind,
+                  "task_class": task_class, "timeout": record["timeout"], "worker": worker,
+                  "text": words}
+
+
+def _delegate_tool(cwd, arguments, sender, side):
+    ok, answer = _delegate(cwd, arguments, sender, side)
+    if not ok:
+        return _tool_error(f"Not delegated: {answer[len('not delegated: '):] if answer.startswith('not delegated: ') else answer}")
+    return {"content": [{"type": "text", "text": answer["text"]}]}
+
+
+# Seconds the Codex MCP server may wait inside one antiphon_task result call.
+SERVER_WAIT_CAP = 5
+
+
+def _guarded(action):
+    """One tool call whose fault must not end the server: an error result,
+    never a traceback out of the serving loop."""
+    try:
+        return action()
+    except Exception as error:      # noqa: BLE001 — the server must keep serving
+        return _tool_error(f"{type(error).__name__}: {error}")
+
+
+def _task_tool(cwd, arguments):
+    task_id, action = arguments.get("id"), arguments.get("action")
+    if not isinstance(task_id, str) or workers.read_task(cwd, task_id) is None:
+        return _tool_error("unknown task id")
+    if action == "status":
+        record = workers.status(cwd, task_id)
+        return {"content": [{"type": "text", "text": json.dumps(record, indent=1)}]}
+    if action == "result":
+        wait = arguments.get("wait")
+        wait = wait if isinstance(wait, (int, float)) and not isinstance(wait, bool) else 0
+        # This server answers one request at a time; a long wait here would
+        # hold antiphon_read and antiphon_send with it. Capped, and said.
+        answer = workers.result(cwd, task_id, min(wait, SERVER_WAIT_CAP))
+        text = json.dumps(answer, indent=1, ensure_ascii=False)
+        if answer and answer.get("state") not in workers.TERMINAL:
+            text += (f"\n(still running; this server waits at most {SERVER_WAIT_CAP} s "
+                     "per call — poll again)")
+        return {"content": [{"type": "text", "text": text}]}
+    if action == "cancel":
+        record = workers.cancel(cwd, task_id)
+        return {"content": [{"type": "text", "text": json.dumps(record, indent=1)}]}
+    return _tool_error("action must be status, result or cancel")
+
+
+def task(*args):
+    """`antiphon task delegate | status <id> | result <id> [wait] | cancel <id>`."""
+    usage = "task: delegate | status <id> | result <id> [wait] | cancel <id>"
+    action = args[0] if args else None
+    if action not in ("delegate", "status", "result", "cancel"):
+        print(usage, file=sys.stderr)
+        return 1
+    cwd = project_dir()
+    if action == "delegate":
+        try:
+            payload = json.load(sys.stdin)
+        except (json.JSONDecodeError, ValueError):
+            payload = {}
+        if not isinstance(payload, dict):
+            payload = {}
+        # The channel server says which side it is and the alias it won;
+        # the same trust `reply` extends to `sender_alias`. Anything else is
+        # the CLI, which knows neither and asks the registry.
+        side = payload.get("side") if payload.get("side") in OTHER_SIDE else None
+        sender = payload.get("sender_alias") if side is not None else None
+        ok, answer = _delegate(cwd, payload, sender, side, os.environ)
+        if not ok:
+            print(f"task: {answer}", file=sys.stderr)
+            return 1
+        print(json.dumps(answer, ensure_ascii=False))
+        return 0
+    task_id = args[1] if len(args) > 1 else None
+    if not isinstance(task_id, str) or workers.read_task(cwd, task_id) is None:
+        print("task: unknown task id", file=sys.stderr)
+        return 1
+    if action == "status":
+        answer = workers.status(cwd, task_id)
+    elif action == "result":
+        try:
+            wait = float(args[2]) if len(args) > 2 else 0.0
+        except ValueError:
+            wait = 0.0
+        answer = workers.result(cwd, task_id, wait)
+    else:
+        answer = workers.cancel(cwd, task_id)
+    print(json.dumps(answer, ensure_ascii=False))
+    return 0
+
+
 COMMANDS = {
     "setup": setup, "status": status, "doctor": doctor, "catch-up": catch_up,
+    "task": task,
     "sources": sources, "retrieve": retrieve,
     "hook": hook, "summary": print_summary,
     "push": push, "reply": reply, "mcp": mcp, "register_peer": register_peer,

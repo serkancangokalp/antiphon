@@ -1544,7 +1544,36 @@ try {
 
   const tools = await client.listTools();
   assert.deepEqual(tools.tools.map((tool) => tool.name),
-    ["reply_to_codex", "reply_to_claude", "antiphon_retrieve"]);
+    ["reply_to_codex", "reply_to_claude", "antiphon_delegate", "antiphon_task",
+     "antiphon_retrieve"]);
+  // Managed workers, end to end against the codex stub on PATH: a fresh
+  // worker is a `codex exec` this server never merges, and the task is
+  // followed by id.
+  const delegateTool = tools.tools.find((tool) => tool.name === "antiphon_delegate");
+  assert.deepEqual(delegateTool.inputSchema.required, ["text"]);
+  assert.match(delegateTool.description, /never merges its work/);
+  await assert.rejects(
+    () => client.callTool({ name: "antiphon_delegate", arguments: { text: "  " } }),
+    /the task text is empty/, "refused before any process starts");
+  await assert.rejects(
+    () => client.callTool({ name: "antiphon_task", arguments: { id: "nope", action: "status" } }),
+    /unknown task id/);
+  const delegated = await client.callTool({
+    name: "antiphon_delegate", arguments: { text: "review the diff" },
+  });
+  assert.equal(delegated.isError, undefined, JSON.stringify(delegated));
+  const delegatedText = delegated.content[0].text;
+  const taskId = /Delegated task ([0-9a-f-]{36}) to a fresh codex worker/.exec(delegatedText)?.[1];
+  assert.ok(taskId, `a fresh codex worker by default from this side: ${delegatedText}`);
+  const collected = await client.callTool({
+    name: "antiphon_task", arguments: { id: taskId, action: "result", wait: 20 },
+  });
+  assert.equal(collected.isError, undefined, JSON.stringify(collected));
+  const result = JSON.parse(collected.content[0].text);
+  assert.equal(result.state, "completed", JSON.stringify(result));
+  assert.equal(result.worker.kind, "codex");
+  assert.match(readFileSync(queueLog, "utf8"), /exec -s read-only --color never \[Antiphon worker codex:/,
+    "the stub saw the worker's own argv: read-only, labelled");
   const claudeTool = tools.tools.find((tool) => tool.name === "reply_to_claude");
   assert.deepEqual(claudeTool.inputSchema.required, ["text", "to"],
     "a same-kind message is always named");
