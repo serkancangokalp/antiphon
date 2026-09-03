@@ -5536,6 +5536,28 @@ class DeliveryReceiptTest(unittest.TestCase):
             self.assertEqual(ledger.read_times(project), {self.ATTACHMENT: entry["read_at"]},
                              "the parked file's read grace starts")
 
+    def test_a_derived_name_an_explicit_endpoint_occupies_credits_nobody(self):
+        """Round-3 review 2026-09-03: the branch was right and unpinned. A
+        session that registered an explicit name equal to another session's
+        derived alias owns that name; the observed session's rollout then
+        names nobody, so a read there credits nothing."""
+        alias = antiphon.peers.auto_identity(self.CODEX_SID)[0]
+        with tempfile.TemporaryDirectory() as project:
+            store = os.path.join(project, ".antiphon", "messages", self.ATTACHMENT)
+            ledger.record_sent(project, self.MID, sender="ui", to_kind="codex", to_alias=alias,
+                               transport="queue", proof="live", sha256="a" * 64, size=5,
+                               attachment=self.ATTACHMENT)
+            self.assertTrue(antiphon.peers.write_observation(project, self.CODEX_SID))
+            antiphon.peers.register(project, "codex", alias, "/tmp/occupant.sock")
+            rollout = self._codex_rollout(project, [
+                self._codex_call(json.dumps({"command": ["cat", store]})),
+                self._codex_message("user", f"{antiphon.PUSH_LABEL} [from=ui id={self.MID}] words")])
+            with patch.object(antiphon, "codex_thread_alive", return_value=None):
+                self.assertEqual(self._hook(project, "claude", codex=[rollout])[0], 0)
+            entry = ledger.read_entry(project, self.MID)
+            self.assertIsNone(entry["read_at"], "an occupied name is nobody's")
+            self.assertIsNone(entry["received_at"])
+
     def test_a_ledger_that_cannot_be_written_is_said_in_the_result(self):
         with tempfile.TemporaryDirectory() as project:
             os.makedirs(os.path.join(project, ".antiphon"))
@@ -7100,8 +7122,9 @@ class DoctorTest(unittest.TestCase):
     @staticmethod
     def legacy_rule(name):
         """The generated section of a shipped version, `<version>-<FILE>`,
-        as `test/fixtures/legacy_rules/` keeps it: npm 0.1.0 to 0.3.3 and
-        the unpublished 0.4.0, extracted from the packages themselves."""
+        as `test/fixtures/legacy_rules/` keeps it: npm 0.1.0 to 0.3.3 from
+        the published tarballs, and the unpublished 0.4.0 from its version
+        commit (b4d550a)."""
         path = os.path.join(os.path.dirname(__file__), "fixtures",
                             "legacy_rules", name + ".md")
         with open(path, encoding="utf-8") as f:

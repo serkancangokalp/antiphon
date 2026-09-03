@@ -576,6 +576,22 @@ class ShippedContractTest(unittest.TestCase):
         self.assertNotRegex(limits, r"(?i)acknowledgement[^.]*not part of this",
                             "the old disclaimer is gone")
 
+    def test_the_readme_counts_are_the_codes(self):
+        """Round 3, 2026-09-03: measured true and unpinned — the numbers the
+        README states are read off the code here."""
+        readme = read("README.md")
+        self.assertEqual(len(antiphon.TOOLS), 5)
+        self.assertIn("all five tools", readme)
+        self.assertIn("`antiphon_retrieve`, `antiphon_delegate` and `antiphon_task`", readme)
+        self.assertIn("forwards `ANTIPHON_NAME`, `ANTIPHON_HOP` and\n`ANTIPHON_HOP_BUDGET`", readme)
+        self.assertIn('env_vars = ["ANTIPHON_NAME", "ANTIPHON_HOP", "ANTIPHON_HOP_BUDGET"]',
+                      read("lib", "antiphon.py"))
+        self.assertIn("None of the eight files", readme)
+        self.assertIn("`.antiphon/.gitignore` for that project", readme)
+        self.assertEqual(antiphon.SERVER_WAIT_CAP, 5)
+        self.assertIn("at most 5 through this server", read("lib", "antiphon.py"))
+        self.assertRegex(readme, r"(?i)`doctor --fix` is the one exception")
+
     def test_every_surface_teaches_managed_workers(self):
         """One task, one worker of the other kind, never merged: the README,
         both rules, both servers' tool descriptions, the BACKLOG and the

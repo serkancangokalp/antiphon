@@ -1,6 +1,6 @@
 # Antiphon product backlog
 
-Last reviewed: 2026-09-02
+Last reviewed: 2026-09-03
 
 ## Start here
 
@@ -44,8 +44,11 @@ was pushed or published. Two things the gate measured and this file keeps:
 **Round 2 (2026-09-03, on 7034e28).** No Critical; every round-1 finding
 verified closed under a biting test; two Importants — a person's un-headed
 note quoting a shipped closing sentence was still cut with a legacy section
-(2ad57aa: the section must be, paragraph for paragraph, a wording that
-shipped, `LEGACY_SECTION_DIGESTS`), and "a worker is not a peer" was false on
+(2ad57aa: the section must be, paragraph for paragraph, one of the wordings
+that shipped — the five npm releases and the unpublished 0.4.0 at its version
+commit, `LEGACY_SECTION_DIGESTS`; the shorter unmarked wordings main carried
+for a few hours while the rules were being shrunk are refused with the
+remedy), and "a worker is not a peer" was false on
 the in-place road (2ad57aa: it is a peer only where its directory carries the
 bridge) — and a page of minors closed in bd5bd8c (an automatic alias keeps
 its receipt after its session exits, the bisection keeps its slack, a
@@ -1933,8 +1936,8 @@ prompt, the sweep on the hook. A worker is followed by its task id — status,
 result, log. It is a peer only where its working directory carries the
 bridge's configuration: in a worktree without it (the usual case — the
 generated files are not committed) it registers nothing and appears on no
-page; run in place, or in a checkout that commits `.codex/config.toml` and
-`.claude/settings.json`, it is a live named peer `worker-<id8>` for its
+page; run in place, or in a checkout that commits `.codex/config.toml`,
+`.codex/hooks.json` and `.claude/settings.json`, it is a live named peer `worker-<id8>` for its
 duration, on the page under that name, with a bare send of its kind refused
 while it runs. It is started as `worker-<id8>` with `ANTIPHON_CWD` at the
 project, so whatever it records lands in the project's store. Seeding a

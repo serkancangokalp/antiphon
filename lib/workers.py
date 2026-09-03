@@ -6,7 +6,9 @@ worker's pid, start time and exit — validated on every read the way the
 delivery ledger is, kept a week, under a directory this code owns outright.
 
 `.antiphon/workers/<task-id>/` is the worker's directory. The bridge's own
-files live at its top — `log`, `exit`, `diff` — and the work happens in
+files live at its top — `log` and `exit`; a diff too large to inline sits
+beside the task record as `.antiphon/tasks/<task-id>.diff` — and the work
+happens in
 `work/` underneath: a detached git worktree at HEAD whenever the project is
 a checkout with a commit, so nothing a worker does touches the user's own
 tree (and nothing uncommitted is visible to it), and a tracked file that
@@ -71,7 +73,6 @@ KEYS = frozenset({
 LOG_FILE = "log"
 EXIT_FILE = "exit"
 TESTS_FILE = "tests.txt"
-DIFF_FILE = "diff"
 WORK_DIR = "work"
 WORK_STORE = ".antiphon"
 
@@ -583,8 +584,17 @@ def start(cwd, record, text, env=None):
     permission class. A refusal leaves no record."""
     env = dict(os.environ if env is None else env)
     task_id = record["id"]
-    if _sound_dir(workers_dir(cwd), create=True) is None:
-        _refuse(cwd, record, f"not delegated: {workers_dir(cwd)} cannot be used")
+    # The store's own creation can raise as well as return None (a full or
+    # read-only disk); either way the start did not happen and leaves
+    # nothing. Measured at the release gate, round 3: the raise escaped.
+    try:
+        usable = _sound_dir(workers_dir(cwd), create=True)
+    except OSError as error:
+        usable, why = None, f": {error}"
+    else:
+        why = ""
+    if usable is None:
+        _refuse(cwd, record, f"not delegated: {workers_dir(cwd)} cannot be used{why}")
     directory = worker_dir(cwd, task_id)
     try:
         os.makedirs(directory, mode=0o700, exist_ok=True)
@@ -805,13 +815,16 @@ def _worktree_diff(cwd, record):
     base = record["base"]
     if base is None or not os.path.isdir(work):
         return None
-    # The bridge's own store is excluded by pathspec, not by the `.gitignore`
-    # written there: a checkout that tracks a `.antiphon/.gitignore` of its
-    # own would otherwise carry the test summary into the diff.
-    outside_store = ("--", ".", f":!{WORK_STORE}")
-    if _git(work, "add", "-A", "--intent-to-add", *outside_store, timeout=30) is None:
+    # The bridge's own store is kept out by never intent-adding it, not by
+    # the `.gitignore` written there: a checkout that tracks a
+    # `.antiphon/.gitignore` of its own would otherwise carry the test
+    # summary into the diff. The diff itself is unrestricted — a tracked file
+    # under the store that the worker edited is a change, and a pathspec on
+    # the diff hid it from the evidence (release gate, round 3).
+    if _git(work, "add", "-A", "--intent-to-add", "--", ".", f":!{WORK_STORE}",
+            timeout=30) is None:
         return None
-    done = _git(work, "diff", "--no-color", base, *outside_store, timeout=60)
+    done = _git(work, "diff", "--no-color", base, timeout=60)
     if done is None or done.returncode != 0:
         return None
     return done.stdout.encode("utf-8", "surrogateescape") if isinstance(done.stdout, str) \

@@ -688,6 +688,43 @@ class LifecycleTest(unittest.TestCase):
             self.assertNotIn("tests.txt", final["diff"], "the summary is evidence, not a change")
             self.assertNotIn(".antiphon", final["diff"])
 
+    def test_a_tracked_file_under_the_store_the_worker_edits_is_in_the_diff(self):
+        """Round 3, 2026-09-03: the store's pathspec was on the diff as well
+        as on the intent-to-add, so a worker's edit to a file the checkout
+        tracks under `.antiphon/` — exactly the pre-0.5.0 install setup now
+        warns about — vanished from the evidence. The summary still stays
+        out: it is never intent-added."""
+        with tempfile.TemporaryDirectory() as project, tempfile.TemporaryDirectory() as bin_dir:
+            os.makedirs(os.path.join(project, ".antiphon"))
+            with open(os.path.join(project, ".antiphon", "cursor.json"), "w") as f:
+                f.write("old\n")
+            self._rooted(project)
+            started = self._run(project, bin_dir,
+                                "echo edited > .antiphon/cursor.json; echo hi > made.txt; "
+                                "echo 'suite: 1 passed' > \"$ANTIPHON_WORKER_TESTS\"; exit 0",
+                                task_class="write")
+            final = workers.result(project, started["id"], wait=10)
+            self.assertEqual(final["state"], "completed", final)
+            self.assertIn("made.txt", final["diff"])
+            self.assertIn(".antiphon/cursor.json", final["diff"], "a tracked edit is evidence")
+            self.assertIn("+edited", final["diff"])
+            self.assertNotIn("tests.txt", final["diff"])
+            self.assertEqual(final["tests"], "suite: 1 passed\n")
+
+    def test_a_worker_directory_that_cannot_be_created_is_a_refusal_that_leaves_nothing(self):
+        """Round 3, 2026-09-03: the guarded branch was right and unpinned —
+        and pinning it found the store's own creation, one line above it,
+        raising out of `start` with the record left behind."""
+        from unittest.mock import patch
+        with tempfile.TemporaryDirectory() as project:
+            record = workers.new_task(project, kind="codex", task_class="read", sha256=SHA, size=1)
+            with patch.object(workers.os, "makedirs", side_effect=OSError(28, "No space left")):
+                with self.assertRaises(workers.Refused) as refused:
+                    workers.start(project, record, "do it")
+            self.assertIn("not delegated", str(refused.exception))
+            self.assertIsNone(workers.read_task(project, record["id"]), "no record")
+            self.assertFalse(os.path.exists(workers.worker_dir(project, record["id"])))
+
     def test_an_oversized_diff_outlives_the_workers_directory_and_goes_with_the_record(self):
         """Round 2, 2026-09-03: a diff too large to inline was written inside
         the worker's directory, which its own collection made sweepable, so

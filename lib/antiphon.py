@@ -8315,7 +8315,10 @@ SECTION_HEADING_LINE = re.compile(r"(?m)^" + re.escape(SECTION_HEADING)
                                   + r"[ \t]*\r?$")
 ANY_HEADING_LINE = re.compile(r"(?m)^#{1,6}[ \t]")
 # Every generated section that shipped before the end marker existed — npm
-# 0.1.0 to 0.3.3 and the unpublished 0.4.0, both files — as the SHA-256 of
+# 0.1.0 to 0.3.3 from the published tarballs, and the unpublished 0.4.0 at its
+# version commit (b4d550a), both files; the shorter unmarked wordings main
+# carried for a few hours on 2026-09-03 while the rules were being shrunk are
+# not here, and such a section is refused with the remedy — as the SHA-256 of
 # its paragraphs after the heading, each collapsed to single spaces and joined
 # by newlines (`_legacy_section_end` computes the same over a rules file, so a
 # re-wrapped paragraph still matches). A section without the marker is

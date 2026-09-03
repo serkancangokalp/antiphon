@@ -85,8 +85,9 @@ write task the diff against the base it started from and its test summary), or
 a read task as much as a write task — works in a detached worktree of its own
 at HEAD under `.antiphon/workers/<id>/work/`, so nothing it does touches your
 tree and nothing uncommitted in your tree is visible to it: a worker asked to
-review "the current changes" reviews HEAD. The bridge's own files — the log,
-the exit code, a large diff — sit beside that worktree; the one file the
+review "the current changes" reviews HEAD. The bridge's own files — the log
+and the exit code — sit beside that worktree, and a diff too large to inline
+sits beside the task record at `.antiphon/tasks/<id>.diff`; the one file the
 worker writes for the bridge, its test summary, sits inside it at
 `.antiphon/tests.txt`, where a write task's sandbox can reach it and where git
 ignores it. A read task (the default) runs under the host's read-only class
@@ -112,7 +113,8 @@ recorded on the ledger; a handed task has no worker here, so `result` and
 task cannot be handed. At most four workers run per project, admitted and
 recorded under one lock, and a worker that has exited gives its slot back the
 moment another is asked for; a worker is stopped at its timeout by the next
-`status`, `result` or hook sweep; a task record lives a week under
+`status`, `result`, hook sweep or a new delegation's admission; a task record
+lives a week under
 `.antiphon/tasks/`, and a worker's directory is swept once its evidence was
 collected — its worktree forgotten by its own entry, never by a prune of your
 repository's other worktrees. Every worker is asked to keep `[Antiphon worker
@@ -124,7 +126,8 @@ that carries no bridge configuration — the usual case, since the files
 appears on no page and makes no bare send refused. Where its working
 directory does carry that configuration — a task run in place because the
 project is not a checkout or has no commit, or a checkout that commits
-`.codex/config.toml` and `.claude/settings.json` — the project's hooks and
+`.codex/config.toml`, `.codex/hooks.json` and `.claude/settings.json` — the
+project's hooks and
 servers are its own for the duration: it is a live named peer
 `worker-<id8>` (it is started as `ANTIPHON_NAME=worker-<id8>` with
 `ANTIPHON_CWD` pointing at the project, so everything it records lands in
@@ -298,11 +301,12 @@ Codex hooks once when Codex first shows them.
 
 Re-running `setup` migrates hooks and instruction blocks written by older
 versions in place; it never creates duplicates. An Antiphon section written
-before 0.5.0 has no end marker: `setup` rewrites it up to the end of the
-wording that version shipped and nothing after, so notes and headings of your
-own below it stay; a section that ends no known way, holds a heading of your
-own, or appears twice is left alone, and `setup` and `doctor` print the same
-remedy. Until `setup` is re-run, a `.codex/config.toml` from before 0.5.0
+before 0.5.0 has no end marker: when it is, word for word, one of the wordings
+that shipped — npm 0.1.0 to 0.3.3, or the unpublished 0.4.0 at its version
+commit — `setup` rewrites it up to the end of that wording and nothing after,
+so notes and headings of your own below it stay; a section with any other
+wording, a heading of your own inside it, or a second Antiphon heading is
+left alone, and `setup` and `doctor` print the same remedy. Until `setup` is re-run, a `.codex/config.toml` from before 0.5.0
 still pre-approves every tool, the worker tools included; `doctor` names it.
 
 A long-lived bridge server keeps the code it loaded, so an upgrade on disk
