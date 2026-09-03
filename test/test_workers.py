@@ -234,6 +234,28 @@ class AdapterTest(unittest.TestCase):
             self.assertTrue(os.path.exists(os.path.join(
                 workers.work_dir(project, reading["id"]), ".git")))
 
+    def test_a_checkout_without_a_commit_runs_a_read_task_in_place_and_refuses_a_write(self):
+        """Measured on the E2E's own `git init` project: `worktree add` fails
+        on `HEAD` before the first commit."""
+        import subprocess
+        with tempfile.TemporaryDirectory() as project, tempfile.TemporaryDirectory() as bin_dir:
+            subprocess.run(["git", "init", "-q", project], check=True)
+            stub = self._stub(bin_dir, "codex")
+            record = workers.new_task(project, kind="codex", task_class="read", sha256=SHA, size=1)
+            started = workers.start(project, record, "look", env=self._env(bin_dir))
+            self.assertEqual(started["state"], "running")
+            self.assertIsNone(started["base"])
+            deadline = time.time() + 5
+            while time.time() < deadline and not os.path.exists(stub + ".env"):
+                time.sleep(0.05)
+            with open(stub + ".env") as f:
+                self.assertIn(f"CWD={project}", f.read())
+            writing = workers.new_task(project, kind="codex", task_class="write", sha256=SHA, size=1)
+            with self.assertRaises(workers.Refused) as refused:
+                workers.start(project, writing, "edit", env=self._env(bin_dir))
+            self.assertIn("needs a commit", str(refused.exception))
+            self.assertIsNone(workers.read_task(project, writing["id"]))
+
     def test_a_fifth_worker_is_refused_with_the_four(self):
         with tempfile.TemporaryDirectory() as project:
             ids = []

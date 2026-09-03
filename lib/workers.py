@@ -483,7 +483,15 @@ def start(cwd, record, text, env=None):
     os.makedirs(directory, mode=0o700, exist_ok=True)
     work = work_dir(cwd, task_id)
     base = None
-    if _git_checkout(cwd):
+    # A checkout with no commit yet (measured: the E2E's own `git init`
+    # project) has nothing to branch a worktree from: a read task runs in
+    # the project under the host's read-only class, a write task is refused.
+    if _git_checkout(cwd) and _head(cwd) is None:
+        if record["task_class"] == "write":
+            _refuse(cwd, record, "not delegated: a write task needs a commit to "
+                                 "branch its worker's worktree from")
+        run_in = cwd
+    elif _git_checkout(cwd):
         done = _git(cwd, "worktree", "add", "--detach", "-q", work, "HEAD")
         if done is None or done.returncode != 0:
             _refuse(cwd, record, "not delegated: the worker's worktree could not be "
