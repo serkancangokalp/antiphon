@@ -2210,6 +2210,36 @@ class AntiphonTest(unittest.TestCase):
                 self.assertEqual(f.read(), "!keep-this\n", "the user's file is theirs")
             self.assertIn(".antiphon/.gitignore is yours", out.getvalue())
 
+    def test_setup_names_store_files_git_already_tracks(self):
+        """Round 2 of the release gate, 2026-09-03: an install from before
+        0.5.0 may have committed the cursor, and an ignore rule does nothing
+        for a tracked file — the line said ✓ over it. It says so now, with
+        the one command that untracks, and setup still exits 0."""
+        import subprocess
+        with tempfile.TemporaryDirectory() as project, \
+             patch.object(antiphon, "project_dir", return_value=project):
+            subprocess.run(["git", "init", "-q", project], check=True)
+            os.makedirs(os.path.join(project, ".antiphon"))
+            with open(os.path.join(project, ".antiphon", "cursor.json"), "w") as f:
+                f.write("{}")
+            subprocess.run(["git", "-C", project, "add", "-A"], check=True)
+            subprocess.run(["git", "-C", project, "-c", "user.email=a@b", "-c", "user.name=a",
+                            "commit", "-q", "-m", "root"], check=True)
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out):
+                self.assertEqual(antiphon.setup(), 0)
+            line = next(l for l in out.getvalue().splitlines() if "Bridge store" in l)
+            self.assertTrue(line.startswith("✓ Bridge store ignored by git"), line)
+            self.assertIn("1 file(s) under .antiphon/ are already tracked", line)
+            self.assertIn("git rm -r --cached .antiphon", line)
+            subprocess.run(["git", "-C", project, "rm", "-r", "-q", "--cached", ".antiphon"],
+                           check=True)
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out):
+                self.assertEqual(antiphon.setup(), 0)
+            line = next(l for l in out.getvalue().splitlines() if "Bridge store" in l)
+            self.assertNotIn("already tracked", line, "nothing tracked, nothing said")
+
     def test_setup_forwards_the_alias_to_the_codex_server(self):
         """Codex does not pass the parent environment to an MCP server: measured
         on live processes, the Claude child carried 46 variables and the Codex

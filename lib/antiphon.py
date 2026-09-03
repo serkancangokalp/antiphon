@@ -7249,10 +7249,14 @@ DELEGATE_DESCRIPTION = (
 TASK_DESCRIPTION = (
     "The lifecycle of a delegated task by id: status, result (with a bounded "
     "wait and the evidence — log tail, a completed write task's diff and its "
-    "test summary), or cancel. Read-only except cancel; a task's record and the "
-    "worker's directory are swept a week after the task, never while it runs. "
-    "A handed task has no worker here: result and cancel are refused for it, "
-    "and only the peer can be told to stop.")
+    "test summary), or cancel. Not read-only: status, result and a new "
+    "delegation's admission stop a worker past its timeout, result marks the "
+    "task collected, cancel stops the worker and removes its directory. The "
+    "worker's directory goes on the next hook after its result was collected, "
+    "or on cancel; the task's record, and a diff too large to inline that is "
+    "written beside it, stay a week — nothing goes while the worker runs. A "
+    "handed task has no worker here: result and cancel are refused for it, and "
+    "only the peer can be told to stop.")
 
 RETRIEVE_DESCRIPTION = (
     "Read-only, write-free retrieval of the complete tool invocation named by a "
@@ -8825,6 +8829,19 @@ STORE_DIR = ".antiphon"
 STORE_IGNORE = "*\n"
 
 
+def _tracked_store(cwd):
+    """How many files under the bridge's store git already tracks in `cwd`;
+    0 outside a checkout, without git, or on any error."""
+    try:
+        done = subprocess.run(["git", "-C", cwd, "ls-files", "-z", "--", STORE_DIR],
+                              capture_output=True, timeout=10)
+    except (OSError, subprocess.SubprocessError):
+        return 0
+    if done.returncode != 0:
+        return 0
+    return len([name for name in done.stdout.split(b"\0") if name])
+
+
 def _store_ignore_state(path):
     """The store's `.gitignore` as it is: None when absent, else its text.
     A directory or a link at that path is read as text that is not ours."""
@@ -8982,18 +8999,24 @@ def setup():
     # a gitlink and `git clean -xdf` would destroy. One `*` under it keeps
     # all of that unstaged; a `.gitignore` of the user's own there is theirs.
     store_ignore = os.path.join(cwd, STORE_DIR, ".gitignore")
+    # An ignore rule does nothing for a file git already tracks (an install
+    # from before 0.5.0 may have committed the cursor): said on the same
+    # line, with the one command that untracks it, and the exit code stays.
+    tracked = _tracked_store(cwd)
+    already = (f" — {tracked} file(s) under {STORE_DIR}/ are already tracked and "
+               f"stay so until `git rm -r --cached {STORE_DIR}`" if tracked else "")
     try:
         current_ignore = _store_ignore_state(store_ignore)
         if current_ignore is None:
             os.makedirs(os.path.dirname(store_ignore), exist_ok=True)
             with open(store_ignore, "w", encoding="utf-8") as f:
                 f.write(STORE_IGNORE)
-            print(f"✓ Bridge store ignored by git: {store_ignore}")
+            print(f"✓ Bridge store ignored by git: {store_ignore}{already}")
         elif current_ignore == STORE_IGNORE:
-            print(f"· Bridge store already ignored by git: {store_ignore}")
+            print(f"· Bridge store already ignored by git: {store_ignore}{already}")
         else:
             print(f"· {STORE_DIR}/.gitignore is yours and was left as is; it should keep "
-                  f"everything under {STORE_DIR}/ unstaged: {store_ignore}")
+                  f"everything under {STORE_DIR}/ unstaged: {store_ignore}{already}")
     except OSError as error:
         failures.append(store_ignore)
         print(f"✗ {STORE_DIR}/.gitignore could not be written "

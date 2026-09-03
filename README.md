@@ -321,7 +321,7 @@ antiphon sources scan      # finish or refresh the durable source catalog
 antiphon sources compact   # retire aged gone sources proved consumed by every relevant reader
 antiphon retrieve <id>     # print one complete tool invocation (never its result)
 antiphon task delegate     # start a managed worker for one task (JSON on stdin: text, kind, to, task, timeout)
-antiphon task status|result|cancel <id> [wait]   # follow a delegated task by id
+antiphon task status|result|cancel <id> [wait]   # follow a delegated task by id; status, result and a new delegate's admission stop a worker past its timeout
 antiphon task list         # every task on record: id, kind, class, state, started
 antiphon --version         # the installed version
 npm test                   # Python unit tests + real MCP protocol test
