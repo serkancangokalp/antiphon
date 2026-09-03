@@ -12,9 +12,10 @@ where a queue is all there is), same-vendor bridging (Claude ↔ Claude, Codex �
 Codex, always by name) and the managed-worker MVP — each in its own worktree,
 each merged after an independent read-only review closed on it, each certified
 by both Python suites, the Node suite, the statics and `fresh-user.sh` from a
-temporary worktree at the exact commit. **npm still serves 0.3.3**: nothing
-here was pushed or published; that is the person's own step, after the Codex
-review over the bridge — which was attempted and is still queued in a Codex
+temporary worktree at the exact commit. **npm still serves 0.3.3**: `main`
+and `v0.5.0` (94d80f2) were pushed to origin on 2026-09-03 at the person's
+word; publishing is the person's own step, after the Codex review over the
+bridge — which was attempted and is still queued in a Codex
 thread that has not taken a turn (the queue measurement of the delivery-truth
 entry, live).
 
@@ -36,7 +37,8 @@ where its directory carries the bridge's configuration, the hop fails closed on 
 the evidence lives in the sandbox, a handed task is refused what it cannot
 do, the E2E takes the worktree road with a real write worker), and the
 words that follow them. `v0.5.0` was re-pointed to the final commit; nothing
-was pushed or published. Two things the gate measured and this file keeps:
+was published before the person's word (the push to origin came on
+2026-09-03, after round 3). Two things the gate measured and this file keeps:
 `codex exec -s workspace-write` records the project as trusted in
 `~/.codex/config.toml` (README §Limits), and the surfaces measure 5,335 /
 5,936 / 3,627 bytes (the token-cost entry).
@@ -56,7 +58,7 @@ source's newest time is its last dated record, two pins that bite) and
 97c8441 (a tracked store is named, the oversized diff outlives the worker's
 directory, a refusal leaves nothing, a store link is refused, the summary
 stays out of the diff, the E2E's trust undo runs from its exit trap). The
-tag was re-pointed again; still nothing pushed or published.
+tag was re-pointed again; nothing published.
 
 **Mixed-version pruning** (a 0.3.x reader deleting current endpoints; a
 listener whose in-memory Node and on-disk Python disagree being told it
