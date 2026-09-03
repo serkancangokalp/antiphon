@@ -317,7 +317,10 @@ class AdapterTest(unittest.TestCase):
         workers past a cap of four, because `admit` counted and `new_task`
         wrote with nothing between them. The count made slow on purpose:
         under the store's lock exactly four are admitted; with the lock
-        gone, more than four are."""
+        gone, more than four are. The control half counts behind a barrier
+        rather than a sleep, so all eight count the empty store before any
+        writes whatever the machine's load — a 200 ms sleep let the
+        control come out at exactly four under a concurrent suite."""
         import contextlib
         import threading
         from unittest.mock import patch
@@ -325,6 +328,12 @@ class AdapterTest(unittest.TestCase):
 
         def slow_count(cwd):
             time.sleep(0.2)
+            return real_count(cwd)
+
+        barrier = threading.Barrier(8, timeout=30)
+
+        def counted_together(cwd):
+            barrier.wait()
             return real_count(cwd)
 
         def storm(project):
@@ -347,11 +356,11 @@ class AdapterTest(unittest.TestCase):
             self.assertEqual(storm(project), (workers.MAX_WORKERS, 8 - workers.MAX_WORKERS))
             self.assertEqual(len(workers.tasks(project)), workers.MAX_WORKERS)
         with tempfile.TemporaryDirectory() as project, \
-             patch.object(workers, "_admitted", side_effect=slow_count), \
+             patch.object(workers, "_admitted", side_effect=counted_together), \
              patch.object(workers, "_locked", lambda cwd: contextlib.nullcontext(True)):
             admitted, _refused = storm(project)
-            self.assertGreater(admitted, workers.MAX_WORKERS,
-                               "without the lock the race is real — the control")
+            self.assertEqual(admitted, 8,
+                             "without the lock the race is real — the control")
 
     def test_a_fractional_timeout_is_clamped_not_refused(self):
         with tempfile.TemporaryDirectory() as project:

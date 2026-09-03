@@ -41,6 +41,20 @@ was pushed or published. Two things the gate measured and this file keeps:
 `~/.codex/config.toml` (README §Limits), and the surfaces measure 5,335 /
 5,936 / 3,627 bytes (the token-cost entry).
 
+**Round 2 (2026-09-03, on 7034e28).** No Critical; every round-1 finding
+verified closed under a biting test; two Importants — a person's un-headed
+note quoting a shipped closing sentence was still cut with a legacy section
+(2ad57aa: the section must be, paragraph for paragraph, a wording that
+shipped, `LEGACY_SECTION_DIGESTS`), and "a worker is not a peer" was false on
+the in-place road (2ad57aa: it is a peer only where its directory carries the
+bridge) — and a page of minors closed in bd5bd8c (an automatic alias keeps
+its receipt after its session exits, the bisection keeps its slack, a
+source's newest time is its last dated record, two pins that bite) and
+97c8441 (a tracked store is named, the oversized diff outlives the worker's
+directory, a refusal leaves nothing, a store link is refused, the summary
+stays out of the diff, the E2E's trust undo runs from its exit trap). The
+tag was re-pointed again; still nothing pushed or published.
+
 **Mixed-version pruning** (a 0.3.x reader deleting current endpoints; a
 listener whose in-memory Node and on-disk Python disagree being told it
 recovered) is closed by the `process_birth` sibling, the two-way
@@ -792,6 +806,11 @@ closing it needs the acknowledgement protocol below.
 
 ### Closed 2026-09-03, with the delivery ledger
 
+- **Two facts from round 2 of the gate.** A delivery to an automatic Codex
+  alias is credited from that session's rollout after the session has exited
+  (the reader's name comes from the stored observation, not from liveness). A
+  source's newest time is its last dated record within the last megabyte; a
+  source undated for longer has no newest time and sets no horizon.
 - **Two limits, measured and left.** A receipt that sits in the reader-side
   skipped span (a transcript more than a day behind the other side's newest
   record) is never seen on that road; the sender's own-transcript road is
