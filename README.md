@@ -77,36 +77,54 @@ because the hook's own refusal reaches a debug log and not the agent.
 a fresh `claude -p` or `codex exec` session for one task and returns at once
 with a task id; `antiphon_task(id, action, wait?)` reports its `status`,
 collects its `result` after a bounded wait (the log tail, and for a completed
-write task the diff against the base it started from and its `tests.txt`), or
-`cancel`s it. Whenever the project is a git checkout the worker works in a
-detached worktree of its own under `.antiphon/workers/<id>/work/`, so nothing
-it does touches your tree; the bridge's own files — the log, the exit code,
-the test summary, a large diff — sit beside that worktree, never inside it. A
-read task (the default) runs under the host's read-only class
+write task the diff against the base it started from and its test summary), or
+`cancel`s it. Whenever the project is a git checkout with a commit the worker —
+a read task as much as a write task — works in a detached worktree of its own
+at HEAD under `.antiphon/workers/<id>/work/`, so nothing it does touches your
+tree and nothing uncommitted in your tree is visible to it: a worker asked to
+review "the current changes" reviews HEAD. The bridge's own files — the log,
+the exit code, a large diff — sit beside that worktree; the one file the
+worker writes for the bridge, its test summary, sits inside it at
+`.antiphon/tests.txt`, where a write task's sandbox can reach it and where git
+ignores it. A read task (the default) runs under the host's read-only class
 (`--permission-mode plan` for Claude, `-s read-only` for Codex); in a project
-that is not a checkout it runs in the project under that class. A write task
-runs under the host's default class in its worktree and returns a diff the
+that is not a checkout it runs in the project under that class, and so in a
+checkout without a commit, where a write task is refused. A write task runs
+under the host's default class in its worktree and returns a diff the
 bridge never applies — the parent agent or the human does, after `git apply
---check`. No worker is ever started with `--dangerously-skip-permissions` or
-`--full-auto`; it carries `ANTIPHON_HOP` one deeper than its parent and is
-refused a delegation of its own at the hop budget (`ANTIPHON_HOP_BUDGET`,
-default 1) — and, because Codex hands its MCP server only the variables its
-config names, a worker whose server cannot see its hop is refused on its name
-alone — so a chain cannot become an invisible loop. On the Codex side the two
-tools are the only ones that ask first: `setup` writes a per-tool
+--check`. No worker is ever started with `--dangerously-skip-permissions`, `--full-auto`
+or a sandbox value that widens its class; it carries `ANTIPHON_HOP` one deeper
+than its parent and is refused a delegation of its own at the hop budget
+(`ANTIPHON_HOP_BUDGET`, default 1) — on both roads: a worker whose server
+cannot see its hop is refused on its name alone, and the command line reads
+that name from the worker's own environment. The budget bounds a cooperating
+chain, not a worker that runs the other CLI by hand from a shell. On the Codex
+side the two tools are the only ones that ask first: `setup` writes a per-tool
 `approval_mode = "prompt"` for them beneath the server's blanket approval of
-the read tools. With `to`, the task is handed to a running named peer of that
-kind over the ordinary addressed send instead (parked as an attachment when
-too large, like any direct send), marked `[Antiphon task <id>]` and recorded
-on the ledger. At most four workers run per project; a worker is stopped at
-its timeout by the next `status`, `result` or hook sweep; a task record lives
-a week under `.antiphon/tasks/`, and a worker's directory is swept once its
-evidence was collected. Every worker is asked to keep `[Antiphon worker
-<kind>:<id>]` at the start of its final message, and its own hooks register it
-as `worker-<id8>` — the name the page shows — so nothing it says is ever the
-parent's own; while it runs it is a live named peer, so a bare `reply_to_codex`
-or `antiphon_send` is refused until it finishes. The same lifecycle is on the
-command line as `antiphon task`.
+the read tools. With `to`, a read task is handed to a running named peer of
+that kind over the ordinary addressed send instead (parked as an attachment
+when too large, like any direct send), marked `[Antiphon task <id>]` and
+recorded on the ledger; a handed task has no worker here, so `result` and
+`cancel` are refused for it and only the peer can be told to stop, and a write
+task cannot be handed. At most four workers run per project, admitted and
+recorded under one lock, and a worker that has exited gives its slot back the
+moment another is asked for; a worker is stopped at its timeout by the next
+`status`, `result` or hook sweep; a task record lives a week under
+`.antiphon/tasks/`, and a worker's directory is swept once its evidence was
+collected — its worktree forgotten by its own entry, never by a prune of your
+repository's other worktrees. Every worker is asked to keep `[Antiphon worker
+<kind>:<id>]` at the start of its final message, so nothing it says reads as
+the parent's own. A worker is followed by its task id — `status`, `result`,
+the log — and not as a peer: its worktree carries the checkout, not the
+bridge's project-local hooks or MCP servers (a fresh directory's hooks and
+servers need the host's own trust), so it registers nothing, appears on no
+page and makes no bare send refused. It is started as
+`ANTIPHON_NAME=worker-<id8>` with `ANTIPHON_CWD` pointing at the project, so
+the bridge call it may still make — a read task run in the project itself —
+lands in the project's own store under that name; seeding the worktree with
+the bridge's configuration is the follow-up, not built. The same lifecycle is
+on the command line as `antiphon task`, and `antiphon task list` names every
+task on record.
 
 ### How identity is preserved
 

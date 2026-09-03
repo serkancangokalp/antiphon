@@ -6,12 +6,22 @@ worker's pid, start time and exit — validated on every read the way the
 delivery ledger is, kept a week, under a directory this code owns outright.
 
 `.antiphon/workers/<task-id>/` is the worker's directory. The bridge's own
-files live at its top — `log`, `exit`, `tests.txt`, `diff` — and the work
-happens in `work/` underneath: a detached git worktree whenever the project
-is a checkout, so nothing a worker does touches the user's own tree, and a
-tracked file that happens to be named `exit` is never read as the worker's
-exit. A read task in a project that is not a checkout runs in the project,
-under the host's read-only class.
+files live at its top — `log`, `exit`, `diff` — and the work happens in
+`work/` underneath: a detached git worktree at HEAD whenever the project is
+a checkout with a commit, so nothing a worker does touches the user's own
+tree (and nothing uncommitted is visible to it), and a tracked file that
+happens to be named `exit` is never read as the worker's exit. The one file
+the worker itself writes for the bridge, its test summary, sits inside the
+worktree at `work/.antiphon/tests.txt`, where a write task's sandbox can
+reach it and where git ignores it. A read task in a project that is not a
+checkout runs in the project, under the host's read-only class.
+
+A worker is followed by its task id — status, result, log — and not as a
+peer: its worktree carries the checkout, not the bridge's project-local
+hooks or MCP servers, so it registers nothing and appears on no page. It is
+started with `ANTIPHON_NAME=worker-<id8>` and `ANTIPHON_CWD=<project>`, so
+the bridge call it may still make (a read task run in the project itself)
+lands in the project's own store under that name.
 
 Nothing here merges a patch, forwards a task or guesses a peer; see
 docs/superpowers/specs/2026-09-03-managed-workers-design.md.
@@ -54,12 +64,14 @@ KEYS = frozenset({
     "timeout", "hop", "created_at", "pid", "birth", "base", "exit_code", "to",
     *OPTIONAL_TIMES})
 
-# The worker's own files, beside the work and never inside it.
+# The bridge's own files, beside the work and never inside it — except the
+# test summary, which the worker writes and its sandbox binds to the work.
 LOG_FILE = "log"
 EXIT_FILE = "exit"
 TESTS_FILE = "tests.txt"
 DIFF_FILE = "diff"
 WORK_DIR = "work"
+WORK_STORE = ".antiphon"
 
 
 def tasks_dir(cwd):
@@ -78,7 +90,10 @@ def _sound_dir(path, create=False):
     if create:
         os.makedirs(parent, exist_ok=True)
         if not os.path.lexists(path):
-            os.mkdir(path, 0o700)
+            # Two first delegations at once both see no store; the second
+            # mkdir must not be the one that fails.
+            with contextlib.suppress(FileExistsError):
+                os.mkdir(path, 0o700)
     # `lstat`, never `stat`: a link to a directory elsewhere is somebody
     # else's directory, and the store's whole premise is ownership.
     try:
@@ -307,10 +322,12 @@ class Refused(Exception):
 
 WORKER_LABEL = "[Antiphon worker {kind}:{task_id}]"
 HOP_BUDGET_DEFAULT = 1
-# The permission-widening flags no worker is ever started with; named here
-# so a test can pin their absence rather than trust the adapter's author.
+# The permission-widening flags — and the values that widen a class through
+# an innocent flag — no worker is ever started with; named here so a test
+# can pin their absence rather than trust the adapter's author.
 FORBIDDEN_FLAGS = ("--dangerously-skip-permissions", "--full-auto",
-                   "--dangerously-bypass-approvals-and-sandbox")
+                   "--dangerously-bypass-approvals-and-sandbox", "--yolo",
+                   "danger-full-access", "bypassPermissions")
 
 
 def worker_dir(cwd, task_id):
@@ -330,7 +347,11 @@ def exit_path(cwd, task_id):
 
 
 def tests_path(cwd, task_id):
-    return os.path.join(worker_dir(cwd, task_id), TESTS_FILE)
+    """Inside the worktree: `codex exec -s workspace-write` binds the worker
+    to its cwd, so a path beside the worktree was one it could not write
+    (review 2026-09-03). Git ignores the directory, so the diff never
+    carries it."""
+    return os.path.join(work_dir(cwd, task_id), WORK_STORE, TESTS_FILE)
 
 
 def hop_budget(env):
@@ -341,12 +362,24 @@ def hop_budget(env):
     return value if value >= 1 else HOP_BUDGET_DEFAULT
 
 
-def current_hop(env):
+def _hop_value(env):
+    """`ANTIPHON_HOP` as the bridge set it: None when unset or blank, an int
+    when it is a hop count, and the raw string when it is neither."""
+    raw = str(env.get("ANTIPHON_HOP", "")).strip()
+    if not raw:
+        return None
     try:
-        value = int(str(env.get("ANTIPHON_HOP", "")).strip())
+        return int(raw)
     except ValueError:
-        return 0
-    return max(0, value)
+        return raw
+
+
+def current_hop(env):
+    """The session's hop, 0 for a session the bridge did not start. A value
+    that is not a non-negative count reads as 0 here and is refused by
+    `check_hop`: a record's hop is never negative."""
+    value = _hop_value(env)
+    return value if isinstance(value, int) and value >= 0 else 0
 
 
 def is_worker_name(alias):
@@ -364,6 +397,11 @@ def check_hop(env, alias=None):
     variables, and only those its config names) may drop `ANTIPHON_HOP`,
     but it forwards `ANTIPHON_NAME`, and a worker's name says what it is."""
     budget, hop = hop_budget(env), current_hop(env)
+    value = _hop_value(env)
+    if value is not None and not (isinstance(value, int) and value >= 0):
+        raise Refused(f"not delegated: ANTIPHON_HOP={value!r} is not a hop count; "
+                      "the bridge sets it to a non-negative integer, so a session "
+                      "carrying anything else may not delegate")
     if is_worker_name(alias) and "ANTIPHON_HOP" not in env:
         raise Refused(f"not delegated: this session is a managed worker ({alias}) "
                       "whose hop is not visible to its server, so it may not "
@@ -379,13 +417,39 @@ def running(cwd):
     return [record for record in tasks(cwd) if record["state"] == "running"]
 
 
+def _admitted(cwd):
+    """What holds a slot: a worker recorded as running, and a task accepted
+    whose start is under way."""
+    return [record for record in tasks(cwd) if record["state"] in ("accepted", "running")]
+
+
 def admit(cwd):
-    """Refuse a fifth worker, naming the four that run."""
-    live = running(cwd)
+    """Refuse a fifth worker, naming the four that hold the slots."""
+    live = _admitted(cwd)
     if len(live) >= MAX_WORKERS:
         raise Refused(f"not delegated: {MAX_WORKERS} workers already run in this "
                       f"project ({', '.join(record['id'] for record in live)}); "
                       "wait for one, or cancel it")
+
+
+def accept(cwd, *, now=None, **fields):
+    """Admit and record one task in a single locked step.
+
+    Review 2026-09-03: `admit` then `new_task` with nothing between them let
+    eight concurrent delegations start seven workers past a cap of four, and
+    a worker that had exited still held its slot until somebody asked after
+    it. So what is recorded as running is reconciled first — outside the
+    lock, because reconciling writes under it — and the count and the write
+    then happen under the store's lock, where nothing can slip between."""
+    for record in running(cwd):
+        status(cwd, record["id"], now, patience=SWEEP_PATIENCE)
+    if _sound_dir(tasks_dir(cwd), create=True) is None:
+        raise OSError(f"the task store under {tasks_dir(cwd)} cannot be used")
+    with _locked(cwd) as held:
+        if not held:
+            raise OSError(f"the task store under {tasks_dir(cwd)} cannot be locked")
+        admit(cwd)
+        return new_task(cwd, **fields)
 
 
 def prompt_for(kind, task_id, text, task_class="read", tests=None):
@@ -399,8 +463,9 @@ def prompt_for(kind, task_id, text, task_class="read", tests=None):
     if task_class == "write" and tests:
         head += (f" Work in the current directory, which is your own git worktree; "
                  f"if you run tests, write a short summary to {tests} "
-                 f"({TESTS_FILE} beside your worktree). Do not commit unless the "
-                 "task says so; your diff is collected either way.")
+                 f"({WORK_STORE}/{TESTS_FILE} inside your worktree, which git "
+                 "ignores). Do not commit unless the task says so; your diff is "
+                 "collected either way.")
     return head + " The task:\n\n" + text
 
 
@@ -409,7 +474,7 @@ def adapter(kind, task_class, text, task_id, tests=None):
     read task, its default class for a write task, never a flag that widens
     either."""
     if task_class == "write" and not tests:
-        tests = TESTS_FILE
+        tests = os.path.join(WORK_STORE, TESTS_FILE)
     prompt = prompt_for(kind, task_id, text, task_class, tests)
     if kind == "claude":
         argv = ["claude", "-p"]
@@ -457,6 +522,18 @@ def _process_start(pid):
     return start[:80] if done.returncode == 0 and start else None
 
 
+def _ignored_store(work):
+    """`work/.antiphon/`, ignored by git there, for the one file the worker
+    writes for the bridge. Never overwrites a `.gitignore` the checkout
+    itself carries at that path."""
+    store = os.path.join(work, WORK_STORE)
+    os.makedirs(store, exist_ok=True)
+    ignore = os.path.join(store, ".gitignore")
+    if not os.path.lexists(ignore):
+        with open(ignore, "w", encoding="utf-8") as f:
+            f.write("*\n")
+
+
 def _refuse(cwd, record, reason):
     """A start that did not happen leaves nothing: not the record, not the
     worktree it may have created."""
@@ -498,16 +575,20 @@ def start(cwd, record, text, env=None):
                                  f"created: {(done.stderr if done else '').strip()[:200]}")
         base = _head(work)
         run_in = work
+        _ignored_store(work)
     elif record["task_class"] == "write":
         _refuse(cwd, record, "not delegated: a write task needs a git checkout "
                              "to give its worker a worktree of its own")
     else:
         run_in = cwd
     # The record's hop is the worker's: `delegate` computed it as the parent's
-    # plus one, so a worker at the budget refuses to delegate further.
+    # plus one, so a worker at the budget refuses to delegate further. Its
+    # bridge directory is the project, not the throwaway worktree: a bridge
+    # call it makes must land in the project's own store, not in one deleted
+    # with the work (review 2026-09-03).
     env["ANTIPHON_HOP"] = str(record["hop"])
     env["ANTIPHON_NAME"] = f"worker-{task_id[:8]}"
-    env["ANTIPHON_CWD"] = run_in
+    env["ANTIPHON_CWD"] = cwd
     env["ANTIPHON_WORKER_DIR"] = directory
     env["ANTIPHON_WORKER_TESTS"] = tests_path(cwd, task_id)
     env["ANTIPHON_WORKER_EXIT"] = exit_path(cwd, task_id)
@@ -594,6 +675,10 @@ def _alive(record):
         return True
     if record["birth"] is not None:
         return _process_start(pid) == record["birth"]
+    # No start time on record — `ps` gave none when the worker began — so a
+    # live pid is taken as the worker: the alternative reads a running
+    # worker as dead on the one platform that cannot date it, and a recycled
+    # pid costs at most a late `failed`.
     return True
 
 
@@ -689,16 +774,39 @@ def _worktree_diff(cwd, record):
         else done.stdout
 
 
+def _bounded_wait(wait):
+    """`wait` as seconds between 0 and MAX_WAIT; anything else is 0."""
+    try:
+        seconds = float(wait or 0)
+    except (TypeError, ValueError):
+        return 0.0
+    if seconds != seconds:
+        return 0.0
+    return min(max(0.0, seconds), float(MAX_WAIT))
+
+
+def _handed(record, verb):
+    """The refusal for a lifecycle action on a task that has no worker here:
+    it was handed to a peer, whose work is its own."""
+    return Refused(f"not {verb}: task {record['id']} was handed to the {record['kind']} "
+                   f"peer {record['to']!r} and has no worker here; its answer comes in "
+                   "the peer's own words (antiphon status shows the receipt), and only "
+                   "the peer can be told to stop")
+
+
 def result(cwd, task_id, wait=0):
     """The task's state and evidence, after waiting up to `wait` seconds
     (at most MAX_WAIT) for it to finish. A completed write task carries its
     diff against the base it started from — inline up to DIFF_INLINE bytes,
     else as a file beside the work — and the worker's test summary when it
     wrote one. The task counts as collected only when the evidence its state
-    promises was actually returned; until then its directory is kept."""
-    wait = min(max(0.0, float(wait or 0)), MAX_WAIT)
+    promises was actually returned; until then its directory is kept. A
+    handed task is refused: nothing is collected by id."""
+    wait = _bounded_wait(wait)
     deadline = time.time() + wait
     record = status(cwd, task_id)
+    if record is not None and record["state"] == "handed":
+        raise _handed(record, "collected")
     while record is not None and record["state"] == "running" and time.time() < deadline:
         time.sleep(0.1)
         record = status(cwd, task_id)
@@ -736,21 +844,52 @@ def result(cwd, task_id, wait=0):
     return answer
 
 
+def _forget_worktree(cwd, work):
+    """Drop git's own entry for this worktree when its directory is already
+    gone — what `git worktree prune` does for every missing worktree of the
+    user's repository, done for ours alone (review 2026-09-03)."""
+    done = _git(cwd, "rev-parse", "--git-common-dir", timeout=10)
+    if done is None or done.returncode != 0:
+        return
+    common = done.stdout.strip()
+    if not os.path.isabs(common):
+        common = os.path.join(cwd, common)
+    admin = os.path.join(common, "worktrees")
+    try:
+        names = os.listdir(admin)
+    except OSError:
+        return
+    wanted = os.path.realpath(os.path.join(work, ".git"))
+    for name in names:
+        entry = os.path.join(admin, name)
+        try:
+            with open(os.path.join(entry, "gitdir"), encoding="utf-8", errors="replace") as f:
+                registered = f.read().strip()
+        except OSError:
+            continue
+        if registered and os.path.realpath(registered) == wanted:
+            shutil.rmtree(entry, ignore_errors=True)
+
+
 def _remove_dir(cwd, record):
     directory = worker_dir(cwd, record["id"])
     work = work_dir(cwd, record["id"])
     if os.path.isdir(work):
         _git(cwd, "worktree", "remove", "--force", work)
     shutil.rmtree(directory, ignore_errors=True)
-    _git(cwd, "worktree", "prune")
+    if _git_checkout(cwd):
+        _forget_worktree(cwd, work)
 
 
 def cancel(cwd, task_id):
     """Stop a running worker and remove its directory; on a finished task,
-    remove the directory and keep the state. A second cancel is one."""
+    remove the directory and keep the state. A second cancel is one. A
+    handed task is refused: there is no worker here to stop."""
     record = status(cwd, task_id)
     if record is None:
         return None
+    if record["state"] == "handed":
+        raise _handed(record, "cancelled")
     if record["state"] == "running":
         _kill_group(record["pid"])
         record = _finish(cwd, task_id, "cancelled", None)

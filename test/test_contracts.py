@@ -613,8 +613,29 @@ class ShippedContractTest(unittest.TestCase):
         self.assertIn("never merges its work", collapsed)
         self.assertIn('name: "antiphon_delegate"', collapsed)
         self.assertIn('name: "antiphon_task"', collapsed)
-        self.assertIn("## P2 — Cross-vendor managed workers (shipped 2026-09-03, MVP)",
-                      read("BACKLOG.md"))
+        # Second review 2026-09-03: both servers said a read task runs in the
+        # project; in a checkout with a commit it runs in a worktree at HEAD,
+        # so uncommitted work is not visible to it — every surface says so.
+        delegate = next(t for t in antiphon.TOOLS if t["name"] == "antiphon_delegate")
+        task_argument = delegate["inputSchema"]["properties"]["task"]["description"]
+        for surface in (antiphon.DELEGATE_DESCRIPTION, task_argument, collapsed):
+            self.assertNotIn("runs read-only in the project", surface)
+            self.assertIn("at HEAD", surface)
+        self.assertRegex(readme, r"(?i)nothing\s+uncommitted[^.]*visible")
+        # And a worker is followed by its task id, not as a peer: the claim
+        # that its hooks register it and the page names it was false — its
+        # worktree carries no bridge configuration.
+        self.assertRegex(readme, r"(?i)followed\s+by\s+its\s+task\s+id")
+        self.assertRegex(readme, r"(?i)not\s+as\s+a\s+peer")
+        self.assertNotIn("the name the page shows", readme)
+        self.assertNotIn("live named peer", readme)
+        self.assertRegex(readme, r"(?i)bounds\s+a\s+cooperating\s+chain")
+        self.assertIn("antiphon task list", readme)
+        backlog = read("BACKLOG.md")
+        self.assertIn("## P2 — Cross-vendor managed workers (shipped 2026-09-03, MVP)", backlog)
+        self.assertNotIn("its registry name `worker-<id8>` on the page", backlog)
+        self.assertRegex(backlog, r"(?i)followed\s+by\s+its\s+task\s+id")
+        self.assertRegex(backlog, r"(?i)seeding\s+the\s+worktree[^.]*follow-up")
         self.assertTrue(os.path.exists(os.path.join(
             ROOT, "docs", "superpowers", "specs", "2026-09-03-managed-workers-design.md")))
         for flag in antiphon.workers.FORBIDDEN_FLAGS:

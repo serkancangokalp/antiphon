@@ -157,12 +157,17 @@ class AdapterTest(unittest.TestCase):
         self.assertEqual(codex_write[:4], ["codex", "exec", "-s", "workspace-write"])
         self.assertIn(workers.TESTS_FILE, workers.adapter("codex", "write", "do it", "t1")[-1],
                       "the write task is told where to leave its test summary")
+        # Review 2026-09-03: a class is widened through a value as easily as
+        # through a flag, and the module's own assert must know both.
+        for widening in ("--yolo", "danger-full-access", "bypassPermissions"):
+            self.assertIn(widening, workers.FORBIDDEN_FLAGS, widening)
         for argv in (claude_read, codex_read, codex_write,
                      workers.adapter("claude", "write", "do it", "t1")):
             joined = " ".join(argv)
             self.assertNotIn("--dangerously-skip-permissions", joined)
             self.assertNotIn("--full-auto", joined)
             self.assertNotIn("bypass", joined)
+            self.assertNotIn("danger-full-access", joined)
             self.assertIn("[Antiphon worker", argv[-1], "the prompt names the label")
             self.assertIn("do it", argv[-1])
             self.assertIn("t1", argv[-1])
@@ -234,6 +239,28 @@ class AdapterTest(unittest.TestCase):
             self.assertTrue(os.path.exists(os.path.join(
                 workers.work_dir(project, reading["id"]), ".git")))
 
+    def test_the_workers_bridge_directory_is_the_project_not_its_worktree(self):
+        """Review 2026-09-03: `ANTIPHON_CWD` named the worktree, so a bridge
+        call from the worker landed in a store deleted with the work. The
+        worker runs in its worktree and talks to the project's store."""
+        import subprocess
+        with tempfile.TemporaryDirectory() as project, tempfile.TemporaryDirectory() as bin_dir:
+            subprocess.run(["git", "init", "-q", project], check=True)
+            subprocess.run(["git", "-C", project, "-c", "user.email=a@b", "-c", "user.name=a",
+                            "commit", "-q", "--allow-empty", "-m", "root"], check=True)
+            stub = self._stub(bin_dir, "codex")
+            record = workers.new_task(project, kind="codex", task_class="read", sha256=SHA, size=1)
+            workers.start(project, record, "look", env=self._env(bin_dir))
+            deadline = time.time() + 5
+            while time.time() < deadline and not os.path.exists(stub + ".env"):
+                time.sleep(0.05)
+            with open(stub + ".env") as f:
+                seen = f.read()
+            work = os.path.realpath(workers.work_dir(project, record["id"]))
+            self.assertIn(f"CWD={project} ", seen, "the bridge directory is the project")
+            self.assertRegex(seen, rf"PWD={work}\b|PWD={workers.work_dir(project, record['id'])}\b",
+                             "the work happens in the worktree")
+
     def test_a_checkout_without_a_commit_runs_a_read_task_in_place_and_refuses_a_write(self):
         """Measured on the E2E's own `git init` project: `worktree add` fails
         on `HEAD` before the first commit."""
@@ -273,6 +300,47 @@ class AdapterTest(unittest.TestCase):
                                 lambda c: c.update(state="completed", finished_at=2.0))
             workers.admit(project)
 
+    def test_admission_and_the_record_are_one_locked_step(self):
+        """Review 2026-09-03: eight concurrent delegations started seven
+        workers past a cap of four, because `admit` counted and `new_task`
+        wrote with nothing between them. The count made slow on purpose:
+        under the store's lock exactly four are admitted; with the lock
+        gone, more than four are."""
+        import contextlib
+        import threading
+        from unittest.mock import patch
+        real_count = workers._admitted
+
+        def slow_count(cwd):
+            time.sleep(0.2)
+            return real_count(cwd)
+
+        def storm(project):
+            admitted, refused = [], []
+
+            def one():
+                try:
+                    admitted.append(workers.accept(project, kind="codex", task_class="read",
+                                                   sha256=SHA, size=1)["id"])
+                except workers.Refused:
+                    refused.append(1)
+            threads = [threading.Thread(target=one) for _ in range(8)]
+            for thread in threads:
+                thread.start()
+            for thread in threads:
+                thread.join()
+            return len(admitted), len(refused)
+        with tempfile.TemporaryDirectory() as project, \
+             patch.object(workers, "_admitted", side_effect=slow_count):
+            self.assertEqual(storm(project), (workers.MAX_WORKERS, 8 - workers.MAX_WORKERS))
+            self.assertEqual(len(workers.tasks(project)), workers.MAX_WORKERS)
+        with tempfile.TemporaryDirectory() as project, \
+             patch.object(workers, "_admitted", side_effect=slow_count), \
+             patch.object(workers, "_locked", lambda cwd: contextlib.nullcontext(True)):
+            admitted, _refused = storm(project)
+            self.assertGreater(admitted, workers.MAX_WORKERS,
+                               "without the lock the race is real — the control")
+
     def test_a_fractional_timeout_is_clamped_not_refused(self):
         with tempfile.TemporaryDirectory() as project:
             self.assertEqual(workers.new_task(project, kind="codex", task_class="read",
@@ -300,6 +368,18 @@ class AdapterTest(unittest.TestCase):
         self.assertIn("ANTIPHON_HOP_BUDGET", str(refused.exception))
         workers.check_hop({})
         workers.check_hop({"ANTIPHON_HOP": "1", "ANTIPHON_HOP_BUDGET": "2"})
+
+    def test_a_hop_that_is_not_a_count_is_refused_never_read_as_zero(self):
+        """Review 2026-09-03: a negative or nonsense `ANTIPHON_HOP` read as
+        hop 0, which is the top of the budget — a session carrying one is
+        refused instead, and a record never carries a negative hop."""
+        for value in ("-3", "nonsense", "1.5"):
+            self.assertEqual(workers.current_hop({"ANTIPHON_HOP": value}), 0, value)
+            with self.assertRaises(workers.Refused, msg=value) as refused:
+                workers.check_hop({"ANTIPHON_HOP": value, "ANTIPHON_HOP_BUDGET": "9"})
+            self.assertIn("is not a hop count", str(refused.exception))
+        workers.check_hop({"ANTIPHON_HOP": "  "}, alias="ui")
+        self.assertEqual(workers.current_hop({"ANTIPHON_HOP": ""}), 0, "blank is unset")
 
 
 
@@ -435,6 +515,15 @@ class LifecycleTest(unittest.TestCase):
             self.assertIn("+hello", final["diff"])
             self.assertIn("made.txt", final["diff"])
             self.assertEqual(final["tests"], "suite: 3 passed\n")
+            # Review 2026-09-03: the summary's path was beside the worktree,
+            # outside the root `codex exec -s workspace-write` binds a worker
+            # to. It lives inside, under a directory git ignores there.
+            work = workers.work_dir(project, started["id"])
+            self.assertEqual(workers.tests_path(project, started["id"]),
+                             os.path.join(work, ".antiphon", "tests.txt"))
+            with open(os.path.join(work, ".antiphon", ".gitignore")) as f:
+                self.assertEqual(f.read(), "*\n")
+            self.assertNotIn(".antiphon", final["diff"], "the summary is not in the diff")
             self.assertEqual(final["log_path"], workers.log_path(project, started["id"]))
             self.assertEqual(final["worker"]["kind"], "codex")
             self.assertEqual(final["worker"]["name"], f"worker-{started['id'][:8]}")
@@ -503,6 +592,91 @@ class LifecycleTest(unittest.TestCase):
             final = workers.result(project, started["id"], wait=0)
             self.assertIn("+x", final["diff"])
             self.assertIsNotNone(workers.read_task(project, started["id"])["collected_at"])
+
+    def test_four_finished_workers_do_not_refuse_a_fifth(self):
+        """Review 2026-09-03: a worker that had exited kept its slot until
+        somebody asked after it, and the refusal named four finished tasks.
+        Admission reconciles first."""
+        with tempfile.TemporaryDirectory() as project, tempfile.TemporaryDirectory() as bin_dir:
+            started = [self._run(project, bin_dir, "exit 0") for _ in range(4)]
+            deadline = time.time() + 5
+            while time.time() < deadline and not all(
+                    os.path.exists(workers.exit_path(project, r["id"])) for r in started):
+                time.sleep(0.05)
+            self.assertEqual([r["state"] for r in workers.tasks(project)], ["running"] * 4,
+                             "nothing has asked yet, so the records still say running")
+            fifth = workers.accept(project, kind="codex", task_class="read", sha256=SHA, size=1)
+            self.assertEqual(fifth["state"], "accepted")
+            self.assertEqual(sorted(r["state"] for r in workers.tasks(project)),
+                             ["accepted"] + ["completed"] * 4)
+
+    def test_a_handed_task_has_no_worker_to_collect_or_cancel(self):
+        """Review 2026-09-03: `cancel` on a handed task reported success and
+        stopped nothing. Both are refused with the one thing that can be
+        done — telling the peer; `status` still reads the record."""
+        with tempfile.TemporaryDirectory() as project:
+            record = workers.new_task(project, kind="codex", task_class="read", sha256=SHA,
+                                      size=1, to="build")
+            workers.update_task(project, record["id"], lambda c: c.update(state="handed"))
+            for action in (workers.result, workers.cancel):
+                with self.assertRaises(workers.Refused, msg=action.__name__) as refused:
+                    action(project, record["id"])
+                self.assertIn("handed to the codex peer 'build' and has no worker here",
+                              str(refused.exception))
+                self.assertIn("only the peer can be told to stop", str(refused.exception))
+            self.assertEqual(workers.status(project, record["id"])["state"], "handed")
+            self.assertEqual(workers.read_task(project, record["id"])["state"], "handed",
+                             "a refusal changes nothing")
+
+    def test_the_result_wait_is_clamped_to_max_wait(self):
+        """Review 2026-09-03, unpinned: without the clamp `result` waits
+        whatever it is asked, and a hundred thousand seconds is a day."""
+        from unittest.mock import patch
+        self.assertEqual(workers._bounded_wait(100_000), workers.MAX_WAIT)
+        self.assertEqual(workers._bounded_wait(-5), 0.0)
+        self.assertEqual(workers._bounded_wait(None), 0.0)
+        self.assertEqual(workers._bounded_wait("soon"), 0.0)
+        self.assertEqual(workers._bounded_wait(float("nan")), 0.0)
+        self.assertEqual(workers._bounded_wait(2.5), 2.5)
+        with tempfile.TemporaryDirectory() as project, tempfile.TemporaryDirectory() as bin_dir:
+            started = self._run(project, bin_dir, "sleep 30")
+            began = time.perf_counter()
+            with patch.object(workers, "MAX_WAIT", 0.3):
+                answer = workers.result(project, started["id"], wait=100_000)
+            self.assertEqual(answer["state"], "running")
+            self.assertLess(time.perf_counter() - began, 3.0)
+            workers.cancel(project, started["id"])
+
+    def test_removing_a_worktree_forgets_ours_and_never_prunes_the_users(self):
+        """Review 2026-09-03: `git worktree prune` after every removal pruned
+        the admin data of any missing worktree of the user's repository. A
+        worktree whose directory is already gone is forgotten by its own
+        entry; a stale entry that is not ours stays."""
+        import subprocess
+        with tempfile.TemporaryDirectory() as project, tempfile.TemporaryDirectory() as bin_dir, \
+             tempfile.TemporaryDirectory() as elsewhere:
+            subprocess.run(["git", "init", "-q", project], check=True)
+            subprocess.run(["git", "-C", project, "-c", "user.email=a@b", "-c", "user.name=a",
+                            "commit", "-q", "--allow-empty", "-m", "root"], check=True)
+            foreign = os.path.join(elsewhere, "theirs")
+            subprocess.run(["git", "-C", project, "worktree", "add", "--detach", "-q",
+                            foreign, "HEAD"], check=True)
+            import shutil
+            shutil.rmtree(foreign)
+            started = self._run(project, bin_dir,
+                                "echo $$ > \"$ANTIPHON_WORKER_DIR/child.pid\"; sleep 30",
+                                task_class="write")
+            self._child_pid(project, started["id"])
+            shutil.rmtree(workers.worker_dir(project, started["id"]))
+            listed = subprocess.run(["git", "-C", project, "worktree", "list", "--porcelain"],
+                                    capture_output=True, text=True).stdout
+            self.assertIn(started["id"], listed, "gone from disk, still on git's books")
+            self.assertIn("theirs", listed)
+            workers.cancel(project, started["id"])
+            listed = subprocess.run(["git", "-C", project, "worktree", "list", "--porcelain"],
+                                    capture_output=True, text=True).stdout
+            self.assertNotIn(started["id"], listed, "ours is forgotten")
+            self.assertIn("theirs", listed, "the user's stale worktree is not ours to prune")
 
     def test_cancel_on_a_finished_task_removes_its_directory(self):
         with tempfile.TemporaryDirectory() as project, tempfile.TemporaryDirectory() as bin_dir:

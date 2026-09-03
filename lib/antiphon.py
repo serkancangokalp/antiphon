@@ -19,6 +19,7 @@ Usage:
   antiphon sources compact     # retire aged gone sources proved safe by every reader
   antiphon retrieve <id>       # print one complete tool invocation (never its result)
   antiphon task delegate       # start a managed worker for one task (stdin JSON)
+  antiphon task list           # every task on record: id, kind, class, state, started
   antiphon task status|result|cancel <id> [wait]   # follow a delegated task by id
   antiphon --version           # the installed version (also -V, version)
 
@@ -6483,6 +6484,18 @@ def drop_attachment(cwd, path):
 RECEIPT_PATIENCE = 10 * 60
 
 
+def _worker_report(cwd):
+    """One line: the managed workers on record, by recorded state — this
+    reconciles nothing, so a worker that exited since its last `status` still
+    reads as running here; `antiphon task list` names each one."""
+    records = workers.tasks(cwd)
+    if not records:
+        return "Workers:            none"
+    counts = collections.Counter(record["state"] for record in records)
+    parts = [f"{counts[state]} {state}" for state in workers.STATES if counts[state]]
+    return "Workers:            " + ", ".join(parts) + " (as recorded; antiphon task list)"
+
+
 def _delivery_report(cwd, now=None):
     """The `status` line for the delivery ledger. A reader, never a writer.
 
@@ -7062,18 +7075,24 @@ TO_DESCRIPTION = ("Alias of the peer to send to. Required whenever the recipient
 DELEGATE_DESCRIPTION = (
     "Delegates one task to a worker of the other kind (or of a kind you name) "
     "and returns at once with a task id: a fresh `claude -p` / `codex exec` "
-    "session in this project, read-only by default, in a git worktree of its "
-    "own for a write task — or, with `to`, the task handed to a running named "
-    "peer over the ordinary addressed send. Every result names the worker; the "
-    "bridge never merges its work, never widens its permissions, and refuses a "
-    "delegation from a session already at the hop budget (ANTIPHON_HOP_BUDGET, "
-    "default 1). Collect with antiphon_task(id, \"result\", wait).")
+    "session, read-only by default, working in a detached git worktree of its "
+    "own at HEAD whenever this project is a checkout with a commit — for a read "
+    "task as for a write task, so it sees committed work and not your "
+    "uncommitted changes; in a plain directory a read task runs in the project "
+    "and a write task is refused. Or, with `to`, a read task handed to a running "
+    "named peer over the ordinary addressed send. Every result names the "
+    "worker; the bridge never merges its work, never widens its permissions, "
+    "and refuses a delegation from a session already at the hop budget "
+    "(ANTIPHON_HOP_BUDGET, default 1). Collect with antiphon_task(id, "
+    "\"result\", wait).")
 
 TASK_DESCRIPTION = (
     "The lifecycle of a delegated task by id: status, result (with a bounded "
     "wait and the evidence — log tail, a completed write task's diff and its "
-    "tests.txt), or cancel. Read-only except cancel; a task's record and the "
-    "worker's directory are swept a week after the task, never while it runs.")
+    "test summary), or cancel. Read-only except cancel; a task's record and the "
+    "worker's directory are swept a week after the task, never while it runs. "
+    "A handed task has no worker here: result and cancel are refused for it, "
+    "and only the peer can be told to stop.")
 
 RETRIEVE_DESCRIPTION = (
     "Read-only, write-free retrieval of the complete tool invocation named by a "
@@ -7134,10 +7153,13 @@ TOOLS = [{
                    "description": ("Hand the task to this running named peer of `kind` "
                                    "instead of starting a worker.")},
             "task": {"type": "string", "enum": ["read", "write"],
-                     "description": ("read (default): review, explain, search — the "
-                                     "worker runs in the project read-only. write: the "
-                                     "worker edits in a git worktree of its own and "
-                                     "returns a diff; nothing is merged.")},
+                     "description": ("read (default): review, explain, search — under "
+                                     "the host's read-only class, in the worker's own "
+                                     "worktree at HEAD (in the project itself only "
+                                     "when it is not a checkout). write: the worker "
+                                     "edits in its own worktree at HEAD and returns a "
+                                     "diff; nothing is merged, a commit is needed, and "
+                                     "it cannot be handed with `to`.")},
             "timeout": {"type": "integer",
                         "description": "Seconds before the worker is stopped (default 900, at most 3600)."},
         },
@@ -7153,8 +7175,9 @@ TOOLS = [{
             "action": {"type": "string", "enum": ["status", "result", "cancel"],
                        "description": ("status: the record now. result: the state and the "
                                        "evidence (log tail; a completed write task's diff "
-                                       "and tests.txt), after waiting up to `wait` seconds. "
-                                       "cancel: stop the worker and remove its directory.")},
+                                       "and test summary), after waiting up to `wait` seconds. "
+                                       "cancel: stop the worker and remove its directory — "
+                                       "refused for a handed task, which has no worker here.")},
             "wait": {"type": "integer",
                      "description": "For result: seconds to wait for the task to finish (0 to 300)."},
         },
@@ -8569,6 +8592,22 @@ def _update_codex_config(path, cwd):
     return True
 
 
+STORE_DIR = ".antiphon"
+STORE_IGNORE = "*\n"
+
+
+def _store_ignore_state(path):
+    """The store's `.gitignore` as it is: None when absent, else its text.
+    A directory or a link at that path is read as text that is not ours."""
+    if os.path.islink(path) or os.path.isdir(path):
+        return ""
+    try:
+        with open(path, encoding="utf-8", errors="replace") as f:
+            return f.read()
+    except FileNotFoundError:
+        return None
+
+
 def setup():
     cwd = project_dir()
     script = os.path.abspath(__file__)
@@ -8707,6 +8746,29 @@ def setup():
     install(local_target, local_mutate,
             "Claude MCP local permission updated",
             "Claude MCP local permission already up to date")
+
+    # --- the bridge's own store stays out of the user's commits ---
+    # `.antiphon/` holds the ledger, the cursors, parked words and a worker's
+    # detached worktree — an embedded repository `git add -A` would stage as
+    # a gitlink and `git clean -xdf` would destroy. One `*` under it keeps
+    # all of that unstaged; a `.gitignore` of the user's own there is theirs.
+    store_ignore = os.path.join(cwd, STORE_DIR, ".gitignore")
+    try:
+        current_ignore = _store_ignore_state(store_ignore)
+        if current_ignore is None:
+            os.makedirs(os.path.dirname(store_ignore), exist_ok=True)
+            with open(store_ignore, "w", encoding="utf-8") as f:
+                f.write(STORE_IGNORE)
+            print(f"✓ Bridge store ignored by git: {store_ignore}")
+        elif current_ignore == STORE_IGNORE:
+            print(f"· Bridge store already ignored by git: {store_ignore}")
+        else:
+            print(f"· {STORE_DIR}/.gitignore is yours and was left as is; it should keep "
+                  f"everything under {STORE_DIR}/ unstaged: {store_ignore}")
+    except OSError as error:
+        failures.append(store_ignore)
+        print(f"✗ {STORE_DIR}/.gitignore could not be written "
+              f"({error.strerror or type(error).__name__}): {store_ignore}", file=sys.stderr)
 
     def rules_text(path):
         """The rules file as it is: '' when absent, None — and a recorded
@@ -9001,6 +9063,7 @@ def status():
     print(f"Claude channel:     {channel}")
     print(attachment_report(cwd))
     print(_delivery_report(cwd))
+    print(_worker_report(cwd))
     print(_codex_census_line(live["codex"], identities))
     for line in _peer_report(displayed, identities):
         print(line)
@@ -11236,10 +11299,16 @@ def _delegate(cwd, payload, sender=None, side=None, env=None):
     if to and side is None:
         return False, ("not delegated: the command line cannot tell which kind you "
                        "are; pass side (claude or codex) beside to")
+    if to and task_class == "write":
+        return False, ("not delegated: a handed task has no worktree of its own, so a "
+                       "write task needs `kind` without `to`; a peer edits in its own "
+                       "checkout on its own terms")
     try:
         # The alias closes the road for a worker whose server cannot see its
         # hop: Codex forwards a curated environment, and the name is in it.
-        workers.check_hop(env, alias=sender)
+        # The command line knows no alias, but the worker's own environment
+        # names it (review 2026-09-03: the CLI road had no fail-closed).
+        workers.check_hop(env, alias=sender or env.get("ANTIPHON_NAME"))
     except workers.Refused as refusal:
         return False, str(refusal)
     sender_side = side or OTHER_SIDE[kind][0]
@@ -11301,9 +11370,8 @@ def _delegate(cwd, payload, sender=None, side=None, env=None):
         return True, {"task_id": task_id, "state": "handed", "to": to, "kind": kind,
                       "task_class": task_class, "text": words}
     try:
-        workers.admit(cwd)
-        record = workers.new_task(cwd, kind=kind, task_class=task_class, sha256=digest,
-                                  size=size, timeout=timeout, hop=hop)
+        record = workers.accept(cwd, kind=kind, task_class=task_class, sha256=digest,
+                                size=size, timeout=timeout, hop=hop)
     except (workers.Refused, ValueError, OSError) as error:
         return False, str(error) if isinstance(error, workers.Refused) else f"not delegated: {error}"
     try:
@@ -11359,26 +11427,48 @@ def _task_tool(cwd, arguments):
         wait = wait if isinstance(wait, (int, float)) and not isinstance(wait, bool) else 0
         # This server answers one request at a time; a long wait here would
         # hold antiphon_read and antiphon_send with it. Capped, and said.
-        answer = workers.result(cwd, task_id, min(wait, SERVER_WAIT_CAP))
+        try:
+            answer = workers.result(cwd, task_id, min(wait, SERVER_WAIT_CAP))
+        except workers.Refused as refusal:
+            return _tool_error(str(refusal))
         text = json.dumps(answer, indent=1, ensure_ascii=False)
         if answer and answer.get("state") not in workers.TERMINAL:
             text += (f"\n(still running; this server waits at most {SERVER_WAIT_CAP} s "
                      "per call — poll again)")
         return {"content": [{"type": "text", "text": text}]}
     if action == "cancel":
-        record = workers.cancel(cwd, task_id)
+        try:
+            record = workers.cancel(cwd, task_id)
+        except workers.Refused as refusal:
+            return _tool_error(str(refusal))
         return {"content": [{"type": "text", "text": json.dumps(record, indent=1)}]}
     return _tool_error("action must be status, result or cancel")
 
 
+def _task_lines(records):
+    """One line per task: id, kind, class, state, and when it started."""
+    lines = []
+    for record in records:
+        started = record["started_at"]
+        when = (time.strftime("%Y-%m-%dT%H:%M:%S", time.localtime(started))
+                if started else "-")
+        lines.append(f"{record['id']}  {record['kind']:<6} {record['task_class']:<5} "
+                     f"{record['state']:<9} {when}")
+    return lines
+
+
 def task(*args):
-    """`antiphon task delegate | status <id> | result <id> [wait] | cancel <id>`."""
-    usage = "task: delegate | status <id> | result <id> [wait] | cancel <id>"
+    """`antiphon task delegate | list | status <id> | result <id> [wait] | cancel <id>`."""
+    usage = "task: delegate | list | status <id> | result <id> [wait] | cancel <id>"
     action = args[0] if args else None
-    if action not in ("delegate", "status", "result", "cancel"):
+    if action not in ("delegate", "list", "status", "result", "cancel"):
         print(usage, file=sys.stderr)
         return 1
     cwd = project_dir()
+    if action == "list":
+        for line in _task_lines(workers.tasks(cwd)):
+            print(line)
+        return 0
     if action == "delegate":
         try:
             payload = json.load(sys.stdin)
@@ -11391,6 +11481,14 @@ def task(*args):
         # the CLI, which knows neither and asks the registry.
         side = payload.get("side") if payload.get("side") in OTHER_SIDE else None
         sender = payload.get("sender_alias") if side is not None else None
+        # A managed worker's name is in its environment; an alias it asserts
+        # on stdin that is not that name would put the hop check on another
+        # session's name (review 2026-09-03).
+        own = os.environ.get("ANTIPHON_NAME")
+        if workers.is_worker_name(own) and sender is not None and sender != own:
+            print(f"task: not delegated: this session is a managed worker ({own}); a "
+                  "sender_alias that is not its own name is not accepted", file=sys.stderr)
+            return 1
         ok, answer = _delegate(cwd, payload, sender, side, os.environ)
         if not ok:
             print(f"task: {answer}", file=sys.stderr)
@@ -11401,16 +11499,20 @@ def task(*args):
     if not isinstance(task_id, str) or workers.read_task(cwd, task_id) is None:
         print("task: unknown task id", file=sys.stderr)
         return 1
-    if action == "status":
-        answer = workers.status(cwd, task_id)
-    elif action == "result":
-        try:
-            wait = float(args[2]) if len(args) > 2 else 0.0
-        except ValueError:
-            wait = 0.0
-        answer = workers.result(cwd, task_id, wait)
-    else:
-        answer = workers.cancel(cwd, task_id)
+    try:
+        if action == "status":
+            answer = workers.status(cwd, task_id)
+        elif action == "result":
+            try:
+                wait = float(args[2]) if len(args) > 2 else 0.0
+            except ValueError:
+                wait = 0.0
+            answer = workers.result(cwd, task_id, wait)
+        else:
+            answer = workers.cancel(cwd, task_id)
+    except workers.Refused as refusal:
+        print(f"task: {refusal}", file=sys.stderr)
+        return 1
     print(json.dumps(answer, ensure_ascii=False))
     return 0
 

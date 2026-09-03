@@ -234,7 +234,7 @@ mkdir -p "$PROJECT"; (cd "$PROJECT" && git init -q)
 export ANTIPHON_CWD="$PROJECT"
 (cd "$PROJECT" && antiphon setup >/dev/null 2>&1) \
   && pass "setup exits 0" || fail "setup exited non-zero"
-for f in .claude/settings.json .claude/settings.local.json .codex/hooks.json .codex/config.toml .mcp.json CLAUDE.md AGENTS.md; do
+for f in .claude/settings.json .claude/settings.local.json .codex/hooks.json .codex/config.toml .mcp.json CLAUDE.md AGENTS.md .antiphon/.gitignore; do
   [ -f "$PROJECT/$f" ] && pass "setup wrote $f" || fail "setup did not write $f"
 done
 check "~/.codex/config.toml untouched" "$(shasum -a 256 "$HOME/.codex/config.toml" 2>/dev/null | cut -d' ' -f1)" "$CODEX_CONFIG_BEFORE"
@@ -368,7 +368,9 @@ pass "the second exact assistant marker landed on attempt $MARKER_ATTEMPT"
 # Stronger than "newest": this is the exact transcript whose assistant block
 # passed the second-marker predicate, and it is the only transcript T2 pushes.
 TRANSCRIPT="$MARKER_TRANSCRIPT"
-[ -d "$PROJECT/.antiphon" ] && pass "the hooks ran (.antiphon exists)" || fail "the hooks never ran"
+# `.antiphon/` itself is setup's now (its .gitignore); the hooks' own files say they ran.
+{ [ -f "$PROJECT/.antiphon/cursor.json" ] || [ -d "$PROJECT/.antiphon/sources" ]; } \
+  && pass "the hooks ran (.antiphon/cursor.json or sources/ exists)" || fail "the hooks never ran"
 e2e_once push || { fail "the T2 push stage attempted to run twice"; exit 1; }
 PUSH="$(printf '{"cwd":"%s","hook_event_name":"Stop","transcript_path":"%s","session_id":"%s"}' \
         "$PROJECT" "$TRANSCRIPT" "$(basename "$TRANSCRIPT" .jsonl)" | (cd "$PROJECT" && antiphon push codex 2>&1))"
@@ -386,17 +388,38 @@ else
 fi
 
 step "T3a — a managed worker: delegate one read task to a fresh codex exec, collect it by id"
+# A commit, so the worker gets the worktree road — the one a real checkout
+# takes — rather than the run-in-place road of a bare `git init`.
+(cd "$PROJECT" && git -c user.email=e2e@antiphon -c user.name=e2e commit -q --allow-empty -m root) \
+  && pass "the project has a commit for a worker's worktree" || fail "the empty root commit failed"
 DELEGATED="$(cd "$PROJECT" && printf '%s' '{"text":"Reply with exactly: WORKER-OK","kind":"codex","timeout":300}' | antiphon task delegate 2>/dev/null)" \
   && pass "antiphon task delegate exits 0" || fail "antiphon task delegate failed: $DELEGATED"
 contains "the answer names a fresh codex worker" "$DELEGATED" "to a fresh codex worker"
 TASK_ID="$(printf '%s' "$DELEGATED" | python3 -c 'import sys, json; print(json.load(sys.stdin)["task_id"])' 2>/dev/null)"
 RESULT="$(cd "$PROJECT" && antiphon task result "$TASK_ID" 240 2>&1)"
 contains "the worker completed within the wait" "$RESULT" '"state": "completed"'
+case "$RESULT" in *'"state": "completed"'*) : ;; *) (cd "$PROJECT" && antiphon task cancel "$TASK_ID" >/dev/null 2>&1) ;; esac
 contains "the result names the worker" "$RESULT" "worker-"
+contains "the read worker ran in a worktree of its own" "$RESULT" "workers/$TASK_ID/work\""
 WORKER_LOG="$PROJECT/.antiphon/workers/$TASK_ID/log"
 if [ -s "$WORKER_LOG" ]; then pass "the worker's log exists and is not empty"; else fail "no worker log at $WORKER_LOG"; fi
 contains "the worker answered in its own log" "$(cat "$WORKER_LOG" 2>/dev/null)" "WORKER-OK"
+# One real write task: the worker edits in its worktree, never the project,
+# and its diff is the evidence — bounded by the same wait as the read task.
+WRITE_DELEGATED="$(cd "$PROJECT" && printf '%s' '{"text":"Create a file named WORKER-WROTE.txt in the current directory containing the single line OK (nothing else), do not commit, then reply with exactly: WORKER-WROTE","kind":"codex","task":"write","timeout":300}' | antiphon task delegate 2>/dev/null)" \
+  && pass "a write task is delegated" || fail "the write delegation failed: $WRITE_DELEGATED"
+WRITE_ID="$(printf '%s' "$WRITE_DELEGATED" | python3 -c 'import sys, json; print(json.load(sys.stdin)["task_id"])' 2>/dev/null)"
+WRITE_RESULT="$(cd "$PROJECT" && antiphon task result "$WRITE_ID" 240 2>&1)"
+contains "the write worker completed within the wait" "$WRITE_RESULT" '"state": "completed"'
+case "$WRITE_RESULT" in *'"state": "completed"'*) : ;; *) (cd "$PROJECT" && antiphon task cancel "$WRITE_ID" >/dev/null 2>&1) ;; esac
+contains "its diff carries the file it made" "$WRITE_RESULT" "WORKER-WROTE.txt"
+contains "and the line it wrote" "$WRITE_RESULT" "+OK"
+if [ -e "$PROJECT/WORKER-WROTE.txt" ]; then fail "the write worker edited the project's own tree"; else pass "the write worker never touched the project's tree"; fi
+LISTED="$(cd "$PROJECT" && antiphon task list 2>&1)"
+contains "task list names the read task" "$LISTED" "$TASK_ID"
+contains "task list names the write task" "$LISTED" "$WRITE_ID"
 SWEPT="$(cd "$PROJECT" && ANTIPHON_NAME= antiphon status 2>&1)"; contains "status still runs with a task on file" "$SWEPT" "Deliveries:"
+contains "status counts the workers on record" "$SWEPT" "Workers:"
 
 step "T3 — Codex's first turn reads what the refused push could not carry"
 BEFORE_ROLLOUTS="$(mktemp)"; find "$HOME/.codex/sessions" -name 'rollout-*.jsonl' 2>/dev/null | sort > "$BEFORE_ROLLOUTS"

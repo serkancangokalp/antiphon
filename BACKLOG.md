@@ -1874,8 +1874,14 @@ a documented, configurable limit is exactly the shape the hop budget above takes
 
 `lib/workers.py` (the store, the adapters, start/status/result/cancel/sweep,
 the hop budget), `antiphon task`, `antiphon_delegate` and `antiphon_task` on
-both servers, the label `[Antiphon worker <kind>:<id>]` in every worker's prompt
-and its registry name `worker-<id8>` on the page, the sweep on the hook. Exit
+both servers, the label `[Antiphon worker <kind>:<id>]` in every worker's
+prompt, the sweep on the hook. A worker is followed by its task id — status,
+result, log — and not as a peer: its worktree carries the checkout and not the
+bridge's project-local hooks or MCP servers, so it registers nothing and
+appears on no page; it is started as `worker-<id8>` with `ANTIPHON_CWD` at the
+project, so any bridge call it does make lands in the project's store. Seeding
+the worktree with the bridge's configuration is the follow-up, not built — a
+fresh directory's hooks and servers need the host's own trust. Exit
 codes come from the worker's own exit file (a shell wrapper writes it; the
 asking process never started the worker), liveness from the pid and its start
 time, timeouts by SIGTERM then SIGKILL on the worker's session. Measured on
@@ -1900,6 +1906,31 @@ collected; the test summary path is named to the worker; a refusal on any
 road leaves no record; an oversized handed task is parked; the Codex
 server's result wait is capped and a tool fault is an error result, never
 the server's end; cancel and timeout are pinned by the worker's real death.
+
+Reviewed again 2026-09-03 at the release gate (the final-SHA pass), each
+finding verified and fixed: both tool descriptions said a read task runs in
+the project — in a checkout with a commit it runs in a worktree at HEAD, and
+the words on every surface now say so with the consequence (uncommitted work
+is not visible to it); the claim that a worker's hooks register it and the
+page names it was false — its worktree has no bridge configuration — and is
+withdrawn above, with `ANTIPHON_CWD` now the project rather than the
+throwaway worktree; the command line had no name-based fail-closed for the
+hop — it reads the worker's name from its own environment and refuses an
+alias asserted on stdin that is not that name; admission and the record were
+two steps, and eight concurrent delegations started seven workers past the
+cap of four — one locked step now, after reconciling what is recorded as
+running, so a worker that exited gives its slot back; the write worker's
+test summary was named beside the worktree, outside the root its sandbox
+binds it to — it lives inside, under a directory git ignores there; `cancel`
+on a handed task reported success and stopped nothing — refused, naming the
+peer, as is `result`, and a write task can no longer be handed; the worktree
+was forgotten by pruning every missing worktree of the user's repository —
+by its own entry now; a hop that is not a count read as hop 0 — refused; the
+forbidden list names the widening values beside the flags; `setup` writes
+`.antiphon/.gitignore` so the store and an embedded worktree are never
+staged; `antiphon task list` and a `Workers:` line in `status`; the E2E
+project has a commit, so the real `codex exec` worker runs in a worktree of
+its own, and a real write task returns the diff of what it made.
 
 No claim is made yet that a Claude worker can appear in Codex's native agent UI,
 or that a Codex worker can appear in Claude Code's native subagent UI. That UX
