@@ -2124,7 +2124,8 @@ class AntiphonTest(unittest.TestCase):
             with open(os.path.join(project, ".codex", "config.toml"),
                       encoding="utf-8") as f:
                 config = f.read()
-        self.assertIn('env_vars = ["ANTIPHON_NAME"]', config)
+        self.assertIn('env_vars = ["ANTIPHON_NAME", "ANTIPHON_HOP", "ANTIPHON_HOP_BUDGET"]',
+                      config)
 
     def test_setup_adds_the_forward_to_a_config_that_predates_it(self):
         """An existing install gets it on the next `setup`, exactly once."""
@@ -4170,7 +4171,7 @@ class ManagedWorkerToolTest(unittest.TestCase):
                  patch.object(antiphon, "claimed_alias", return_value="ui"):
                 code, out, err = self._task(project, ("delegate",),
                                             {"text": "review the diff", "kind": "codex",
-                                             "to": "build"})
+                                             "to": "build", "side": "claude"})
             self.assertEqual(code, 0, err)
             answer = json.loads(out)
             self.assertEqual(answer["state"], "handed")
@@ -4188,7 +4189,8 @@ class ManagedWorkerToolTest(unittest.TestCase):
             self.assertEqual((entry["to_kind"], entry["to_alias"], entry["sender_kind"]),
                              ("codex", "build", "claude"))
             code, _out, err = self._task(project, ("delegate",),
-                                         {"text": "x", "kind": "codex", "to": "build"})
+                                         {"text": "x", "kind": "codex", "to": "build",
+                                          "side": "claude"})
             self.assertEqual(code, 1, "no transport: refused")
 
     def test_status_result_and_cancel_by_id(self):
@@ -4260,6 +4262,110 @@ class ManagedWorkerToolTest(unittest.TestCase):
         self.assertIn("worker-1d5a03e0", text)
         self.assertLess(text.index("worker-1d5a03e0"), text.index("reviewed: fine"))
         self.assertIn("build", text)
+
+    # ---- review 2026-09-03 ----
+
+    def test_a_worker_whose_hop_its_server_cannot_see_may_not_delegate(self):
+        """Codex hands its MCP server a curated environment (measured: ten
+        variables and what the config names). A worker's name is forwarded;
+        without a visible hop that name alone closes the road."""
+        with tempfile.TemporaryDirectory() as project, tempfile.TemporaryDirectory() as bin_dir:
+            env = {"PATH": self._stub_path(bin_dir)}
+            with patch.dict(antiphon.os.environ, env, clear=False):
+                antiphon.os.environ.pop("ANTIPHON_HOP", None)
+                result = antiphon._delegate_tool(project, {"text": "x"}, "worker-abcdef12", "codex")
+            self.assertTrue(result.get("isError"), result)
+            self.assertIn("managed worker (worker-abcdef12) whose hop is not visible",
+                          result["content"][0]["text"])
+            self.assertEqual(workers.tasks(project), [])
+            with patch.dict(antiphon.os.environ, dict(env, ANTIPHON_HOP="1",
+                                                      ANTIPHON_HOP_BUDGET="2")):
+                result = antiphon._delegate_tool(project, {"text": "x"}, "worker-abcdef12", "codex")
+            self.assertIsNot(result.get("isError"), True, result)
+            for task_id in [t["id"] for t in workers.tasks(project)]:
+                workers.cancel(project, task_id)
+
+    def test_a_refused_hand_off_leaves_no_record(self):
+        with tempfile.TemporaryDirectory() as project:
+            with patch.object(antiphon, "send_to_codex", return_value=(
+                    False, antiphon._ClassifiedRefusal("not delivered: nobody", "no-peer"))), \
+                 patch.object(antiphon, "claimed_alias", return_value="ui"):
+                code, _out, err = self._task(project, ("delegate",),
+                                             {"text": "x", "kind": "codex", "to": "build",
+                                              "side": "claude"})
+            self.assertEqual(code, 1)
+            self.assertIn("task: not delegated: not delivered: nobody", err)
+            self.assertEqual(workers.tasks(project), [])
+            self.assertEqual(ledger.entries(project), [])
+
+    def test_an_oversized_handed_task_is_parked_like_any_direct_send(self):
+        text = "y" * 4_000
+        with tempfile.TemporaryDirectory() as project:
+            sends = []
+            with patch.object(antiphon, "send_to_codex",
+                              side_effect=lambda cwd, m, to=None, sender=None:
+                                  sends.append(m) or (True, "live")), \
+                 patch.object(antiphon, "_oversized_for_queue",
+                              side_effect=lambda message: len(message) > 500), \
+                 patch.object(antiphon, "claimed_alias", return_value="ui"):
+                code, out, err = self._task(project, ("delegate",),
+                                            {"text": text, "kind": "codex", "to": "build",
+                                             "side": "claude"})
+            self.assertEqual(code, 0, err)
+            self.assertIn(antiphon.ATTACHMENT_LABEL, sends[0])
+            self.assertIn("[Antiphon task", sends[0])
+            answer = json.loads(out)
+            entry = ledger.read_entry(project, answer["task_id"])
+            self.assertRegex(entry["attachment"], r"^[0-9a-f-]{36}\.txt$")
+            self.assertEqual(workers.read_task(project, answer["task_id"])["state"], "handed")
+
+    def test_the_cli_needs_a_side_to_hand_a_task(self):
+        with tempfile.TemporaryDirectory() as project, \
+             patch.object(antiphon, "send_to_codex", return_value=(True, "live")) as send:
+            code, _out, err = self._task(project, ("delegate",),
+                                         {"text": "x", "kind": "codex", "to": "build"})
+            self.assertEqual(code, 1)
+            self.assertIn("pass side", err)
+            send.assert_not_called()
+            self.assertEqual(workers.tasks(project), [])
+
+    def test_the_codex_servers_result_wait_is_capped(self):
+        """The Codex MCP server answers requests one at a time; a five-minute
+        wait would freeze antiphon_read for five minutes."""
+        with tempfile.TemporaryDirectory() as project:
+            record = workers.new_task(project, kind="codex", task_class="read", sha256="a" * 64,
+                                      size=1)
+            waits = []
+
+            def fake_result(cwd, task_id, wait=0):
+                waits.append(wait)
+                return {"state": "accepted"}
+            with patch.object(antiphon.workers, "result", side_effect=fake_result):
+                answer = antiphon._task_tool(project, {"id": record["id"], "action": "result",
+                                                       "wait": 300})
+            self.assertEqual(waits, [antiphon.SERVER_WAIT_CAP])
+            self.assertLessEqual(antiphon.SERVER_WAIT_CAP, 5)
+            self.assertIn("poll", answer["content"][0]["text"].lower())
+
+    def test_a_tool_that_raises_does_not_end_the_codex_server(self):
+        requests = [{"jsonrpc": "2.0", "id": 7, "method": "tools/call",
+                     "params": {"name": "antiphon_delegate", "arguments": {"text": "x"}}},
+                    {"jsonrpc": "2.0", "id": 8, "method": "tools/call",
+                     "params": {"name": "antiphon_task",
+                                "arguments": {"id": "nope", "action": "status"}}}]
+        out = io.StringIO()
+        with patch.object(antiphon.sys, "stdin",
+                          io.StringIO("".join(json.dumps(r) + "\n" for r in requests))), \
+             patch.object(antiphon, "_delegate_tool", side_effect=RuntimeError("boom")), \
+             contextlib.redirect_stdout(out), contextlib.redirect_stderr(io.StringIO()):
+            antiphon._mcp_serve("/tmp/project", "build")
+        answers = [json.loads(line) for line in out.getvalue().splitlines() if line.strip()]
+        self.assertEqual([a["id"] for a in answers], [7, 8], "the second request was answered")
+        self.assertTrue(answers[0]["result"].get("isError"))
+        self.assertIn("RuntimeError", answers[0]["result"]["content"][0]["text"])
+
+    def test_help_lists_task(self):
+        self.assertIn("antiphon task", antiphon.__doc__)
 
     def test_the_delegate_tool_defaults_the_kind_to_the_other_side(self):
         with tempfile.TemporaryDirectory() as project, tempfile.TemporaryDirectory() as bin_dir:
@@ -6184,6 +6290,23 @@ class DoctorTest(unittest.TestCase):
         self.assertTrue(line.startswith("✗ AGENTS.md: the Antiphon section is missing"), line)
         self.assertIn("run `antiphon setup`", line)
 
+    def test_doctor_names_a_config_without_the_worker_approvals(self):
+        """An install from before the worker tools pre-approves them: `setup`
+        writes the per-tool prompt and doctor names a config lacking it."""
+        project = self.project()
+        self.set_up(project)
+        path = os.path.join(project, ".codex", "config.toml")
+        with open(path, encoding="utf-8") as f:
+            config = f.read()
+        head = config.index("\n[mcp_servers.antiphon.tools.antiphon_delegate]")
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(config[:head] + "\n")
+        code, printed = self.run_doctor(project)
+        self.assertEqual(code, 1)
+        line = self.line_for(printed, "config.toml")
+        self.assertTrue(line.startswith("✗"), line)
+        self.assertIn("[mcp_servers.antiphon.tools.antiphon_delegate]", line)
+
     def test_doctor_notes_deliveries_without_a_receipt_after_ten_minutes(self):
         """Measured: a queued row sat in an open app-hosted thread for over an
         hour while the tool had said delivered. Doctor reads the ledger and
@@ -7524,13 +7647,20 @@ class SetupShapeCharacterizationTest(unittest.TestCase):
                          '[mcp_servers.antiphon]\n'
                          'command = "antiphon"\n'
                          'args = ["mcp"]\n'
-                         '# read-only local bridge; no need to ask on every turn\n'
+                         '# the read tools need no prompt; the two worker tools below do\n'
                          'default_tools_approval_mode = "approve"\n'
-                         '# forwarded, not set: the peer name comes from the terminal that\n'
-                         '# started this session, and Codex does not pass it down otherwise\n'
-                         'env_vars = ["ANTIPHON_NAME"]\n'
+                         '# forwarded, not set: the peer name and the hop come from the\n'
+                         '# terminal (or the worker) that started this session, and Codex\n'
+                         '# does not pass them down otherwise\n'
+                         'env_vars = ["ANTIPHON_NAME", "ANTIPHON_HOP", "ANTIPHON_HOP_BUDGET"]\n'
                          '\n[mcp_servers.antiphon.env]\n'
-                         f'ANTIPHON_CWD = "{project}"\n')
+                         f'ANTIPHON_CWD = "{project}"\n'
+                         '\n[mcp_servers.antiphon.tools.antiphon_delegate]\n'
+                         '# starts a process of the other kind; asks first\n'
+                         'approval_mode = "prompt"\n'
+                         '\n[mcp_servers.antiphon.tools.antiphon_task]\n'
+                         '# may stop one; asks first\n'
+                         'approval_mode = "prompt"\n')
 
     def test_setup_writes_the_whole_mcp_channel_entry(self):
         """`args = ["channel"]`, not `["mcp"]`: the two servers hand out

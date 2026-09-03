@@ -581,10 +581,28 @@ class ShippedContractTest(unittest.TestCase):
         both rules, both servers' tool descriptions, the BACKLOG and the
         spec agree on the tools, the bound and the rule."""
         readme = read("README.md")
+        self.assertRegex(readme, r"a diff the\s+bridge never\s+applies")
+        self.assertRegex(readme, r"\[Antiphon worker\s+<kind>:<id>\]")
         for words in ("### Managed workers", "`antiphon_delegate(", "`antiphon_task(",
-                      "never\napplies", "ANTIPHON_HOP_BUDGET", "antiphon task delegate",
-                      "[Antiphon worker <kind>:<id>]", "never a host-native subagent"):
+                      "ANTIPHON_HOP_BUDGET", "antiphon task delegate",
+                      "`--permission-mode plan`"):
             self.assertIn(words, readme, words)
+        # Prose wraps: every multi-word phrase is pinned across whitespace.
+        for phrase in ("never a host-native subagent", "asked to keep",
+                       "stopped at its timeout by the next"):
+            self.assertRegex(readme, r"\s+".join(phrase.split()), phrase)
+        self.assertRegex(readme, r"asks? first", "the Codex side's two process tools prompt")
+        self.assertNotIn("runs at most an hour", readme)
+        self.assertNotIn("runs read-only in the project", readme)
+        spec = read("docs", "superpowers", "specs", "2026-09-03-managed-workers-design.md")
+        self.assertIn("`kind` names the worker's kind", spec,
+                      "the spec says the rule the code implements, not the one it replaced")
+        self.assertNotIn("Both → refused", spec)
+        config = antiphon._codex_config_block("/p")
+        self.assertIn("[mcp_servers.antiphon.tools.antiphon_delegate]\n", config)
+        self.assertIn("[mcp_servers.antiphon.tools.antiphon_task]\n", config)
+        self.assertEqual(config.count('approval_mode = "prompt"'), 2)
+        self.assertIn('env_vars = ["ANTIPHON_NAME", "ANTIPHON_HOP", "ANTIPHON_HOP_BUDGET"]', config)
         for rule in (antiphon.AGENTS_RULE, antiphon.CLAUDE_RULE):
             self.assertIn("`antiphon_delegate`", rule)
             self.assertIn("`antiphon_task`", rule)

@@ -386,7 +386,7 @@ else
 fi
 
 step "T3a — a managed worker: delegate one read task to a fresh codex exec, collect it by id"
-DELEGATED="$(cd "$PROJECT" && printf '%s' '{"text":"Reply with exactly: WORKER-OK","kind":"codex","timeout":300}' | antiphon task delegate 2>&1)" \
+DELEGATED="$(cd "$PROJECT" && printf '%s' '{"text":"Reply with exactly: WORKER-OK","kind":"codex","timeout":300}' | antiphon task delegate 2>/dev/null)" \
   && pass "antiphon task delegate exits 0" || fail "antiphon task delegate failed: $DELEGATED"
 contains "the answer names a fresh codex worker" "$DELEGATED" "to a fresh codex worker"
 TASK_ID="$(printf '%s' "$DELEGATED" | python3 -c 'import sys, json; print(json.load(sys.stdin)["task_id"])' 2>/dev/null)"

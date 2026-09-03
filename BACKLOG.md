@@ -1876,6 +1876,24 @@ macOS: a zombie session leader makes `killpg(pgid, 0)` answer EPERM, read as
 gone. Not in the MVP: native subagent UI on either host, resume, native worker
 APIs — the portable contract is the task id, the lifecycle and the evidence.
 
+Reviewed 2026-09-03 by an independent read-only pass (five Critical, seven
+Important), each verified and fixed: the hop budget did not reach a Codex
+worker's server (Codex forwards only the variables its config names) — the
+config now forwards `ANTIPHON_HOP`/`ANTIPHON_HOP_BUDGET` and a worker whose
+server cannot see its hop is refused on its name alone; a claude read task ran
+under the parent's own permission mode in the parent's tree — read tasks run
+under `--permission-mode plan` and, in a checkout, in a worktree of their own;
+the diff was taken against the index (blind to staged and committed work,
+and shipping the bridge's own files for loose work) — it is taken against the
+recorded base, and the bridge's files sit beside the worktree, never inside
+it; the Codex server's blanket tool approval covered the two process tools —
+they ask first; the hook's sweep could spend ten seconds per stuck worker —
+it sends the signals and moves on; a result without its evidence is not
+collected; the test summary path is named to the worker; a refusal on any
+road leaves no record; an oversized handed task is parked; the Codex
+server's result wait is capped and a tool fault is an error result, never
+the server's end; cancel and timeout are pinned by the worker's real death.
+
 No claim is made yet that a Claude worker can appear in Codex's native agent UI,
 or that a Codex worker can appear in Claude Code's native subagent UI. That UX
 would be optional integration work; the portable contract is Antiphon's own
