@@ -56,7 +56,10 @@ host's own bookkeeping:
 - A Codex user record beginning `# AGENTS.md instructions for ` whose text
   carries a complete `<INSTRUCTIONS>` fence is a host record.
 - A Codex assistant record beginning `[external_agent_tool_call: NAME]` renders
-  as a name-only tool line (`external agent: NAME`), never as `Codex:` speech;
+  as a name-only tool line (`external agent: NAME`), never as `Codex:` speech
+  (outcome, 2026-09-03: the relay is filtered whole — the measured shape
+  carried nothing a reader could act on, and BACKLOG keeps the measurement;
+  the name-only line was not built);
   `[external_agent_tool_result]` is a tool output and stays filtered, exactly as
   every other output does. No arguments, no results, no id (nothing retrievable
   backs it).
@@ -83,7 +86,9 @@ measured reason, and the entry says so.
 **2c. Shorter agent surfaces.** `CLAUDE_RULE`, `AGENTS_RULE` and the channel
 `instructions` keep every fact the contract tests pin and lose the
 implementation narrative (v4 adoption, lanes, compaction journal, manifest
-retention) that belongs in README. Target: each under 3,000 bytes.
+retention) that belongs in README. Target: each under 3,000 bytes. (Outcome:
+not reached — the pinned contract facts alone fill about 4.5 KB; the measured
+sizes and the ceilings are in BACKLOG's token-cost entry.)
 
 **2d. Doctor sees rule drift.** `CLAUDE.md`/`AGENTS.md` whose Antiphon section
 differs from the generated rule is `✗ … run antiphon setup`, like the missing

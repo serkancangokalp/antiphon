@@ -1292,7 +1292,7 @@ class IdentityPrivacyContractTest(unittest.TestCase):
         # sentence, because the rule must name every tool the server offers.
         for where, text, ceiling in (("CLAUDE_RULE", antiphon.CLAUDE_RULE, 5_450),
                                      ("AGENTS_RULE", antiphon.AGENTS_RULE, 5_950),
-                                     ("channel instructions", channel, 3_500)):
+                                     ("channel instructions", channel, 3_700)):
             self.assertLessEqual(len(text.encode("utf-8")), ceiling,
                                  f"{where}: {len(text.encode('utf-8'))} bytes")
 

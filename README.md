@@ -8,7 +8,7 @@ With one terminal per side there is nothing to configure beyond `antiphon setup`
 
 ## How it works
 
-No shared log is kept. Both CLIs already write their own transcripts; Antiphon reads and derives from them, recording which messages each peer has already seen. An unnamed peer keeps its cursor at `.antiphon/cursor.json`; a named one owns `.antiphon/peers/<side>-<name>/cursor.json`, so two sessions on the same side never advance each other's place. Every direct send leaves one small file on a delivery ledger at `.antiphon/deliveries/<id>.json` — who sent, to whom, over what, the words' digest and never the words — kept for a week, two for an entry with a notice its sender has not heard; receipts come from the peer's own transcript, read by the same reader that builds the pull page, which never looks behind the 24-hour page horizon, so a receipt older than that is never seen and `status` says so. An automatic Claude identity also records which session its owner runs now, one small file per owner under `.antiphon/identity/claude/`, named from a digest rather than from anything about the session. `doctor` reports that a proof could not be read or could not be trusted without naming the file; this is the directory it means, and removing the unreadable one costs nothing — the next turn writes it again.
+No shared log is kept. Both CLIs already write their own transcripts; Antiphon reads and derives from them, recording which messages each peer has already seen. An unnamed peer keeps its cursor at `.antiphon/cursor.json`; a named one owns `.antiphon/peers/<side>-<name>/cursor.json`, so two sessions on the same side never advance each other's place. Every direct send leaves one small file on a delivery ledger at `.antiphon/deliveries/<id>.json` — who sent, to whom, over what, the words' digest — and, for a refused line, its first 60 characters so the sender can recognise it; never the words otherwise — kept for a week, two for an entry with a notice its sender has not heard; receipts come from the peer's own transcript, read by the same reader that builds the pull page, which never looks behind the 24-hour page horizon, so a receipt older than that is never seen and `status` says so. An automatic Claude identity also records which session its owner runs now, one small file per owner under `.antiphon/identity/claude/`, named from a digest rather than from anything about the session. `doctor` reports that a proof could not be read or could not be trusted without naming the file; this is the directory it means, and removing the unreadable one costs nothing — the next turn writes it again.
 
 ### Pull — shared context, no wake
 
@@ -66,10 +66,13 @@ A tool result says what happened and no more. `reply_to_codex` answers
 *queued* — `codex queue` accepted a row, and Codex reads it at its next turn
 — and `antiphon_send` answers *delivered* to Claude's channel; neither is
 the peer reading the words. The receipt is the peer's own transcript showing
-the message, and `antiphon status` reports what is awaiting a receipt, what
-was received and what was refused. A `@codex` or `@claude` line the Stop hook
-could not deliver is reported on the sender's next page, with the reason,
-because the hook's own refusal reaches a debug log and not the agent.
+the message — a delivery to a named peer is credited only from that peer's
+transcript, a bare one from any transcript of its kind — and `antiphon status`
+reports what is awaiting a receipt, what was received and what was refused. A
+`@codex` or `@claude` line the Stop hook could not deliver is reported on the
+sender's next page, with the reason (at most eight notices per page, the rest
+on the following turns; a reason is kept to 400 characters), because the
+hook's own refusal reaches a debug log and not the agent.
 
 ### Managed workers — one task, one worker of the other kind
 
@@ -266,7 +269,13 @@ Codex hooks once when Codex first shows them.
     cd /your/project && antiphon setup
 
 Re-running `setup` migrates hooks and instruction blocks written by older
-versions in place; it never creates duplicates.
+versions in place; it never creates duplicates. An Antiphon section written
+before 0.5.0 has no end marker: `setup` rewrites it up to the end of the
+wording that version shipped and nothing after, so notes and headings of your
+own below it stay; a section that ends no known way, holds a heading of your
+own, or appears twice is left alone, and `setup` and `doctor` print the same
+remedy. Until `setup` is re-run, a `.codex/config.toml` from before 0.5.0
+still pre-approves every tool, the worker tools included; `doctor` names it.
 
 A long-lived bridge server keeps the code it loaded, so an upgrade on disk
 runs beside sessions still using the old reader for a while. That is safe in
@@ -409,8 +418,9 @@ newest-file fallback to masquerade as project completeness.
 A page never carries a record older than 24 hours before the newest complete
 record the other side wrote in any of its sources — one moment for the whole
 reader, never later than the wall clock, so a source that stopped more than a
-day before that newest record is skipped whole and a record stamped in the
-future cannot move the horizon. A reader that fell further behind skips to
+day before that newest record is skipped whole — unless its records carry no
+readable time, which are read rather than skipped on the strength of records
+before them — and a record stamped in the future cannot move the horizon. A reader that fell further behind skips to
 that point: the page says `skipped: N raw bytes of … activity older than 24
 hours …` once, where it happened, `status` counts what the next page will
 skip, and the transcripts keep what was skipped. Measured before the horizon existed, a
@@ -546,8 +556,9 @@ byte for byte as the environment grows, measured here from 1,044,820 down to
 and an exec the kernel refuses for any other reason comes back as a named
 refusal instead of a traceback.
 
-A parked file has a read receipt: the peer's own transcript shows the tool
-call that read it, and the reader that already walks that transcript records
+A parked file has a read receipt: the named recipient's own transcript shows
+the tool call that read it — another peer of the same kind opening the file is
+not the receipt — and the reader that already walks that transcript records
 the receipt on the delivery ledger under `.antiphon/deliveries/`. A file with
 a read receipt is collected one hour after the read; a file without one waits
 out the 7 days and then expires unread, and its sender hears that on its next

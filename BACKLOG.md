@@ -27,12 +27,13 @@ recovered) is closed by the `process_birth` sibling, the two-way
 
 **Token cost** (2026-09-03): host records are no longer rendered as speech,
 the page has a 24-hour horizon relative to the other side's newest record,
-the agent surfaces are a third smaller, and doctor sees a stale rule section
+the agent surfaces are about a quarter smaller, and doctor sees a stale rule section
 — see *P1 — Token cost of the passive page and the static surfaces*.
 
 **Delivery truth** (2026-09-03): every direct send is on a ledger under
 `.antiphon/deliveries/`, `reply_to_codex` says queued and never delivered,
-receipts come from the peer's own transcript, a refused Stop marker and an
+receipts come from the named recipient's own transcript (a bare delivery's
+from any transcript of its kind), a refused Stop marker and an
 attachment that expired unread are reported on the sender's next page, a
 bare-reply refusal names the last unanswered sender, and `status`/`doctor`
 read the ledger — see *P1 — `reply_to_codex` can report success while the
@@ -768,8 +769,19 @@ closing it needs the acknowledgement protocol below.
 
 ### Closed 2026-09-03, with the delivery ledger
 
-- **Acknowledgement** is a read receipt from the peer's own transcript: the
-  reader that already walks it reports a tool call naming
+- **Two limits, measured and left.** A receipt that sits in the reader-side
+  skipped span (a transcript more than a day behind the other side's newest
+  record) is never seen on that road; the sender's own-transcript road is
+  horizon-independent, and `status`/`doctor` say "sent before the page
+  horizon without a receipt". The ledger is scanned linearly on every hook —
+  about 0.9 s at 10,000 entries, measured by the release-gate review — and is
+  bounded by the seven-day TTL rather than by a cache; a project that sends
+  hundreds of direct messages a day will feel it before anything else does.
+- **Acknowledgement** is a read receipt from the named recipient's own
+  transcript — a bare delivery's from any transcript of its kind; the reader's
+  name comes from its session record, live or not, and an unknown reader
+  credits bare deliveries only — the reader that already walks it reports a
+  tool call naming
   `.antiphon/messages/<uuid>.txt`, and the ledger entry for that delivery
   gets `read_at`. The sweep collects a read file `ATTACHMENT_READ_GRACE`
   (3,600 s) after the receipt; a file with no receipt waits out the TTL as
@@ -2093,13 +2105,19 @@ section now closes with `SECTION_END`, so a rewrite keeps the notes a person
 appended after it, and `doctor` says what a rewrite of an older, unmarked
 section replaces.
 
-**The surfaces shrank by a third.** `CLAUDE_RULE`, `AGENTS_RULE` and the
-channel instructions keep every fact the contract tests pin and lose the
+**The surfaces shrank by about a quarter.** `CLAUDE_RULE`, `AGENTS_RULE` and
+the channel instructions keep every fact the contract tests pin and lose the
 implementation narrative (v4 cursor keys, the v3 sibling, lanes, compaction),
-which now lives in README and this file only: 4,740 / 5,338 / 3,183 bytes,
-with ceilings pinned at 5,000 / 5,500 / 3,500 so they cannot regrow unnoticed.
-The 3,000 the campaign aimed for was not reachable without dropping pinned
-contract facts, which fill about 4.5 KB on their own. On 2026-09-03 the delivery-truth review asked for one clause the recipient acts on — "or 1 hour after the bridge sees it read" — and the ceilings moved by 100 bytes each for it (CLAUDE_RULE 5,100, AGENTS_RULE 5,600); the measured sizes are 5,013 and 5,533.
+which now lives in README and this file only. The two rules went from 7,354 /
+8,120 bytes to 4,740 / 5,338 in this phase's first cut; the delivery-truth
+review then asked for one clause the recipient acts on ("or 1 hour after the
+bridge sees it read"), the same-vendor and managed-worker phases added a
+sentence each, and the release-gate review found the channel instructions
+naming neither worker tool. At 0.5.0 they measure 5,335 / 5,936 / 3,627
+bytes, with ceilings pinned at 5,450 / 5,950 / 3,700 in `test_contracts`, so
+they cannot regrow unnoticed. The 3,000
+the campaign aimed for was not reachable without dropping pinned contract
+facts, which fill about 4.5 KB on their own.
 
 **Doctor sees rule drift.** `CLAUDE.md` and `AGENTS.md` whose Antiphon
 section is missing or differs from the generated rule are `✗ … run
