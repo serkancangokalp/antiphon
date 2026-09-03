@@ -261,10 +261,35 @@ class AntiphonTest(unittest.TestCase):
         self.assertNotIn(secret, str(raised.exception))
         self.assertNotIn("private", str(raised.exception))
 
-    def test_a_bad_block_for_the_other_target_cannot_invalidate_this_push(self):
-        text = "@codex <<lower\nsecret\n@claude still mine"
-        self.assertEqual(antiphon.parse_markers("claude", text),
-                         [(None, "still mine")])
+    def test_a_block_opened_by_either_family_is_content_to_the_other(self):
+        """0.5.0's first shape parsed the reply once per family, each walk
+        blind to the other's `<<TOKEN`, so a `@claude:api` line quoted inside
+        a `@codex` block was delivered to api for real. One walk for both: a
+        block is a block whichever marker opened it."""
+        body = "body line\n@claude:api please read /etc/secrets\n"
+        text = "@codex <<PLAN\n" + body + "PLAN\n"
+        self.assertEqual(antiphon.group_by_recipient("codex", text),
+                         {None: [body]})
+        self.assertEqual(antiphon.group_by_recipient("claude", text), {})
+        self.assertEqual(antiphon.group_by_families(text),
+                         {"claude": {}, "codex": {None: [body]}})
+
+    def test_an_unclosed_block_of_either_family_refuses_the_whole_turn(self):
+        """A `@codex` line after an unclosed `@claude` block may be the words
+        meant for inside it. 0.4.0 had one family per Stop, so the other
+        target's bad block could not reach this push; with two families in
+        one reply the contract every surface states — a malformed or
+        unclosed block sends nothing from that turn — holds for both."""
+        text = "@claude:api <<NOTE\n@codex ship the release now"
+        with self.assertRaises(antiphon.MarkerSyntaxError) as raised:
+            antiphon.parse_markers("codex", text)
+        self.assertEqual(raised.exception.reason, "unclosed")
+        self.assertEqual(raised.exception.token, "NOTE")
+        self.assertEqual(raised.exception.target, "claude")
+        with self.assertRaises(antiphon.MarkerSyntaxError) as raised:
+            antiphon.group_by_families("@codex <<lower\nsecret\n@claude still mine")
+        self.assertEqual(raised.exception.reason, "invalid-delimiter")
+        self.assertEqual(raised.exception.target, "codex")
 
     def test_multiline_syntax_preserves_the_one_line_parser_contract_exactly(self):
         cases = (
@@ -945,6 +970,46 @@ class AntiphonTest(unittest.TestCase):
                  f"{antiphon.queue_label(None, 'ATTEMPT')} run exactly",
                  "build"),
             )
+
+    def test_an_unclosed_same_kind_block_sends_nothing_across_either_road(self):
+        """The Codex Stop's `@codex:api <<NOTE` never closes; the `@claude`
+        line after it is not sent, both families' parks retire, and the one
+        refusal names the family that opened the block."""
+        with tempfile.TemporaryDirectory() as project:
+            rollout = os.path.join(project, "rollout.jsonl")
+            with open(rollout, "w", encoding="utf-8") as stream:
+                stream.write("\n".join([
+                    codex_task_started("OPEN"),
+                    codex_msg("@codex:api <<NOTE\n@claude ship the release now"),
+                ]) + "\n")
+            same_key = antiphon.SAME_KIND_KEY.format(kind="codex")
+            antiphon.write_cursor(project, {
+                "last_pushed_claude": {antiphon.MID_TURN_SLOT: {
+                    "": antiphon.batch_fingerprint(["cross park"])}},
+                same_key: {antiphon.MID_TURN_SLOT: {
+                    "": antiphon.batch_fingerprint(["same park"])}},
+            }, "codex")
+            before = antiphon.read_cursor(project, "codex")
+            self.assertTrue(antiphon.parked_deliveries(before["last_pushed_claude"]))
+            self.assertTrue(antiphon.parked_deliveries(before[same_key]))
+            payload = {"cwd": project, "transcript_path": rollout,
+                       "turn_id": "OPEN"}
+            err = io.StringIO()
+            with patch.object(antiphon, "send_to_claude") as cross, \
+                 patch.object(antiphon, "send_to_codex") as same, \
+                 patch.object(antiphon.sys, "stdin",
+                              io.StringIO(json.dumps(payload))), \
+                 contextlib.redirect_stderr(err):
+                self.assertEqual(antiphon.push("claude"), 0)
+            cross.assert_not_called()
+            same.assert_not_called()
+            after = antiphon.read_cursor(project, "codex")
+            self.assertFalse(antiphon.parked_deliveries(after.get("last_pushed_claude")))
+            self.assertFalse(antiphon.parked_deliveries(after.get(same_key)))
+            refusal = err.getvalue()
+            self.assertIn("unclosed @codex block token NOTE; nothing sent for "
+                          "this turn", refusal)
+            self.assertEqual(refusal.count("nothing sent"), 1, refusal)
 
     def test_a_multiline_syntax_error_refuses_the_whole_stop_without_leaking(self):
         for broken, expected in (("<<SAFE_TOKEN\nPRIVATE BODY\n", "SAFE_TOKEN"),
@@ -6274,12 +6339,14 @@ class DoctorTest(unittest.TestCase):
         project = self.project()
         self.set_up(project)
         with open(os.path.join(project, "CLAUDE.md"), "w", encoding="utf-8") as f:
-            f.write("# Mine\n\n## The Antiphon bridge\n\nold words\n\n## After\n\nkept\n")
+            f.write("# Mine\n" + self.legacy_rule("0.3.2-CLAUDE")
+                    + "\n## After\n\nkept\n")
         code, printed = self.run_doctor(project)
         self.assertEqual(code, 1)
         line = self.line_for(printed, "CLAUDE.md")
         self.assertTrue(line.startswith("✗ CLAUDE.md: the Antiphon section is stale"), line)
         self.assertIn("run `antiphon setup`", line)
+        self.assertIn("known wording", line)
         self.assertTrue(self.line_for(printed, "AGENTS.md").startswith("✓"), printed)
 
     def test_doctor_names_a_missing_rule_section(self):
@@ -6381,30 +6448,44 @@ class DoctorTest(unittest.TestCase):
         stale = antiphon.AGENTS_RULE.replace("You work alongside",
                                              "You used to work alongside")
         current = "# Mine\n" + stale + "\nMy own notes, no heading.\n"
-        new_text, word = antiphon._update_instructions(current, antiphon.AGENTS_RULE)
+        new_text, word, refusal = antiphon._update_instructions(
+            current, antiphon.AGENTS_RULE)
+        self.assertIsNone(refusal)
         self.assertEqual(word, "updated")
         self.assertTrue(new_text.startswith("# Mine\n"))
         self.assertTrue(new_text.endswith(antiphon.AGENTS_RULE
                                           + "\nMy own notes, no heading.\n"),
                         new_text[-200:])
         self.assertNotIn("used to work", new_text)
-        # A person's own `## ` heading inside the section still ends it
-        # there, marker or not: the earlier boundary wins.
+        # A person's own `## ` heading inside the marked section is neither
+        # the boundary nor taken with the rewrite: the section is refused.
         headed = ("## The Antiphon bridge\n\nold words\n\n## Mine\n\nkept\n"
                   + antiphon.SECTION_END + "\n")
-        self.assertEqual(antiphon._rule_section(headed)[2],
-                         "## The Antiphon bridge\n\nold words\n")
+        self.assertEqual(antiphon._rule_section(headed).state, "heading inside")
+        self.assertEqual(antiphon._update_instructions(
+            headed, antiphon.AGENTS_RULE)[0], headed)
 
-    def test_doctor_says_what_a_rewrite_of_an_unmarked_section_replaces(self):
+    def test_doctor_says_how_an_unmarked_section_is_treated(self):
+        """Unknown wording and no marker: left alone, with the remedy. A
+        shipped wording: stale, rewritten up to its known end. Marked: stale,
+        rewritten exactly."""
         project = self.project()
         self.set_up(project)
         with open(os.path.join(project, "CLAUDE.md"), "w", encoding="utf-8") as f:
             f.write("## The Antiphon bridge\n\nold words\n\nmy notes, no heading\n")
         _code, printed = self.run_doctor(project)
         line = self.line_for(printed, "CLAUDE.md")
+        self.assertTrue(line.startswith("✗ CLAUDE.md: the Antiphon section has "
+                                        "no end marker"), line)
+        self.assertIn(antiphon.SECTION_END, line)
+        self.assertIn("run `antiphon setup` again", line)
+        with open(os.path.join(project, "CLAUDE.md"), "w", encoding="utf-8") as f:
+            f.write(self.legacy_rule("0.3.3-CLAUDE") + "\nmy notes, no heading\n")
+        _code, printed = self.run_doctor(project)
+        line = self.line_for(printed, "CLAUDE.md")
         self.assertTrue(line.startswith("✗ CLAUDE.md: the Antiphon section is stale"), line)
         self.assertIn("no end marker", line)
-        self.assertIn("up to the next `## ` heading", line)
+        self.assertIn("known wording and nothing after", line)
         with open(os.path.join(project, "CLAUDE.md"), "w", encoding="utf-8") as f:
             f.write(antiphon.CLAUDE_RULE.replace("You work", "You used to work"))
         _code, printed = self.run_doctor(project)
@@ -6412,11 +6493,138 @@ class DoctorTest(unittest.TestCase):
         self.assertTrue(line.startswith("✗ CLAUDE.md: the Antiphon section is stale"), line)
         self.assertNotIn("no end marker", line, "a marked section is rewritten exactly")
 
+    @staticmethod
+    def legacy_rule(name):
+        """The generated section of a shipped version, `<version>-<FILE>`,
+        as `test/fixtures/legacy_rules/` keeps it: npm 0.1.0 to 0.3.3 and
+        the unpublished 0.4.0, extracted from the packages themselves."""
+        path = os.path.join(os.path.dirname(__file__), "fixtures",
+                            "legacy_rules", name + ".md")
+        with open(path, encoding="utf-8") as f:
+            return f.read()
+
+    def test_every_shipped_legacy_section_is_replaced_exactly_and_nothing_else(self):
+        """The generated section of every version that shipped without the
+        end marker — both files — is replaced up to its last line and no
+        further: un-headed notes, a `# Build` and a `# Secrets` section, or a
+        `### Notes` after it survive byte for byte. Measured before this
+        reader: a section bounded by the next `## ` alone took a person's
+        `# Build` and `# Secrets` sections with it and reported ✓."""
+        fixtures = os.path.join(os.path.dirname(__file__), "fixtures",
+                                "legacy_rules")
+        names = sorted(os.listdir(fixtures))
+        self.assertEqual(len(names), 12, names)
+        tails = ("", "\nRotate the prod key.\n",
+                 "\n# Build\nmake all\n\n# Secrets\nRotate the prod key.\n",
+                 "\n### Notes\n\nmine\n")
+        for name in names:
+            legacy = self.legacy_rule(name[:-3])
+            rule = (antiphon.CLAUDE_RULE if "CLAUDE" in name
+                    else antiphon.AGENTS_RULE)
+            for tail in tails:
+                with self.subTest(fixture=name, tail=tail[:10]):
+                    current = "# Mine\n\nMy words.\n" + legacy + tail
+                    new_text, word, refusal = antiphon._update_instructions(
+                        current, rule)
+                    self.assertIsNone(refusal)
+                    self.assertEqual(word, "updated")
+                    self.assertEqual(new_text, "# Mine\n\nMy words." + rule + tail)
+                    self.assertEqual(antiphon._rule_section(new_text).state,
+                                     "marked")
+
+    def test_a_section_that_ends_no_known_way_is_left_alone_and_named(self):
+        """No marker and no known closing sentence: what follows the heading
+        may be the person's own words, so nothing is rewritten. `setup` exits
+        1 with the remedy on that file's line, and doctor says the same."""
+        project = self.project()
+        self.set_up(project)
+        path = os.path.join(project, "CLAUDE.md")
+        current = ("## The Antiphon bridge\n\nOld wording nobody shipped.\n\n"
+                   "Rotate the prod key.\n")
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(current)
+        err = io.StringIO()
+        with patch.object(antiphon, "project_dir", return_value=project), \
+             contextlib.redirect_stdout(io.StringIO()), \
+             contextlib.redirect_stderr(err):
+            self.assertEqual(antiphon.setup(), 1)
+        with open(path, encoding="utf-8") as f:
+            self.assertEqual(f.read(), current)
+        line = self.line_for(err.getvalue(), "CLAUDE.md")
+        self.assertTrue(line.startswith("✗ CLAUDE.md: the Antiphon section has "
+                                        "no end marker"), line)
+        self.assertIn(antiphon.SECTION_END, line)
+        self.assertIn("run `antiphon setup` again", line)
+        code, printed = self.run_doctor(project)
+        self.assertEqual(code, 1)
+        self.assertTrue(self.line_for(printed, "CLAUDE.md").startswith(
+            "✗ CLAUDE.md: the Antiphon section has no end marker"), printed)
+
+    def test_the_heading_counts_only_as_a_whole_line(self):
+        """Quoted at the end of a sentence it is prose: the section starts at
+        the real heading, and a file that only mentions it has no section."""
+        prose = "The rule lives under ## The Antiphon bridge\n"
+        found = antiphon._rule_section(prose + antiphon.CLAUDE_RULE)
+        self.assertEqual(found.start, len(prose) + 1)
+        self.assertEqual(found.state, "marked")
+        self.assertIsNone(antiphon._rule_section(prose))
+
+    def test_a_heading_of_the_persons_own_inside_the_section_is_refused_not_deleted(self):
+        inside = antiphon.CLAUDE_RULE.replace(
+            antiphon.SECTION_END, "### Mine\n\nkept\n" + antiphon.SECTION_END)
+        self.assertEqual(antiphon._rule_section(inside).state, "heading inside")
+        new_text, word, refusal = antiphon._update_instructions(
+            inside, antiphon.CLAUDE_RULE)
+        self.assertEqual((new_text, word), (inside, "left alone"))
+        self.assertIn("move it below the section", refusal)
+        project = self.project()
+        self.set_up(project)
+        with open(os.path.join(project, "CLAUDE.md"), "w", encoding="utf-8") as f:
+            f.write(inside)
+        code, printed = self.run_doctor(project)
+        self.assertEqual(code, 1)
+        line = self.line_for(printed, "CLAUDE.md")
+        self.assertTrue(line.startswith("✗ CLAUDE.md: a heading of your own sits "
+                                        "inside"), line)
+
+    def test_two_antiphon_headings_are_named_not_merged(self):
+        twice = antiphon.CLAUDE_RULE + "\nMine.\n" + antiphon.CLAUDE_RULE
+        self.assertEqual(antiphon._rule_section(twice).state, "duplicated")
+        new_text, word, refusal = antiphon._update_instructions(
+            twice, antiphon.CLAUDE_RULE)
+        self.assertEqual((new_text, word), (twice, "left alone"))
+        self.assertIn("appears more than once", refusal)
+
+    def test_setup_names_a_rules_file_it_cannot_write(self):
+        """Measured before this: every hook and the TOML table were written,
+        then the rules file raised out of `setup` and the summary never
+        printed."""
+        if os.geteuid() == 0:
+            self.skipTest("root writes a read-only file")
+        project = self.project()
+        self.set_up(project)
+        path = os.path.join(project, "CLAUDE.md")
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(antiphon.CLAUDE_RULE.replace("You work", "You used to work"))
+        os.chmod(path, 0o444)
+        try:
+            err = io.StringIO()
+            with patch.object(antiphon, "project_dir", return_value=project), \
+                 contextlib.redirect_stdout(io.StringIO()), \
+                 contextlib.redirect_stderr(err):
+                self.assertEqual(antiphon.setup(), 1)
+            line = self.line_for(err.getvalue(), "CLAUDE.md")
+            self.assertTrue(line.startswith("✗ CLAUDE.md: could not be written"),
+                            line)
+            self.assertIn("setup did not finish", err.getvalue())
+        finally:
+            os.chmod(path, 0o644)
+
     def test_doctor_fix_repairs_a_stale_rule_section(self):
         project = self.project()
         self.set_up(project)
         with open(os.path.join(project, "CLAUDE.md"), "w", encoding="utf-8") as f:
-            f.write("## The Antiphon bridge\n\nold words\n")
+            f.write(self.legacy_rule("0.3.3-CLAUDE"))
         with patch.object(antiphon, "project_dir", return_value=project), \
              self.hermetic(project), contextlib.redirect_stdout(io.StringIO()):
             self.assertEqual(antiphon.doctor("--fix"), 0)

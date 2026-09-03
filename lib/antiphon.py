@@ -136,9 +136,11 @@ class MarkerSyntaxError(ValueError):
     attempted token is kept on the exception a caller will print.
     """
 
-    def __init__(self, reason, token=None):
+    def __init__(self, reason, token=None, target=None):
         self.reason = reason
         self.token = token if reason == "unclosed" else None
+        # The family whose marker opened the block, for the refusal line.
+        self.target = target
         if self.token is None:
             message = "invalid multi-line marker delimiter"
         else:
@@ -178,34 +180,54 @@ def _marker_physical_lines(text):
         start = end + 1
 
 
-def _marker_records(target, text):
-    """Parse one-line and explicit delimited marker records atomically."""
+def _all_marker_records(text, families=MARKER_SIDES):
+    """[(family, alias, message)] for every marker family, in one walk.
+
+    One walk for both families rather than one per family: a `<<TOKEN` block
+    is consumed whole whichever family opened it, so a marker-looking line in
+    its body is content to the other family as well, and an unclosed or
+    malformed block refuses the whole turn for both. Two independent walks —
+    the shape 0.5.0 first shipped — handed a block's body to the other
+    family's parser, which delivered the quoted line for real.
+    """
     lines = list(_marker_physical_lines(text or ""))
     found, index = [], 0
     while index < len(lines):
         _piece, content = lines[index]
-        marker = _marker_line(target, content)
-        if marker is None:
+        hit = None
+        for family in families:
+            marker = _marker_line(family, content)
+            if marker is not None:
+                hit = family, marker
+                break
+        if hit is None:
             index += 1
             continue
-        alias, message = marker
+        family, (alias, message) = hit
         if not message.startswith("<<"):
-            found.append((alias, message))
+            found.append((family, alias, message))
             index += 1
             continue
         opener = MARKER_BLOCK.fullmatch(message)
         if opener is None:
-            raise MarkerSyntaxError("invalid-delimiter")
+            raise MarkerSyntaxError("invalid-delimiter", target=family)
         token = opener.group("token")
         body, closing = [], index + 1
         while closing < len(lines) and lines[closing][1] != token:
             body.append(lines[closing][0])
             closing += 1
         if closing == len(lines):
-            raise MarkerSyntaxError("unclosed", token)
-        found.append((alias, "".join(body)))
+            raise MarkerSyntaxError("unclosed", token, target=family)
+        found.append((family, alias, "".join(body)))
         index = closing + 1
     return found
+
+
+def _marker_records(target, text):
+    """Parse one-line and explicit delimited marker records atomically."""
+    return [(alias, message)
+            for family, alias, message in _all_marker_records(text)
+            if family == target]
 
 
 def parse_markers(target, text):
@@ -232,6 +254,15 @@ def group_by_recipient(target, text):
     for alias, message in parse_markers(target, text):
         batches.setdefault(alias, []).append(message)
     return batches
+
+
+def group_by_families(text):
+    """{family: group_by_recipient(family, text)} for both families.
+
+    Each family's grouping is a full walk of the text, so the block another
+    family opened is a block here too; one syntax failure raises for both.
+    """
+    return {family: group_by_recipient(family, text) for family in MARKER_SIDES}
 
 
 def batch_fingerprint(messages):
@@ -5130,39 +5161,51 @@ def push(target="codex"):
     # can retire through the same compare-and-clear helper as a markerless Stop
     # without creating a second cursor mutation rule.
     side = sender_side(target)
-    code = _push_batches(cwd, side, target, f"last_pushed_{target}", reply_text,
+    cross_key = f"last_pushed_{target}"
+    same_key = SAME_KIND_KEY.format(kind=side)
+    # One reading of the reply for both families. A block opened by either
+    # marker is consumed whole for both, and a malformed or unclosed block
+    # sends nothing from this turn on either road: the words after it may be
+    # the ones meant for inside it.
+    try:
+        grouped = group_by_families(reply_text)
+    except MarkerSyntaxError as failure:
+        family = failure.target or target
+        if failure.reason == "unclosed":
+            print(f"antiphon: unclosed @{family} block token {failure.token}; "
+                  "nothing sent for this turn", file=sys.stderr)
+        else:
+            print(f"antiphon: invalid multi-line @{family} marker delimiter; "
+                  "nothing sent for this turn", file=sys.stderr)
+        held = read_cursor(cwd, side)
+        code = _retire_park(cwd, side, cross_key,
+                            parked_deliveries(held.get(cross_key)))
+        same = _retire_park(cwd, side, same_key,
+                            parked_deliveries(held.get(same_key)))
+        return code or same
+    code = _push_batches(cwd, side, target, cross_key, grouped[target],
                          turn_key, input_data)
-    # The same transcript, read once more for the same-kind marker —
-    # `@claude:name` in a Claude reply, `@codex:name` in a Codex one — under a
-    # key of its own. Its refusals are reported like every Stop refusal and
-    # never change the cross-kind outcome above.
-    same = _push_batches(cwd, side, side, SAME_KIND_KEY.format(kind=side),
-                         reply_text, turn_key, input_data)
+    # The same reading's same-kind family — `@claude:name` in a Claude reply,
+    # `@codex:name` in a Codex one — under a key of its own. Its refusals are
+    # reported like every Stop refusal and never change the cross-kind
+    # outcome above.
+    same = _push_batches(cwd, side, side, same_key, grouped[side],
+                         turn_key, input_data)
     return code or same
 
 
-def _push_batches(cwd, side, target, key, reply_text, turn_key, input_data):
-    """One marker family of one Stop: parse, refuse, deliver, record.
+def _push_batches(cwd, side, target, key, grouped, turn_key, input_data):
+    """One marker family of one Stop: refuse, deliver, record.
 
-    `target == side` is the same-kind pass. A bare same-kind marker and the
-    sender's own alias are refused before any transport is touched: a
-    same-kind line without a name has no meaning, and a session does not
-    write to itself. Both refusals go on the ledger, so the sender's next
-    page says them — the Stop hook's own stderr does not reach the agent.
+    `grouped` is this family's share of the one parse `push` made of the
+    reply; the parse and its syntax refusal live there, once for both
+    families. `target == side` is the same-kind pass. A bare same-kind
+    marker and the sender's own alias are refused before any transport is
+    touched: a same-kind line without a name has no meaning, and a session
+    does not write to itself. Both refusals go on the ledger, so the sender's
+    next page says them — the Stop hook's own stderr does not reach the agent.
     """
     same_kind = target == side
-    try:
-        grouped = group_by_recipient(target, reply_text)
-    except MarkerSyntaxError as failure:
-        if failure.reason == "unclosed":
-            print(f"antiphon: unclosed @{target} block token {failure.token}; "
-                  "nothing sent for this turn", file=sys.stderr)
-        else:
-            print(f"antiphon: invalid multi-line @{target} marker delimiter; "
-                  "nothing sent for this turn", file=sys.stderr)
-        held = read_cursor(cwd, side).get(key)
-        return _retire_park(cwd, side, key, parked_deliveries(held))
-
     batches = {}
     for recipient, messages in grouped.items():
         # Reported per line, not per recipient: a batch holding one empty marker
@@ -8060,10 +8103,47 @@ def hook_installed(data, shape):
 
 
 SECTION_HEADING = "## The Antiphon bridge"
-# Closes the generated section. Without it the section runs to the next `## `
+# Closes the generated section. Before it existed the section ran to the next `## `
 # heading or the end of the file, and a rewrite takes whatever a person
 # appended after it — their own notes — along with the stale words.
 SECTION_END = "<!-- antiphon: end of the generated section -->"
+# The heading counts only as a whole line: quoted mid-sentence it is prose.
+SECTION_HEADING_LINE = re.compile(r"(?m)^" + re.escape(SECTION_HEADING)
+                                  + r"[ \t]*\r?$")
+ANY_HEADING_LINE = re.compile(r"(?m)^#{1,6}[ \t]")
+# The closing sentence of every generated section shipped before the end
+# marker existed — npm 0.1.0 to 0.3.3 and the unpublished 0.4.0 — newest
+# first, because a newer wording carries an older one in its middle. A
+# section without the marker is rewritten only up to the end of the line
+# holding the newest of these it contains; a section that ends no known way
+# is left alone and named, because what follows may be the person's own words.
+LEGACY_SECTION_FOOTERS = (
+    "while an oversized `@codex` line is not parked — it is refused, and its "
+    "words travel with your visible reply through the passive pages instead.",
+    "while an oversized `@claude` line is not parked — it is refused, and its "
+    "words travel with your visible reply through the passive pages instead.",
+    "and one that exists unseen is why a bare message to Codex is refused.",
+    "a session without a name is live but unaddressable, and nothing can be "
+    "sent back to it.",
+    "Use the `reply_to_codex` tool to answer them.",
+    "only that line is sent to the running Claude session as an MCP Channel "
+    "event.",
+)
+RuleSection = collections.namedtuple("RuleSection", "start end text state")
+# A section in one of these states is never rewritten. The sentence is the
+# remedy, and setup and doctor print the same one.
+SECTION_REFUSALS = {
+    "unbounded": ("the Antiphon section has no end marker and does not end "
+                  "with a wording setup knows, so it was left alone — put the "
+                  f"line `{SECTION_END}` after its last Antiphon paragraph, or "
+                  "delete the section, then run `antiphon setup` again"),
+    "heading inside": ("a heading of your own sits inside the Antiphon "
+                       "section, so it was left alone — move it below the "
+                       "section, then run `antiphon setup` again"),
+    "duplicated": ("the Antiphon heading appears more than once, so nothing "
+                   "was rewritten — keep one section, then run `antiphon "
+                   "setup` again"),
+}
 
 TOOL_RETRIEVAL_RULE = (
     "Every compact tool-call line carries a content-bound `tc1` id: the "
@@ -8475,42 +8555,74 @@ def _add_hook(hooks, command, legacy_commands=None, label=None):
     return True
 
 
+def _legacy_footer_end(current, body_start):
+    """Offset just past the line holding the newest known closing sentence
+    after `body_start`, or None. Whitespace-tolerant: a person's editor may
+    have re-wrapped the paragraph."""
+    for footer in LEGACY_SECTION_FOOTERS:
+        pattern = re.compile(r"\s+".join(re.escape(word)
+                                        for word in footer.split()))
+        match = pattern.search(current, body_start)
+        if match:
+            newline = current.find("\n", match.end())
+            return len(current) if newline == -1 else newline + 1
+    return None
+
+
 def _rule_section(current):
-    """`(start, end, section)` of the Antiphon section in a rules file, or
-    None when the heading is absent. One reader for the writer and doctor: a
-    diagnostic holding its own idea of where the section ends is the drift
-    this arrangement exists to prevent."""
-    heading = SECTION_HEADING
-    start = current.find(heading)
-    if start == -1:
+    """The Antiphon section of a rules file as a `RuleSection`, or None when
+    the heading is absent. One reader for the writer and doctor: a diagnostic
+    holding its own idea of where the section ends is the drift this
+    arrangement exists to prevent.
+
+    `state` is `marked` (ends at its own marker), `legacy` (no marker; ends
+    after a known closing sentence), or one of `SECTION_REFUSALS` — a section
+    the writer must not touch, with `end` None and `text` running to the end
+    of the file. The heading is matched as a whole line, and a heading of any
+    level inside the section, or a second Antiphon heading, is a refusal:
+    the words the rewrite would take are somebody's own. Measured before this
+    reader: an unanchored heading and a `## `-only boundary let `setup` and
+    `doctor --fix` replace a person's `# Build` and `# Secrets` sections
+    with the rule and report ✓."""
+    matches = list(SECTION_HEADING_LINE.finditer(current))
+    if not matches:
         return None
-    ends = []
-    marker = current.find(SECTION_END, start + len(heading))
+    start, body_start = matches[0].start(), matches[0].end()
+    if len(matches) > 1:
+        return RuleSection(start, None, current[start:], "duplicated")
+    marker = current.find(SECTION_END, body_start)
     if marker != -1:
         after = marker + len(SECTION_END)
-        ends.append(after + 1 if current[after:after + 1] == "\n" else after)
-    next_heading = current.find("\n## ", start + len(heading))
-    if next_heading != -1:
-        ends.append(next_heading)
-    end = min(ends) if ends else -1
-    section = current[start:] if end == -1 else current[start:end]
-    return start, end, section
+        end = after + 1 if current[after:after + 1] == "\n" else after
+        state = ("heading inside"
+                 if ANY_HEADING_LINE.search(current, body_start, marker)
+                 else "marked")
+        return RuleSection(start, end, current[start:end], state)
+    end = _legacy_footer_end(current, body_start)
+    if end is None:
+        return RuleSection(start, None, current[start:], "unbounded")
+    if ANY_HEADING_LINE.search(current, body_start, end):
+        return RuleSection(start, None, current[start:], "heading inside")
+    return RuleSection(start, end, current[start:end], "legacy")
 
 
 def _update_instructions(current, rule):
-    """Adds the Antiphon section, or edits it in place if it's stale.
+    """`(text, status word, refusal)`: adds the Antiphon section, or edits it
+    in place if it's stale; `refusal` is the remedy sentence when the section
+    is in a state the writer must not touch, and the text is then unchanged.
 
     Just checking the heading and skipping wasn't enough: when the rule text
     changed, the old text stayed put and kept telling the agent something no
     longer true."""
     found = _rule_section(current)
     if found is None:
-        return current + rule, "added"
-    start, end, old_section = found
-    if old_section.strip() == rule.strip():
-        return current, "already up to date"
-    tail = "" if end == -1 else current[end:]
-    return current[:start].rstrip("\n") + rule + tail, "updated"
+        return current + rule, "added", None
+    if found.state in SECTION_REFUSALS:
+        return current, "left alone", SECTION_REFUSALS[found.state]
+    if found.text.strip() == rule.strip():
+        return current, "already up to date", None
+    tail = current[found.end:]
+    return current[:found.start].rstrip("\n") + rule + tail, "updated", None
 
 
 # Matches `[table]` and `[[table]]` headers, capturing the name between them.
@@ -8734,10 +8846,21 @@ def setup():
         current = rules_text(target)
         if current is None:
             continue
-        new_text, status_word = _update_instructions(current, rule)
+        new_text, status_word, refusal = _update_instructions(current, rule)
+        if refusal:
+            failures.append(target)
+            print(f"✗ {name}: {refusal}", file=sys.stderr)
+            continue
         if new_text != current:
-            with open(target, "w", encoding="utf-8") as f:
-                f.write(new_text)
+            try:
+                with open(target, "w", encoding="utf-8") as f:
+                    f.write(new_text)
+            except OSError as error:
+                failures.append(target)
+                print(f"✗ {name}: could not be written "
+                      f"({error.strerror or type(error).__name__})",
+                      file=sys.stderr)
+                continue
         print(f"{'✓' if new_text != current else '·'} {name} rule {status_word}: {target}")
 
     print("\n— One last step: Codex hooks need a one-time security approval.")
@@ -8754,9 +8877,9 @@ def setup():
     print("  terminals; a bare send is refused when more than one candidate is live.")
     if failures:
         listed = "\n  ".join(failures)
-        print(f"\n✗ setup did not finish. {len(failures)} file(s) were left untouched "
-              f"because they could not be read:\n  {listed}\n"
-              "  Fix or move them, then run `antiphon setup` again.", file=sys.stderr)
+        print(f"\n✗ setup did not finish. {len(failures)} file(s) were left untouched; "
+              f"the line above each says why:\n  {listed}\n"
+              "  Fix them, then run `antiphon setup` again.", file=sys.stderr)
         return 1
     return 0
 
@@ -9721,13 +9844,17 @@ def _doctor_config(report, cwd, states):
         if found is None:
             report.bad(f"{name}: the Antiphon section is missing — run "
                        "`antiphon setup`")
-        elif found[2].strip() != rule.strip():
-            # A section from before the end marker is rewritten through the
-            # next `## ` heading, notes appended to it included; said once,
-            # here, where the person decides.
-            legacy = ("" if SECTION_END in found[2] else
-                      " (a section this old has no end marker, so the rewrite "
-                      "replaces everything up to the next `## ` heading)")
+        elif found.state in SECTION_REFUSALS:
+            # The same sentence setup prints: the section is the person's to
+            # sort out, and this is where they decide.
+            report.bad(f"{name}: {SECTION_REFUSALS[found.state]}")
+        elif found.text.strip() != rule.strip():
+            # A section from before the end marker is rewritten up to the end
+            # of its known wording and no further; said once, here.
+            legacy = ("" if found.state == "marked" else
+                      " (a section this old has no end marker; the rewrite "
+                      "replaces it up to the end of its known wording and "
+                      "nothing after)")
             report.bad(f"{name}: the Antiphon section is stale — run "
                        f"`antiphon setup`{legacy}")
         else:
