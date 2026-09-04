@@ -1005,6 +1005,16 @@ class LifecycleTest(unittest.TestCase):
             time.sleep(0.05)
         self.fail(f"never {wanted}: {workers.read_task(project, task_id)}")
 
+    def _inline_wrapper(self, *args, **kwargs):
+        """Run protocol units without draining the test runner's process group.
+
+        A real wrapper is its own process-group leader.  These inline tests
+        deliberately exercise marker and descriptor behavior in the unittest
+        process instead; descendant drainage has separate subprocess tests.
+        """
+        with patch.object(workers, "_drain_adapter_group", return_value=True):
+            return workers._worker_wrapper(*args, **kwargs)
+
     def _legacy_record(self, task_id=None, **changes):
         record = {
             "version": workers.LEGACY_TASK_VERSION,
@@ -1681,7 +1691,7 @@ class LifecycleTest(unittest.TestCase):
 
             with patch.object(workers, "_write_worker_exit",
                               side_effect=exit_while_locked):
-                code = workers._worker_wrapper(
+                code = self._inline_wrapper(
                     lock_fd, gate_read, ready_write, commit_read,
                     exit_file, ["/usr/bin/true"], proof=PROOF)
 
@@ -1733,7 +1743,7 @@ class LifecycleTest(unittest.TestCase):
 
             with patch.object(workers, "_write_live_marker",
                               side_effect=interrupt_terminal_write):
-                code = workers._worker_wrapper(
+                code = self._inline_wrapper(
                     lock_fd, gate_read, ready_write, commit_read,
                     exit_file, ["/usr/bin/true"], proof=PROOF)
 
@@ -1767,7 +1777,7 @@ class LifecycleTest(unittest.TestCase):
 
             with patch.object(workers, "_write_worker_exit",
                               side_effect=interrupt_before_publication):
-                code = workers._worker_wrapper(
+                code = self._inline_wrapper(
                     lock_fd, gate_read, ready_write, commit_read,
                     exit_file, ["/usr/bin/true"], proof=PROOF)
 
@@ -1824,7 +1834,7 @@ class LifecycleTest(unittest.TestCase):
 
             with patch.object(workers, "_write_worker_exit",
                               side_effect=OSError("mirror unavailable")):
-                code = workers._worker_wrapper(
+                code = self._inline_wrapper(
                     lock_fd, gate_read, ready_write, commit_read,
                     os.path.join(directory, "exit"), ["/usr/bin/true"],
                     proof=PROOF)
@@ -1858,7 +1868,7 @@ class LifecycleTest(unittest.TestCase):
                 " try: os.fstat(int(raw)); out.append('open')\n"
                 " except OSError: out.append('closed')\n"
                 "open(sys.argv[1], 'w').write(','.join(out))\n")
-            code = workers._worker_wrapper(
+            code = self._inline_wrapper(
                 lock_fd, gate_read, ready_write, commit_read, exit_file,
                 [sys.executable, "-c", script, observed,
                  str(lock_fd), str(gate_read), str(ready_write), str(commit_read)],
@@ -2248,12 +2258,37 @@ class LifecycleTest(unittest.TestCase):
             self.assertEqual(len(workers._admitted(project)), 1)
 
     def test_malformed_group_process_state_never_proves_group_death(self):
-        malformed = subprocess.CompletedProcess(
-            args=["ps"], returncode=0,
-            stdout="4242 4242 Zombie\n", stderr="")
-        with patch.object(workers.subprocess, "run", return_value=malformed):
-            self.assertIsNone(workers._group_members(4242))
-            self.assertEqual(workers._group_process_liveness(4242), "unknown")
+        for row in ("4242 4242 Zombie\n", "4242 4242\n"):
+            malformed = subprocess.CompletedProcess(
+                args=["ps"], returncode=0, stdout=row, stderr="")
+            with self.subTest(row=row), \
+                 patch.object(workers.subprocess, "run",
+                              return_value=malformed):
+                self.assertIsNone(workers._group_members(4242))
+                self.assertEqual(
+                    workers._group_process_liveness(4242), "unknown")
+
+    def test_an_unrelated_group_with_no_usable_state_does_not_hide_absence(self):
+        """A row whose PGID is provably elsewhere cannot describe our group.
+
+        Process churn may leave an unrelated row without a usable state.  Its
+        parseable, different PGID is still enough to exclude it without
+        weakening the fail-closed rule for malformed or target-group rows.
+        """
+        cases = (
+            ("4343 4343 ?\n4242 4242 S\n", [(4242, "S")]),
+            ("4343 4343\n", []),
+        )
+        for row, expected in cases:
+            snapshot = subprocess.CompletedProcess(
+                args=["ps"], returncode=0, stdout=row, stderr="")
+            with self.subTest(row=row), \
+                 patch.object(workers.subprocess, "run",
+                              return_value=snapshot):
+                self.assertEqual(workers._group_members(4242), expected)
+                self.assertEqual(
+                    workers._group_process_liveness(4242),
+                    "live" if expected else "dead")
 
     def test_adapter_drain_tolerates_one_unreadable_process_snapshot(self):
         """A transient `ps` failure must not abandon descendants and leave
@@ -4972,7 +5007,11 @@ workers.start(sys.argv[1], workers.read_task(sys.argv[1], sys.argv[2]), "x")
                 before = time.monotonic()
                 result = workers._git(
                     project, "worktree", "add", "--detach", "-q", work,
-                    "HEAD", timeout=1.0, lease_fd=lease)
+                    # The elapsed assertion below detects waiting for the
+                    # detached pipe owner.  Give the direct Git process its
+                    # ordinary scheduling budget so host load is not mistaken
+                    # for that pipe-ownership defect.
+                    "HEAD", timeout=5.0, lease_fd=lease)
                 elapsed = time.monotonic() - before
 
                 self.assertIsNotNone(result)

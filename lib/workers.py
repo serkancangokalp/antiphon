@@ -2123,9 +2123,10 @@ def _group_process_liveness(pgid):
 def _group_members(pgid):
     """The bounded process-table members of one group, or None if unreadable.
 
-    Only a completely parsed successful snapshot can prove an empty group.
-    Silently skipping a schema-drifted row turns unknown process-table state
-    into false absence and can publish a terminal worker outcome too early.
+    Every row must identify a positive pid and process group.  Once a row's
+    process group is proved different, its state is irrelevant to this group;
+    target-group rows still need a fully valid state before the snapshot can
+    prove liveness or absence.
     """
     if pgid is None:
         return []
@@ -2146,17 +2147,19 @@ def _group_members(pgid):
         if not line:
             continue
         pieces = line.split(None, 2)
-        if len(pieces) != 3:
+        if len(pieces) < 2:
             return None
         try:
             member_pid, member_group = int(pieces[0]), int(pieces[1])
         except ValueError:
             return None
-        if (member_pid <= 0 or member_group <= 0
-                or PROCESS_STATE.fullmatch(pieces[2]) is None):
+        if member_pid <= 0 or member_group <= 0:
             return None
-        if member_group == pgid:
-            members.append((member_pid, pieces[2]))
+        if member_group != pgid:
+            continue
+        if len(pieces) != 3 or PROCESS_STATE.fullmatch(pieces[2]) is None:
+            return None
+        members.append((member_pid, pieces[2]))
     return members
 
 
