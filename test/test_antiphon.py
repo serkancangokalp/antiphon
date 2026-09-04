@@ -4437,14 +4437,14 @@ class ManagedWorkerToolTest(unittest.TestCase):
             for task_id in ids:
                 self._task(project, ("cancel", task_id))
 
-    def test_delegate_refuses_falsy_explicit_task_classes_before_any_side_effect(self):
+    def test_delegate_refuses_explicit_invalid_kind_and_task_before_any_side_effect(self):
         """Only an absent task defaults to read.  A present invalid value must
         not be normalised after the Node wrapper has already bound its expected
         response to that value: doing so can start or hand off work which the
         wrapper then reports as an invalid, retryable response.
         """
         with tempfile.TemporaryDirectory() as project:
-            for task_class in ("", False, 0):
+            for task_class in (None, "", False, 0):
                 ok = detail = None
                 with self.subTest(task_class=task_class), \
                      patch.object(
@@ -4458,6 +4458,20 @@ class ManagedWorkerToolTest(unittest.TestCase):
                 self.assertFalse(ok)
                 self.assertEqual(detail,
                                  "not delegated: task must be read or write")
+            for kind in (None, "", False, 0):
+                ok = detail = None
+                with self.subTest(kind=kind), \
+                     patch.object(
+                         antiphon.workers, "new_task",
+                         side_effect=AssertionError("invalid kind reached storage")):
+                    ok, detail = antiphon._delegate(
+                        project,
+                        {"text": "review the diff", "kind": kind,
+                         "task": "read"},
+                        side="claude", env={})
+                self.assertFalse(ok)
+                self.assertEqual(
+                    detail, "not delegated: name a kind (claude or codex)")
             self.assertEqual(workers.tasks(project), [])
             self.assertEqual(ledger.entries(project), [])
 
@@ -4880,6 +4894,46 @@ class ManagedWorkerToolTest(unittest.TestCase):
         self.assertEqual(answer["tracking"], "incomplete")
         self.assertEqual(answer["state"], "handing")
         self.assertEqual(retained["state"], "handing")
+        self.assertIn("do not retry automatically", answer["text"])
+
+    def test_an_unexpected_post_transport_readback_still_returns_a_safe_state(self):
+        """A successful handed write followed by a mismatched read and then a
+        failed tracking transition must remain a structured do-not-retry
+        result.  Returning the durable ``handed`` state beside incomplete keys
+        makes Node reject work the peer may already be doing.
+        """
+        real_update = antiphon.workers.update_task
+        real_read = antiphon.workers.read_task
+        updates = 0
+
+        def hand_then_fail(cwd, task_id, mutate):
+            nonlocal updates
+            updates += 1
+            if updates == 1:
+                return real_update(cwd, task_id, mutate)
+            return False
+
+        def mismatched_handed(cwd, task_id):
+            record = real_read(cwd, task_id)
+            if record is not None and record["state"] == "handed":
+                return dict(record, task_class="write")
+            return record
+
+        with tempfile.TemporaryDirectory() as project, \
+             patch.object(antiphon, "send_to_codex", return_value=(True, "live")), \
+             patch.object(antiphon.workers, "update_task",
+                          side_effect=hand_then_fail), \
+             patch.object(antiphon.workers, "read_task",
+                          side_effect=mismatched_handed):
+            ok, answer = antiphon._delegate(
+                project, {"text": "look", "kind": "codex", "to": "build"},
+                sender="ui", side="claude")
+
+        self.assertTrue(ok, "transport succeeded; a caller must not retry")
+        self.assertEqual(updates, 2)
+        self.assertEqual(answer["state"], "tracking_incomplete")
+        self.assertIn(answer["state"], antiphon.INCOMPLETE_HANDOFF_STATES)
+        self.assertEqual(answer["tracking"], "incomplete")
         self.assertIn("do not retry automatically", answer["text"])
 
     def test_a_mismatched_ledger_readback_never_claims_handed(self):

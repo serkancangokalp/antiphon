@@ -2266,10 +2266,10 @@ python3 test/host_wrapper_census.py \
 
 The utility prints bounded aggregate counts only — never transcript text or
 individual paths. `promptSource` is reported only as `system`, `sdk`, `typed`,
-`<absent>`, `<non-string>`, or `<other>`; an unknown transcript value is never
-copied into an output key. Tag names are limited to 64 characters and 256 keys,
-with fixed `<overlong-tag>` and `<additional-tags>` buckets for the remainder.
-Review its tag keys, then:
+`queued`, `suggestion_accepted`, `<absent>`, `<non-string>`, or `<other>`; an
+unknown transcript value is never copied into an output key. Tag names are
+limited to 64 characters and 256 keys, with fixed `<overlong-tag>` and
+`<additional-tags>` buckets for the remainder. Review its tag keys, then:
 
 - count every production-eligible, non-meta, non-empty Claude `type=user`
   message and Codex `response_item/message/role=user` message whose joined text

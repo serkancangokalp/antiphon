@@ -14,7 +14,8 @@ OPENING_TAG = re.compile(r"^\s*<([A-Za-z][A-Za-z0-9_-]*)(?=[\s>/])")
 ABSENT = "<absent>"
 NON_STRING_SOURCE = "<non-string>"
 OTHER_SOURCE = "<other>"
-KNOWN_PROMPT_SOURCES = frozenset(("system", "sdk", "typed"))
+KNOWN_PROMPT_SOURCES = frozenset((
+    "system", "sdk", "typed", "queued", "suggestion_accepted"))
 MAX_TAG_LENGTH = 64
 # Reserve one key each for an overlong tag and cardinality overflow.  The
 # census is a diagnostic over untrusted transcript bytes; its JSON output and

@@ -12478,14 +12478,13 @@ def _delegate(cwd, payload, sender=None, side=None, env=None):
     text_bytes = _utf8_bytes(text)
     if text_bytes is None:
         return False, f"not delegated: {UTF8_TEXT_REFUSAL}"
+    kind_present = "kind" in payload
     kind = payload.get("kind")
-    if kind is None and side in OTHER_SIDE:
+    if not kind_present and side in OTHER_SIDE:
         kind = OTHER_SIDE[side][0]
     if kind not in workers.KINDS:
         return False, "not delegated: name a kind (claude or codex)"
-    task_class = payload.get("task")
-    if task_class is None:
-        task_class = "read"
+    task_class = payload.get("task") if "task" in payload else "read"
     if task_class not in workers.CLASSES:
         return False, "not delegated: task must be read or write"
     to = payload.get("to")

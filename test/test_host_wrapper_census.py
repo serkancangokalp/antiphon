@@ -138,15 +138,20 @@ class HostWrapperCensusTest(unittest.TestCase):
             claude = os.path.join(root, "claude")
             codex = os.path.join(root, "codex")
             os.makedirs(codex)
-            records = [{
+            first_records = [{
                 "type": "user", "promptSource": source_secret,
                 "message": {"content": f"<{tag_secret}>\nbody"},
             }]
-            records.extend({
+            first_records.extend({
                 "type": "user", "promptSource": "system",
                 "message": {"content": f"<candidate-{number}>\nbody"},
-            } for number in range(census.MAX_TAG_KEYS + 20))
-            self.write_lines(claude, "project/one.jsonl", records)
+            } for number in range(200))
+            second_records = [{
+                "type": "user", "promptSource": "system",
+                "message": {"content": f"<candidate-{number}>\nbody"},
+            } for number in range(200, 400)]
+            self.write_lines(claude, "project/one.jsonl", first_records)
+            self.write_lines(claude, "project/two.jsonl", second_records)
 
             result = census.census(claude, codex)
 
@@ -571,6 +576,13 @@ class HostWrapperCensusTest(unittest.TestCase):
                              antiphon._filesystem_safe_relative(value), value)
 
     def test_parsers_match_production_meta_empty_and_join_rules(self):
+        for source in ("system", "sdk", "typed", "queued",
+                       "suggestion_accepted"):
+            self.assertEqual(
+                census._prompt_source({"promptSource": source}), source)
+        self.assertEqual(
+            census._prompt_source({"promptSource": "future-private-value"}),
+            census.OTHER_SOURCE)
         self.assertEqual(census.claude_user_blocks({
             "type": "user", "isMeta": True, "message": {
                 "content": "<meta-only>\nnot eligible"}}), [])

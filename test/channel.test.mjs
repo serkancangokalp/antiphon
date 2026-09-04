@@ -1570,15 +1570,18 @@ try {
     /timeout must be a finite number/,
     "a non-finite timeout is refused before task or transport state");
   assert.deepEqual(existsSync(tasksDir) ? readdirSync(tasksDir) : [], tasksBeforeBadTimeout);
-  await assert.rejects(
-    () => client.callTool({
-      name: "antiphon_delegate",
-      arguments: { text: "look", task: "" },
-    }),
-    /task must be read or write/,
-    "a present invalid task class is refused before work can start");
+  for (const [arguments_, refusal] of [
+    [{ text: "look", task: "" }, /task must be read or write/],
+    [{ text: "look", task: null }, /task must be read or write/],
+    [{ text: "look", kind: null }, /name a kind/],
+  ]) {
+    await assert.rejects(
+      () => client.callTool({ name: "antiphon_delegate", arguments: arguments_ }),
+      refusal,
+      "a present invalid kind or task class is refused before work can start");
+  }
   assert.deepEqual(existsSync(tasksDir) ? readdirSync(tasksDir) : [], tasksBeforeBadTimeout,
-    "an invalid task class cannot leave work for a caller to retry");
+    "an invalid kind or task class cannot leave work for a caller to retry");
   await assert.rejects(
     () => client.callTool({ name: "antiphon_task", arguments: { id: "nope", action: "status" } }),
     /unknown task id/);
