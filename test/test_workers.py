@@ -6,6 +6,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "lib"))
 import workers
 
 import contextlib
+import errno
 import hashlib
 import json
 import os
@@ -2864,6 +2865,23 @@ class LifecycleTest(unittest.TestCase):
                 self.assertNotEqual(stream.read(), workers.LEGACY_FENCE_TOKEN)
             self.assertFalse(os.path.exists(workers.tasks_dir(project)))
 
+    def test_the_epoch_fence_probe_distinguishes_denial_from_a_writable_store(self):
+        """Exercise the probe itself, not only the caller that consumes it."""
+        denied = OSError(errno.EACCES, "permission denied")
+        with patch.object(workers.tempfile, "mkstemp", side_effect=denied):
+            self.assertTrue(workers._legacy_store_rejects_writes("/legacy"))
+
+        with tempfile.TemporaryDirectory() as directory:
+            self.assertFalse(workers._legacy_store_rejects_writes(directory))
+            self.assertEqual(
+                [name for name in os.listdir(directory)
+                 if name.startswith(".v2-write-probe-")], [])
+
+        unexpected = OSError(errno.EIO, "storage failure")
+        with patch.object(workers.tempfile, "mkstemp", side_effect=unexpected):
+            with self.assertRaisesRegex(OSError, "storage failure"):
+                workers._legacy_store_rejects_writes("/legacy")
+
     def test_crash_after_fchmod_before_commit_is_recovered(self):
         with tempfile.TemporaryDirectory() as project:
             with patch.object(workers, "_write_legacy_fence_token",
@@ -3614,11 +3632,15 @@ class LifecycleTest(unittest.TestCase):
                               refined["finished_at"], refined["to"]),
                              ("cancelled", None, 3.0, None))
 
-    def test_cancel_never_returns_internal_control_from_an_unknown_outcome(self):
+    def test_cancel_keeps_an_unresolved_outcome_for_later_evidence(self):
         with tempfile.TemporaryDirectory() as project:
             record = workers.new_task(
                 project, kind="codex", task_class="read", sha256=SHA, size=1)
-            os.makedirs(workers.worker_dir(project, record["id"]), exist_ok=True)
+            directory = workers.worker_dir(project, record["id"])
+            os.makedirs(directory, exist_ok=True)
+            evidence = os.path.join(directory, "future-evidence")
+            with open(evidence, "w", encoding="ascii") as stream:
+                stream.write("keep me")
             workers.update_task(project, record["id"], lambda changed: changed.update(
                 state="running", pid=4242, birth="recorded birth",
                 started_at=1.0,
@@ -3631,10 +3653,16 @@ class LifecycleTest(unittest.TestCase):
             self.assertTrue(workers.read_task(project, record["id"])["to"].startswith(
                 workers.LOCAL_CONTROL_PREFIX))
 
-            answer = workers.cancel(project, record["id"])
+            with self.assertRaisesRegex(
+                    workers.Refused, "outcome is still unknown.*result.*kept"):
+                workers.cancel(project, record["id"])
 
-            self.assertEqual(answer["state"], "outcome_unknown")
-            self.assertIsNone(answer["to"])
+            current = workers.read_task(project, record["id"])
+            self.assertEqual(current["state"], "outcome_unknown")
+            self.assertIsNone(current["collected_at"])
+            self.assertTrue(os.path.isdir(directory))
+            with open(evidence, encoding="ascii") as stream:
+                self.assertEqual(stream.read(), "keep me")
 
     def test_authenticated_natural_exit_refines_an_unknown_outcome(self):
         with tempfile.TemporaryDirectory() as project:
@@ -3847,10 +3875,14 @@ class LifecycleTest(unittest.TestCase):
                               side_effect=("live", "live", "dead")), \
                  patch.object(workers, "_signal_authorized", return_value=True), \
                  patch.object(workers, "_kill_group", return_value="not_sent"):
-                final = workers.cancel(project, record["id"])
+                with self.assertRaisesRegex(
+                        workers.Refused, "outcome is still unknown"):
+                    workers.cancel(project, record["id"])
 
+            final = workers.read_task(project, record["id"])
             self.assertEqual((final["state"], final["exit_code"]),
                              ("outcome_unknown", None))
+            self.assertTrue(os.path.isdir(directory))
 
     def test_cancel_keeps_work_when_the_worker_survives_its_signal(self):
         with tempfile.TemporaryDirectory() as project:
@@ -5574,6 +5606,85 @@ workers.start(sys.argv[1], workers.read_task(sys.argv[1], sys.argv[2]), "x")
                 spawn.call_args.args[0][:4],
                 [sys.executable, "-E", "-s", "-S"])
 
+    def test_git_identity_is_durable_before_the_guardian_opens_its_gate(self):
+        with tempfile.TemporaryDirectory() as directory, \
+             tempfile.TemporaryDirectory() as bin_dir:
+            fake_git = os.path.join(bin_dir, "git")
+            with open(fake_git, "w", encoding="utf-8") as stream:
+                stream.write(f"#!{sys.executable}\nraise SystemExit(0)\n")
+            os.chmod(fake_git, 0o755)
+            live = os.path.join(directory, "live")
+            lease = os.open(live, os.O_CREAT | os.O_RDWR, 0o600)
+            workers._write_live_marker(lease, workers.LIVE_STARTING)
+            events = []
+            real_marker = workers._write_live_marker
+            real_write = workers.os.write
+
+            def observe_marker(descriptor, marker):
+                if marker.startswith(workers.LIVE_GIT_MUTATOR):
+                    events.append("identity")
+                return real_marker(descriptor, marker)
+
+            def observe_write(descriptor, content):
+                if content == b"1":
+                    events.append("gate")
+                return real_write(descriptor, content)
+
+            with patch.dict(os.environ, {
+                    "PATH": bin_dir + os.pathsep + os.environ.get("PATH", "")}), \
+                 patch.object(workers, "_write_live_marker",
+                              side_effect=observe_marker), \
+                 patch.object(workers.os, "write", side_effect=observe_write), \
+                 patch.object(workers, "_emit_guardian_output"):
+                result = workers._git_guardian_main([
+                    "_git_guardian", str(lease), "5", directory,
+                    "rev-parse", "HEAD"])
+
+            self.assertEqual(result, 0)
+            self.assertGreaterEqual(len(events), 2)
+            self.assertEqual(events[:2], ["identity", "gate"])
+
+    def test_the_git_process_cannot_inherit_the_guardian_lease(self):
+        """The executable sees only its explicit gate, never lifecycle power."""
+        with tempfile.TemporaryDirectory() as directory, \
+             tempfile.TemporaryDirectory() as bin_dir:
+            observed = os.path.join(directory, "lease-observation")
+            live = os.path.join(directory, "live")
+            lease = os.open(live, os.O_CREAT | os.O_RDWR, 0o600)
+            os.set_inheritable(lease, True)
+            identity = os.fstat(lease)
+            fake_git = os.path.join(bin_dir, "git")
+            with open(fake_git, "w", encoding="utf-8") as stream:
+                stream.write(
+                    f"#!{sys.executable}\n"
+                    "import os\n"
+                    "wanted = os.environ['ANTIPHON_TEST_LEASE_IDENTITY']\n"
+                    "seen = False\n"
+                    "for candidate in range(3, 256):\n"
+                    "    try:\n"
+                    "        info = os.fstat(candidate)\n"
+                    "    except OSError:\n"
+                    "        continue\n"
+                    "    if f'{info.st_dev}:{info.st_ino}' == wanted:\n"
+                    "        seen = True\n"
+                    "        break\n"
+                    "with open(os.environ['ANTIPHON_TEST_LEASE_RESULT'], 'w') as out:\n"
+                    "    out.write('leaked' if seen else 'closed')\n")
+            os.chmod(fake_git, 0o755)
+            with patch.dict(os.environ, {
+                    "PATH": bin_dir + os.pathsep + os.environ.get("PATH", ""),
+                    "ANTIPHON_TEST_LEASE_IDENTITY":
+                        f"{identity.st_dev}:{identity.st_ino}",
+                    "ANTIPHON_TEST_LEASE_RESULT": observed}), \
+                 patch.object(workers, "_emit_guardian_output"):
+                result = workers._git_guardian_main([
+                    "_git_guardian", str(lease), "5", directory,
+                    "rev-parse", "HEAD"])
+
+            self.assertEqual(result, 0)
+            with open(observed, encoding="ascii") as stream:
+                self.assertEqual(stream.read(), "closed")
+
     def test_a_worktree_without_a_verifiable_base_is_refused_and_fully_removed(self):
         """A successful `worktree add` is not enough to publish a worker.
 
@@ -5745,18 +5856,16 @@ workers.start(sys.argv[1], workers.read_task(sys.argv[1], sys.argv[2]), "x")
             self.assertIsNone(final["collected_at"])
             self.assertTrue(os.path.isdir(directory))
 
-    def test_cancel_returns_a_concurrently_refined_terminal_outcome(self):
-        """Cleanup adopts only a same-generation refinement under its lock.
-
-        A late authenticated publication may refine `outcome_unknown` between
-        the caller's observation and cleanup. The caller must not receive the
-        stale conservative state after the durable row says completed.
-        """
+    def test_cancel_keeps_evidence_when_unknown_refines_before_cleanup(self):
+        """A stale cancel observation cannot erase a newly proved result."""
         with tempfile.TemporaryDirectory() as project:
             record = workers.new_task(
                 project, kind="codex", task_class="read", sha256=SHA, size=1)
             directory = workers.worker_dir(project, record["id"])
             os.makedirs(directory)
+            evidence = os.path.join(directory, "result-evidence")
+            with open(evidence, "w", encoding="ascii") as stream:
+                stream.write("keep me")
             workers.update_task(project, record["id"], lambda changed: changed.update(
                 state="running", pid=4242, birth="recorded birth",
                 created_at=1.0, started_at=1.0,
@@ -5770,12 +5879,20 @@ workers.start(sys.argv[1], workers.read_task(sys.argv[1], sys.argv[2]), "x")
                 project, observed["id"], "completed", 0, now=3.0,
                 stop_resolution="natural")
 
-            answer = workers._finish_cancel(project, record["id"], observed)
+            with patch.object(workers, "_remove_dir_held",
+                              wraps=workers._remove_dir_held) as remove:
+                with self.assertRaisesRegex(
+                        workers.Refused, "refined to completed.*inspect its result"):
+                    workers._finish_cancel(project, record["id"], observed)
 
-            self.assertEqual(answer["state"], "completed")
-            self.assertEqual(answer["exit_code"], 0)
+            remove.assert_not_called()
             self.assertEqual(workers.read_task(project, record["id"])["state"],
                              "completed")
+            self.assertIsNone(
+                workers.read_task(project, record["id"])["collected_at"])
+            self.assertTrue(os.path.isdir(directory))
+            with open(evidence, encoding="ascii") as stream:
+                self.assertEqual(stream.read(), "keep me")
 
     def test_cancel_observes_its_final_row_before_releasing_cleanup_lock(self):
         """A reused UUID cannot become the answer after cleanup linearizes."""

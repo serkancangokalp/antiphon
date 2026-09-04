@@ -11196,17 +11196,23 @@ def _doctor_workers(report, cwd):
             f"workers: {uncertain} running {noun} unknown liveness after the "
             "task deadline; no terminal outcome is claimed, and each work directory "
             "and worker slot are kept")
-    recoveries = collections.Counter(
-        workers.accepted_start_recovery(cwd, record) for record in records)
-    missing = recoveries["git_completion_receipt_missing"]
+    recoveries = collections.defaultdict(list)
+    for record in records:
+        recovery = workers.accepted_start_recovery(cwd, record)
+        if recovery is not None:
+            recoveries[recovery].append(record)
+    missing_records = recoveries["git_completion_receipt_missing"]
+    missing = len(missing_records)
     if missing:
         noun = "task has" if missing == 1 else "tasks have"
+        task_ids = ", ".join(record["id"] for record in missing_records)
         report.note(
             f"workers: {missing} accepted {noun} no durable Git completion "
-            "receipt; each accepted row, cleanup witness, work and worker "
-            "slot is kept; do not retry automatically; operator intervention "
-            "outside Antiphon is required")
-    unknown = recoveries["unknown"]
+            f"receipt ({task_ids}); each accepted row, cleanup witness, work "
+            "and worker slot is kept; do not retry or delete it automatically; "
+            "run `antiphon task status <id>` and follow README `Recovering a "
+            "missing Git completion receipt`")
+    unknown = len(recoveries["unknown"])
     if unknown:
         noun = "task has" if unknown == 1 else "tasks have"
         report.note(

@@ -4881,8 +4881,10 @@ class ManagedWorkerToolTest(unittest.TestCase):
                 antiphon._doctor_workers(antiphon._Report(), project)
             text = out.getvalue()
             self.assertIn("no durable Git completion receipt", text)
-            self.assertIn("do not retry automatically", text)
-            self.assertIn("operator intervention outside Antiphon", text)
+            self.assertIn(record["id"], text)
+            self.assertIn("do not retry or delete it automatically", text)
+            self.assertIn("antiphon task status <id>", text)
+            self.assertIn("Recovering a missing Git completion receipt", text)
 
             os.unlink(os.path.join(
                 workers.tasks_dir(project), record["id"] + ".json"))

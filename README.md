@@ -187,9 +187,12 @@ ordinary terminal task record lives a week under
 `.antiphon/tasks-v2/`, and a worker's directory is swept once its evidence was
 collected; a durable `cancelled` row needs no result evidence and authorizes a
 later sweep to retry directory cleanup after a crash. Reading
-`outcome_unknown` never collects a possible future result;
-refinement exposes its evidence first. Expiry revalidates the exact row under
-the task lock. Git-backed work writes its durable cleanup witness before
+`outcome_unknown` never collects a possible future result; refinement exposes
+its evidence first. Explicit cancel also refuses while the outcome remains
+unknown, and refuses a refinement first observed during cleanup, so the caller
+can inspect the newly proved result before making a fresh cleanup decision.
+Expiry revalidates the exact row under the task lock. Git-backed work writes
+its durable cleanup witness before
 `git worktree add`, covering a crash before `base` reaches the accepted row,
 and fsyncs the containing worker-directory entry before Git is touched; it
 revalidates the added worktree's base before admitting the adapter. A visible
@@ -209,9 +212,10 @@ whole Git/filesystem cleanup transaction share the task-store lock; a new row
 cannot reuse an id while its current or legacy row, lifecycle marker, retained
 diff or worker directory remains. Record-first cleanup requires those state
 markers to stay absent, while terminal cleanup retains its row. `cancel` reads
-that same generation again before releasing the cleanup lock, so a concurrent
-authenticated refinement of `outcome_unknown` is not reported stale and a
-later same-id task cannot become the answer.
+that same generation before deleting anything and again before releasing the
+cleanup lock. A concurrent authenticated refinement of `outcome_unknown`
+therefore refuses without erasing its evidence, and a later same-id task cannot
+become the answer.
 The worktree-add lease is held by a small Python guardian whose environment,
 user-site and `sitecustomize` startup paths are disabled. Git cannot cross its
 one-byte gate until the exact Git pid/birth recovery marker is durable, and
@@ -226,6 +230,39 @@ and worker slot remain, `status`, `task list` and `doctor` name the uncertainty,
 and automatic retry is withheld until operator intervention outside Antiphon.
 A deliberately detached same-UID Git or hook process that keeps mutating after
 the direct Git command returns is outside this cooperative boundary.
+
+#### Recovering a missing Git completion receipt
+
+This state is deliberately not auto-recoverable: Antiphon cannot tell whether
+Git or one of its hooks still has unpublished work. Use the task id printed by
+`antiphon task list` and `antiphon doctor`, then:
+
+1. Confirm the state with `antiphon task status <id>`. Do not retry, cancel or
+   delete the task while its mutation boundary is uncertain, and stop starting
+   new Antiphon workers in this checkout during the investigation.
+2. Before changing anything, copy `.antiphon/tasks-v2/<id>.json`,
+   `.antiphon/tasks-v2/<id>.live`, any `<id>.diff`, the complete
+   `.antiphon/workers/<id>/` directory and the output of
+   `git -C <project> worktree list --porcelain` to a location outside the
+   project. These files are the recovery evidence.
+3. Establish quiescence with operating-system process and open-file tools.
+   The stored pid, its birth time or the death of one process-group leader is
+   not sufficient: stop if any Git, hook or descendant process might still
+   mutate the project or worker worktree.
+4. If the exact worker worktree exists, inspect and preserve its status and
+   diff first. Remove its registration only through Git, using its exact
+   absolute path (`git -C <project> worktree remove --force
+   <absolute-worker-worktree>`), then verify that path is absent from
+   `git worktree list --porcelain`. Never delete an entry under
+   `.git/worktrees` by hand.
+5. Removing the retained task state is an informed operator decision, not an
+   Antiphon recovery claim. Only after quiescence and evidence preservation,
+   remove paths for that exact id, with its JSON row last; never use a glob or
+   remove the whole `.antiphon` or `.git` tree. Finish by checking
+   `antiphon task list` and `antiphon doctor`. If quiescence cannot be proved,
+   leave the evidence in place; Antiphon intentionally has no force-reclaim
+   command.
+
 On the first current-protocol worker admission,
 Antiphon inspects the previous `.antiphon/tasks/` store under its old lock. It
 refuses while an old worker, unresolved old process group or uncollected old

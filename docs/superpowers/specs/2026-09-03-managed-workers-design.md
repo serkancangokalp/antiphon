@@ -127,8 +127,11 @@ the attachments and the ledger; a task record never carries the task text
 worker-visible, while the current reader's lifecycle marker stays beside the
 task record. An unlocked orphan marker left by an older reader is pruned only
 after the same seven-day retention window. `outcome_unknown` is not marked
-collected because later authenticated evidence may refine it. Expiry and
-terminal cleanup revalidate the exact observed row under the task lock;
+collected because later authenticated evidence may refine it. Explicit cancel
+refuses both an unresolved outcome and a refinement first observed while the
+cleanup lock is held, retaining the work so the proved result can be inspected
+before a fresh cleanup decision. Expiry and terminal cleanup revalidate the
+exact observed row under the task lock;
 completed work still requires collection, while a durable `cancelled` row
 authorizes an idempotent retry after a crash. Record
 retirement is durably acknowledged before external work is removed, and a
@@ -139,10 +142,10 @@ retryable refusal. Task-id creation and the full Git/filesystem cleanup
 transaction share the task-store lock. Creation refuses every current or
 legacy row, lifecycle marker, retained diff and worker directory with that id;
 record-first cleanup requires the row and marker to remain physically absent.
-After successful terminal cleanup, `cancel` observes the same lifecycle
-generation again before releasing that lock, so a concurrent authenticated
-refinement of `outcome_unknown` is returned rather than a stale snapshot and a
-later same-id task can never be adopted.
+Before terminal cleanup, `cancel` re-reads the same lifecycle generation under
+the task lock, and it observes that row again before releasing the lock. A
+concurrent authenticated refinement of `outcome_unknown` therefore refuses
+without deleting its evidence, and a later same-id task can never be adopted.
 Before `git worktree add` is invoked, a durable marker in the worker directory
 preserves the exact Git cleanup key, and the containing task-directory entry is
 fsynced before Git can publish its own admin entry; a missing post-add base is

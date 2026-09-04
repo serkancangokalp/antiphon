@@ -3299,12 +3299,36 @@ def _finish_cancel(cwd, task_id, record):
     # the lock is released, an expired row may be retired and its UUID reused;
     # that later generation must never become this cancel call's answer.
     with _locked(cwd) as held:
-        if not held or not _remove_dir_held(cwd, record):
+        current = read_task(cwd, task_id) if held else None
+        if not _same_cleanup_generation(current, record):
+            raise Refused(
+                f"not cancelled: task {task_id}'s lifecycle changed before "
+                "cleanup; its record and work are kept, so inspect it and retry")
+        if current["state"] not in WORKER_TERMINAL:
+            raise Refused(
+                f"not cancelled: task {task_id} is no longer terminal; its "
+                "record and work are kept, so inspect it and retry")
+        # An unresolved outcome deliberately remains open to a late,
+        # authenticated supervisor publication.  Even an unchanged row is not
+        # cleanup authority: the publication can already be durable in the
+        # live marker while its row-refining reader waits for this lock.
+        if record["state"] == "outcome_unknown":
+            if current["state"] != "outcome_unknown":
+                raise Refused(
+                    f"not cancelled: task {task_id} refined to "
+                    f"{current['state']} while cancel was finalizing; inspect "
+                    "its result before retrying cancel")
+            raise Refused(
+                f"not cancelled: task {task_id}'s outcome is still unknown; "
+                "its possible later result and work are kept until status "
+                "resolves it")
+        record = current
+        if not _remove_dir_held(cwd, record):
             raise Refused(
                 f"not cancelled: task {task_id}'s worker directory could not be "
                 "removed completely; its terminal record is kept, so retry cancel")
-        # `outcome_unknown` alone may have been refined by an authenticated
-        # wrapper between the caller's observation and this cleanup lock.
+        # Keep the returned row inside the same generation boundary as the
+        # completed cleanup.  No writer can enter while this lock is held.
         current = read_task(cwd, task_id)
         if (_same_cleanup_generation(current, record)
                 and current["state"] in WORKER_TERMINAL):
