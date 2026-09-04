@@ -107,9 +107,11 @@ write task the diff against the base it started from and its test summary), or
 a read task as much as a write task — works in a detached worktree of its own
 at HEAD under `.antiphon/workers/<id>/work/`, so nothing it does touches your
 tree and nothing uncommitted in your tree is visible to it: a worker asked to
-review "the current changes" reviews HEAD. The bridge's own files — the log
-and the exit code — sit beside that worktree, and a diff too large to inline
-sits beside the task record at `.antiphon/tasks/<id>.diff`; the one file the
+review "the current changes" reviews HEAD. The log and a compatibility copy
+of the exit code sit beside that worktree; the current reader trusts neither
+for lifecycle authority. A supervisor-only `.antiphon/tasks/<id>.live` marker
+binds the final exit code beside the task record, where a too-large diff also
+sits as `.antiphon/tasks/<id>.diff`; the one file the
 worker writes for the bridge, its test summary, sits inside it at
 `.antiphon/tests.txt`, where a write task's sandbox can reach it and where git
 ignores it. A read task (the default) runs under the host's read-only class
@@ -149,10 +151,23 @@ older Claude channel accepts a same-kind handoff but cannot preserve its Claude
 origin, the result keeps the successful handoff state and tells you to reconnect
 that recipient before relying on its displayed sender label;
 receipt still comes only from the peer's transcript. At most four workers run per project, admitted and
-recorded under one lock, and a worker that has exited gives its slot back the
-moment another is asked for; a worker is stopped at its timeout by the next
-`status`, `result`, hook sweep or a new delegation's admission; a task record
-lives a week under
+recorded under one lock. A Python supervisor holds a protected per-worker
+marker from before admission until it binds and publishes the exit code;
+`delegate` returns only
+after an `admit` → `ready` → `commit` handshake, so a refused start cannot run
+its adapter later. A worker whose exit is proved gives its slot back the
+moment another is asked for; one whose exact process identity is proved is
+stopped at its timeout by the next `status`, `result`, hook sweep or new
+delegation. A final protected-marker read after identity verification is the
+stop action's boundary: an outcome already published there wins; otherwise
+the timeout or cancel owns any later publication. If liveness or ownership
+cannot be proved after the deadline, the
+durable v1 record deliberately remains `running`: Antiphon invents no terminal
+outcome and sends no unverified signal, retaining its work directory and one
+of the four slots indefinitely. A later trustworthy published exit or restored
+observation reconciles it automatically; otherwise operator intervention
+outside Antiphon is required, with no unsafe force-reclaim command. An
+ordinary terminal task record lives a week under
 `.antiphon/tasks/`, and a worker's directory is swept once its evidence was
 collected — its worktree forgotten by its own entry, never by a prune of your
 repository's other worktrees. Every worker is asked to keep `[Antiphon worker

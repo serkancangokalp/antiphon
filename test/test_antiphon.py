@@ -4760,7 +4760,10 @@ class ManagedWorkerToolTest(unittest.TestCase):
             first = workers.new_task(project, kind="codex", task_class="read", sha256="a" * 64, size=1)
             workers.new_task(project, kind="codex", task_class="read", sha256="a" * 64, size=1)
             workers.update_task(project, first["id"],
-                                lambda c: c.update(state="running", pid=1, started_at=1.0))
+                                lambda c: c.update(
+                                    state="running", pid=os.getpid(),
+                                    birth=workers._process_start(os.getpid()),
+                                    started_at=time.time()))
             self.assertEqual(antiphon._worker_report(project),
                              "Workers:            1 accepted, 1 running (as recorded; antiphon task list)")
             out = io.StringIO()
@@ -4771,6 +4774,28 @@ class ManagedWorkerToolTest(unittest.TestCase):
                  contextlib.redirect_stdout(out):
                 self.assertEqual(antiphon.status(), 0)
             self.assertIn("Workers:            1 accepted, 1 running", out.getvalue())
+
+    def test_status_names_a_worker_whose_outcome_could_not_be_observed(self):
+        with tempfile.TemporaryDirectory() as project:
+            record = workers.new_task(
+                project, kind="codex", task_class="read", sha256="a" * 64, size=1)
+            workers.update_task(project, record["id"], lambda changed: changed.update(
+                state="running", pid=4242, birth="recorded birth",
+                started_at=1.0, timeout=1))
+            with patch.object(workers, "_worker_liveness", return_value="live"), \
+                 patch.object(workers, "_signal_authorized", return_value=False):
+                self.assertEqual(
+                    antiphon._worker_report(project),
+                    "Workers:            1 running (as recorded; antiphon task list); "
+                    "1 running worker has unknown liveness after the task deadline")
+                out = io.StringIO()
+                with contextlib.redirect_stdout(out):
+                    antiphon._doctor_workers(antiphon._Report(), project)
+            self.assertIn(
+                "· workers: 1 running worker has unknown liveness after the task deadline; "
+                "no terminal outcome is claimed, and each work directory and worker slot "
+                "are kept",
+                out.getvalue())
 
     def test_a_refused_hand_off_leaves_no_record(self):
         with tempfile.TemporaryDirectory() as project:

@@ -92,14 +92,28 @@ Hop budget: `ANTIPHON_HOP_BUDGET` (default 1). A worker is started with
 allow a bounded deeper chain"). The bridge never forwards a task automatically,
 so the budget is the only recursion there can be, and it is stated.
 
-Timeouts: a task has a `timeout` (default 900 s, at most 3600 s); past it the
-worker is sent SIGTERM, then SIGKILL after 10 s, and the task is `timed_out`
-with whatever output exists.
+Timeouts: a task has a `timeout` (default 900 s, at most 3600 s). A Python
+supervisor owns a task-store live lock and binds its exit code into the marker
+before unlocking; its adapter is
+admitted only after the task record is durable and an `admit` → `ready` →
+`commit` handshake completes. Past the timeout, an exactly identified worker
+is sent SIGTERM, then SIGKILL after 10 s, and is `timed_out` only when a signal
+was actually sent and death was proved. Unprovable liveness or ownership never
+authorizes a signal or a terminal guess: the v1 `running` record, directory and
+worker slot remain indefinitely for rolling-reader safety, until trustworthy
+evidence arrives or an operator intervenes outside Antiphon. A finished shell
+wrapper awaiting reaping as a zombie is stopped, not live; a non-zombie member
+of its process group still keeps the task running. After exact identity is
+verified, one final protected-marker read is the stop action's linearization
+point: a result published before it wins naturally, while an unchanged ACTIVE
+marker assigns any later publication to that timeout or cancel.
 
 Storage: `.antiphon/tasks/` and `.antiphon/workers/` are swept on the hook like
 the attachments and the ledger; a task record never carries the task text
-(its SHA-256 and size), and the worker's log is the worker's own file under
-its worktree.
+(its SHA-256 and size). The worker's log and an old-reader exit mirror are
+worker-visible, while the current reader's lifecycle marker stays beside the
+task record. An unlocked orphan marker left by an older reader is pruned only
+after the same seven-day retention window.
 
 ## What this does not claim
 

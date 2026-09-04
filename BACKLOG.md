@@ -1949,12 +1949,18 @@ project, so whatever it records lands in the project's store. Seeding a
 worktree with the bridge's configuration on purpose is the follow-up, not
 built (round 2 of the release gate corrected the earlier claim that a fresh
 directory's hooks need the host's trust: the E2E shows `codex exec` running
-the project hooks in an untrusted directory). Exit
-codes come from the worker's own exit file (a shell wrapper writes it; the
-asking process never started the worker), liveness from the pid and its start
-time, timeouts by SIGTERM then SIGKILL on the worker's session. Measured on
-macOS: a zombie session leader makes `killpg(pgid, 0)` answer EPERM, read as
-gone. Not in the MVP: native subagent UI on either host, resume, native worker
+the project hooks in an untrusted directory). Exit codes now come from a
+Python supervisor that binds the value into its task-store live marker before
+unlocking; the worker-directory copy exists only for rolling old readers. The
+adapter crosses an `admit` → `ready` → `commit` barrier only
+after the compatible v1 `running` record and exact process birth are durable.
+Timeout and cancel signals require that exact identity; ambiguous liveness
+keeps the record, directory and one of four slots indefinitely rather than
+inventing failure or risking an unrelated process. A later trustworthy exit
+or restored observation reconciles it; there is no unsafe force-reclaim. A
+final protected-marker read after identity is the stop boundary: an already
+published outcome wins, otherwise the action owns the later publication.
+Not in the MVP: native subagent UI on either host, resume, native worker
 APIs — the portable contract is the task id, the lifecycle and the evidence.
 
 Reviewed 2026-09-03 by an independent read-only pass (five Critical, seven
@@ -1966,8 +1972,9 @@ under the parent's own permission mode in the parent's tree — read tasks run
 under `--permission-mode plan` and, in a checkout, in a worktree of their own;
 the diff was taken against the index (blind to staged and committed work,
 and shipping the bridge's own files for loose work) — it is taken against the
-recorded base, and the bridge's files sit beside the worktree, never inside
-it; the Codex server's blanket tool approval covered the two process tools —
+recorded base, while the worker-visible log sits beside the worktree and the
+trusted lifecycle marker sits beside the task record, never inside the work;
+the Codex server's blanket tool approval covered the two process tools —
 they ask first; the hook's sweep could spend ten seconds per stuck worker —
 it sends the signals and moves on; a result without its evidence is not
 collected; the test summary path is named to the worker; a refusal on any

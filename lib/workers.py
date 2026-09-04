@@ -3,12 +3,14 @@
 `.antiphon/tasks/<task-id>.json` holds what a task is and what became of it —
 its kind and class, the task text's digest and size (never the text), the
 worker's pid, start time and exit — validated on every read the way the
-delivery ledger is, kept a week, under a directory this code owns outright.
+delivery ledger is, retained for a week after it becomes terminal (and kept
+while its liveness is uncertain), under a directory this code owns outright.
 
-`.antiphon/workers/<task-id>/` is the worker's directory. The bridge's own
-files live at its top — `log` and `exit`; a diff too large to inline sits
-beside the task record as `.antiphon/tasks/<task-id>.diff` — and the work
-happens in
+`.antiphon/workers/<task-id>/` is the worker's directory. The bridge's
+worker-visible files `log` and `exit` live at its top. The supervisor's lock
+sits beside the trusted task record as `.antiphon/tasks/<task-id>.live`,
+outside the adapter's writable directory; a diff too large to inline sits
+there as `.antiphon/tasks/<task-id>.diff` — and the work happens in
 `work/` underneath: a detached git worktree at HEAD whenever the project is
 a checkout with a commit, so nothing a worker does touches the user's own
 tree (and nothing uncommitted is visible to it), and a tracked file that
@@ -32,15 +34,18 @@ docs/superpowers/specs/2026-09-03-managed-workers-design.md.
 """
 
 import contextlib
+import errno
 import fcntl
 import json
 import math
 import os
 import re
+import select
 import shutil
 import signal
 import stat
 import subprocess
+import sys
 import tempfile
 import time
 import uuid
@@ -56,6 +61,11 @@ MAX_TIMEOUT = 3600
 # Seconds an `accepted` record may wait for its `start` before a sweep
 # treats it as a start that died mid-way.
 START_PATIENCE = 60
+# A new wrapper waits behind its admission pipe while its exact process birth
+# is sampled. Without that identity Antiphon could keep it live, but could
+# never safely authorize timeout or cancellation signals after a pid reuse.
+START_IDENTITY_PATIENCE = 0.5
+START_ACTIVE_PATIENCE = 1.0
 LEGACY_STATES = ("accepted", "running", "completed", "failed", "cancelled",
                  "timed_out", "blocked", "handed")
 V2_STATES = ("handing", "tracking_incomplete", "delivery_refused")
@@ -74,10 +84,16 @@ KEYS = frozenset({
     "timeout", "hop", "created_at", "pid", "birth", "base", "exit_code", "to",
     *OPTIONAL_TIMES})
 
-# The bridge's own files, beside the work and never inside it — except the
-# test summary, which the worker writes and its sandbox binds to the work.
+# The worker-visible log and legacy-reader exit mirror sit beside the work;
+# the trusted live marker sits with the task record; only the test summary is
+# inside the worktree, where the worker's sandbox binds it.
 LOG_FILE = "log"
 EXIT_FILE = "exit"
+LIVE_SUFFIX = ".live"
+LIVE_STARTING = b"starting\n"
+LIVE_ACTIVE = b"active\n"
+LIVE_PUBLISHED = b"published:"
+LIVE_CEILING = 16
 TESTS_FILE = "tests.txt"
 WORK_DIR = "work"
 WORK_STORE = ".antiphon"
@@ -364,7 +380,7 @@ def _diff_path(cwd, task_id):
 
 
 def _discard_record(cwd, task_id):
-    """Remove one task's durable files and say whether both are absent.
+    """Remove one task's durable files and say whether all are absent.
 
     Callers that report a refused peer hand-off need this answer: silently
     ignoring an unlink failure leaves a `handing` record that looks like an
@@ -373,7 +389,8 @@ def _discard_record(cwd, task_id):
     # Ancillary evidence goes first and the state-bearing JSON goes last. If
     # any earlier unlink fails, callers can still turn that record into an
     # explicit `delivery_refused` instead of being left with an unreadable id.
-    paths = (_diff_path(cwd, task_id), _path(cwd, task_id))
+    paths = (_diff_path(cwd, task_id), live_path(cwd, task_id),
+             _path(cwd, task_id))
     for path in paths:
         try:
             os.unlink(path)
@@ -393,6 +410,59 @@ def prune(cwd, now):
             continue
         if now - record["created_at"] > TASK_TTL:
             _discard_record(cwd, record["id"])
+    _prune_orphan_live(cwd, now)
+
+
+def _prune_orphan_live(cwd, now):
+    """Bound old-reader orphan locks without ever unlinking a held one."""
+    directory = _sound_dir(tasks_dir(cwd))
+    if directory is None:
+        return
+    try:
+        names = os.listdir(directory)
+    except OSError:
+        return
+    candidates = []
+    for name in names:
+        if not name.endswith(LIVE_SUFFIX):
+            continue
+        task_id = name[:-len(LIVE_SUFFIX)]
+        if TASK_ID.fullmatch(task_id):
+            candidates.append((task_id, os.path.join(directory, name)))
+    with _locked(cwd) as held:
+        if not held:
+            return
+        for task_id, path in candidates:
+            if read_task(cwd, task_id) is not None:
+                continue
+            flags = os.O_RDWR | os.O_NONBLOCK
+            if hasattr(os, "O_NOFOLLOW"):
+                flags |= os.O_NOFOLLOW
+            try:
+                fd = os.open(path, flags)
+            except OSError:
+                continue
+            try:
+                try:
+                    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                except OSError:
+                    continue
+                info = os.fstat(fd)
+                if (not stat.S_ISREG(info.st_mode)
+                        or now - info.st_mtime <= TASK_TTL):
+                    continue
+                try:
+                    named = os.lstat(path)
+                except OSError:
+                    continue
+                if (named.st_dev, named.st_ino) != (info.st_dev, info.st_ino):
+                    continue
+                with contextlib.suppress(OSError):
+                    os.unlink(path)
+            finally:
+                with contextlib.suppress(OSError):
+                    fcntl.flock(fd, fcntl.LOCK_UN)
+                os.close(fd)
 
 
 # ---------- the worker: one subprocess of the other kind ----------
@@ -425,6 +495,63 @@ def log_path(cwd, task_id):
 
 def exit_path(cwd, task_id):
     return os.path.join(worker_dir(cwd, task_id), EXIT_FILE)
+
+
+def live_path(cwd, task_id):
+    """The supervisor-owned lock, outside the adapter's writable directory."""
+    return os.path.join(tasks_dir(cwd), task_id + LIVE_SUFFIX)
+
+
+def _write_live_marker(fd, marker):
+    """Replace the bounded state inside an already-open regular lock file."""
+    if (marker not in (LIVE_STARTING, LIVE_ACTIVE)
+            and _published_code(marker) is None):
+        raise ValueError("unknown live-lock marker")
+    os.lseek(fd, 0, os.SEEK_SET)
+    os.ftruncate(fd, 0)
+    remaining = memoryview(marker)
+    while remaining:
+        written = os.write(fd, remaining)
+        if written <= 0:
+            raise OSError("the live-lock marker could not be written")
+        remaining = remaining[written:]
+    os.fsync(fd)
+
+
+def _read_live_marker(fd):
+    """The bounded marker on an open live lock, or None."""
+    try:
+        info = os.fstat(fd)
+        if not stat.S_ISREG(info.st_mode) or info.st_size > LIVE_CEILING:
+            return None
+        os.lseek(fd, 0, os.SEEK_SET)
+        marker = os.read(fd, LIVE_CEILING + 1)
+    except OSError:
+        return None
+    if marker in (LIVE_STARTING, LIVE_ACTIVE) or _published_code(marker) is not None:
+        return marker
+    return None
+
+
+def _published_marker(code):
+    """The supervisor-only terminal marker carrying one shell exit status."""
+    if type(code) is not int or not 0 <= code <= 255:
+        raise ValueError("an exit status must be between 0 and 255")
+    return LIVE_PUBLISHED + str(code).encode("ascii") + b"\n"
+
+
+def _published_code(marker):
+    """The exit status bound into a complete terminal marker, or None."""
+    if not isinstance(marker, bytes) or not marker.startswith(LIVE_PUBLISHED):
+        return None
+    raw = marker[len(LIVE_PUBLISHED):]
+    if not raw.endswith(b"\n"):
+        return None
+    token = raw[:-1]
+    if not token or not token.isdigit() or len(token) > 3:
+        return None
+    code = int(token)
+    return code if 0 <= code <= 255 else None
 
 
 def tests_path(cwd, task_id):
@@ -709,43 +836,187 @@ def start(cwd, record, text, env=None):
     env["ANTIPHON_CWD"] = cwd
     env["ANTIPHON_WORKER_DIR"] = directory
     env["ANTIPHON_WORKER_TESTS"] = tests_path(cwd, task_id)
-    env["ANTIPHON_WORKER_EXIT"] = exit_path(cwd, task_id)
     argv = adapter(record["kind"], record["task_class"], text, task_id,
                    tests=tests_path(cwd, task_id))
-    # A shell wrapper writes the worker's exit code to the task's exit file:
-    # the process that asks later is not the one that started it, so there
-    # is no waitpid, only the file. Its own session, so a cancel or a timeout
-    # reaches the whole group.
-    wrapped = ["/bin/sh", "-c", '"$@"; echo $? > "$ANTIPHON_WORKER_EXIT"',
-               "antiphon-worker"] + argv
+    # The wrapper inherits an already-held task-store lock and releases it
+    # only after binding the exit code into its terminal marker. A later
+    # process can therefore prove liveness and outcome without a racy `ps`
+    # observation or worker-writable result. It also waits on a pipe:
+    # the adapter starts only after the running record is durable; EOF aborts
+    # it. The adapter inherits neither control descriptor. Old workers without
+    # this file retain the pid/birth reader below for rolling compatibility.
+    lock_fd = None
+    gate_read = None
+    gate_write = None
+    ready_read = None
+    ready_write = None
+    commit_read = None
+    commit_write = None
+    try:
+        flags = os.O_CREAT | os.O_RDWR
+        if hasattr(os, "O_NOFOLLOW"):
+            flags |= os.O_NOFOLLOW
+        lock_fd = os.open(live_path(cwd, task_id), flags, 0o600)
+        os.fchmod(lock_fd, 0o600)
+        fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        _write_live_marker(lock_fd, LIVE_STARTING)
+        gate_read, gate_write = os.pipe()
+        ready_read, ready_write = os.pipe()
+        commit_read, commit_write = os.pipe()
+    except OSError as error:
+        for fd in (gate_read, gate_write, ready_read, ready_write,
+                   commit_read, commit_write, lock_fd):
+            if fd is None:
+                continue
+            with contextlib.suppress(OSError):
+                os.close(fd)
+        _refuse(cwd, record, f"not delegated: the worker's live lock could not be "
+                             f"created: {error}")
+    wrapped = [sys.executable, os.path.abspath(__file__), "_worker_wrapper",
+               str(lock_fd), str(gate_read), str(ready_write), str(commit_read),
+               exit_path(cwd, task_id)] + argv
     try:
         log = open(log_path(cwd, task_id), "ab")
     except OSError as error:
+        for fd in (gate_read, gate_write, ready_read, ready_write,
+                   commit_read, commit_write, lock_fd):
+            with contextlib.suppress(OSError):
+                os.close(fd)
         _refuse(cwd, record, f"not delegated: the worker's log could not be opened: {error}")
     try:
         child = subprocess.Popen(wrapped, cwd=run_in, env=env, stdin=subprocess.DEVNULL,
                                  stdout=log, stderr=subprocess.STDOUT,
-                                 start_new_session=True)
+                                 start_new_session=True,
+                                 pass_fds=(lock_fd, gate_read, ready_write, commit_read))
     except OSError as error:
         log.close()
+        for fd in (gate_read, gate_write, ready_read, ready_write,
+                   commit_read, commit_write, lock_fd):
+            with contextlib.suppress(OSError):
+                os.close(fd)
         _refuse(cwd, record, f"not delegated: the {record['kind']} CLI could not be "
                              f"started: {error}")
     log.close()
+    os.close(lock_fd)
+    os.close(gate_read)
+    os.close(ready_write)
+    os.close(commit_read)
+
+    def abort_unadmitted():
+        """Close the gate and reap its wrapper; no adapter can have started."""
+        nonlocal gate_write, ready_read, commit_write
+        if gate_write is not None:
+            with contextlib.suppress(OSError):
+                os.close(gate_write)
+            gate_write = None
+        if ready_read is not None:
+            with contextlib.suppress(OSError):
+                os.close(ready_read)
+            ready_read = None
+        if commit_write is not None:
+            with contextlib.suppress(OSError):
+                os.close(commit_write)
+            commit_write = None
+        try:
+            child.wait(timeout=0.5)
+        except subprocess.TimeoutExpired:
+            _kill_group(child.pid, 0.1)
+            with contextlib.suppress(subprocess.TimeoutExpired):
+                child.wait(timeout=0.5)
+
     birth = _process_start(child.pid)
-    # Detached on purpose: the exit file, not waitpid, is the answer, and a
-    # Popen left with no return code warns at shutdown as if forgotten.
-    child.returncode = 0
+    identity_deadline = time.time() + START_IDENTITY_PATIENCE
+    while birth is None and time.time() < identity_deadline:
+        time.sleep(0.02)
+        birth = _process_start(child.pid)
+    if birth is None:
+        abort_unadmitted()
+        _refuse(cwd, record, "not delegated: the worker's process identity "
+                             "could not be recorded")
 
     def mutate(changed):
+        if changed["state"] != "accepted":
+            return
         changed["state"] = "running"
         changed["pid"] = child.pid
         changed["birth"] = birth
         changed["base"] = base
         changed["started_at"] = time.time()
-    if not update_task(cwd, task_id, mutate):
-        _kill_group(child.pid, 0.5)
-        _refuse(cwd, record, "not delegated: the task record could not be updated")
-    return read_task(cwd, task_id)
+    updated = update_task(cwd, task_id, mutate)
+    started = read_task(cwd, task_id)
+    if not (updated and started is not None and started["state"] == "running"
+            and started["pid"] == child.pid):
+        # EOF is the abort token. The wrapper has not started the adapter and
+        # never will, so cleanup cannot erase a live task even if the wrapper
+        # itself takes a moment to notice the closed pipe.
+        abort_unadmitted()
+        if started is None or started["state"] == "accepted":
+            _refuse(cwd, record, "not delegated: the task record could not be updated")
+        raise Refused(
+            "not delegated: the task start was superseded before its adapter was admitted")
+    try:
+        os.write(gate_write, b"1")
+    except OSError:
+        # No byte means the adapter was never admitted. Preserve refusal's
+        # no-record/no-work contract instead of claiming a task was started.
+        # A concurrent reconciler may already have recorded the wrapper's
+        # terminal failure, though; that durable outcome must not disappear.
+        abort_unadmitted()
+        current = read_task(cwd, task_id)
+        if current is not None and not (
+                current["state"] == "running" and current["pid"] == child.pid):
+            raise Refused(
+                "not delegated: the worker start gate failed after another "
+                "lifecycle outcome was recorded")
+        _refuse(cwd, record, "not delegated: the worker start gate could not be released")
+    finally:
+        if gate_write is not None:
+            with contextlib.suppress(OSError):
+                os.close(gate_write)
+            gate_write = None
+    ready = False
+    try:
+        readable, _writable, _exceptional = select.select(
+            [ready_read], [], [], START_ACTIVE_PATIENCE)
+        ready = bool(readable) and os.read(ready_read, 1) == b"1"
+    except (OSError, ValueError):
+        ready = False
+    finally:
+        if ready_read is not None:
+            with contextlib.suppress(OSError):
+                os.close(ready_read)
+            ready_read = None
+    if not ready:
+        # The wrapper waits for the separate commit pipe after READY, so even
+        # an acknowledgement racing this timeout cannot admit the adapter.
+        abort_unadmitted()
+        current = read_task(cwd, task_id)
+        if current is not None and not (
+                current["state"] == "running" and current["pid"] == child.pid):
+            raise Refused(
+                "not delegated: worker activation failed after another "
+                "lifecycle outcome was recorded")
+        _refuse(cwd, record, "not delegated: the worker did not acknowledge its start")
+    try:
+        os.write(commit_write, b"1")
+    except OSError:
+        abort_unadmitted()
+        current = read_task(cwd, task_id)
+        if current is not None and not (
+                current["state"] == "running" and current["pid"] == child.pid):
+            raise Refused(
+                "not delegated: worker activation failed after another "
+                "lifecycle outcome was recorded")
+        _refuse(cwd, record, "not delegated: the worker start commit failed")
+    finally:
+        if commit_write is not None:
+            with contextlib.suppress(OSError):
+                os.close(commit_write)
+            commit_write = None
+    # Detached on purpose: the published marker, not waitpid, is the answer,
+    # and a Popen left with no return code warns at shutdown as if forgotten.
+    child.returncode = 0
+    return started
 
 
 # ---------- the lifecycle: status, result, cancel, sweep ----------
@@ -764,85 +1035,388 @@ BLOCKED_PATTERN = re.compile(r"(?i)permission (denied|required)|requires approva
 TERMINAL = ("completed", "failed", "cancelled", "timed_out", "blocked")
 
 
-def _reap(pid):
-    """Collect the wrapper if this process is its parent; a zombie leader
-    makes macOS answer `killpg(pgid, 0)` with EPERM, which is "gone"."""
-    with contextlib.suppress(ChildProcessError, OSError):
-        os.waitpid(pid, os.WNOHANG)
+def _reap(pid, patience=0.0):
+    """Collect the wrapper if this process is its parent, optionally waiting."""
+    if type(pid) is not int or pid <= 0:
+        return
+    deadline = time.time() + patience
+    while True:
+        try:
+            reaped, _status = os.waitpid(pid, os.WNOHANG)
+        except (ChildProcessError, OSError, OverflowError, ValueError):
+            return
+        if reaped or time.time() >= deadline:
+            return
+        time.sleep(0.01)
 
 
-def _group_gone(pid):
+def _group_liveness(pid):
+    """`live`, `dead`, or `unknown` for the worker's process group."""
+    if not pid:
+        return "dead"
     _reap(pid)
     try:
         os.killpg(pid, 0)
-    except (ProcessLookupError, PermissionError):
-        return True
-    return False
+    except ProcessLookupError:
+        return "dead"
+    except PermissionError:
+        return "unknown"
+    except (OverflowError, ValueError):
+        return "unknown"
+    return "live"
 
 
-def _alive(record):
+def _process_state(pid):
+    """The kernel state letters for one pid, `absent`, or None if unreadable."""
+    try:
+        done = subprocess.run(["ps", "-o", "stat=", "-p", str(pid)],
+                              capture_output=True, text=True, timeout=5,
+                              env={**os.environ, "LC_ALL": "C"})
+    except (OSError, subprocess.SubprocessError):
+        return None
+    state = done.stdout.strip().split(None, 1)[0] if done.stdout.strip() else ""
+    if done.returncode == 0 and state:
+        return state[:16]
+    return "absent" if done.returncode != 0 and not state else None
+
+
+def _group_process_liveness(pgid):
+    """Use process-table states to distinguish a zombie-only process group."""
+    try:
+        done = subprocess.run(["ps", "-axo", "pgid=,stat="],
+                              capture_output=True, text=True, timeout=5,
+                              env={**os.environ, "LC_ALL": "C"})
+    except (OSError, subprocess.SubprocessError):
+        return "unknown"
+    if done.returncode != 0:
+        return "unknown"
+    states = []
+    for line in done.stdout.splitlines():
+        pieces = line.split(None, 1)
+        if len(pieces) != 2:
+            continue
+        try:
+            member_group = int(pieces[0])
+        except ValueError:
+            continue
+        if member_group == pgid:
+            states.append(pieces[1])
+    if not states or all(state.startswith("Z") for state in states):
+        return "dead"
+    return "live"
+
+
+def _group_gone(pid):
+    """Positive absence for a process group; permission proves nothing."""
+    return _group_liveness(pid) == "dead"
+
+
+def _process_identity(record):
+    """`live`, `zombie`, `absent`, `recycled`, or `unknown` for one pid."""
     pid = record["pid"]
     if not pid:
-        return False
+        return "absent"
     _reap(pid)
     try:
         os.kill(pid, 0)
     except ProcessLookupError:
-        return False
+        return "absent"
     except PermissionError:
-        return True
-    if record["birth"] is not None:
-        return _process_start(pid) == record["birth"]
-    # No start time on record — `ps` gave none when the worker began — so a
-    # live pid is taken as the worker: the alternative reads a running
-    # worker as dead on the one platform that cannot date it, and a recycled
-    # pid costs at most a late `failed`.
-    return True
+        return "unknown"
+    except (OverflowError, ValueError):
+        return "unknown"
+    if record["birth"] is None:
+        return "unknown"
+    observed = _process_start(pid)
+    if observed is None:
+        return "unknown"
+    if observed != record["birth"]:
+        return "recycled"
+    state = _process_state(pid)
+    if state is None:
+        return "unknown"
+    if state == "absent":
+        return "absent"
+    return "zombie" if state.startswith("Z") else "live"
+
+
+def _process_liveness(record):
+    """`live`, `dead`, or `unknown` from a legacy pid/birth observation."""
+    identity = _process_identity(record)
+    if identity == "live":
+        return "live"
+    if identity in ("zombie", "absent", "recycled"):
+        return "dead"
+    return "unknown"
+
+
+def _alive(record):
+    """Compatibility boolean for callers that only need positive proof."""
+    return _process_liveness(record) == "live"
+
+
+def _lock_observation(cwd, task_id):
+    """One lock's lifecycle state and its bound published exit, if any.
+
+    The process that created a pre-lock task has no file, which is distinct
+    from a current task whose owned lock cannot be inspected. A held lock is
+    live. Once acquired, its marker distinguishes a wrapper that atomically
+    published an exit from one that died before doing so.
+    """
+    flags = os.O_RDWR
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    try:
+        fd = os.open(live_path(cwd, task_id), flags)
+    except FileNotFoundError:
+        return "legacy", None
+    except OSError:
+        return "unknown", None
+    try:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            # Marker writes are truncate-then-write transitions. Only a
+            # complete ACTIVE marker authorizes an action; STARTING and
+            # partial bytes suppress signals before or between phases.
+            marker = _read_live_marker(fd)
+            if marker == LIVE_ACTIVE:
+                return "live", None
+            if _published_code(marker) is not None:
+                return "settling", None
+            if marker == LIVE_STARTING:
+                return "starting", None
+            return "held_unknown", None
+        except OSError as error:
+            if error.errno in (errno.EACCES, errno.EAGAIN):
+                marker = _read_live_marker(fd)
+                if marker == LIVE_ACTIVE:
+                    return "live", None
+                if _published_code(marker) is not None:
+                    return "settling", None
+                if marker == LIVE_STARTING:
+                    return "starting", None
+                return "held_unknown", None
+            return "unknown", None
+        marker = _read_live_marker(fd)
+        with contextlib.suppress(OSError):
+            fcntl.flock(fd, fcntl.LOCK_UN)
+        code = _published_code(marker)
+        if code is not None:
+            return "published", code
+        if marker in (LIVE_STARTING, LIVE_ACTIVE):
+            return "dead", None
+        return "unknown", None
+    finally:
+        os.close(fd)
+
+
+def _lock_liveness(cwd, task_id):
+    """Compatibility view of `_lock_observation` without the bound outcome."""
+    return _lock_observation(cwd, task_id)[0]
+
+
+def _worker_liveness(cwd, record, lock=None):
+    """Prove the wrapper or its orphaned process group live, dead, or unknown.
+
+    A current wrapper's held lock is positive liveness. An unlocked lock is
+    not by itself death: SIGKILL can remove the Python supervisor while an
+    adapter-compatible process group remains. That group keeps the record
+    quarantined but is not proof of ownership; a pid whose birth differs is
+    likewise never signalled.
+    """
+    lock = _lock_liveness(cwd, record["id"]) if lock is None else lock
+    if lock in ("starting", "live", "settling", "held_unknown"):
+        return "live" if type(record["pid"]) is int and record["pid"] > 0 else "unknown"
+    identity = _process_identity(record)
+    if identity == "recycled":
+        return "dead"
+    if identity == "live":
+        # A legacy or unreadable lock can fall back to the exact pid. A
+        # current unlocked wrapper should already have published its exit and
+        # is in a tiny teardown window (or broke the invariant), so do not
+        # authorize a signal or terminal claim from that contradiction.
+        return "live" if lock in ("legacy", "unknown") else "unknown"
+    if identity == "unknown":
+        return "unknown"
+    if identity == "zombie":
+        # A shell wrapper can remain in the process table until another
+        # long-lived parent reaps it. It is no longer executing; only a
+        # non-zombie member of its process group can keep the task live.
+        return _group_process_liveness(record["pid"])
+    return _group_liveness(record["pid"])
+
+
+def _signal_authorized(cwd, record, lock=None):
+    """Whether this observation identifies the recorded process group.
+
+    The protected lock proves a lifecycle phase, not which kernel pid owns the
+    process group. A recycled or unreadable pid identity remains unactionable.
+    Once the recorded leader is absent, a surviving group may be an orphan or
+    a later group that reused the number; only exact pid/birth identity can
+    authorize a signal.
+    """
+    lock = _lock_liveness(cwd, record["id"]) if lock is None else lock
+    # Only the supervisor's complete ACTIVE marker (or a pre-lock worker)
+    # makes a process observation actionable. During STARTING no adapter has
+    # been committed; during SETTLING its outcome is already being published;
+    # and a partial/unreadable marker proves no lifecycle phase at all.
+    return lock in ("live", "legacy") and _process_identity(record) == "live"
+
+
+def _action_ready(cwd, record, lock):
+    """Linearize a stop request after identity, before its first signal.
+
+    Publication observed by the final protected-lock read wins as a natural
+    outcome. A still-ACTIVE marker makes the action the later fact; publication
+    after that point belongs to the requested stop even if kernel delivery and
+    wrapper teardown overlap.
+    """
+    if not _signal_authorized(cwd, record, lock=lock):
+        return "unknown", None
+    current, code = _lock_observation(cwd, record["id"])
+    if current == "published":
+        return "published", code
+    if current != lock or current not in ("live", "legacy"):
+        return "unknown", None
+    return "ready", None
 
 
 def _read_exit(cwd, task_id):
-    """The worker's exit code from its exit file, or None: bounded, digits
-    only — the file's path is in the worker's environment, and what a worker
-    may write there is not a code."""
+    """A pre-supervisor worker's bounded exit token, or None.
+
+    Current supervisors mirror their code here only for rolling old readers;
+    current readers use the code bound into the protected live marker.
+    """
+    flags = os.O_RDONLY | os.O_NONBLOCK
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
     try:
-        with open(exit_path(cwd, task_id), "rb") as f:
-            raw = f.read(EXIT_CEILING + 1)
+        fd = os.open(exit_path(cwd, task_id), flags)
     except OSError:
         return None
+    try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            return None
+        raw = os.read(fd, EXIT_CEILING + 1)
+    except OSError:
+        return None
+    finally:
+        os.close(fd)
     token = raw.decode("ascii", "replace").strip()
     if len(raw) > EXIT_CEILING or not token.isdigit() or len(token) > 3:
         return None
     return int(token)
 
 
+def liveness_unknown(cwd, record, now=None, observation=None):
+    """Whether liveness is currently unknown after the task's deadline.
+
+    The task timeout is the bound: before it, `running` needs no qualifier;
+    afterwards every reporting surface names an observation failure. No
+    sidecar is needed, so a stale or unwritable diagnostic file can neither
+    manufacture nor hide the current fact.
+    """
+    if record is None or record.get("state") != "running":
+        return False
+    now = time.time() if now is None else now
+    deadline = (record["started_at"] or now) + record["timeout"]
+    if observation is None:
+        observation = _worker_liveness(cwd, record)
+    if now < deadline:
+        return False
+    if observation in ("unknown", "unknown_after_signal"):
+        return True
+    # A lock or group can prove worker-associated activity without proving
+    # that the recorded pid still owns the group Antiphon would signal.
+    return observation == "live" and not _signal_authorized(cwd, record)
+
+
+LIVENESS_UNKNOWN_DETAIL = (
+    "worker liveness or ownership could not be proved after its deadline; "
+    "no terminal outcome was claimed, and its work and worker slot are kept")
+LIVENESS_UNKNOWN_AFTER_SIGNAL_DETAIL = (
+    "a stop signal was attempted after the task deadline, but the worker's "
+    "resulting liveness could not be proved; no terminal outcome was claimed, "
+    "and its work and worker slot are kept")
+
+
+def _liveness_detail(observation):
+    return (LIVENESS_UNKNOWN_AFTER_SIGNAL_DETAIL
+            if observation == "unknown_after_signal"
+            else LIVENESS_UNKNOWN_DETAIL)
+
+
+def reported_status(cwd, task_id, now=None, patience=KILL_PATIENCE):
+    """A status record plus a current, read-only liveness qualification."""
+    record, observation = _reconcile_status(
+        cwd, task_id, now=now, patience=patience)
+    if not liveness_unknown(cwd, record, now=now, observation=observation):
+        return record
+    answer = dict(record)
+    answer["worker_liveness"] = "unknown"
+    answer["liveness_detail"] = _liveness_detail(observation)
+    return answer
+
+
 def _log_tail(cwd, task_id):
+    flags = os.O_RDONLY | os.O_NONBLOCK
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
     try:
-        with open(log_path(cwd, task_id), "rb") as f:
-            f.seek(0, os.SEEK_END)
-            size = f.tell()
-            f.seek(max(0, size - LOG_TAIL))
-            return f.read().decode("utf-8", "replace")
+        fd = os.open(log_path(cwd, task_id), flags)
     except OSError:
         return ""
+    try:
+        info = os.fstat(fd)
+        if not stat.S_ISREG(info.st_mode):
+            return ""
+        os.lseek(fd, max(0, info.st_size - LOG_TAIL), os.SEEK_SET)
+        return os.read(fd, LOG_TAIL).decode("utf-8", "replace")
+    except OSError:
+        return ""
+    finally:
+        os.close(fd)
 
 
 def _kill_group(pid, patience=KILL_PATIENCE):
-    """SIGTERM the worker's session, wait `patience`, then SIGKILL."""
+    """Stop one session, distinguishing whether Antiphon sent a signal.
+
+    `absent` means the first signal found no group, so a concurrently
+    published nonzero exit is still the worker's natural outcome. `not_sent`
+    means permission or malformed identity prevented the first signal.
+    `stopped` means a signal was sent and absence was proved; `unresolved`
+    means a signal was sent but absence was not proved.
+    """
+    if type(pid) is not int or pid <= 0:
+        return "not_sent"
+    sent = False
     for signum, wait in ((signal.SIGTERM, patience), (signal.SIGKILL, min(2.0, patience + 0.5))):
         try:
             os.killpg(pid, signum)
-        except (ProcessLookupError, PermissionError):
+        except ProcessLookupError:
             _reap(pid)
-            return
+            return "stopped" if sent else "absent"
+        except PermissionError:
+            return "unresolved" if sent else "not_sent"
+        except (OverflowError, ValueError):
+            return "unresolved" if sent else "not_sent"
+        sent = True
         deadline = time.time() + wait
         while time.time() < deadline:
             if _group_gone(pid):
-                return
+                return "stopped"
             time.sleep(0.05)
+    return "stopped" if _group_gone(pid) else "unresolved"
 
 
-def _finish(cwd, task_id, state, exit_code=None, now=None):
+def _finish(cwd, task_id, state, exit_code=None, now=None,
+            from_states=("running",)):
     def mutate(changed):
+        # Two readers can reconcile the same worker concurrently.  Once one
+        # has written a terminal fact, a stale observation must not replace it.
+        if changed["state"] not in from_states:
+            return
         changed["state"] = state
         changed["exit_code"] = exit_code
         changed["finished_at"] = time.time() if now is None else now
@@ -850,30 +1424,87 @@ def _finish(cwd, task_id, state, exit_code=None, now=None):
     return read_task(cwd, task_id)
 
 
-def status(cwd, task_id, now=None, patience=KILL_PATIENCE):
-    """The task's record, reconciled with what its worker did: the exit file
-    decides, a vanished process without one is a failure, a process past
-    its timeout is killed (with `patience` before the SIGKILL) and timed
-    out. Never guessed from the log alone."""
+def _finish_exit(cwd, record, code, now):
+    # The durable exit is enough to answer, but the long-lived MCP server may
+    # also be the wrapper's parent. Reap its now-finished child so successful
+    # workers do not accumulate as zombies between tool calls.
+    _reap(record["pid"], 0.25)
+    if code == 0:
+        state = "completed"
+    elif BLOCKED_PATTERN.search(_log_tail(cwd, record["id"])):
+        state = "blocked"
+    else:
+        state = "failed"
+    return _finish(cwd, record["id"], state, code, now)
+
+
+def _reconcile_status(cwd, task_id, now=None, patience=KILL_PATIENCE):
+    """Reconcile a task from its protected marker or legacy process evidence.
+
+    A published marker binds the outcome. A vanished old wrapper can use its
+    legacy exit mirror. A positively owned process past its timeout is killed
+    (with `patience` before SIGKILL) and timed out. Unreadable or unowned
+    liveness is reported out of band while the compatible `running` record
+    keeps its slot. Never guessed from the log.
+    """
     now = time.time() if now is None else now
     record = read_task(cwd, task_id)
-    if record is None or record["state"] != "running":
-        return record
-    code = _read_exit(cwd, task_id)
-    if code is not None:
-        if code == 0:
-            state = "completed"
-        elif BLOCKED_PATTERN.search(_log_tail(cwd, task_id)):
-            state = "blocked"
-        else:
-            state = "failed"
-        return _finish(cwd, task_id, state, code, now)
-    if not _alive(record):
-        return _finish(cwd, task_id, "failed", None, now)
+    if record is None:
+        return record, None
+    if record["state"] != "running":
+        return record, None
+    lock, published_code = _lock_observation(cwd, task_id)
+    if lock == "published":
+        # PUBLISHED can only be written through the supervisor-owned lock,
+        # after its atomic exit write and before unlock. It is stronger than
+        # a process-table observation, whose zombie/reaping state can lag.
+        return _finish_exit(cwd, record, published_code, now), None
+    liveness = _worker_liveness(cwd, record, lock=lock)
+    if liveness == "dead":
+        # The wrapper publishes before releasing its lock.  Legacy wrappers
+        # have the same shell order but no lock. Read only after both facts;
+        # a cached adapter-written token can never borrow later proof.
+        if lock == "legacy":
+            code = _read_exit(cwd, task_id)
+            if code is not None:
+                return _finish_exit(cwd, record, code, now), None
+        return _finish(cwd, task_id, "failed", None, now), None
+    if liveness == "unknown":
+        # The durable v1 state stays `running`: an older reader must keep this
+        # possibly-live worker in the four-slot cap.  Once both bounds pass,
+        # reporting surfaces call `liveness_unknown` below and name why no
+        # signal or terminal claim was made.
+        return record, "unknown"
     if now - (record["started_at"] or now) > record["timeout"]:
-        _kill_group(record["pid"], patience)
-        return _finish(cwd, task_id, "timed_out", None, now)
-    return record
+        # The protected ACTIVE marker and exact pid/birth authorize a signal.
+        # `_action_ready` then reads the marker once more: publication before
+        # that point wins; an unchanged ACTIVE marker linearizes the action.
+        # Ambiguity keeps the task and its slot.
+        action, natural_code = _action_ready(cwd, record, lock)
+        if action == "published":
+            return _finish_exit(cwd, record, natural_code, now), None
+        if action != "ready":
+            return record, "unknown"
+        stop = _kill_group(record["pid"], patience)
+        after_lock, after_code = _lock_observation(cwd, task_id)
+        after = _worker_liveness(cwd, record, lock=after_lock)
+        if after == "dead":
+            code = (_read_exit(cwd, task_id) if after_lock == "legacy"
+                    else after_code if after_lock == "published" else None)
+            if code is not None and stop in ("absent", "not_sent"):
+                return _finish_exit(cwd, record, code, now), None
+            state = "failed" if stop in ("absent", "not_sent") else "timed_out"
+            return _finish(cwd, task_id, state, None, now), None
+        observation = ("unknown_after_signal"
+                       if after == "unknown" and stop in ("stopped", "unresolved")
+                       else after)
+        return record, observation
+    return record, liveness
+
+
+def status(cwd, task_id, now=None, patience=KILL_PATIENCE):
+    """The reconciled durable task record; reporting uses the same probe."""
+    return _reconcile_status(cwd, task_id, now=now, patience=patience)[0]
 
 
 def _worktree_diff(cwd, record):
@@ -947,13 +1578,13 @@ def result(cwd, task_id, wait=0):
     handed task is refused: nothing is collected by id."""
     wait = _bounded_wait(wait)
     deadline = time.time() + wait
-    record = status(cwd, task_id)
+    record, observation = _reconcile_status(cwd, task_id)
     if record is not None and record["state"] in (
             "handing", "handed", "tracking_incomplete", "delivery_refused"):
         raise _handed(record, "collected")
     while record is not None and record["state"] == "running" and time.time() < deadline:
         time.sleep(0.1)
-        record = status(cwd, task_id)
+        record, observation = _reconcile_status(cwd, task_id)
     if record is None:
         return None
     answer = {"id": task_id, "state": record["state"], "exit_code": record["exit_code"],
@@ -962,6 +1593,9 @@ def result(cwd, task_id, wait=0):
                          "directory": worker_dir(cwd, task_id),
                          "work": work_dir(cwd, task_id) if record["base"] else None,
                          "task_class": record["task_class"]}}
+    if liveness_unknown(cwd, record, observation=observation):
+        answer["worker_liveness"] = "unknown"
+        answer["liveness_detail"] = _liveness_detail(observation)
     if record["state"] not in TERMINAL:
         return answer
     evidence = True
@@ -1036,9 +1670,56 @@ def cancel(cwd, task_id):
     if record["state"] in (
             "handing", "handed", "tracking_incomplete", "delivery_refused"):
         raise _handed(record, "cancelled")
+    if record["state"] == "accepted":
+        raise Refused(
+            f"not cancelled: task {task_id} is still starting; retry after its "
+            "running record or refusal is visible")
     if record["state"] == "running":
-        _kill_group(record["pid"])
-        record = _finish(cwd, task_id, "cancelled", None)
+        lock, _published_code_before = _lock_observation(cwd, task_id)
+        if lock == "starting":
+            raise Refused(
+                f"not cancelled: task {task_id} is still starting; retry after "
+                "its adapter has crossed the start gate")
+        liveness = _worker_liveness(cwd, record, lock=lock)
+        if liveness == "unknown":
+            raise Refused(
+                f"not cancelled: task {task_id}'s worker identity could not be "
+                "verified; retry when worker liveness can be observed")
+        if liveness == "dead":
+            record = status(cwd, task_id)
+            if record is not None and record["state"] == "running":
+                raise Refused(
+                    f"not cancelled: task {task_id}'s worker identity could not be "
+                    "verified; retry after its state can be reconciled")
+        else:
+            action, natural_code = _action_ready(cwd, record, lock)
+            if action == "published":
+                record = _finish_exit(cwd, record, natural_code, time.time())
+            elif action != "ready":
+                raise Refused(
+                    f"not cancelled: task {task_id}'s worker identity could not be "
+                    "verified; retry when worker liveness can be observed")
+            else:
+                stop = _kill_group(record["pid"])
+                after_lock, after_code = _lock_observation(cwd, task_id)
+                after = _worker_liveness(cwd, record, lock=after_lock)
+                if after == "dead":
+                    code = (_read_exit(cwd, task_id) if after_lock == "legacy"
+                            else after_code if after_lock == "published" else None)
+                    if code is not None and stop in ("absent", "not_sent"):
+                        record = _finish_exit(cwd, record, code, time.time())
+                    else:
+                        state = ("failed" if stop in ("absent", "not_sent")
+                                 else "cancelled")
+                        record = _finish(cwd, task_id, state, None)
+                elif after == "live":
+                    raise Refused(
+                        f"not cancelled: task {task_id}'s worker still appears live "
+                        "after the signal attempt; its work is kept")
+                else:
+                    raise Refused(
+                        f"not cancelled: task {task_id}'s worker could not be proved "
+                        "stopped after the signal attempt; its work is kept")
     _remove_dir(cwd, record)
     return record
 
@@ -1056,9 +1737,8 @@ def sweep(cwd, now):
                 _discard_record(cwd, record["id"])
             continue
         record = status(cwd, record["id"], now, patience=SWEEP_PATIENCE) or record
-        # Belt and braces: a running worker is at most MAX_TIMEOUT old
-        # before status times it out, and the TTL is a week, so this arm
-        # cannot be reached by an expired record — it states the rule.
+        # Uncertain liveness deliberately keeps a compatible `running` row,
+        # its directory and its slot even beyond the ordinary task TTL.
         if record["state"] == "running":
             continue
         expired = now - record["created_at"] > TASK_TTL
@@ -1066,3 +1746,125 @@ def sweep(cwd, now):
         if expired or collected:
             _remove_dir(cwd, record)
     prune(cwd, now)
+
+
+def _write_worker_exit(path, code):
+    """Atomically publish one shell-compatible exit status."""
+    directory = os.path.dirname(path)
+    fd, temporary = tempfile.mkstemp(dir=directory, prefix=".exit-", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "wb") as stream:
+            os.fchmod(stream.fileno(), 0o600)
+            stream.write(f"{code}\n".encode("ascii"))
+        os.replace(temporary, path)
+    except Exception:
+        with contextlib.suppress(OSError):
+            os.unlink(temporary)
+        raise
+
+
+def _worker_wrapper(lock_fd, gate_fd, ready_fd, commit_fd, exit_file, argv):
+    """Wait for admission, run one adapter, then publish before unlocking."""
+    code = 125
+    terminate_requested = False
+
+    def request_termination(_signum, _frame):
+        nonlocal terminate_requested
+        terminate_requested = True
+
+    previous_term = signal.signal(signal.SIGTERM, request_termination)
+    try:
+        try:
+            admitted = os.read(gate_fd, 1) == b"1"
+        except OSError as error:
+            admitted = False
+            print(f"antiphon worker: start gate could not be read: {error}",
+                  file=sys.stderr)
+        finally:
+            with contextlib.suppress(OSError):
+                os.close(gate_fd)
+        if admitted and not terminate_requested:
+            code = 127
+            child = None
+            try:
+                # This transition is what makes timeout/cancel actionable.
+                # Before it, STARTING is negative evidence and readers refuse
+                # to signal a wrapper whose adapter has not crossed the gate.
+                _write_live_marker(lock_fd, LIVE_ACTIVE)
+                os.write(ready_fd, b"1")
+                os.close(ready_fd)
+                ready_fd = None
+                committed = os.read(commit_fd, 1) == b"1"
+                os.close(commit_fd)
+                commit_fd = None
+                if not committed:
+                    code = 125
+                elif terminate_requested:
+                    code = 128 + signal.SIGTERM
+                else:
+                    child = subprocess.Popen(argv)
+                    if terminate_requested:
+                        # Covers a signal delivered between the commit check
+                        # and Popen. The group signal also reaches this child.
+                        child.terminate()
+                    code = child.wait()
+                    if code < 0:
+                        code = min(255, 128 + abs(code))
+            except OSError as error:
+                print(f"antiphon worker: command could not start: {error}",
+                      file=sys.stderr)
+                if child is not None and child.poll() is None:
+                    with contextlib.suppress(OSError):
+                        child.terminate()
+                    try:
+                        child.wait(timeout=0.5)
+                    except subprocess.TimeoutExpired:
+                        with contextlib.suppress(OSError):
+                            child.kill()
+                        with contextlib.suppress(subprocess.TimeoutExpired):
+                            child.wait(timeout=0.5)
+        # Keep the worker-directory token for readers from before the
+        # supervisor protocol. It is best-effort: current outcome publication
+        # must not depend on an adapter-writable compatibility mirror.
+        try:
+            _write_worker_exit(exit_file, code)
+        except OSError as error:
+            print(f"antiphon worker: legacy outcome mirror could not be written: {error}",
+                  file=sys.stderr)
+        try:
+            _write_live_marker(lock_fd, _published_marker(code))
+        except OSError as error:
+            print(f"antiphon worker: outcome could not be published: {error}",
+                  file=sys.stderr)
+            # STARTING, ACTIVE or a partial transition remains. Once the lock
+            # is released, a reader can tell that no outcome was published.
+    finally:
+        signal.signal(signal.SIGTERM, previous_term)
+        if ready_fd is not None:
+            with contextlib.suppress(OSError):
+                os.close(ready_fd)
+        if commit_fd is not None:
+            with contextlib.suppress(OSError):
+                os.close(commit_fd)
+        with contextlib.suppress(OSError):
+            os.close(lock_fd)
+    return code
+
+
+def _worker_wrapper_main(args):
+    if len(args) < 7 or args[0] != "_worker_wrapper":
+        return 2
+    try:
+        lock_fd, gate_fd, ready_fd, commit_fd = (
+            int(args[1]), int(args[2]), int(args[3]), int(args[4]))
+    except (TypeError, ValueError):
+        return 2
+    if (lock_fd < 0 or gate_fd < 0 or ready_fd < 0 or commit_fd < 0
+            or not args[5] or not args[6:]):
+        return 2
+    return _worker_wrapper(
+        lock_fd, gate_fd, ready_fd, commit_fd, args[5], args[6:])
+
+
+if __name__ == "__main__":
+    raise SystemExit(_worker_wrapper_main(sys.argv[1:]))

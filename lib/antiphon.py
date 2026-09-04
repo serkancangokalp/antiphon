@@ -6935,7 +6935,12 @@ def _worker_report(cwd):
         return "Workers:            none"
     counts = collections.Counter(record["state"] for record in records)
     parts = [f"{counts[state]} {state}" for state in workers.STATES if counts[state]]
-    return "Workers:            " + ", ".join(parts) + " (as recorded; antiphon task list)"
+    line = "Workers:            " + ", ".join(parts) + " (as recorded; antiphon task list)"
+    uncertain = sum(1 for record in records if workers.liveness_unknown(cwd, record))
+    if uncertain:
+        noun = "worker has" if uncertain == 1 else "workers have"
+        line += f"; {uncertain} running {noun} unknown liveness after the task deadline"
+    return line
 
 
 def _delivery_report(cwd, now=None):
@@ -11171,6 +11176,19 @@ def _doctor_deliveries(report, cwd):
             "retry is suppressed")
 
 
+def _doctor_workers(report, cwd):
+    """Name visible worker uncertainty without reconciling or signalling."""
+    uncertain = sum(
+        1 for record in workers.tasks(cwd)
+        if workers.liveness_unknown(cwd, record))
+    if uncertain:
+        noun = "worker has" if uncertain == 1 else "workers have"
+        report.note(
+            f"workers: {uncertain} running {noun} unknown liveness after the "
+            "task deadline; no terminal outcome is claimed, and each work directory "
+            "and worker slot are kept")
+
+
 def _doctor_codex_tool_shapes(report, cwd):
     """Expose fail-closed Codex schema drift without printing its payload."""
     count = _codex_tool_shape_count(cwd)
@@ -11270,6 +11288,7 @@ def _doctor_readonly():
     _doctor_channel(report, cwd, live)
     _doctor_codex(report, cwd)
     _doctor_deliveries(report, cwd)
+    _doctor_workers(report, cwd)
     _doctor_sources(report, cwd)
     _doctor_codex_tool_shapes(report, cwd)
     _doctor_replay(report, cwd)
@@ -12716,7 +12735,7 @@ def _task_tool(cwd, arguments):
     if not isinstance(task_id, str) or workers.read_task(cwd, task_id) is None:
         return _tool_error("unknown task id")
     if action == "status":
-        record = workers.status(cwd, task_id)
+        record = workers.reported_status(cwd, task_id)
         return {"content": [{"type": "text", "text": json.dumps(record, indent=1)}]}
     if action == "result":
         wait = arguments.get("wait")
@@ -12797,7 +12816,7 @@ def task(*args):
         return 1
     try:
         if action == "status":
-            answer = workers.status(cwd, task_id)
+            answer = workers.reported_status(cwd, task_id)
         elif action == "result":
             try:
                 wait = float(args[2]) if len(args) > 2 else 0.0
