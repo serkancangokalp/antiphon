@@ -2243,7 +2243,9 @@ while 448 deeper files are reported separately as `excluded`; all five observed
 eligible user messages. Codex reported 281 then 282 production rollout files
 as another session appeared, zero
 excluded JSONL files, and 1,739 eligible user messages. These scoped counts are
-not numerically comparable to the older flat recursive totals. They will go
+not numerically comparable to the older flat recursive totals. A later exact-
+scope check also excludes Codex rollouts below dot-prefixed directories, just
+as production's recursive glob does. They will go
 stale as each host adds, renames or drops its own wrapper tags. Re-run before
 every release with:
 
@@ -2262,13 +2264,17 @@ python3 test/host_wrapper_census.py \
   --codex-root "$HOME/.codex/sessions"
 ```
 
-The utility prints aggregate counts only — never transcript text or individual
-paths. Review its tag keys, then:
+The utility prints bounded aggregate counts only — never transcript text or
+individual paths. `promptSource` is reported only as `system`, `sdk`, `typed`,
+`<absent>`, `<non-string>`, or `<other>`; an unknown transcript value is never
+copied into an output key. Tag names are limited to 64 characters and 256 keys,
+with fixed `<overlong-tag>` and `<additional-tags>` buckets for the remainder.
+Review its tag keys, then:
 
 - count every production-eligible, non-meta, non-empty Claude `type=user`
   message and Codex `response_item/message/role=user` message whose joined text
-  opens with `<`, split by side, each one carrying its `promptSource` value (or
-  its absence);
+  opens with `<`, split by side, each one carrying its bounded `promptSource`
+  category;
 - for every opening tag that turns up, decide host bookkeeping or a person's
   own words before touching either set — a tag seen on only one side stays out
   of the other's;

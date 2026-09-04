@@ -12396,6 +12396,10 @@ def print_summary(side="claude"):
 # ---------- managed workers: delegate, and follow a task by id ----------
 
 TASK_MARK = "[Antiphon task {task_id}]"
+# These are the only conservative post-transport states the Node wrapper may
+# return to an agent.  A contract test reads its literal set so adding a Python
+# outcome cannot silently turn delivered work into a retryable wrapper error.
+INCOMPLETE_HANDOFF_STATES = ("handing", "tracking_incomplete", "missing")
 
 
 def _update_handoff_state(cwd, task_id, state):
@@ -12434,6 +12438,11 @@ def _incomplete_handoff(cwd, task_id, *, kind, to, task_class, transport,
     _update_handoff_state(cwd, task_id, "tracking_incomplete")
     retained = workers.read_task(cwd, task_id)
     retained_state = retained["state"] if retained is not None else "missing"
+    if retained_state not in INCOMPLETE_HANDOFF_STATES:
+        # The peer may already act.  An unexpected durable read-back is still
+        # tracking damage, never permission for the wrapper to reject the
+        # response and invite a duplicate delivery.
+        retained_state = "tracking_incomplete"
     if outcome_unknown:
         movement = "may have been queued" if transport == "queue" else "may have been delivered"
     else:
@@ -12474,7 +12483,9 @@ def _delegate(cwd, payload, sender=None, side=None, env=None):
         kind = OTHER_SIDE[side][0]
     if kind not in workers.KINDS:
         return False, "not delegated: name a kind (claude or codex)"
-    task_class = payload.get("task") or "read"
+    task_class = payload.get("task")
+    if task_class is None:
+        task_class = "read"
     if task_class not in workers.CLASSES:
         return False, "not delegated: task must be read or write"
     to = payload.get("to")

@@ -643,6 +643,22 @@ class ShippedContractTest(unittest.TestCase):
         # so uncommitted work is not visible to it — every surface says so.
         delegate = next(t for t in antiphon.TOOLS if t["name"] == "antiphon_delegate")
         task_argument = delegate["inputSchema"]["properties"]["task"]["description"]
+        self.assertEqual(
+            delegate["inputSchema"]["properties"]["task"]["enum"],
+            list(antiphon.workers.CLASSES))
+        node_classes = re.search(
+            r'task: \{\s*type: "string", enum: (\[[^\]]+\])', node)
+        self.assertIsNotNone(node_classes, "the channel task-class enum")
+        self.assertEqual(json.loads(node_classes.group(1)),
+                         list(antiphon.workers.CLASSES))
+        node_incomplete = re.search(
+            r'const incompleteHandoffStates = new Set\((\[[^\]]+\])\)', node)
+        self.assertIsNotNone(node_incomplete,
+                             "the channel incomplete-handoff state set")
+        self.assertEqual(
+            set(json.loads(node_incomplete.group(1))),
+            set(antiphon.INCOMPLETE_HANDOFF_STATES),
+            "Python and Node must accept the same incomplete handoff states")
         node_task = re.search(r'task: \{\s*type: "string", enum: \["read", "write"\],'
                               r'\s*description: "([^"]*)"', node)
         self.assertIsNotNone(node_task, "the channel server's task argument")

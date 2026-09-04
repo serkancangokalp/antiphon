@@ -126,6 +126,78 @@ class HostWrapperCensusTest(unittest.TestCase):
             result["codex"]["excluded"]["tags"]["not-a-rollout"]["<absent>"], 1)
         self.assertNotIn("not-a-rollout", result["codex"]["production"]["tags"])
 
+    def test_transcript_derived_output_keys_are_bounded_categories(self):
+        """Aggregate output may name a plausible wrapper, but it must never
+        copy an arbitrary prompt source or an unbounded tag-shaped secret.
+        Cardinality is bounded too, so many adversarial tags cannot turn this
+        release diagnostic into an unbounded output channel.
+        """
+        source_secret = "SOURCE-SECRET-" + "s" * 300
+        tag_secret = "TAG-SECRET-" + "t" * 300
+        with tempfile.TemporaryDirectory() as root:
+            claude = os.path.join(root, "claude")
+            codex = os.path.join(root, "codex")
+            os.makedirs(codex)
+            records = [{
+                "type": "user", "promptSource": source_secret,
+                "message": {"content": f"<{tag_secret}>\nbody"},
+            }]
+            records.extend({
+                "type": "user", "promptSource": "system",
+                "message": {"content": f"<candidate-{number}>\nbody"},
+            } for number in range(census.MAX_TAG_KEYS + 20))
+            self.write_lines(claude, "project/one.jsonl", records)
+
+            result = census.census(claude, codex)
+
+        rendered = json.dumps(result, sort_keys=True)
+        self.assertNotIn(source_secret, rendered)
+        self.assertNotIn(tag_secret, rendered)
+        stats = result["claude"]["production"]
+        self.assertEqual(stats["prompt_sources"][census.OTHER_SOURCE], 1)
+        self.assertEqual(
+            stats["tags"][census.OVERLONG_TAG][census.OTHER_SOURCE], 1)
+        self.assertLessEqual(len(stats["tags"]), census.MAX_TAG_KEYS)
+        self.assertIn(census.ADDITIONAL_TAGS, stats["tags"])
+
+    def test_hidden_codex_paths_match_production_glob_scope(self):
+        """Python's recursive glob does not descend through dot directories;
+        the census must report their files and ambiguous links as excluded,
+        never as evidence for a production filter.
+        """
+        record = {"type": "response_item", "payload": {
+            "type": "message", "role": "user", "content": [{
+                "type": "input_text", "text": "<candidate>\nbody",
+            }]}}
+        with tempfile.TemporaryDirectory() as root, \
+             tempfile.TemporaryDirectory() as outside:
+            claude = os.path.join(root, "claude")
+            codex = os.path.join(root, "codex")
+            os.makedirs(claude)
+            visible = self.write_lines(
+                codex, "2026/rollout-visible.jsonl", [record])
+            hidden = self.write_lines(
+                codex, ".hidden/rollout-hidden.jsonl", [record])
+            os.makedirs(os.path.join(outside, "nested"))
+            os.symlink(os.path.join(outside, "nested"),
+                       os.path.join(codex, ".hidden-link"))
+
+            result = census.census(claude, codex)
+            with patch.object(antiphon, "CODEX_SESSIONS", codex):
+                production = antiphon._enumerate_catalog_candidates(
+                    root, "codex")
+
+        self.assertEqual(
+            production.relative_paths,
+            (os.path.relpath(visible, codex),),
+            "the premise: production excludes the hidden rollout")
+        side = result["codex"]
+        self.assertEqual(side["production"]["files"], 1)
+        self.assertEqual(side["production"]["refused_files"], 0)
+        self.assertEqual(side["excluded"]["files"], 1)
+        self.assertEqual(side["excluded"]["refused_files"], 1)
+        self.assertNotEqual(hidden, visible)
+
     def test_symlinked_files_and_directories_are_refused_not_aggregated(self):
         """The census must not learn from paths production will refuse."""
         with tempfile.TemporaryDirectory() as root:

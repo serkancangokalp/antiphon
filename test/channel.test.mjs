@@ -1319,8 +1319,13 @@ async function anOversizedMessageIsRefusedWithoutKillingTheSession() {
   try {
     assert.ok(await waitFor(() => existsSync(session.socketPath)), session.stderr());
 
-    const refusal = await sendTo(session.socketPath,
-      JSON.stringify({ content: "x".repeat(200 * 1024) }));
+    const unicodeContent = "😀".repeat(40 * 1024);
+    const unicodePayload = JSON.stringify({ content: unicodeContent });
+    assert.ok(unicodeContent.length < 128 * 1024,
+      "UTF-16 length alone would put this message below the channel cap");
+    assert.ok(Buffer.byteLength(unicodePayload) > 128 * 1024,
+      "its actual UTF-8 transport bytes exceed the cap");
+    const refusal = await sendTo(session.socketPath, unicodePayload);
     assert.match(refusal, /too large/, `expected a refusal, got: ${refusal}`);
     assert.equal(session.child.exitCode, null, "the session must stay alive");
     assert.ok(existsSync(session.socketPath), "the socket must survive");
@@ -1565,6 +1570,15 @@ try {
     /timeout must be a finite number/,
     "a non-finite timeout is refused before task or transport state");
   assert.deepEqual(existsSync(tasksDir) ? readdirSync(tasksDir) : [], tasksBeforeBadTimeout);
+  await assert.rejects(
+    () => client.callTool({
+      name: "antiphon_delegate",
+      arguments: { text: "look", task: "" },
+    }),
+    /task must be read or write/,
+    "a present invalid task class is refused before work can start");
+  assert.deepEqual(existsSync(tasksDir) ? readdirSync(tasksDir) : [], tasksBeforeBadTimeout,
+    "an invalid task class cannot leave work for a caller to retry");
   await assert.rejects(
     () => client.callTool({ name: "antiphon_task", arguments: { id: "nope", action: "status" } }),
     /unknown task id/);

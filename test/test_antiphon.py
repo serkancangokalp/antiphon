@@ -4437,6 +4437,30 @@ class ManagedWorkerToolTest(unittest.TestCase):
             for task_id in ids:
                 self._task(project, ("cancel", task_id))
 
+    def test_delegate_refuses_falsy_explicit_task_classes_before_any_side_effect(self):
+        """Only an absent task defaults to read.  A present invalid value must
+        not be normalised after the Node wrapper has already bound its expected
+        response to that value: doing so can start or hand off work which the
+        wrapper then reports as an invalid, retryable response.
+        """
+        with tempfile.TemporaryDirectory() as project:
+            for task_class in ("", False, 0):
+                ok = detail = None
+                with self.subTest(task_class=task_class), \
+                     patch.object(
+                         antiphon.workers, "new_task",
+                         side_effect=AssertionError("invalid task reached storage")):
+                    ok, detail = antiphon._delegate(
+                        project,
+                        {"text": "review the diff", "kind": "codex",
+                         "task": task_class},
+                        side="claude", env={})
+                self.assertFalse(ok)
+                self.assertEqual(detail,
+                                 "not delegated: task must be read or write")
+            self.assertEqual(workers.tasks(project), [])
+            self.assertEqual(ledger.entries(project), [])
+
     def test_delegate_refuses_deeply_nested_json_without_a_traceback(self):
         raw = "[" * 1_500 + "0" + "]" * 1_500
         with tempfile.TemporaryDirectory() as project, \

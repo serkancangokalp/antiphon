@@ -12,6 +12,16 @@ import stat
 
 OPENING_TAG = re.compile(r"^\s*<([A-Za-z][A-Za-z0-9_-]*)(?=[\s>/])")
 ABSENT = "<absent>"
+NON_STRING_SOURCE = "<non-string>"
+OTHER_SOURCE = "<other>"
+KNOWN_PROMPT_SOURCES = frozenset(("system", "sdk", "typed"))
+MAX_TAG_LENGTH = 64
+# Reserve one key each for an overlong tag and cardinality overflow.  The
+# census is a diagnostic over untrusted transcript bytes; its JSON output and
+# in-memory aggregation must stay bounded even if every line invents a tag.
+MAX_TAG_KEYS = 256
+OVERLONG_TAG = "<overlong-tag>"
+ADDITIONAL_TAGS = "<additional-tags>"
 
 # The shapes that are not tags, mirrored from production (a contract test
 # compares them): the AGENTS.md injection is a user prefix plus a fence, the
@@ -28,12 +38,29 @@ CLAUDE_HOST_LITERALS = ("[Request interrupted by user]",
 def opening_tag(text):
     """Return a complete opening tag name at the start of text, if present."""
     match = OPENING_TAG.match(text or "")
-    return match.group(1) if match else None
+    if not match:
+        return None
+    tag = match.group(1)
+    return tag if len(tag) <= MAX_TAG_LENGTH else OVERLONG_TAG
 
 
 def _prompt_source(record):
-    source = record.get("promptSource", ABSENT)
-    return source if isinstance(source, str) else "<non-string>"
+    if "promptSource" not in record:
+        return ABSENT
+    source = record.get("promptSource")
+    if not isinstance(source, str):
+        return NON_STRING_SOURCE
+    return source if source in KNOWN_PROMPT_SOURCES else OTHER_SOURCE
+
+
+def _count_tag(target, tag, source, amount=1):
+    """Increment one tag without allowing unbounded key cardinality."""
+    reserved = (OVERLONG_TAG, ADDITIONAL_TAGS)
+    ordinary = sum(1 for key in target if key not in reserved)
+    if (tag not in target and tag not in reserved
+            and ordinary >= MAX_TAG_KEYS - len(reserved)):
+        tag = ADDITIONAL_TAGS
+    target[tag][source] += amount
 
 
 def _join_text_blocks(blocks):
@@ -346,7 +373,7 @@ def _stats(root, files, blocks_for, shapes_for, inventory_refusals=0):
                         local_sources[prompt_source] += 1
                         tag = opening_tag(text)
                         if tag is not None:
-                            local_tags[tag][prompt_source] += 1
+                            _count_tag(local_tags, tag, prompt_source)
                     for shape in shapes_for(record):
                         local_shapes[shape] += 1
         except OSError:
@@ -359,7 +386,8 @@ def _stats(root, files, blocks_for, shapes_for, inventory_refusals=0):
         prompt_sources.update(local_sources)
         shapes.update(local_shapes)
         for tag, sources in local_tags.items():
-            tags[tag].update(sources)
+            for source, amount in sources.items():
+                _count_tag(tags, tag, source, amount)
     return {
         "files": len(files),
         "refused_files": refused_files,
@@ -382,7 +410,9 @@ def _side_census(root, kind, blocks_for, shapes_for):
             # immediate project directory, then only its immediate
             # transcripts. Nested subagent transcripts are not candidates.
             return len(path.split(os.sep)) == 2
-        return os.path.basename(path).startswith("rollout-")
+        parts = path.split(os.sep)
+        return (all(not part.startswith(".") for part in parts)
+                and os.path.basename(path).startswith("rollout-"))
 
     def production_refusal(item):
         path, may_be_directory = item
@@ -393,8 +423,10 @@ def _side_census(root, kind, blocks_for, shapes_for):
                     or (len(parts) == 1 and may_be_directory))
         # Codex discovers matching leaves recursively. Any symlink may be a
         # directory containing such leaves, regardless of its own suffix.
-        return ((basename.startswith("rollout-")
-                 and basename.endswith(".jsonl")) or may_be_directory)
+        visible = all(not part.startswith(".") for part in parts)
+        return visible and ((basename.startswith("rollout-")
+                            and basename.endswith(".jsonl"))
+                           or may_be_directory)
 
     admitted = [path for path in all_files if production_member(path)]
     admitted_set = set(admitted)
