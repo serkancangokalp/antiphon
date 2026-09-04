@@ -65,9 +65,9 @@ class CrossBoundaryContractTest(unittest.TestCase):
             self.assertEqual(words[0], "antiphon", template)
             self.assertIn(words[1], antiphon.COMMANDS, template)
 
-    def test_mcp_entry_setup_writes_is_dispatched_by_the_node_binary(self):
-        """`.mcp.json` starts `antiphon channel`; bin/antiphon.mjs must branch on
-        exactly that word, and the command must be the binary package.json ships."""
+    def test_mcp_entry_setup_writes_is_dispatched_by_the_installed_binary(self):
+        """`.mcp.json` starts `antiphon channel`; the installed dispatcher
+        must exec the Node server for exactly that word."""
         with tempfile.TemporaryDirectory() as project, \
              patch.object(antiphon, "project_dir", return_value=project), \
              contextlib.redirect_stdout(io.StringIO()):
@@ -78,10 +78,10 @@ class CrossBoundaryContractTest(unittest.TestCase):
         package = json.loads(read("package.json"))
         self.assertIn(server["command"], package["bin"])
 
-        branch = capture(r'subcommand\s*===\s*"([^"]+)"',
-                         read("bin", "antiphon.mjs"))
-        self.assertIsNotNone(branch, "subcommand comparison not found in bin/antiphon.mjs")
-        self.assertEqual(server["args"], [branch])
+        dispatcher = read("bin", "antiphon")
+        self.assertIn('arguments[:1] == ["channel"]', dispatcher)
+        self.assertIn('"lib", "channel.mjs"', dispatcher)
+        self.assertEqual(server["args"], ["channel"])
 
     def test_agents_rule_names_the_mcp_tool_codex_actually_gets(self):
         """AGENTS_RULE tells Codex to call a tool by name; that name has to be
@@ -627,6 +627,15 @@ class ShippedContractTest(unittest.TestCase):
         node = read("lib", "channel.mjs")
         collapsed = re.sub(r'"\s*\+\s*\n\s*"', "", node)
         self.assertIn("never merges its work", collapsed)
+        for surface in (antiphon.DELEGATE_DESCRIPTION, collapsed):
+            self.assertIn("same attempt id", surface)
+            self.assertRegex(
+                surface, r"(?i)tracking[^.]*incomplete[^.]*not (?:to )?retry")
+            self.assertIn("fresh-worker result names the worker", surface)
+            self.assertIn("collected with antiphon_task", surface)
+            self.assertIn("hand-off result names the peer", surface)
+            self.assertIn("not collected by id", surface)
+            self.assertIn("answer arrives in that peer's own words", surface)
         self.assertIn('name: "antiphon_delegate"', collapsed)
         self.assertIn('name: "antiphon_task"', collapsed)
         # Second review 2026-09-03: both servers said a read task runs in the
@@ -634,6 +643,22 @@ class ShippedContractTest(unittest.TestCase):
         # so uncommitted work is not visible to it — every surface says so.
         delegate = next(t for t in antiphon.TOOLS if t["name"] == "antiphon_delegate")
         task_argument = delegate["inputSchema"]["properties"]["task"]["description"]
+        self.assertEqual(
+            delegate["inputSchema"]["properties"]["task"]["enum"],
+            list(antiphon.workers.CLASSES))
+        node_classes = re.search(
+            r'task: \{\s*type: "string", enum: (\[[^\]]+\])', node)
+        self.assertIsNotNone(node_classes, "the channel task-class enum")
+        self.assertEqual(json.loads(node_classes.group(1)),
+                         list(antiphon.workers.CLASSES))
+        node_incomplete = re.search(
+            r'const incompleteHandoffStates = new Set\((\[[^\]]+\])\)', node)
+        self.assertIsNotNone(node_incomplete,
+                             "the channel incomplete-handoff state set")
+        self.assertEqual(
+            set(json.loads(node_incomplete.group(1))),
+            set(antiphon.INCOMPLETE_HANDOFF_STATES),
+            "Python and Node must accept the same incomplete handoff states")
         node_task = re.search(r'task: \{\s*type: "string", enum: \["read", "write"\],'
                               r'\s*description: "([^"]*)"', node)
         self.assertIsNotNone(node_task, "the channel server's task argument")
@@ -672,6 +697,9 @@ class ShippedContractTest(unittest.TestCase):
         self.assertIsNotNone(node_task_tool, "the channel server's antiphon_task description")
         node_description = "".join(re.findall(r'"([^"]*)"', node_task_tool.group(1)))
         self.assertEqual(node_description, antiphon.TASK_DESCRIPTION)
+        self.assertRegex(
+            antiphon.TASK_DESCRIPTION,
+            r"(?i)handing[^.]*tracking_incomplete[^.]*peer may already act")
         for words in ("stop a worker past its timeout",
                       "on the next hook after its result was collected",
                       "written beside it", "nothing goes while the worker runs"):
@@ -724,6 +752,18 @@ class ShippedContractTest(unittest.TestCase):
         self.assertIn("a same-kind message to nobody in particular has no meaning", collapsed)
         kind = next(t for t in antiphon.TOOLS if t["name"] == "antiphon_send")
         self.assertIn("another Codex session", kind["inputSchema"]["properties"]["kind"]["description"])
+        self.assertIn("unknown outcome", kind["description"])
+        self.assertIn("do-not-retry", kind["description"])
+        self.assertIn("transcript already proves receipt", kind["description"])
+        self.assertIn("returns received", kind["description"])
+        for tool_name in ("reply_to_codex", "reply_to_claude"):
+            start = node.index(f'name: "{tool_name}"')
+            end = node.index("inputSchema:", start)
+            description = node[start:end]
+            self.assertIn("unknown outcome", description, tool_name)
+            self.assertIn("not to retry", description, tool_name)
+            self.assertIn("transcript already proves receipt", description, tool_name)
+            self.assertIn("returns received", description, tool_name)
         self.assertIn("## P1 — Same-vendor bridging: Codex ↔ Codex and Claude ↔ Claude "
                       "(shipped 2026-09-03)", read("BACKLOG.md"))
 
@@ -749,6 +789,13 @@ class ShippedContractTest(unittest.TestCase):
         self.assertRegex(section(readme, "Limits"),
                          r"(?i)a tool result is a statement about the transport")
         self.assertRegex(section(readme, "Limits"), r"(?i)last unanswered sender")
+        self.assertIn("`[HH:MM]`", readme)
+        self.assertIn("`[YYYY-MM-DD HH:MM]`", readme)
+        self.assertIn("`[time unavailable]`", readme)
+        for rule in (antiphon.AGENTS_RULE, antiphon.CLAUDE_RULE):
+            self.assertIn("`[HH:MM]`", rule)
+            self.assertIn("`[YYYY-MM-DD HH:MM]`", rule)
+            self.assertIn("`[time unavailable]`", rule)
         backlog = read("BACKLOG.md")
         self.assertIn("## P1 — `reply_to_codex` can report success while the peer "
                       "receives nothing (fixed)", backlog)
@@ -1035,14 +1082,13 @@ class ShippedContractTest(unittest.TestCase):
             doctor, r"(?is)default read-only command.*configuration repair")
 
     def test_the_readme_shows_how_to_start_each_kind_of_named_peer(self):
-        """Naming is not a flag on a command, it is an environment variable read
-        at startup, and getting it wrong is invisible: the session comes up fine
-        and simply cannot be addressed."""
+        """The guided launcher sets the startup environment and host-specific
+        Claude flag together, so the default docs cannot omit either half."""
         readme = read("README.md")
-        for command in ("ANTIPHON_NAME=ui claude",
-                        "ANTIPHON_NAME=api claude",
-                        "ANTIPHON_NAME=build codex",
-                        "ANTIPHON_NAME=review codex"):
+        for command in ("antiphon launch claude --name ui",
+                        "antiphon launch claude --name api",
+                        "antiphon launch codex --name build",
+                        "antiphon launch codex --name review"):
             self.assertIn(command, readme, command)
 
     def test_the_multi_peer_section_addresses_both_sides_by_name(self):
@@ -1119,8 +1165,8 @@ class ShippedContractTest(unittest.TestCase):
             with contextlib.redirect_stdout(printed):
                 self.assertEqual(antiphon.setup(), 0)
         guidance = printed.getvalue()
-        self.assertRegex(guidance, r"ANTIPHON_NAME=\S+ claude ")
-        self.assertRegex(guidance, r"ANTIPHON_NAME=\S+ codex")
+        self.assertRegex(guidance, r"antiphon launch claude --name \S+")
+        self.assertRegex(guidance, r"antiphon launch codex --name \S+")
 
 if __name__ == "__main__":
     unittest.main()

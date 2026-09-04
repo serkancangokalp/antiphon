@@ -1618,7 +1618,8 @@ class AntiphonTest(unittest.TestCase):
             "received. That thread is unproven: the host keeps no writer lock for "
             "it, so it may be open or long closed."))
         self.assertEqual(answer, {"queued": True, "id": entry["id"], "proof": "unproven",
-                                  "to": None, "attachment": None, "recorded": True})
+                                  "to": None, "attachment": None, "recorded": True,
+                                  "dedupe_recorded": True})
         self.assertEqual((entry["sender"], entry["to_kind"], entry["to_alias"],
                           entry["transport"], entry["proof"], entry["state"],
                           entry["sha256"], entry["size"]),
@@ -1739,7 +1740,7 @@ class AntiphonTest(unittest.TestCase):
     class _Channel:
         """A channel socket that is not there for the first `missing` connects."""
 
-        def __init__(self, missing=0, reply=b'{"ok": true}'):
+        def __init__(self, missing=0, reply=None):
             self.missing = missing
             self.reply = reply
             self.connects = 0
@@ -1769,12 +1770,17 @@ class AntiphonTest(unittest.TestCase):
 
         def sendall(self, data):
             self.sent += data
+            if self.reply is None:
+                request = json.loads(data.decode())
+                self.reply = json.dumps({
+                    "ok": True, "message_id": request["message_id"],
+                }).encode()
 
         def shutdown(self, _how):
             pass
 
         def recv(self, _n):
-            data, self.reply = self.reply, b""
+            data, self.reply = self.reply or b"", b""
             return data
 
     class _RecoveringSockets:
@@ -2035,6 +2041,31 @@ class AntiphonTest(unittest.TestCase):
         self.assertIn("invalid response", detail)
         self.assertEqual(chan.connects, 1, "the message must not be sent twice")
 
+    def test_a_deep_channel_reply_is_bounded_after_bytes_leave(self):
+        """Valid, small JSON can exceed the decoder's recursion limit. The
+        delivery road must classify that acknowledgement as unknown, not crash.
+        """
+        deep = b'{"a":' * 1_200 + b'{}' + b'}' * 1_200
+        self.assertLess(len(deep), 64 * 1024)
+
+        delivery = self._Channel(reply=deep)
+        with tempfile.TemporaryDirectory() as project, \
+             patch.object(antiphon.socket, "socket", delivery), \
+             patch.object(antiphon, "_resolve_target",
+                          return_value=antiphon.ResolvedTarget(
+                              "/tmp/ui.sock", "", "registered")):
+            ok, detail = antiphon.send_to_claude(project, "hello")
+        self.assertFalse(ok)
+        self.assertIn("invalid response", detail)
+        self.assertIs(detail.delivery_unknown, True)
+        self.assertEqual(delivery.connects, 1)
+        self.assertTrue(delivery.sent, "the classification happens after sendall")
+
+        control = self._Channel(reply=deep)
+        with tempfile.TemporaryDirectory() as project, \
+             patch.object(antiphon.socket, "socket", control):
+            self.assertFalse(antiphon._request_claude_reassert(project, "ui"))
+
     def test_send_to_claude_uses_mcp_channel_socket(self):
         class FakeSocket:
             def __init__(self, *_):
@@ -2045,12 +2076,17 @@ class AntiphonTest(unittest.TestCase):
             def __exit__(self, *_): return False
             def settimeout(self, _): pass
             def connect(self, path): self.path = path
-            def sendall(self, data): self.sent = data
+            def sendall(self, data):
+                self.sent = data
+                self.answer = json.dumps({
+                    "ok": True,
+                    "message_id": json.loads(data)["message_id"],
+                }).encode()
             def shutdown(self, _): pass
             def recv(self, _):
                 if self.received: return b""
                 self.received = True
-                return b'{"ok": true, "message_id": "m1"}'
+                return self.answer
 
         sock = FakeSocket()
         with patch.object(antiphon.socket, "socket", return_value=sock):
@@ -3690,9 +3726,106 @@ class ToolInvocationIdentityTest(unittest.TestCase):
     def test_non_tool_rendering_is_unchanged_by_the_optional_event_field(self):
         event = antiphon.Event(0, "claude", "plain", self.SOURCE, "g", 0, 10)
         record = antiphon.Record(0, self.SOURCE, "g", 0, 10, (event,))
-        self.assertEqual(antiphon._render_record(record, "codex"),
+        self.assertEqual(antiphon._render_record(
+            record, "codex", today=antiphon.datetime.fromtimestamp(0).date()),
                          "[%s] Claude:\nplain" %
                          antiphon.datetime.fromtimestamp(0).strftime("%H:%M"))
+
+
+class RecordTimestampTest(unittest.TestCase):
+    """A compact clock never makes yesterday look like today."""
+
+    SOURCE = "4eecac24-1c21-47ad-ab11-a650708f3098"
+
+    @staticmethod
+    def _record(when, text="plain", offset=0):
+        event = antiphon.Event(
+            when, "claude", text, RecordTimestampTest.SOURCE, "g",
+            offset, offset + 10)
+        return antiphon.Record(
+            when, RecordTimestampTest.SOURCE, "g", offset, offset + 10,
+            (event,))
+
+    def test_another_local_day_is_date_qualified_while_today_stays_compact(self):
+        today = antiphon.datetime(2026, 9, 4).date()
+        yesterday = antiphon.datetime(2026, 9, 3, 11, 43).timestamp()
+        same_day = antiphon.datetime(2026, 9, 4, 2, 38).timestamp()
+        tomorrow = antiphon.datetime(2026, 9, 5, 0, 1).timestamp()
+
+        self.assertEqual(antiphon._record_clock(yesterday, today),
+                         "2026-09-03 11:43")
+        self.assertEqual(antiphon._record_clock(same_day, today), "02:38")
+        self.assertEqual(antiphon._record_clock(tomorrow, today),
+                         "2026-09-05 00:01")
+
+    def test_an_unrenderable_host_timestamp_cannot_drop_the_page(self):
+        class OutOfRangeDatetime:
+            @staticmethod
+            def fromtimestamp(_epoch):
+                raise OverflowError("outside platform time_t")
+
+        today = antiphon.datetime(2026, 9, 4).date()
+        epoch = antiphon.iso_epoch("9999-12-31T23:59:59Z")
+        with patch.object(antiphon, "datetime", OutOfRangeDatetime):
+            clock = antiphon._record_clock(epoch, today)
+
+        self.assertEqual(clock, "time unavailable")
+
+    def test_parser_extremes_always_render_a_nonempty_clock(self):
+        today = antiphon.datetime(2026, 9, 4).date()
+        for stamp in ("0001-01-01T00:00:00Z", "9999-12-31T23:59:59Z"):
+            with self.subTest(stamp=stamp):
+                epoch = antiphon.iso_epoch(stamp)
+                self.assertIsNotNone(epoch, "the production parser admits this stamp")
+                clock = antiphon._record_clock(epoch, today)
+                self.assertIsInstance(clock, str)
+                self.assertTrue(clock)
+
+    def test_date_labels_are_inside_the_existing_page_budget(self):
+        today = antiphon.datetime(2026, 9, 4).date()
+        base = antiphon.datetime(2026, 9, 3, 1, 0).timestamp()
+        records = [self._record(base + index * 60, "x" * 260, index * 10)
+                   for index in range(40)]
+        events = [event for record in records for event in record.events]
+        scanned = {self.SOURCE: {"gen": "g", "offset": 400}}
+
+        page, advance, _count = antiphon._build_page(
+            events, scanned, "codex", today=today)
+
+        self.assertLessEqual(len(page.encode("utf-8")), antiphon.PAGE_BUDGET)
+        self.assertTrue(advance.has_more, "the byte limit, not the record limit, split the page")
+        clocks = re.findall(r"^\[([^]]+)\] Claude:$", page, re.MULTILINE)
+        self.assertGreater(len(clocks), 0)
+        self.assertTrue(all(clock.startswith("2026-09-03 ") for clock in clocks), clocks)
+
+    def test_date_label_bytes_reduce_the_number_of_records_that_fit(self):
+        """The date is not decoration added after selection: its eleven extra
+        bytes per run can move the frontier. The patched control is the
+        realistic mutation where selection still budgets the old short clock.
+        """
+        record_day = antiphon.datetime(2026, 9, 3).date()
+        next_day = antiphon.datetime(2026, 9, 4).date()
+        base = antiphon.datetime(2026, 9, 3, 1, 0).timestamp()
+        records = [self._record(base + index * 60, "x" * 180, index * 10)
+                   for index in range(40)]
+        events = [event for record in records for event in record.events]
+        scanned = {self.SOURCE: {"gen": "g", "offset": 400}}
+
+        same_page, same_advance, same_count = antiphon._build_page(
+            events, scanned, "codex", today=record_day)
+        dated_page, dated_advance, dated_count = antiphon._build_page(
+            events, scanned, "codex", today=next_day)
+        with patch.object(antiphon, "_record_clock", return_value="01:00"):
+            _mutated_page, _mutated_advance, mutated_count = antiphon._build_page(
+                events, scanned, "codex", today=next_day)
+
+        self.assertLessEqual(len(same_page.encode("utf-8")), antiphon.PAGE_BUDGET)
+        self.assertLessEqual(len(dated_page.encode("utf-8")), antiphon.PAGE_BUDGET)
+        self.assertTrue(same_advance.has_more)
+        self.assertTrue(dated_advance.has_more)
+        self.assertLess(dated_count, same_count)
+        self.assertEqual(mutated_count, same_count,
+                         "removing date bytes must make the control fit more records")
 
 
 class ToolInvocationRetrievalTest(unittest.TestCase):
@@ -4304,6 +4437,59 @@ class ManagedWorkerToolTest(unittest.TestCase):
             for task_id in ids:
                 self._task(project, ("cancel", task_id))
 
+    def test_delegate_refuses_explicit_invalid_kind_and_task_before_any_side_effect(self):
+        """Only an absent task defaults to read.  A present invalid value must
+        not be normalised after the Node wrapper has already bound its expected
+        response to that value: doing so can start or hand off work which the
+        wrapper then reports as an invalid, retryable response.
+        """
+        with tempfile.TemporaryDirectory() as project:
+            for task_class in (None, "", False, 0):
+                ok = detail = None
+                with self.subTest(task_class=task_class), \
+                     patch.object(
+                         antiphon.workers, "new_task",
+                         side_effect=AssertionError("invalid task reached storage")):
+                    ok, detail = antiphon._delegate(
+                        project,
+                        {"text": "review the diff", "kind": "codex",
+                         "task": task_class},
+                        side="claude", env={})
+                self.assertFalse(ok)
+                self.assertEqual(detail,
+                                 "not delegated: task must be read or write")
+            for kind in (None, "", False, 0):
+                ok = detail = None
+                with self.subTest(kind=kind), \
+                     patch.object(
+                         antiphon.workers, "new_task",
+                         side_effect=AssertionError("invalid kind reached storage")):
+                    ok, detail = antiphon._delegate(
+                        project,
+                        {"text": "review the diff", "kind": kind,
+                         "task": "read"},
+                        side="claude", env={})
+                self.assertFalse(ok)
+                self.assertEqual(
+                    detail, "not delegated: name a kind (claude or codex)")
+            self.assertEqual(workers.tasks(project), [])
+            self.assertEqual(ledger.entries(project), [])
+
+    def test_delegate_refuses_deeply_nested_json_without_a_traceback(self):
+        raw = "[" * 1_500 + "0" + "]" * 1_500
+        with tempfile.TemporaryDirectory() as project, \
+             patch.object(antiphon, "project_dir", return_value=project), \
+             patch.object(antiphon.sys, "stdin", io.StringIO(raw)), \
+             contextlib.redirect_stdout(io.StringIO()) as out, \
+             contextlib.redirect_stderr(io.StringIO()) as err:
+            code = antiphon.task("delegate")
+
+        self.assertEqual(code, 1)
+        self.assertEqual(out.getvalue(), "")
+        self.assertIn("task: not delegated: the task text is empty", err.getvalue())
+        self.assertEqual(workers.tasks(project), [])
+        self.assertEqual(ledger.entries(project), [])
+
     def test_delegate_hands_a_task_to_a_running_named_peer(self):
         with tempfile.TemporaryDirectory() as project:
             sends = []
@@ -4334,6 +4520,81 @@ class ManagedWorkerToolTest(unittest.TestCase):
                                          {"text": "x", "kind": "codex", "to": "build",
                                           "side": "claude"})
             self.assertEqual(code, 1, "no transport: refused")
+
+    def test_a_handed_same_kind_task_warns_when_the_listener_is_old(self):
+        with tempfile.TemporaryDirectory() as project, \
+             patch.object(antiphon, "send_to_claude",
+                          return_value=(True, antiphon.OLD_LISTENER)):
+            ok, answer = antiphon._delegate(
+                project,
+                {"text": "review the diff", "kind": "claude", "to": "opus"},
+                sender="ui", side="claude")
+
+        self.assertTrue(ok, answer)
+        self.assertEqual(answer["state"], "handed")
+        self.assertIn("predates same-kind sends", answer["text"])
+        self.assertIn("reconnect that session", answer["text"])
+
+        with tempfile.TemporaryDirectory() as project, \
+             patch.object(antiphon, "send_to_claude",
+                          return_value=(True, antiphon.OLD_LISTENER)), \
+             patch.object(antiphon.ledger, "record_sent", return_value=False):
+            ok, incomplete = antiphon._delegate(
+                project,
+                {"text": "review the diff", "kind": "claude", "to": "opus"},
+                sender="ui", side="claude")
+        self.assertTrue(ok, incomplete)
+        self.assertEqual(incomplete["tracking"], "incomplete")
+        self.assertIn("reconnect that session", incomplete["text"])
+
+    def test_nonfinite_handoff_timeout_is_refused_on_cli_and_codex_mcp(self):
+        """Python's JSON decoder accepts Infinity and turns 1e309 into it.
+        Neither spelling may reach the task store or either transport.
+        """
+        for token in ("Infinity", "1e309"):
+            with self.subTest(surface="cli", token=token), \
+                 tempfile.TemporaryDirectory() as project, \
+                 patch.object(antiphon, "project_dir", return_value=project), \
+                 patch.object(antiphon.workers, "new_task") as new_task, \
+                 patch.object(antiphon, "send_to_codex") as send_codex, \
+                 patch.object(antiphon, "send_to_claude") as send_claude, \
+                 patch.object(antiphon.sys, "stdin", io.StringIO(
+                     '{"text":"look","kind":"codex","to":"build",'
+                     '"side":"claude","timeout":' + token + '}')), \
+                 contextlib.redirect_stdout(io.StringIO()) as output, \
+                 contextlib.redirect_stderr(io.StringIO()) as error:
+                code = antiphon.task("delegate")
+            self.assertEqual(code, 1)
+            self.assertEqual(output.getvalue(), "")
+            self.assertIn("timeout must be a finite number", error.getvalue())
+            new_task.assert_not_called()
+            send_codex.assert_not_called()
+            send_claude.assert_not_called()
+            self.assertFalse(os.path.exists(os.path.join(project, ".antiphon")))
+
+            request = (
+                '{"jsonrpc":"2.0","id":7,"method":"tools/call",'
+                '"params":{"name":"antiphon_delegate","arguments":'
+                '{"text":"look","kind":"claude","to":"api",'
+                '"timeout":' + token + '}}}\n')
+            with self.subTest(surface="codex-mcp", token=token), \
+                 tempfile.TemporaryDirectory() as project, \
+                 patch.object(antiphon.workers, "new_task") as new_task, \
+                 patch.object(antiphon, "send_to_codex") as send_codex, \
+                 patch.object(antiphon, "send_to_claude") as send_claude, \
+                 patch.object(antiphon.sys, "stdin", io.StringIO(request)), \
+                 contextlib.redirect_stdout(io.StringIO()) as output, \
+                 contextlib.redirect_stderr(io.StringIO()):
+                antiphon._mcp_serve(project, "build")
+            result = json.loads(output.getvalue())["result"]
+            self.assertIs(result.get("isError"), True)
+            self.assertIn("timeout must be a finite number",
+                          result["content"][0]["text"])
+            self.assertNotIn("OverflowError", result["content"][0]["text"])
+            new_task.assert_not_called()
+            send_codex.assert_not_called()
+            send_claude.assert_not_called()
+            self.assertFalse(os.path.exists(os.path.join(project, ".antiphon")))
 
     def test_status_result_and_cancel_by_id(self):
         with tempfile.TemporaryDirectory() as project, tempfile.TemporaryDirectory() as bin_dir:
@@ -4524,6 +4785,417 @@ class ManagedWorkerToolTest(unittest.TestCase):
             self.assertEqual(workers.tasks(project), [])
             self.assertEqual(ledger.entries(project), [])
 
+    def test_a_handed_task_store_failure_prevents_transport(self):
+        with tempfile.TemporaryDirectory() as project, \
+             patch.object(antiphon.workers, "new_task",
+                          side_effect=OSError("task store unavailable")), \
+             patch.object(antiphon, "send_to_codex",
+                          return_value=(True, "live")) as send, \
+             patch.object(antiphon, "claimed_alias", return_value="ui"):
+            ok, answer = antiphon._delegate(
+                project, {"text": "look", "kind": "codex", "to": "build"},
+                sender="ui", side="claude")
+
+        self.assertFalse(ok)
+        self.assertIn("not delegated: task store unavailable", answer)
+        send.assert_not_called()
+
+    def test_a_handed_task_is_read_back_before_any_transport(self):
+        """A writer that returns success without durable bytes must not put
+        an id in a peer's hands that this bridge cannot resolve afterwards.
+        """
+        task_id = "2e6b14f1-1659-544a-98d4-56d6eca8fa48"
+        phantom = {
+            "id": task_id, "kind": "codex", "task_class": "read",
+            "state": "handing", "sha256": hashlib.sha256(b"look").hexdigest(),
+            "size": 4, "to": "build", "hop": 1,
+        }
+        with tempfile.TemporaryDirectory() as project, \
+             patch.object(antiphon.workers, "new_task", return_value=phantom), \
+             patch.object(antiphon, "send_to_codex", return_value=(True, "live")) as send:
+            ok, answer = antiphon._delegate(
+                project, {"text": "look", "kind": "codex", "to": "build"},
+                sender="ui", side="claude")
+
+        self.assertFalse(ok)
+        self.assertIn("could not be read back", answer)
+        send.assert_not_called()
+
+    def test_a_ledger_failure_after_delivery_never_claims_a_trackable_task(self):
+        with tempfile.TemporaryDirectory() as project, \
+             patch.object(antiphon, "send_to_codex", return_value=(True, "live")), \
+             patch.object(antiphon.ledger, "record_sent", return_value=False):
+            ok, answer = antiphon._delegate(
+                project, {"text": "look", "kind": "codex", "to": "build"},
+                sender="ui", side="claude")
+            tasks_after = workers.tasks(project)
+            deliveries_after = ledger.entries(project)
+
+        self.assertTrue(ok, "the transport succeeded; only tracking failed")
+        self.assertEqual(answer["state"], "tracking_incomplete")
+        self.assertIn("delivery_id", answer)
+        self.assertEqual(answer["task_id"], answer["delivery_id"],
+                         "one attempt id serves both records")
+        self.assertIn("queued", answer["text"])
+        self.assertIn("do not retry automatically", answer["text"])
+        self.assertEqual([task["state"] for task in tasks_after],
+                         ["tracking_incomplete"])
+        self.assertEqual(deliveries_after, [])
+
+    def test_a_task_transition_failure_keeps_only_the_accurate_delivery_entry(self):
+        real_update = antiphon.workers.update_task
+        attempts = iter((False, True))
+
+        def fail_handed_once(cwd, task_id, mutate):
+            if not next(attempts):
+                return False
+            return real_update(cwd, task_id, mutate)
+
+        with tempfile.TemporaryDirectory() as project, \
+             patch.object(antiphon, "send_to_claude", return_value=(True, "channel")), \
+             patch.object(antiphon.workers, "update_task",
+                          side_effect=fail_handed_once):
+            ok, answer = antiphon._delegate(
+                project, {"text": "look", "kind": "claude", "to": "opus"},
+                sender="build", side="codex")
+
+            entry = ledger.read_entry(project, answer["delivery_id"])
+            tasks_after = workers.tasks(project)
+
+        self.assertTrue(ok)
+        self.assertEqual(answer["state"], "tracking_incomplete")
+        self.assertEqual(answer["task_id"], answer["delivery_id"])
+        self.assertIn("delivered", answer["text"])
+        self.assertIn("do not retry automatically", answer["text"])
+        self.assertEqual([task["state"] for task in tasks_after],
+                         ["tracking_incomplete"])
+        self.assertIsNotNone(entry)
+        self.assertEqual((entry["id"], entry["sender"], entry["sender_kind"],
+                          entry["to_kind"], entry["to_alias"], entry["transport"],
+                          entry["sha256"], entry["size"]),
+                         (answer["delivery_id"], "build", "codex", "claude",
+                          "opus", "channel", hashlib.sha256(b"look").hexdigest(), 4))
+
+    def test_a_post_transport_task_lock_exception_keeps_the_peer_visible_id(self):
+        """Even an exceptional store boundary after the send must return the
+        prepared id.  The peer may already be acting on the task it names.
+        """
+        with tempfile.TemporaryDirectory() as project, \
+             patch.object(antiphon, "send_to_codex", return_value=(True, "live")), \
+             patch.object(antiphon.workers, "update_task",
+                          side_effect=OSError("lock unavailable")):
+            ok, answer = antiphon._delegate(
+                project, {"text": "look", "kind": "codex", "to": "build"},
+                sender="ui", side="claude")
+            retained = workers.read_task(project, answer["task_id"])
+
+        self.assertTrue(ok)
+        self.assertEqual(answer["task_id"], answer["delivery_id"])
+        self.assertEqual(answer["tracking"], "incomplete")
+        self.assertEqual(answer["state"], "handing")
+        self.assertEqual(retained["state"], "handing")
+        self.assertIn("do not retry automatically", answer["text"])
+
+    def test_an_unexpected_post_transport_readback_still_returns_a_safe_state(self):
+        """A successful handed write followed by a mismatched read and then a
+        failed tracking transition must remain a structured do-not-retry
+        result.  Returning the durable ``handed`` state beside incomplete keys
+        makes Node reject work the peer may already be doing.
+        """
+        real_update = antiphon.workers.update_task
+        real_read = antiphon.workers.read_task
+        updates = 0
+
+        def hand_then_fail(cwd, task_id, mutate):
+            nonlocal updates
+            updates += 1
+            if updates == 1:
+                return real_update(cwd, task_id, mutate)
+            return False
+
+        def mismatched_handed(cwd, task_id):
+            record = real_read(cwd, task_id)
+            if record is not None and record["state"] == "handed":
+                return dict(record, task_class="write")
+            return record
+
+        with tempfile.TemporaryDirectory() as project, \
+             patch.object(antiphon, "send_to_codex", return_value=(True, "live")), \
+             patch.object(antiphon.workers, "update_task",
+                          side_effect=hand_then_fail), \
+             patch.object(antiphon.workers, "read_task",
+                          side_effect=mismatched_handed):
+            ok, answer = antiphon._delegate(
+                project, {"text": "look", "kind": "codex", "to": "build"},
+                sender="ui", side="claude")
+
+        self.assertTrue(ok, "transport succeeded; a caller must not retry")
+        self.assertEqual(updates, 2)
+        self.assertEqual(answer["state"], "tracking_incomplete")
+        self.assertIn(answer["state"], antiphon.INCOMPLETE_HANDOFF_STATES)
+        self.assertEqual(answer["tracking"], "incomplete")
+        self.assertIn("do not retry automatically", answer["text"])
+
+    def test_a_mismatched_ledger_readback_never_claims_handed(self):
+        real_read = antiphon.ledger.read_entry
+
+        def wrong_proof(cwd, task_id):
+            entry = real_read(cwd, task_id)
+            return dict(entry, proof="not-the-transport-proof")
+
+        with tempfile.TemporaryDirectory() as project, \
+             patch.object(antiphon, "send_to_claude", return_value=(True, "channel")), \
+             patch.object(antiphon.ledger, "read_entry", side_effect=wrong_proof):
+            ok, answer = antiphon._delegate(
+                project, {"text": "look", "kind": "claude", "to": "opus"},
+                sender="build", side="codex")
+            record = workers.read_task(project, answer["task_id"])
+
+        self.assertTrue(ok)
+        self.assertEqual(answer["tracking"], "incomplete")
+        self.assertEqual(answer["state"], "tracking_incomplete")
+        self.assertEqual(record["state"], "tracking_incomplete")
+        self.assertIn("do not retry automatically", answer["text"])
+
+    def test_a_mismatched_delivery_timestamp_never_claims_handed(self):
+        """Receipt qualification uses the instant captured before transport,
+        so that supplied timestamp is part of the exact durable handoff too.
+        """
+        real_read = antiphon.ledger.read_entry
+
+        def wrong_timestamp(cwd, task_id):
+            entry = real_read(cwd, task_id)
+            return dict(entry, sent_at=entry["sent_at"] + 1.0)
+
+        with tempfile.TemporaryDirectory() as project, \
+             patch.object(antiphon, "send_to_claude", return_value=(True, "channel")), \
+             patch.object(antiphon.ledger, "read_entry", side_effect=wrong_timestamp):
+            ok, answer = antiphon._delegate(
+                project, {"text": "look", "kind": "claude", "to": "opus"},
+                sender="build", side="codex")
+            record = workers.read_task(project, answer["task_id"])
+
+        self.assertTrue(ok)
+        self.assertEqual(answer["tracking"], "incomplete")
+        self.assertEqual(answer["state"], "tracking_incomplete")
+        self.assertEqual(record["state"], "tracking_incomplete")
+        self.assertIn("do not retry automatically", answer["text"])
+
+    def test_a_mismatched_task_readback_never_claims_handed(self):
+        real_read = antiphon.workers.read_task
+
+        def wrong_class(cwd, task_id):
+            record = real_read(cwd, task_id)
+            if record is not None and record["state"] == "handed":
+                return dict(record, task_class="write")
+            return record
+
+        with tempfile.TemporaryDirectory() as project, \
+             patch.object(antiphon, "send_to_codex", return_value=(True, "live")), \
+             patch.object(antiphon.workers, "read_task", side_effect=wrong_class):
+            ok, answer = antiphon._delegate(
+                project, {"text": "look", "kind": "codex", "to": "build"},
+                sender="ui", side="claude")
+
+        self.assertTrue(ok)
+        self.assertEqual(answer["tracking"], "incomplete")
+        self.assertNotEqual(answer["state"], "handed")
+        self.assertIn("do not retry automatically", answer["text"])
+
+    def test_an_unknown_transport_outcome_retains_the_peer_visible_task_id(self):
+        class UnknownOutcome(str):
+            delivery_unknown = True
+
+        with tempfile.TemporaryDirectory() as project, \
+             patch.object(antiphon, "send_to_claude", return_value=(
+                 False, UnknownOutcome("channel reply was lost"))):
+            ok, answer = antiphon._delegate(
+                project, {"text": "look", "kind": "claude", "to": "opus"},
+                sender="build", side="codex")
+            record = workers.read_task(project, answer["task_id"])
+            delivery = ledger.read_entry(project, answer["delivery_id"])
+
+        self.assertTrue(ok, "unknown is not a definite refusal after bytes may have left")
+        self.assertEqual(answer["tracking"], "incomplete")
+        self.assertEqual(answer["task_id"], answer["delivery_id"])
+        self.assertIsNotNone(record)
+        self.assertIn(record["state"], ("handing", "tracking_incomplete"))
+        self.assertEqual((delivery["state"], delivery["transport"],
+                          delivery["to_alias"]),
+                         ("unknown", "channel", "opus"))
+        self.assertIn("may have been delivered", answer["text"])
+        self.assertIn("do not retry automatically", answer["text"])
+
+    def test_unknown_handoff_diagnostics_are_part_of_the_exact_readback(self):
+        class UnknownOutcome(str):
+            delivery_unknown = True
+
+        real_read = antiphon.ledger.read_entry
+        for field in ("reason", "preview"):
+            with self.subTest(field=field), tempfile.TemporaryDirectory() as project:
+                def corrupt_diagnostic(cwd, task_id, field=field):
+                    entry = real_read(cwd, task_id)
+                    return dict(entry, **{field: "corrupted after write"})
+
+                with patch.object(antiphon, "send_to_claude", return_value=(
+                         False, UnknownOutcome("channel reply was lost"))), \
+                     patch.object(antiphon.ledger, "read_entry",
+                                  side_effect=corrupt_diagnostic):
+                    ok, answer = antiphon._delegate(
+                        project, {"text": "look", "kind": "claude", "to": "opus"},
+                        sender="build", side="codex")
+
+            self.assertTrue(ok)
+            self.assertIs(answer["delivery_recorded"], False)
+            self.assertIn("delivery ledger could not be written", answer["text"])
+
+    def test_an_unknown_handoff_accepts_a_receipt_that_wins_the_readback_race(self):
+        class UnknownOutcome(str):
+            delivery_unknown = True
+
+        real_record = antiphon.ledger.record_unknown
+
+        def record_then_receive(cwd, task_id, **fields):
+            written = real_record(cwd, task_id, **fields)
+            self.assertTrue(written)
+            self.assertTrue(antiphon.ledger.mark_received(
+                cwd, task_id, 2_000.0, to_kind=fields["to_kind"],
+                reader_alias=fields["to_alias"]))
+            return written
+
+        with tempfile.TemporaryDirectory() as project, \
+             patch.object(antiphon, "send_to_claude", return_value=(
+                 False, UnknownOutcome("channel reply was lost"))), \
+             patch.object(antiphon.ledger, "record_unknown",
+                          side_effect=record_then_receive):
+            ok, answer = antiphon._delegate(
+                project, {"text": "look", "kind": "claude", "to": "opus"},
+                sender="build", side="codex")
+            delivery = ledger.read_entry(project, answer["delivery_id"])
+
+        self.assertTrue(ok)
+        self.assertIs(answer["delivery_recorded"], True)
+        self.assertNotIn("delivery ledger could not be written", answer["text"])
+        self.assertEqual((delivery["version"], delivery["state"],
+                          delivery["received_at"], delivery["reason"],
+                          delivery["preview"]),
+                         (1, "sent", 2_000.0, None, None))
+
+    def test_a_definite_refusal_records_cleanup_failure_instead_of_hiding_it(self):
+        refusal = antiphon._ClassifiedRefusal("not delivered: nobody", "no-peer")
+        with tempfile.TemporaryDirectory() as project, \
+             patch.object(antiphon, "send_to_codex", return_value=(False, refusal)), \
+             patch.object(antiphon.workers, "_discard_record", return_value=False):
+            ok, answer = antiphon._delegate(
+                project, {"text": "look", "kind": "codex", "to": "build"},
+                sender="ui", side="claude")
+            records = workers.tasks(project)
+
+        self.assertFalse(ok)
+        self.assertIn("not delivered: nobody", answer)
+        self.assertIn("local preparation cleanup was incomplete", answer)
+        self.assertEqual(len(records), 1)
+        self.assertEqual(records[0]["state"], "delivery_refused")
+        self.assertIn(records[0]["id"], answer)
+
+    def test_partial_refusal_cleanup_keeps_the_task_for_delivery_refused(self):
+        """Ancillary cleanup can fail after a colliding diff appeared. The
+        task JSON must be removed last so the refusal remains classifiable.
+        """
+        refusal = antiphon._ClassifiedRefusal(
+            "not delivered: nobody", "no-peer")
+        real_unlink = antiphon.workers.os.unlink
+
+        def refuse_after_diff(cwd, *_args, **_kwargs):
+            task_id = antiphon.workers.tasks(cwd)[0]["id"]
+            with open(antiphon.workers._diff_path(cwd, task_id), "w") as stream:
+                stream.write("collision")
+            return False, refusal
+
+        def fail_diff_only(path):
+            if path.endswith(".diff"):
+                raise PermissionError("diff is busy")
+            return real_unlink(path)
+
+        with tempfile.TemporaryDirectory() as project, \
+             patch.object(antiphon, "send_to_codex",
+                          side_effect=refuse_after_diff), \
+             patch.object(antiphon.workers.os, "unlink",
+                          side_effect=fail_diff_only):
+            ok, answer = antiphon._delegate(
+                project, {"text": "look", "kind": "codex", "to": "build"},
+                sender="ui", side="claude")
+            records = antiphon.workers.tasks(project)
+
+        self.assertFalse(ok)
+        self.assertIn("local preparation cleanup was incomplete", answer)
+        self.assertEqual(len(records), 1)
+        self.assertEqual(records[0]["state"], "delivery_refused")
+
+    def test_two_task_transition_failures_report_the_retained_handing_state(self):
+        """Once transport succeeded, even failure to write the recovery state
+        cannot erase the peer-visible id or claim a state that is not on disk.
+        """
+        with tempfile.TemporaryDirectory() as project, \
+             patch.object(antiphon, "send_to_claude", return_value=(True, "channel")), \
+             patch.object(antiphon.workers, "update_task", return_value=False):
+            ok, answer = antiphon._delegate(
+                project, {"text": "look", "kind": "claude", "to": "opus"},
+                sender="build", side="codex")
+            record = workers.read_task(project, answer["task_id"])
+            entry = ledger.read_entry(project, answer["delivery_id"])
+
+        self.assertTrue(ok)
+        self.assertEqual(answer["task_id"], answer["delivery_id"])
+        self.assertEqual(answer["state"], "handing")
+        self.assertEqual(record["state"], "handing")
+        self.assertIsNotNone(entry, "the ledger still truthfully records the delivery")
+        self.assertIn("tracking is incomplete", answer["text"])
+        self.assertIn("do not retry automatically", answer["text"])
+
+    def test_a_successful_hand_off_persists_matching_task_and_delivery_records(self):
+        with tempfile.TemporaryDirectory() as project, \
+             patch.object(antiphon, "send_to_codex", return_value=(True, "live")):
+            ok, answer = antiphon._delegate(
+                project, {"text": "review", "kind": "codex", "to": "build"},
+                sender="ui", side="claude")
+            task = workers.read_task(project, answer["task_id"])
+            entry = ledger.read_entry(project, answer["task_id"])
+
+        digest = hashlib.sha256(b"review").hexdigest()
+        self.assertTrue(ok)
+        self.assertEqual(answer["state"], "handed")
+        self.assertEqual(answer["task_id"], answer["delivery_id"],
+                         "the task and delivery are one shared attempt")
+        self.assertEqual((task["id"], task["state"], task["to"], task["sha256"],
+                          task["size"]),
+                         (answer["task_id"], "handed", "build", digest, 6))
+        self.assertEqual((entry["id"], entry["to_alias"], entry["transport"],
+                          entry["sha256"], entry["size"]),
+                         (answer["task_id"], "build", "queue", digest, 6))
+
+    def test_an_incompletely_tracked_hand_off_refuses_result_and_cancel_by_id(self):
+        with tempfile.TemporaryDirectory() as project, \
+             patch.object(antiphon, "send_to_codex", return_value=(True, "live")), \
+             patch.object(antiphon.ledger, "record_sent", return_value=False):
+            ok, answer = antiphon._delegate(
+                project, {"text": "look", "kind": "codex", "to": "build"},
+                sender="ui", side="claude")
+            task_id = answer["task_id"]
+
+            refusals = []
+            for action in ("result", "cancel"):
+                code, _out, err = self._task(project, (action, task_id))
+                refusals.append((action, code, err))
+            after = workers.read_task(project, task_id)
+
+        self.assertTrue(ok)
+        for action, code, err in refusals:
+            self.assertEqual(code, 1, action)
+            self.assertIn("tracking is incomplete", err)
+            self.assertIn("peer may already act", err)
+        self.assertEqual(after["state"], "tracking_incomplete")
+
     def test_an_oversized_handed_task_is_parked_like_any_direct_send(self):
         text = "y" * 4_000
         with tempfile.TemporaryDirectory() as project:
@@ -4554,6 +5226,21 @@ class ManagedWorkerToolTest(unittest.TestCase):
             self.assertIn("pass side", err)
             send.assert_not_called()
             self.assertEqual(workers.tasks(project), [])
+
+    def test_an_invalid_handoff_recipient_never_becomes_a_durable_preparation(self):
+        for recipient in ("bad name", "UPPER", "x" * 33):
+            with self.subTest(recipient=recipient), \
+                 tempfile.TemporaryDirectory() as project, \
+                 patch.object(antiphon, "send_to_codex", return_value=(True, "live")) as send:
+                ok, answer = antiphon._delegate(
+                    project,
+                    {"text": "look", "kind": "codex", "to": recipient},
+                    sender="ui", side="claude")
+
+                self.assertFalse(ok)
+                self.assertIn("usable peer name", answer)
+                send.assert_not_called()
+                self.assertEqual(workers.tasks(project), [])
 
     def test_the_codex_servers_result_wait_is_capped(self):
         """The Codex MCP server answers requests one at a time; a five-minute
@@ -4598,7 +5285,10 @@ class ManagedWorkerToolTest(unittest.TestCase):
             with patch.dict(antiphon.os.environ, {"PATH": self._stub_path(bin_dir)}):
                 result = antiphon._delegate_tool(project, {"text": "look"}, "build", "codex")
             self.assertIsNot(result.get("isError"), True, result)
-            self.assertIn("to a fresh claude worker", result["content"][0]["text"])
+            payload = json.loads(result["content"][0]["text"])
+            self.assertIn("to a fresh claude worker", payload["text"])
+            self.assertRegex(payload["task_id"], r"^[0-9a-f-]{36}$")
+            self.assertEqual(payload["state"], "running")
             result = antiphon._delegate_tool(project, {"text": ""}, "build", "codex")
             self.assertTrue(result.get("isError"))
             self.assertIn("the task text is empty", result["content"][0]["text"])
@@ -4633,7 +5323,7 @@ class SameVendorTest(unittest.TestCase):
     # ---- Task 3: same-kind Stop markers ----
 
     def _stop(self, project, side, reply_text, turn_key="", who="ui",
-              sends=None):
+              sends=None, claude_result=None, codex_result=None):
         """One Stop hook of `side`, with both transports mocked and recorded.
 
         `sends` collects `("claude", args, kwargs)` / `("codex", args, kwargs)`.
@@ -4643,11 +5333,11 @@ class SameVendorTest(unittest.TestCase):
 
         def to_claude(*args, **kwargs):
             sends.append(("claude", args, kwargs))
-            return True, ""
+            return claude_result or (True, "")
 
         def to_codex(*args, **kwargs):
             sends.append(("codex", args, kwargs))
-            return True, "live"
+            return codex_result or (True, "live")
 
         target = "codex" if side == "claude" else "claude"
         reader = "_claude_turn" if side == "claude" else "_codex_turn"
@@ -4750,6 +5440,113 @@ class SameVendorTest(unittest.TestCase):
             self.assertEqual(len(sends), 1, "the same turn's marker goes once")
             self._stop(project, "claude", "@claude:api once", turn_key="t2", sends=sends)
             self.assertEqual(len(sends), 2, "a later turn's identical marker is new")
+
+    def test_an_unknown_stop_marker_outcome_is_recorded_and_not_retried(self):
+        class UnknownOutcome(str):
+            delivery_unknown = True
+
+        unknown = (False, UnknownOutcome("channel reply was lost"))
+        with tempfile.TemporaryDirectory() as project:
+            antiphon.peers.register(project, "claude", "api", "/tmp/api.sock")
+            sends = []
+            first = self._stop(
+                project, "claude", "@claude:api once", turn_key="t1",
+                sends=sends, claude_result=unknown)
+            second = self._stop(
+                project, "claude", "@claude:api once", turn_key="t1",
+                sends=sends, claude_result=unknown)
+            entries = ledger.entries(project)
+
+        self.assertEqual(len(sends), 1, "an unknown post-send result is never auto-retried")
+        self.assertIn("outcome unknown", first[1])
+        self.assertNotIn("delivery failed", first[1])
+        self.assertEqual(second[0], 0)
+        self.assertEqual([entry["state"] for entry in entries], ["unknown"])
+
+    def test_an_unknown_stop_outcome_survives_a_lost_cursor_write(self):
+        """The v2 ledger says the outcome is unknown, but text plus recipient
+        alone cannot distinguish a later turn.  Exact turn-scoped suppression
+        evidence bridges a failed cursor write without swallowing that turn."""
+        class UnknownOutcome(str):
+            delivery_unknown = True
+
+        unknown = (False, UnknownOutcome("channel reply was lost"))
+        real_update = antiphon.update_cursor
+        calls = 0
+
+        def lose_first(cwd, side, mutate):
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                return False
+            return real_update(cwd, side, mutate)
+
+        with tempfile.TemporaryDirectory() as project, \
+             patch.object(antiphon, "update_cursor", side_effect=lose_first):
+            sends = []
+            first = self._stop(
+                project, "claude", "@claude:api once", turn_key="t1",
+                sends=sends, claude_result=unknown)
+            second = self._stop(
+                project, "claude", "@claude:api once", turn_key="t1",
+                sends=sends, claude_result=unknown)
+            third = self._stop(
+                project, "claude", "@claude:api once", turn_key="t2",
+                sends=sends, claude_result=unknown)
+
+        self.assertEqual(first[0], 1, "the cursor failure remains visible")
+        self.assertEqual(second[0], 0)
+        self.assertEqual(len(sends), 2,
+                         "same turn suppressed; identical later turn sent once")
+        self.assertIn("not retrying automatically", second[1])
+
+    def test_an_unknown_stop_marker_with_no_ledger_returns_a_visible_failure(self):
+        class UnknownOutcome(str):
+            delivery_unknown = True
+
+        unknown = (False, UnknownOutcome("channel reply was lost"))
+        with tempfile.TemporaryDirectory() as project, \
+             patch.object(antiphon.ledger, "record_unknown", return_value=False):
+            antiphon.peers.register(project, "claude", "api", "/tmp/api.sock")
+            sends = []
+            first = self._stop(
+                project, "claude", "@claude:api once", turn_key="t1",
+                sends=sends, claude_result=unknown)
+            second = self._stop(
+                project, "claude", "@claude:api once", turn_key="t1",
+                sends=sends, claude_result=unknown)
+
+        self.assertEqual(first[0], 1,
+                         "a hook cannot hide that its only unknown notice was lost")
+        self.assertIn("could not record the unknown outcome", first[1])
+        self.assertEqual(len(sends), 1,
+                         "the successfully written cursor still suppresses retry")
+        self.assertEqual(second[0], 0)
+
+    def test_a_parked_direct_codex_send_dedupes_the_original_stop_marker(self):
+        class UnknownOutcome(str):
+            delivery_unknown = True
+
+        outcomes = ((True, "live"),
+                    (False, UnknownOutcome("queue acknowledgement was lost")))
+        for direct_outcome in outcomes:
+            with self.subTest(unknown=not direct_outcome[0]), \
+                 tempfile.TemporaryDirectory() as project, \
+                 patch.object(antiphon, "_oversized_for_queue", return_value=True), \
+                 patch.object(antiphon, "send_to_codex",
+                              return_value=direct_outcome):
+                result = antiphon._send_tool_to_codex(
+                    project, "same original words", "review", "build")
+
+                sends = []
+                code, err, sends = self._stop(
+                    project, "codex", "@codex:review same original words",
+                    turn_key="same-turn", sends=sends)
+
+            self.assertNotEqual(result.get("isError"), True)
+            self.assertEqual(code, 0, err)
+            self.assertEqual(sends, [],
+                             "the original marker must not resend its parked envelope")
 
     def test_a_reply_can_address_both_kinds_at_once(self):
         with tempfile.TemporaryDirectory() as project:
@@ -4970,13 +5767,18 @@ class SameVendorTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as project:
             antiphon.peers.register(project, "claude", "api", "/tmp/api.sock")
             wire = self._Capture()
-            wire.answer = b'{"ok": true, "message_id": "m1"}'
+            wire.answer = json.dumps({
+                "ok": True, "message_id": self.MID,
+            }).encode()
             with patch.object(antiphon.socket, "socket", wire):
                 ok, detail = antiphon.send_to_claude(project, "hi", "api", sender_alias="ui",
                                                      message_id=self.MID, sender_kind="claude")
             self.assertEqual((ok, detail), (True, "old-listener"))
             wire = self._Capture()
-            wire.answer = b'{"ok": true, "message_id": "m1", "sender_kind": "claude"}'
+            wire.answer = json.dumps({
+                "ok": True, "message_id": self.MID,
+                "sender_kind": "claude",
+            }).encode()
             with patch.object(antiphon.socket, "socket", wire):
                 ok, detail = antiphon.send_to_claude(project, "hi", "api", sender_alias="ui",
                                                      message_id=self.MID, sender_kind="claude")
@@ -4999,7 +5801,7 @@ class SameVendorTest(unittest.TestCase):
 
         def __init__(self):
             self.sent = b""
-            self.answer = b'{"ok": true, "message_id": "m1"}'
+            self.answer = None
 
         def __call__(self, *_a, **_k):
             return self
@@ -5021,6 +5823,11 @@ class SameVendorTest(unittest.TestCase):
 
         def sendall(self, data):
             self.sent += data
+            if self.answer is None:
+                self.answer = json.dumps({
+                    "ok": True,
+                    "message_id": json.loads(data)["message_id"],
+                }).encode()
 
         def shutdown(self, _how):
             pass
@@ -5095,7 +5902,65 @@ class DeliveryReceiptTest(unittest.TestCase):
     ATTACHMENT = "2e6b14f1-1659-544a-98d4-56d6eca8fa48.txt"
 
     def setUp(self):
-        self.now = time.strftime("%Y-%m-%dT%H:%M:%S.000Z", time.gmtime())
+        # These transcript fixtures describe observations after the delivery
+        # rows each test creates. Keep that causal ordering explicit now that
+        # a read may never be credited to a later basename reuse.
+        self.now = time.strftime(
+            "%Y-%m-%dT%H:%M:%S.000Z", time.gmtime(time.time() + 60))
+
+    def test_every_send_family_records_when_the_attempt_began(self):
+        """A receiver can write a read proof inside the transport call.  The
+        later ledger row must predate that observation on Stop, reply, tool,
+        and handed-task roads, or basename reuse protection rejects it."""
+        def observed_transport(observed, proof):
+            def send(*_args, **_kwargs):
+                observed.append(time.time())
+                time.sleep(0.002)
+                return True, proof
+            return send
+
+        with tempfile.TemporaryDirectory() as project:
+            observed = []
+            with patch.object(antiphon, "send_to_codex",
+                              side_effect=observed_transport(observed, "live")), \
+                 patch.object(antiphon, "claimed_alias", return_value=None):
+                code, err = self._push(project, "@codex:build stop words")
+            self.assertEqual(code, 0, err)
+            self.assertLessEqual(ledger.entries(project)[0]["sent_at"], observed[0])
+
+        with tempfile.TemporaryDirectory() as project:
+            observed = []
+            payload = {"text": "reply words", "to": "build"}
+            with patch.object(antiphon, "project_dir", return_value=project), \
+                 patch.object(antiphon, "send_to_codex",
+                              side_effect=observed_transport(observed, "live")), \
+                 patch.object(antiphon.sys, "stdin",
+                              io.StringIO(json.dumps(payload))), \
+                 contextlib.redirect_stdout(io.StringIO()), \
+                 contextlib.redirect_stderr(io.StringIO()):
+                self.assertEqual(antiphon.reply(), 0)
+            self.assertLessEqual(ledger.entries(project)[0]["sent_at"], observed[0])
+
+        with tempfile.TemporaryDirectory() as project:
+            observed = []
+            with patch.object(antiphon, "send_to_claude",
+                              side_effect=observed_transport(observed, "channel")):
+                result = antiphon._send_tool(
+                    project, "tool words", "api", sender="build")
+            self.assertIsNot(result.get("isError"), True, result)
+            self.assertLessEqual(ledger.entries(project)[0]["sent_at"], observed[0])
+
+        with tempfile.TemporaryDirectory() as project:
+            observed = []
+            with patch.object(antiphon, "send_to_claude",
+                              side_effect=observed_transport(observed, "channel")):
+                ok, answer = antiphon._delegate(
+                    project, {"text": "task words", "kind": "claude",
+                              "to": "opus"}, sender="build", side="codex")
+            self.assertTrue(ok, answer)
+            self.assertLessEqual(
+                ledger.read_entry(project, answer["delivery_id"])["sent_at"],
+                observed[0])
 
     # ---- fixtures in the measured shapes ----
 
@@ -5618,6 +6483,65 @@ class DeliveryReceiptTest(unittest.TestCase):
             self.assertNotIn("2 deliveries", note, "the unknowable one is not a fault")
             self.assertIn("1 older than the 24-hour page horizon", note)
 
+    def test_unknown_outcomes_are_also_split_at_the_receipt_horizon(self):
+        recent = "2e6b14f1-1659-544a-98d4-56d6eca8fa48"
+        old = "3f7c25a2-2760-455b-a9e5-67e7fdb90b59"
+        with tempfile.TemporaryDirectory() as project:
+            now = time.time()
+            for delivery, at in ((recent, now - 25 * 60),
+                                 (old, now - 2 * antiphon.PAGE_HORIZON)):
+                self.assertTrue(ledger.record_unknown(
+                    project, delivery, sender="ui", to_kind="codex",
+                    to_alias="build", transport="queue", sha256="a" * 64,
+                    size=2, reason="ack lost", preview="hello",
+                    at=at, sender_kind="claude"))
+
+            line = antiphon._delivery_report(project, now)
+            self.assertIn("1 outcome unknown (1 not yet reported to the sender)",
+                          line)
+            self.assertIn(
+                "1 unknown outcome before the 24-hour page horizon "
+                "(a receipt that old is never seen; 1 not yet reported to "
+                "the sender)", line)
+            report = antiphon._Report()
+            out = io.StringIO()
+            with patch.object(antiphon.time, "time", return_value=now), \
+                 contextlib.redirect_stdout(out):
+                antiphon._doctor_deliveries(report, project)
+            note = out.getvalue()
+            self.assertIn("1 transport outcome is unknown within the receipt horizon",
+                          note)
+            self.assertIn("a later peer transcript receipt can resolve it", note)
+            self.assertIn(
+                "1 unknown transport outcome is older than the 24-hour page "
+                "horizon; a receipt that old can no longer be observed",
+                note)
+
+    def test_status_and_doctor_expose_retained_exact_stop_suppression(self):
+        with tempfile.TemporaryDirectory() as project:
+            now = time.time()
+            fingerprint = hashlib.sha256(b"exact turn").hexdigest()
+            self.assertTrue(ledger.record_stop_outcome(
+                project, side="codex", key="last_pushed_claude", slot="",
+                fingerprint=fingerprint, delivery_id=self.MID,
+                at=now - 30))
+
+            line = antiphon._delivery_report(project, now)
+            self.assertEqual(
+                line,
+                "Deliveries:         1 exact Stop outcome retained after a "
+                "cursor write failure (oldest under a minute; automatic retry "
+                "suppressed)")
+            report = antiphon._Report()
+            out = io.StringIO()
+            with patch.object(antiphon.time, "time", return_value=now), \
+                 contextlib.redirect_stdout(out):
+                antiphon._doctor_deliveries(report, project)
+            self.assertIn(
+                "1 exact Stop outcome is retained after a cursor write "
+                "failure (oldest under a minute); automatic retry is suppressed",
+                out.getvalue())
+
     # ---- same-kind receipts: the receiver's own transcript ----
 
     def test_a_claude_hook_reads_receipts_off_its_own_transcript(self):
@@ -5754,6 +6678,111 @@ class DeliveryReceiptTest(unittest.TestCase):
             self.assertEqual((code, out), (0, ""), "nothing visible, nothing delivered")
             entry = ledger.read_entry(project, self.MID)
         self.assertIsNotNone(entry["received_at"])
+
+    def test_an_unstored_receipt_keeps_the_empty_page_cursor_for_retry(self):
+        """Cursor progress is safe only after the proof is applied or durably
+        sidecarred.  An empty filtered page must obey the same ordering."""
+        with tempfile.TemporaryDirectory() as project:
+            path = self._codex_rollout(project, [self._codex_message(
+                "user", f"{antiphon.CHANNEL_LABEL} [from=ui id={self.MID}] run")])
+            with patch.object(ledger, "_write_pending_receipt", return_value=False):
+                code, out = self._hook(project, "claude", codex=[path])
+            self.assertEqual((code, out), (0, ""))
+            cursor = antiphon.read_cursor(project, "claude")
+            positions, _since, _replay = antiphon.positions_for(cursor, "claude")
+            self.assertEqual(dict(positions), {}, "the receipt-bearing record is retried")
+
+            self._sent(project)
+            again = self._hook(project, "claude", codex=[path])
+            self.assertEqual(again, (0, ""))
+            self.assertIsNotNone(ledger.read_entry(project, self.MID)["received_at"])
+            cursor = antiphon.read_cursor(project, "claude")
+            positions, _since, _replay = antiphon.positions_for(cursor, "claude")
+            self.assertTrue(positions, "cursor advances after the proof is durable")
+
+    def test_a_malformed_exact_receipt_sidecar_holds_cursor_and_doctor_fails(self):
+        with tempfile.TemporaryDirectory() as project:
+            path = self._codex_rollout(project, [self._codex_message(
+                "user", f"{antiphon.CHANNEL_LABEL} [from=ui id={self.MID}] run")])
+            self.assertIsNotNone(ledger._sound_pending_dir(project, create=True))
+            sidecar = ledger._pending_path(
+                project, "received", self.MID, "codex", None)
+            with open(sidecar, "w") as stream:
+                stream.write("{")
+
+            code, out = self._hook(project, "claude", codex=[path])
+            self.assertEqual((code, out), (0, ""))
+            cursor = antiphon.read_cursor(project, "claude")
+            positions, _since, _replay = antiphon.positions_for(cursor, "claude")
+            self.assertEqual(dict(positions), {}, "unrecorded proof is retried")
+            self.assertIn("invalid pending receipt record",
+                          antiphon._delivery_report(project))
+
+            report = antiphon._Report()
+            printed = io.StringIO()
+            with contextlib.redirect_stdout(printed):
+                antiphon._doctor_deliveries(report, project)
+            self.assertTrue(report.broken)
+            self.assertIn("pending-receipt record is invalid", printed.getvalue())
+
+    def test_an_unusable_pending_receipt_store_is_visible_to_status_and_doctor(self):
+        with tempfile.TemporaryDirectory() as project, \
+             tempfile.TemporaryDirectory() as outside:
+            os.makedirs(ledger.ledger_dir(project), mode=0o700)
+            pending = os.path.join(
+                ledger.ledger_dir(project), ledger.PENDING_RECEIPT_DIRECTORY)
+            os.symlink(outside, pending)
+
+            self.assertIn("pending receipt store unusable",
+                          antiphon._delivery_report(project))
+            report = antiphon._Report()
+            printed = io.StringIO()
+            with contextlib.redirect_stdout(printed):
+                antiphon._doctor_deliveries(report, project)
+            self.assertTrue(report.broken)
+            diagnosis = printed.getvalue()
+            self.assertIn("pending-receipt store is not a readable plain directory",
+                          diagnosis)
+            self.assertIn("cursor cannot advance safely", diagnosis)
+            self.assertIn(".antiphon/deliveries/pending-receipts", diagnosis)
+
+    def test_an_unlistable_pending_receipt_store_breaks_doctor(self):
+        with tempfile.TemporaryDirectory() as project:
+            pending = ledger._sound_pending_dir(project, create=True)
+            self.assertIsNotNone(pending)
+            real_listdir = ledger.os.listdir
+
+            def fail_pending(path):
+                if path == pending:
+                    raise OSError("permission denied")
+                return real_listdir(path)
+
+            report = antiphon._Report()
+            printed = io.StringIO()
+            with patch.object(ledger.os, "listdir", side_effect=fail_pending), \
+                 contextlib.redirect_stdout(printed):
+                antiphon._doctor_deliveries(report, project)
+            self.assertTrue(report.broken)
+            self.assertIn("pending-receipt store is not a readable plain directory",
+                          printed.getvalue())
+
+    def test_an_unusable_stop_outcome_store_is_visible_to_status_and_doctor(self):
+        with tempfile.TemporaryDirectory() as project, \
+             tempfile.TemporaryDirectory() as outside:
+            os.makedirs(ledger.ledger_dir(project), mode=0o700)
+            outcomes = os.path.join(
+                ledger.ledger_dir(project), ledger.STOP_OUTCOME_DIRECTORY)
+            os.symlink(outside, outcomes)
+
+            self.assertIn("Stop suppression store unusable",
+                          antiphon._delivery_report(project))
+            report = antiphon._Report()
+            printed = io.StringIO()
+            with contextlib.redirect_stdout(printed):
+                antiphon._doctor_deliveries(report, project)
+            self.assertTrue(report.broken)
+            self.assertIn("Stop suppression store is not a readable plain directory",
+                          printed.getvalue())
 
     def test_a_hook_marks_the_delivery_received_on_a_page_with_words(self):
         with tempfile.TemporaryDirectory() as project:
@@ -6920,7 +7949,7 @@ class DoctorTest(unittest.TestCase):
         """A machine where everything the bridge needs is installed, and the
         `antiphon` on PATH is the copy under test."""
         root = os.path.dirname(os.path.dirname(os.path.realpath(antiphon.__file__)))
-        return {"antiphon": os.path.join(root, "bin", "antiphon.mjs"),
+        return {"antiphon": os.path.join(root, "bin", "antiphon"),
                 "python3": "/usr/bin/python3", "node": "/usr/bin/node",
                 "codex": "/usr/bin/codex"}
 
@@ -6928,7 +7957,7 @@ class DoctorTest(unittest.TestCase):
         """A machine whose `antiphon` on PATH lives in `root` — the copy this
         project's hooks would run."""
         tools = self.healthy_tools()
-        tools["antiphon"] = os.path.join(root, "bin", "antiphon.mjs")
+        tools["antiphon"] = os.path.join(root, "bin", "antiphon")
         return tools
 
     HEALTHY_VERSIONS = {"/usr/bin/python3": "Python 3.9.6",
@@ -7034,6 +8063,19 @@ class DoctorTest(unittest.TestCase):
         self.assertEqual(self.line_for(printed, "deliveries:"), "",
                          "five minutes without a receipt is not news")
 
+    def test_doctor_reports_bounded_receipt_first_evidence_read_only(self):
+        project = self.project()
+        self.set_up(project)
+        self.assertTrue(ledger.record_receipts(
+            project, [("received", "83f48150-6f08-4d21-b51e-10af885dc39f",
+                       time.time() - 120, "build")], read_by="codex"))
+        before = self.snapshot(project)
+        _code, printed = self.run_doctor(project)
+        line = self.line_for(printed, "delivery receipts:")
+        self.assertIn("1 receipt proof is retained for sender-row reconciliation", line)
+        self.assertEqual(self.snapshot(project), before,
+                         "doctor never reconciles or prunes")
+
     def test_doctor_names_an_unreadable_rules_file(self):
         project = self.project()
         self.set_up(project)
@@ -7071,8 +8113,8 @@ class DoctorTest(unittest.TestCase):
         """The section ends at its own marker now. Before, it ran to the
         next `## ` heading or the end of the file, and a rewrite took the
         notes a person had appended after it along with the stale words."""
-        stale = antiphon.AGENTS_RULE.replace("You work alongside",
-                                             "You used to work alongside")
+        stale = antiphon.AGENTS_RULE.replace("You work with",
+                                             "You used to work with")
         current = "# Mine\n" + stale + "\nMy own notes, no heading.\n"
         new_text, word, refusal = antiphon._update_instructions(
             current, antiphon.AGENTS_RULE)
@@ -7917,7 +8959,7 @@ class DoctorTest(unittest.TestCase):
         # install check call the copy on PATH broken, which is a different
         # diagnosis than the one under test.
         version = antiphon._package_version(antiphon._package_root())
-        for name in ("lib/antiphon.py", "lib/peers.py", "lib/channel.mjs", "package.json"):
+        for name in antiphon.CODE_FILES:
             path = os.path.join(root, name)
             with open(path, "w", encoding="utf-8") as f:
                 f.write(json.dumps({"version": version}) + "\n"
@@ -7940,7 +8982,7 @@ class DoctorTest(unittest.TestCase):
         code, printed = self.run_doctor(project, tools=self.tools_at(root), processes=[
             (4242, stale_start, f"python3 {root}/lib/antiphon.py mcp"),
             (4243, fresh_start, f"/opt/node/bin/node {root}/lib/channel.mjs"),
-            (4244, stale_start, f"node /opt/homebrew/bin/antiphon mcp"),   # the wrapper: not a server
+            (4244, stale_start, f"node /opt/homebrew/bin/antiphon mcp"),   # legacy wrapper: not a server
         ])
         self.assertEqual(code, 1)
         stale = self.line_for(printed, "pid 4242")
@@ -7952,9 +8994,40 @@ class DoctorTest(unittest.TestCase):
         self.assertEqual(self.line_for(printed, "pid 4243"), "",
                          "a server younger than its code is not named")
         self.assertEqual(self.line_for(printed, "pid 4244"), "",
-                         "the wrapper only spawns; it is not a server")
+                         "the legacy wrapper only spawned; it was not a server")
         self.assertTrue(self.line_for(printed, "running: 1 server").startswith("✓"),
                         printed)
+
+    def test_doctor_staleness_includes_every_server_loaded_support_module(self):
+        """Schema and imported-JS-only updates must require the same restart
+        as an edit to the server entrypoint itself.
+        """
+        project = self.project()
+        self.set_up(project)
+        changed = time.time() - 600
+        cases = (
+            ("lib/ledger.py", "python3 {root}/lib/antiphon.py mcp"),
+            ("lib/workers.py", "python3 {root}/lib/antiphon.py mcp"),
+            ("lib/identity.mjs", "node {root}/lib/channel.mjs"),
+        )
+        for offset, (name, command) in enumerate(cases):
+            with self.subTest(name=name):
+                root = self.fake_root(changed)
+                path = os.path.join(root, name)
+                os.makedirs(os.path.dirname(path), exist_ok=True)
+                with open(path, "w", encoding="utf-8") as stream:
+                    stream.write("# changed support module\n")
+                future = changed + 300
+                os.utime(path, (future, future))
+                pid = 4300 + offset
+                code, printed = self.run_doctor(
+                    project, tools=self.tools_at(root), processes=[
+                        (pid, int(changed + 60), command.format(root=root)),
+                    ])
+                self.assertEqual(code, 1, printed)
+                self.assertTrue(
+                    self.line_for(printed, f"pid {pid}").startswith("✗ running:"),
+                    printed)
 
     def test_doctor_names_a_server_whose_tree_is_gone(self):
         """Measured: a channel from two days earlier, parent `launchd`, running
@@ -8134,6 +9207,39 @@ class DoctorTest(unittest.TestCase):
         self.assertEqual(self.line_for(printed, "another install"), "",
                          "it was judged, so it is not counted as somebody else's")
 
+    def test_a_registered_server_on_different_bytes_is_not_called_current(self):
+        """A server can be newer than every file in its own old install while
+        this project's hooks have moved to another same-version copy.  Mtime
+        alone then calls incompatible loaded code current, even though it may
+        not understand the active copy's durable schemas.
+        """
+        project = self.project()
+        self.set_up(project)
+        changed = time.time() - 600
+        active = self.fake_root(changed)
+        serving = self.fake_root(changed)
+        with open(os.path.join(active, "lib", "ledger.py"), "a",
+                  encoding="utf-8") as stream:
+            stream.write("# active schema bytes\n")
+        os.utime(os.path.join(active, "lib", "ledger.py"), (changed, changed))
+        pid = 5169
+        self.assertTrue(antiphon.peers.register(
+            project, "claude", "ui", "/tmp/ui.sock", pid=pid,
+            owner_key="300:ui"))
+
+        code, printed = self.run_doctor(
+            project, tools=self.tools_at(active), processes=[
+                (pid, int(changed + 60),
+                 f"node {serving}/lib/channel.mjs"),
+            ])
+
+        self.assertEqual(code, 1, printed)
+        line = self.line_for(printed, f"pid {pid}")
+        self.assertTrue(line.startswith("✗ running:"), printed)
+        self.assertIn("different code copy", line)
+        self.assertIn("restart that Claude Code session", line)
+        self.assertNotIn("server(s) on their current code", printed)
+
     def test_the_queue_note_names_only_this_project_s_threads(self):
         """Same fresh-project measurement: the note named threads queued from
         another project, which the reader cannot act on from here. A thread is
@@ -8215,8 +9321,8 @@ class DoctorTest(unittest.TestCase):
         """Measured before this change: `antiphon --version` fell through the
         command table like a typo — it printed the usage and exited 1. The
         number it prints is read from package.json, not spelled again here;
-        one of the two spellings is through the Node wrapper, which is what
-        PATH actually runs."""
+        one of the two spellings is through the installed dispatcher, which is
+        what PATH actually runs."""
         lib = os.path.dirname(antiphon.__file__)
         script = os.path.join(lib, "antiphon.py")
         with open(os.path.join(lib, "..", "package.json"), encoding="utf-8") as f:
@@ -8228,8 +9334,8 @@ class DoctorTest(unittest.TestCase):
                                       stdin=subprocess.DEVNULL)
                 self.assertEqual(done.returncode, 0, done.stderr)
                 self.assertEqual(done.stdout, f"antiphon {version}\n")
-        wrapper = os.path.join(lib, "..", "bin", "antiphon.mjs")
-        done = subprocess.run(["node", wrapper, "--version"],
+        wrapper = os.path.join(lib, "..", "bin", "antiphon")
+        done = subprocess.run([sys.executable, wrapper, "--version"],
                               capture_output=True, text=True, timeout=60,
                               stdin=subprocess.DEVNULL)
         self.assertEqual(done.returncode, 0, done.stderr)
@@ -8573,21 +9679,19 @@ class SetupShapeCharacterizationTest(unittest.TestCase):
             "✓ AGENTS.md rule added: " + os.path.join(project, "AGENTS.md"),
             "✓ CLAUDE.md rule added: " + os.path.join(project, "CLAUDE.md"),
             "",
-            "— One last step: Codex hooks need a one-time security approval.",
-            "  Open `codex` in this directory; approve the hook at the "
+            "— Start the two agents:",
+            "  antiphon launch claude",
+            "  antiphon launch codex",
+            "  Approve the Codex hook at the "
             "'New hook - review required' prompt.",
             "  Approval is granted once and then persists (it asks again only "
             "if the file changes).",
-            "",
-            "— Start Claude with the channel enabled:",
-            "  claude --dangerously-load-development-channels server:antiphon",
-            "  In the research preview, the first launch needs both a "
-            "development channel and an MCP approval.",
+            "  Claude's research preview may also ask for a development-channel "
+            "and MCP approval.",
             "",
             "— More than one terminal? Explicit names are recommended:",
-            "  ANTIPHON_NAME=ui claude --dangerously-load-development-channels "
-            "server:antiphon",
-            "  ANTIPHON_NAME=build codex",
+            "  antiphon launch claude --name ui",
+            "  antiphon launch codex --name build",
             "  Antiphon may assign an automatic auto- alias after host identity "
             "is proved.",
             "  ANTIPHON_NAME overrides it and remains the clearest choice for "
@@ -8631,8 +9735,290 @@ class SetupShapeCharacterizationTest(unittest.TestCase):
         ])
 
 
+class LaunchTest(unittest.TestCase):
+    """The friendly launch path owns Antiphon's flags, not the user's shell."""
+
+    def project(self, configured=True):
+        project = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, project, ignore_errors=True)
+        if configured:
+            with patch.object(antiphon, "project_dir", return_value=project), \
+                 contextlib.redirect_stdout(io.StringIO()), \
+                 contextlib.redirect_stderr(io.StringIO()):
+                self.assertEqual(antiphon.setup(), 0)
+        return project
+
+    @staticmethod
+    def snapshot(project):
+        found = {}
+        for root, directories, files in os.walk(project):
+            directories.sort()
+            for name in sorted(files):
+                path = os.path.join(root, name)
+                with open(path, "rb") as stream:
+                    found[os.path.relpath(path, project)] = stream.read()
+        return found
+
+    def run_launch(self, project, *args, executable="/usr/local/bin/host", env=None,
+                   exec_error=None, actual_cwd=None):
+        out, err = io.StringIO(), io.StringIO()
+        environment = {} if env is None else env
+        with patch.object(antiphon, "project_dir", return_value=project), \
+             patch.object(antiphon.os, "getcwd",
+                          return_value=actual_cwd or project), \
+             patch.object(antiphon, "_which", return_value=executable), \
+             patch.object(antiphon.os, "execve", side_effect=exec_error) as execute, \
+             patch.object(antiphon.os, "execvpe",
+                          side_effect=AssertionError("PATH was resolved twice")), \
+             patch.dict(antiphon.os.environ, environment, clear=True), \
+             contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            code = antiphon.launch(*args)
+        return code, out.getvalue(), err.getvalue(), execute
+
+    def test_launch_refuses_an_inherited_project_different_from_process_cwd(self):
+        configured = self.project()
+        actual_cwd = self.project(configured=False)
+        before_configured = self.snapshot(configured)
+        before_actual = self.snapshot(actual_cwd)
+
+        code, out, err, execute = self.run_launch(
+            configured, "codex", env={"ANTIPHON_CWD": configured},
+            actual_cwd=actual_cwd)
+
+        self.assertEqual((code, out), (1, ""))
+        self.assertIn("ANTIPHON_CWD", err)
+        self.assertIn("current directory", err)
+        self.assertIn("unset it", err)
+        execute.assert_not_called()
+        self.assertEqual(self.snapshot(configured), before_configured)
+        self.assertEqual(self.snapshot(actual_cwd), before_actual)
+
+    def test_claude_launch_adds_one_channel_flag_and_preserves_host_arguments(self):
+        project = self.project()
+        before = self.snapshot(project)
+
+        code, out, err, execute = self.run_launch(
+            project, "claude", "--name", "Opus", "--", "--model", "opus",
+            "prompt with spaces", env={"PATH": "/usr/local/bin", "KEEP": "yes"})
+
+        self.assertEqual((code, out, err), (0, "", ""))
+        execute.assert_called_once()
+        executable, argv, launched_env = execute.call_args.args
+        self.assertEqual(executable, "/usr/local/bin/host")
+        self.assertEqual(argv, [
+            "/usr/local/bin/host", "--dangerously-load-development-channels",
+            "server:antiphon", "--model", "opus", "prompt with spaces",
+        ])
+        self.assertEqual(launched_env,
+                         {"PATH": "/usr/local/bin", "KEEP": "yes",
+                          "ANTIPHON_NAME": "opus"})
+        self.assertEqual(self.snapshot(project), before,
+                         "launch preflight is read-only")
+
+    def test_codex_launch_preserves_a_working_environment_name_and_argv(self):
+        project = self.project()
+        code, out, err, execute = self.run_launch(
+            project, "codex", "--", "--model", "gpt-5.6-sol",
+            env={"PATH": "/usr/local/bin", "ANTIPHON_NAME": "Build"})
+
+        self.assertEqual((code, out, err), (0, "", ""))
+        _executable, argv, launched_env = execute.call_args.args
+        self.assertEqual(argv, ["/usr/local/bin/host", "--model", "gpt-5.6-sol"])
+        self.assertEqual(launched_env["ANTIPHON_NAME"], "Build")
+
+    def test_launch_refuses_host_flags_that_disable_or_move_the_bridge(self):
+        cases = (
+            ("claude", ("--safe-mode",)),
+            ("claude", ("--safe-mode=true",)),
+            ("claude", ("--bare",)),
+            ("claude", ("--restricted",)),
+            ("claude", ("--strict-mcp-config",)),
+            ("claude", ("--setting-sources", "user")),
+            ("claude", ("--setting-sources=user",)),
+            ("claude", ("--no-session-persistence",)),
+            ("claude", ("--worktree", "feature")),
+            ("claude", ("--worktree=feature",)),
+            ("claude", ("-w", "feature")),
+            ("claude", ("-wfeature",)),
+            ("claude", ("-w=feature",)),
+            ("codex", ("-C", "/tmp/elsewhere")),
+            ("codex", ("-C/tmp/elsewhere",)),
+            ("codex", ("-C=/tmp/elsewhere",)),
+            ("codex", ("--cd", "/tmp/elsewhere")),
+            ("codex", ("--cd=/tmp/elsewhere",)),
+        )
+        for host, host_args in cases:
+            with self.subTest(host=host, args=host_args):
+                project = self.project()
+                before = self.snapshot(project)
+                code, out, err, execute = self.run_launch(
+                    project, host, "--", *host_args)
+                self.assertEqual((code, out), (2, ""))
+                self.assertIn("not compatible with a ready Antiphon session", err)
+                self.assertIn("start the host manually", err)
+                execute.assert_not_called()
+                self.assertEqual(self.snapshot(project), before)
+
+    def test_a_host_option_after_its_own_boundary_is_literal_content(self):
+        for literal in ("--safe-mode", antiphon.CLAUDE_CHANNEL_FLAG):
+            with self.subTest(literal=literal):
+                project = self.project()
+                code, out, err, execute = self.run_launch(
+                    project, "claude", "--", "--", literal)
+
+                self.assertEqual((code, out, err), (0, "", ""))
+                self.assertEqual(execute.call_args.args[1][-2:], ["--", literal])
+
+    def test_launch_refuses_environment_modes_that_disable_claude_setup(self):
+        for variable in ("CLAUDE_CODE_SAFE_MODE", "CLAUDE_CODE_SIMPLE",
+                         "CLAUDE_CODE_RESTRICTED"):
+            for value in ("1", " TRUE "):
+                with self.subTest(variable=variable, value=value):
+                    project = self.project()
+                    code, out, err, execute = self.run_launch(
+                        project, "claude", env={variable: value})
+                    self.assertEqual((code, out), (2, ""))
+                    self.assertIn(variable, err)
+                    self.assertIn("unset it", err)
+                    execute.assert_not_called()
+
+    def test_launch_allows_false_environment_values_the_host_allows(self):
+        for variable in ("CLAUDE_CODE_SAFE_MODE", "CLAUDE_CODE_SIMPLE",
+                         "CLAUDE_CODE_RESTRICTED"):
+            for value in ("0", "false", "no", "off", ""):
+                with self.subTest(variable=variable, value=value):
+                    project = self.project()
+                    code, out, err, execute = self.run_launch(
+                        project, "claude", env={variable: value})
+                    self.assertEqual((code, out, err), (0, "", ""))
+                    execute.assert_called_once()
+
+    def test_an_exec_failure_is_bounded_and_names_the_host(self):
+        project = self.project()
+        failure = OSError(errno.EACCES, "Permission denied")
+
+        code, out, err, execute = self.run_launch(
+            project, "codex", exec_error=failure)
+
+        self.assertEqual((code, out), (1, ""))
+        self.assertEqual(err,
+                         "antiphon launch: could not start `codex` (Permission denied)\n")
+        execute.assert_called_once()
+
+    def test_the_installed_launch_process_becomes_the_host_and_preserves_exit(self):
+        """The npm executable itself, not only `launch()` in isolation, must
+        disappear into the host.  PID and exit status discriminate a wrapper
+        that merely spawns and waits."""
+        project = self.project()
+        bin_dir = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, bin_dir, ignore_errors=True)
+        host = os.path.join(bin_dir, "codex")
+        with open(host, "w", encoding="utf-8") as stream:
+            stream.write("#!/usr/bin/env python3\n"
+                         "import os, sys\n"
+                         "print(os.getpid(), flush=True)\n"
+                         "sys.exit(7)\n")
+        os.chmod(host, 0o755)
+        binary = os.path.join(os.path.dirname(antiphon.__file__), "..", "bin",
+                              "antiphon")
+        environment = dict(os.environ, ANTIPHON_CWD=project,
+                           PATH=bin_dir + os.pathsep + os.environ.get("PATH", ""))
+        process = subprocess.Popen(
+            [sys.executable, binary, "launch", "codex"], cwd=project,
+            env=environment, text=True, stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE)
+        out, err = process.communicate(timeout=10)
+        self.assertEqual(err, "")
+        self.assertEqual(int(out.strip()), process.pid,
+                         "the top-level CLI pid is now the host pid")
+        self.assertEqual(process.returncode, 7, "the host exit status is exact")
+
+    @unittest.skipIf(os.name == "nt", "POSIX signal status contract")
+    def test_the_installed_launch_process_preserves_the_hosts_signal_status(self):
+        project = self.project()
+        bin_dir = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, bin_dir, ignore_errors=True)
+        host = os.path.join(bin_dir, "codex")
+        with open(host, "w", encoding="utf-8") as stream:
+            stream.write("#!/usr/bin/env python3\n"
+                         "import os, time\n"
+                         "print(os.getpid(), flush=True)\n"
+                         "time.sleep(30)\n")
+        os.chmod(host, 0o755)
+        binary = os.path.join(os.path.dirname(antiphon.__file__), "..", "bin",
+                              "antiphon")
+        environment = dict(os.environ, ANTIPHON_CWD=project,
+                           PATH=bin_dir + os.pathsep + os.environ.get("PATH", ""))
+        process = subprocess.Popen(
+            [sys.executable, binary, "launch", "codex"], cwd=project,
+            env=environment, text=True, stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE)
+        try:
+            self.assertEqual(int(process.stdout.readline().strip()), process.pid)
+            process.send_signal(signal.SIGTERM)
+            _out, err = process.communicate(timeout=10)
+        finally:
+            if process.poll() is None:
+                process.kill()
+                process.wait(timeout=5)
+        self.assertEqual(err, "")
+        self.assertEqual(process.returncode, -signal.SIGTERM)
+
+    def test_incomplete_configuration_and_missing_host_each_name_one_remedy(self):
+        project = self.project(configured=False)
+        code, _out, err, execute = self.run_launch(project, "claude")
+        self.assertEqual(code, 1)
+        self.assertEqual(err, "antiphon launch: project configuration is incomplete; "
+                              "run `antiphon setup`, then retry\n")
+        execute.assert_not_called()
+
+        configured = self.project()
+        code, _out, err, execute = self.run_launch(
+            configured, "codex", executable=None)
+        self.assertEqual(code, 1)
+        self.assertEqual(err, "antiphon launch: `codex` was not found on PATH\n")
+        execute.assert_not_called()
+
+    def test_invalid_antiphon_options_never_reach_the_host(self):
+        project = self.project()
+        cases = [
+            ((), "usage:"),
+            (("other",), "host must be claude or codex"),
+            (("claude", "--name"), "--name needs a value"),
+            (("claude", "--name", "bad name"), "name is not usable"),
+            (("claude", "--name", "one", "--name", "two"),
+             "--name may be passed once"),
+            (("codex", "--model", "x"), "put host arguments after an exact `--`"),
+            (("claude", "--", "--dangerously-load-development-channels",
+              "server:other"), "already supplies the Antiphon development channel"),
+            (("claude", "--",
+              "--dangerously-load-development-channels=server:other"),
+             "already supplies the Antiphon development channel"),
+        ]
+        for args, wanted in cases:
+            with self.subTest(args=args):
+                code, _out, err, execute = self.run_launch(project, *args)
+                self.assertEqual(code, 2)
+                self.assertIn(wanted, err)
+                execute.assert_not_called()
+
+        code, _out, err, execute = self.run_launch(
+            project, "codex", env={"ANTIPHON_NAME": "bad name"})
+        self.assertEqual(code, 2)
+        self.assertIn("ANTIPHON_NAME is not usable", err)
+        execute.assert_not_called()
+
+        code, _out, err, execute = self.run_launch(
+            project, "codex", env={"ANTIPHON_NAME": ""})
+        self.assertEqual(code, 2)
+        self.assertIn("ANTIPHON_NAME is not usable", err)
+        execute.assert_not_called()
+
+
 class PagedSummaryModelTest(unittest.TestCase):
     """The page model delivers whole completed source records in source order."""
+
+    TODAY = antiphon.datetime.fromtimestamp(10).date()
 
     def event(self, text, source="source", generation="generation", offset=0,
               end=100, when=10.0, kind="codex"):
@@ -8652,8 +10038,11 @@ class PagedSummaryModelTest(unittest.TestCase):
                 }
                 for source, generation, offset in sources}
 
-    def page(self, events, scanned=None, side="claude", replay_reason=None):
-        return antiphon._build_page(events, scanned or {}, side, replay_reason)
+    def page(self, events, scanned=None, side="claude", replay_reason=None,
+             today=None):
+        return antiphon._build_page(
+            events, scanned or {}, side, replay_reason,
+            today=self.TODAY if today is None else today)
 
     def test_events_from_one_source_record_are_one_atomic_record(self):
         events = [
@@ -8669,6 +10058,18 @@ class PagedSummaryModelTest(unittest.TestCase):
         self.assertEqual(count, 1)
         self.assertTrue(advance.has_more)
         self.assertEqual(advance.sources["source"]["offset"], 100)
+
+    def test_a_json_escaped_lone_surrogate_is_rendered_as_a_safe_escape(self):
+        """Host JSON may contain an escaped non-scalar code unit. One bad
+        record must remain visible and must not crash or poison the page.
+        """
+        event = self.event("ordinary\ud800text")
+        text, advance, count = self.page(
+            [event], self.scanned(("source", "generation", 100)))
+        self.assertIn("ordinary\\ud800text", text)
+        self.assertEqual(text.encode("utf-8").decode("utf-8"), text)
+        self.assertEqual(count, 1)
+        self.assertFalse(advance.has_more)
 
     def test_the_oldest_completed_records_fill_the_page_first(self):
         events = [
@@ -8729,7 +10130,7 @@ class PagedSummaryModelTest(unittest.TestCase):
         widest_skip = {f"source-{i}": 30_000_000 for i in range(5)}
         complete = antiphon._render_page(
             "claude", antiphon._ordered_records(events), False, None,
-            None, None, widest_skip)
+            None, None, widest_skip, self.TODAY)
         self.assertLessEqual(len(complete), antiphon.PAGE_BUDGET)
         self.assertGreater(len(complete.encode("utf-8")), antiphon.PAGE_BUDGET)
         text, advance, count = antiphon._build_page(
@@ -8833,7 +10234,8 @@ class PagedSummaryModelTest(unittest.TestCase):
             self.event("   ", offset=0, end=100, when=when + 1),
             self.event("tail\n", offset=0, end=100, when=when + 2),
         ]
-        text, _advance, _count = self.page(events)
+        text, _advance, _count = self.page(
+            events, today=antiphon.datetime.fromtimestamp(when).date())
         self.assertEqual(text, "## What happened on the Codex side (since your last turn)\n"
                          "has_more: false\n"
                          "has_more_scope: currently discovered sources\n"
@@ -8866,8 +10268,9 @@ class PagedSummaryModelTest(unittest.TestCase):
         ]
         records = antiphon._ordered_records(events)
         complete = antiphon._render_page(
-            "claude", records, False, "legacy_upgrade")
-        without_replay = antiphon._render_page("claude", records, False, None)
+            "claude", records, False, "legacy_upgrade", today=self.TODAY)
+        without_replay = antiphon._render_page(
+            "claude", records, False, None, today=self.TODAY)
         without_scope = complete.replace(
             "has_more_scope: currently discovered sources\n", "", 1)
         self.assertGreater(len(complete.encode("utf-8")), antiphon.PAGE_BUDGET)
@@ -9394,6 +10797,25 @@ class SafeSourceTest(unittest.TestCase):
     def test_missing_dir_fd_support_is_a_classified_refusal(self):
         with tempfile.TemporaryDirectory() as root, \
              patch.object(antiphon.os, "supports_dir_fd", set()):
+            refusal = antiphon._open_safe_source(root, self._candidate(), "/repo")
+        self.assertIsInstance(refusal, antiphon.SourceRefusal)
+        self.assertEqual(refusal.reason, "unsupported-platform")
+
+    def test_advertised_dir_fd_runtime_refusal_is_classified(self):
+        """The capability set is advisory; a runtime refusal stays a normal
+        discovery result rather than escaping the hook as a traceback.
+        """
+        original = antiphon.os.open
+
+        def unavailable(*_args, **_kwargs):
+            raise NotImplementedError("dir_fd is unavailable")
+
+        supported = set(getattr(antiphon.os, "supports_dir_fd", set()))
+        supported.discard(original)
+        supported.add(unavailable)
+        with tempfile.TemporaryDirectory() as root, \
+             patch.object(antiphon.os, "open", unavailable), \
+             patch.object(antiphon.os, "supports_dir_fd", supported):
             refusal = antiphon._open_safe_source(root, self._candidate(), "/repo")
         self.assertIsInstance(refusal, antiphon.SourceRefusal)
         self.assertEqual(refusal.reason, "unsupported-platform")
@@ -13099,13 +14521,21 @@ class PagedDeliveryTest(_PagingIntegrationCase):
             cursor_path = os.path.join(project, ".antiphon", "cursor.json")
             with open(cursor_path, "rb") as stream:
                 before = stream.read()
-            code = self._hook(
-                project, codex_paths=[path], side="claude",
-                deliver=lambda line: attempted.append(line) or False)[0]
-            with open(cursor_path, "rb") as stream:
-                after = stream.read()
-            repeated = self._hook(
-                project, codex_paths=[path], side="claude")[1]
+            # This assertion isolates the cursor/delivery transaction.  Source
+            # catalog bootstrap is deliberately independent of that cursor
+            # and can truthfully advance from `building` to `complete` between
+            # two attempts, changing only the diagnostic line on the page.
+            # Freeze that unrelated updater so byte equality tests the record
+            # and cursor contract instead of depending on the runner's HOME.
+            with patch.object(antiphon, "_hook_catalog_update",
+                              return_value=True):
+                code = self._hook(
+                    project, codex_paths=[path], side="claude",
+                    deliver=lambda line: attempted.append(line) or False)[0]
+                with open(cursor_path, "rb") as stream:
+                    after = stream.read()
+                repeated = self._hook(
+                    project, codex_paths=[path], side="claude")[1]
         attempted_text = json.loads(attempted[0])["hookSpecificOutput"]["additionalContext"]
         self.assertEqual(code, 1)
         self.assertEqual(after, before)
@@ -14677,7 +16107,8 @@ class CodexPeerWiringTest(unittest.TestCase):
             self._hold_lock(antiphon.state_path(project, "claude"))
             with patch.object(antiphon, "CURSOR_LOCK_PATIENCE", 0.1), \
                  contextlib.redirect_stderr(io.StringIO()):
-                antiphon._record_delivery(project, "codex", "hello")
+                recorded = antiphon._record_delivery(project, "codex", "hello")
+            self.assertIs(recorded, False)
             self.assertEqual(antiphon.read_cursor(project, "claude"), {},
                              "a writer that bypassed the lock would have "
                              "written the fingerprint anyway")
@@ -15878,25 +17309,31 @@ class SourceAwarePullTest(unittest.TestCase):
         The property is what matters and it holds everywhere: a label can only
         be added as the prefix grows, never removed, so candidate size stays
         monotone, the budget loop cannot oscillate, and `selected` is still the
-        largest length that fits."""
+        largest length that fits. This fixture pins the pre-existing compact
+        clock so it measures label overhead alone; `RecordTimestampTest`
+        independently proves dated-clock overhead moves the real frontier.
+        """
         project = self.project()
         events = self._budget_events(30, 5, body=200)
-        base_text, base_advance, _ = self._summary(project, events)
-        self._codex_claim(project, "build", self.A)
-        text, advance, _ = self._summary(project, events)
+        compact = lambda epoch, _today: antiphon.datetime.fromtimestamp(
+            epoch).strftime("%H:%M")
+        with patch.object(antiphon, "_record_clock", side_effect=compact):
+            base_text, base_advance, _ = self._summary(project, events)
+            self._codex_claim(project, "build", self.A)
+            text, advance, _ = self._summary(project, events)
+
+            records = antiphon._ordered_records(events)
+            join = antiphon._session_join(project, "codex")
+            sizes = [len(antiphon._render_page(
+                "claude", records[:length], length < len(records), None, join)
+                         .encode("utf-8"))
+                     for length in range(1, len(records) + 1)]
 
         self.assertLessEqual(len(text.encode("utf-8")), antiphon.PAGE_BUDGET)
         self.assertEqual(base_text.count("] Codex"), 35)
         self.assertFalse(base_advance.has_more)
         self.assertEqual(text.count("] Codex"), 33)
         self.assertTrue(advance.has_more, "the page defers two records instead")
-
-        records = antiphon._ordered_records(events)
-        join = antiphon._session_join(project, "codex")
-        sizes = [len(antiphon._render_page("claude", records[:length],
-                                           length < len(records), None, join)
-                     .encode("utf-8"))
-                 for length in range(1, len(records) + 1)]
         self.assertEqual([index for index in range(1, len(sizes))
                           if sizes[index] < sizes[index - 1]], [],
                          "a label is never removed as the prefix grows")
@@ -16562,23 +17999,23 @@ class RoutingTest(unittest.TestCase):
         class Fake:
             def settimeout(self, _): pass
             def connect(self, address): connected.append(address)
-            def sendall(self, _): pass
+            def sendall(self, data):
+                self.answer = json.dumps({
+                    "ok": True,
+                    "message_id": json.loads(data)["message_id"],
+                }).encode()
             def shutdown(self, _): pass
-            def recv(self, _): return b'{"ok": true}' if not connected[1:] else b""
+            def recv(self, _):
+                answer, self.answer = getattr(self, "answer", b""), b""
+                return answer
             def close(self): pass
             def __enter__(self): return self
             def __exit__(self, *_): return False
 
-        replies = [b'{"ok": true}', b""]
-
-        class Reading(Fake):
-            def recv(self, _):
-                return replies.pop(0) if replies else b""
-
         with tempfile.TemporaryDirectory() as project:
             antiphon.peers.register(project, "claude", "ui", "/tmp/ui.sock")
             antiphon.peers.register(project, "claude", "api", "/tmp/api.sock")
-            with patch.object(antiphon.socket, "socket", lambda *a, **k: Reading()):
+            with patch.object(antiphon.socket, "socket", lambda *a, **k: Fake()):
                 ok, detail = antiphon.send_to_claude(project, "hi", "api")
         self.assertTrue(ok, detail)
         self.assertEqual(connected, ["/tmp/api.sock"])
@@ -16722,24 +18159,23 @@ class ToolRecipientTest(unittest.TestCase):
         class Fake:
             def settimeout(self, _): pass
             def connect(self, address): connected.append(address)
-            def sendall(self, _): pass
+            def sendall(self, data):
+                self.answer = json.dumps({
+                    "ok": True,
+                    "message_id": json.loads(data)["message_id"],
+                }).encode()
             def shutdown(self, _): pass
-            def recv(self, _): return b'{"ok": true}' if len(connected) == 1 \
-                                     and not getattr(self, "done", False) else b""
+            def recv(self, _):
+                answer, self.answer = getattr(self, "answer", b""), b""
+                return answer
             def close(self): pass
             def __enter__(self): return self
             def __exit__(self, *_): return False
 
-        replies = [b'{"ok": true}', b""]
-
-        class Reading(Fake):
-            def recv(self, _):
-                return replies.pop(0) if replies else b""
-
         with tempfile.TemporaryDirectory() as project:
             antiphon.peers.register(project, "claude", "ui", "/tmp/ui.sock")
             antiphon.peers.register(project, "claude", "api", "/tmp/api.sock")
-            with patch.object(antiphon.socket, "socket", lambda *a, **k: Reading()), \
+            with patch.object(antiphon.socket, "socket", lambda *a, **k: Fake()), \
                  patch.object(antiphon, "_record_delivery"):
                 result = antiphon._send_tool(project, "hello", "api")
         self.assertNotIn("isError", result)
@@ -17195,7 +18631,8 @@ class ToolRecipientTest(unittest.TestCase):
         self.assertEqual(code, 1, "a bookkeeping failure is reported")
         self.assertEqual(recipients, ["build"],
                          "only real recipients reached the transport")
-        self.assertIn("could not record delivery for build", err)
+        self.assertIn("could not promote delivery for build", err)
+        self.assertIn("exact suppression evidence was retained", err)
         self.assertNotIn("midturn", err,
                          "and the park is named to nobody")
 
@@ -17233,7 +18670,8 @@ class ToolRecipientTest(unittest.TestCase):
                 self.assertTrue(held)
                 code, err = self._stop(project, "@codex:build ship it")
         self.assertEqual(code, 1)
-        self.assertIn("could not record delivery", err)
+        self.assertIn("could not promote delivery", err)
+        self.assertIn("exact suppression evidence was retained", err)
         self.assertIn(antiphon.PARK_LEFT_BEHIND, err,
                       "both costs are reported, not one blanket 'not a drop'")
 
@@ -18577,7 +20015,7 @@ class RefusedSendHonestyTest(unittest.TestCase):
         never retry.
         """
 
-        def __init__(self, answer=b'{"ok": true, "message_id": "m1"}', breaks=None):
+        def __init__(self, answer=None, breaks=None):
             self.answer = answer
             self.breaks = breaks
 
@@ -18602,6 +20040,11 @@ class RefusedSendHonestyTest(unittest.TestCase):
         def sendall(self, _data):
             if self.breaks is not None:
                 raise self.breaks
+            if self.answer is None:
+                self.answer = json.dumps({
+                    "ok": True,
+                    "message_id": json.loads(_data)["message_id"],
+                }).encode()
 
         def shutdown(self, _how):
             pass
@@ -18651,6 +20094,187 @@ class RefusedSendHonestyTest(unittest.TestCase):
                          "Permission denied — "
                          + antiphon.TOOL_GUIDANCE.format(
                              seen="only a tool-name line"))
+
+    def test_all_direct_send_surfaces_preserve_an_unknown_outcome_and_attempt_id(self):
+        class UnknownOutcome(str):
+            delivery_unknown = True
+
+        unknown = UnknownOutcome("transport reply was lost")
+
+        with tempfile.TemporaryDirectory() as project, \
+             patch.object(antiphon, "send_to_codex", return_value=(False, unknown)):
+            code, out, err = self._reply(project, {"text": "hi", "to": "build"})
+            reply_codex = json.loads(out)
+        self.assertEqual((code, err), (0, ""))
+        self.assertEqual(reply_codex["outcome"], "unknown")
+        self.assertRegex(reply_codex["id"], r"^[0-9a-f-]{36}$")
+        self.assertIn("do not retry automatically", reply_codex["text"])
+
+        with tempfile.TemporaryDirectory() as project, \
+             patch.object(antiphon, "send_to_claude", return_value=(False, unknown)):
+            code, out, err = self._reply(
+                project, {"text": "hi", "kind": "claude", "to": "api",
+                          "sender_alias": "ui"})
+            reply_claude = json.loads(out)
+        self.assertEqual((code, err), (0, ""))
+        self.assertEqual(reply_claude["outcome"], "unknown")
+        self.assertRegex(reply_claude["id"], r"^[0-9a-f-]{36}$")
+
+        with tempfile.TemporaryDirectory() as project, \
+             patch.object(antiphon, "send_to_codex", return_value=(False, unknown)):
+            codex_result = antiphon._send_tool_to_codex(project, "hi", "build", "ui")
+            codex_payload = json.loads(codex_result["content"][0]["text"])
+        self.assertIsNot(codex_result.get("isError"), True)
+        self.assertEqual(codex_payload["outcome"], "unknown")
+        self.assertRegex(codex_payload["id"], r"^[0-9a-f-]{36}$")
+
+        with tempfile.TemporaryDirectory() as project, \
+             patch.object(antiphon, "_oversized_for_claude", return_value=True), \
+             patch.object(antiphon, "send_to_claude", return_value=(False, unknown)):
+            claude_result = antiphon._send_tool(project, "hi", "api", "ui")
+            claude_payload = json.loads(claude_result["content"][0]["text"])
+            parked = os.listdir(os.path.join(project, ".antiphon", "messages"))
+        self.assertIsNot(claude_result.get("isError"), True)
+        self.assertEqual(claude_payload["outcome"], "unknown")
+        self.assertRegex(claude_payload["id"], r"^[0-9a-f-]{36}$")
+        self.assertEqual(len(parked), 1, "the peer may need the attachment it received")
+
+    def test_all_direct_unknown_surfaces_report_a_receipt_that_won_the_race(self):
+        """The transport acknowledgement can disappear after the receiver's
+        transcript already committed. The row is then `sent`; no surface may
+        return a contradictory `outcome: unknown`."""
+        class UnknownOutcome(str):
+            delivery_unknown = True
+
+        unknown = UnknownOutcome("transport reply was lost")
+        message_id = "83f48150-6f08-4d21-b51e-10af885dc39f"
+
+        def seed(project, kind, alias):
+            self.assertTrue(ledger.record_receipts(
+                project, [("received", message_id, time.time(), alias)],
+                read_by=kind))
+
+        def assert_resolved(project, payload):
+            self.assertEqual(payload["outcome"], "received")
+            self.assertIs(payload["recorded"], True)
+            self.assertIn("transcript already proves receipt", payload["text"])
+            self.assertIn("do not retry", payload["text"])
+            self.assertNotIn("outcome unknown", payload["text"].lower())
+            entry = ledger.read_entry(project, message_id)
+            self.assertEqual((entry["version"], entry["state"]), (1, "sent"))
+            self.assertIsNotNone(entry["received_at"])
+
+        with tempfile.TemporaryDirectory() as project:
+            seed(project, "codex", "build")
+            with patch.object(antiphon, "delivery_id", return_value=message_id), \
+                 patch.object(antiphon, "send_to_codex",
+                              return_value=(False, unknown)):
+                code, out, err = self._reply(project, {"text": "hi", "to": "build"})
+            self.assertEqual((code, err), (0, ""))
+            assert_resolved(project, json.loads(out))
+
+        with tempfile.TemporaryDirectory() as project:
+            seed(project, "claude", "api")
+            with patch.object(antiphon, "delivery_id", return_value=message_id), \
+                 patch.object(antiphon, "send_to_claude",
+                              return_value=(False, unknown)):
+                code, out, err = self._reply(
+                    project, {"text": "hi", "kind": "claude", "to": "api",
+                              "sender_alias": "ui"})
+            self.assertEqual((code, err), (0, ""))
+            assert_resolved(project, json.loads(out))
+
+        with tempfile.TemporaryDirectory() as project:
+            seed(project, "codex", "build")
+            with patch.object(antiphon, "delivery_id", return_value=message_id), \
+                 patch.object(antiphon, "send_to_codex",
+                              return_value=(False, unknown)):
+                result = antiphon._send_tool_to_codex(
+                    project, "hi", "build", "ui")
+            assert_resolved(project, json.loads(result["content"][0]["text"]))
+
+        with tempfile.TemporaryDirectory() as project:
+            seed(project, "claude", "api")
+            with patch.object(antiphon, "delivery_id", return_value=message_id), \
+                 patch.object(antiphon, "send_to_claude",
+                              return_value=(False, unknown)):
+                result = antiphon._send_tool(project, "hi", "api", "ui")
+            assert_resolved(project, json.loads(result["content"][0]["text"]))
+
+    def test_a_direct_unknown_requires_an_exact_ledger_readback(self):
+        """A writer's success bit alone cannot make an unknown attempt durable,
+        and its pre-transport timestamp is one of the fields that must survive.
+        """
+        class UnknownOutcome(str):
+            delivery_unknown = True
+
+        unknown = UnknownOutcome("transport reply was lost")
+
+        with tempfile.TemporaryDirectory() as project, \
+             patch.object(antiphon, "send_to_codex", return_value=(False, unknown)), \
+             patch.object(antiphon.ledger, "record_unknown", return_value=True):
+            result = antiphon._send_tool_to_codex(project, "hi", "build", "ui")
+            missing = json.loads(result["content"][0]["text"])
+
+        self.assertEqual(missing["outcome"], "unknown")
+        self.assertIs(missing["recorded"], False)
+        self.assertIn("delivery ledger could not be written", missing["text"])
+
+        real_read = antiphon.ledger.read_entry
+
+        def wrong_timestamp(cwd, message_id):
+            entry = real_read(cwd, message_id)
+            return dict(entry, sent_at=entry["sent_at"] + 1.0)
+
+        with tempfile.TemporaryDirectory() as project, \
+             patch.object(antiphon, "send_to_codex", return_value=(False, unknown)), \
+             patch.object(antiphon.ledger, "read_entry", side_effect=wrong_timestamp):
+            result = antiphon._send_tool_to_codex(project, "hi", "build", "ui")
+            altered = json.loads(result["content"][0]["text"])
+
+        self.assertEqual(altered["outcome"], "unknown")
+        self.assertIs(altered["recorded"], False)
+        self.assertIn("delivery ledger could not be written", altered["text"])
+
+    def test_all_unknown_direct_send_surfaces_report_dedupe_write_failure(self):
+        class UnknownOutcome(str):
+            delivery_unknown = True
+
+        unknown = UnknownOutcome("transport reply was lost")
+
+        def assert_warning(payload):
+            self.assertIs(payload["dedupe_recorded"], False)
+            self.assertIn("Stop-marker suppression could not be recorded",
+                          payload["text"])
+            self.assertIn("may be sent again", payload["text"])
+
+        with tempfile.TemporaryDirectory() as project, \
+             patch.object(antiphon, "send_to_codex", return_value=(False, unknown)), \
+             patch.object(antiphon, "_record_delivery", return_value=False):
+            code, out, err = self._reply(project, {"text": "hi", "to": "build"})
+            self.assertEqual((code, err), (0, ""))
+            assert_warning(json.loads(out))
+
+        with tempfile.TemporaryDirectory() as project, \
+             patch.object(antiphon, "send_to_claude", return_value=(False, unknown)), \
+             patch.object(antiphon, "_record_delivery", return_value=False):
+            code, out, err = self._reply(
+                project, {"text": "hi", "kind": "claude", "to": "api",
+                          "sender_alias": "ui"})
+            self.assertEqual((code, err), (0, ""))
+            assert_warning(json.loads(out))
+
+        with tempfile.TemporaryDirectory() as project, \
+             patch.object(antiphon, "send_to_codex", return_value=(False, unknown)), \
+             patch.object(antiphon, "_record_delivery", return_value=False):
+            result = antiphon._send_tool_to_codex(project, "hi", "build", "ui")
+            assert_warning(json.loads(result["content"][0]["text"]))
+
+        with tempfile.TemporaryDirectory() as project, \
+             patch.object(antiphon, "send_to_claude", return_value=(False, unknown)), \
+             patch.object(antiphon, "_record_delivery", return_value=False):
+            result = antiphon._send_tool(project, "hi", "api", "ui")
+            assert_warning(json.loads(result["content"][0]["text"]))
 
     def test_a_missing_codex_session_still_gets_the_guidance(self):
         """Discovery finding no rollout to address says nothing about a peer's
@@ -18744,11 +20368,6 @@ class RefusedSendHonestyTest(unittest.TestCase):
                  antiphon.subprocess, "run",
                  side_effect=OSError(errno.E2BIG, "Argument list too long"))),
              "Argument list too long", replied),
-            ("_queue_codex: the subprocess never completed",
-             lambda: named_reply(patch.object(
-                 antiphon.subprocess, "run",
-                 side_effect=subprocess.TimeoutExpired("codex", 15))),
-             "TimeoutExpired", replied),
             ("_queue_codex: the host refused the queue",
              lambda: named_reply(patch.object(
                  antiphon.subprocess, "run",
@@ -18771,33 +20390,416 @@ class RefusedSendHonestyTest(unittest.TestCase):
                  side_effect=FileNotFoundError(errno.ENOENT,
                                                "No such file or directory"))),
              "no Claude peer is registered", sent),
-            ("send_to_claude: it broke after the bytes went out",
-             lambda: send(channel(breaks=OSError(errno.EPIPE, "Broken pipe"))),
-             "Channel is down: Broken pipe", sent),
-            ("send_to_claude: the answer did not decode",
-             lambda: send(channel(answer=b"not json at all")),
-             "invalid response", sent),
-            ("send_to_claude: the answer decoded to something that is not one",
-             lambda: send(channel(answer=b"[]")),
-             "invalid response", sent),
             ("send_to_claude: the channel server itself said no",
              lambda: send(channel(
                  answer=b'{"ok": false, "error": "channel said no"}')),
              "channel said no", sent),
         ]
-        # 10 original rows plus `_queue_codex`'s crash-belt and the bare
-        # channel's honest `no-peer` refusal. The former turns
+        # Six original definite-refusal rows plus `_queue_codex`'s crash-belt
+        # and the bare channel's honest `no-peer` refusal. The former turns
         # an exec the kernel refuses — measured at 1.1 MB of message on this
         # machine — into a classified refusal instead of a traceback out of a
-        # Stop hook. The quota refusal born in the spill branch adds no row: it
-        # is unclassed, and an unwrapped refusal is not a census site.
-        self.assertEqual(len(sites), 12,
+        # Stop hook. Four post-write sites moved to the outcome-unknown test
+        # below: they are deliberately not refusals. The quota refusal born in
+        # the spill branch adds no row: it is unclassed, and an unwrapped
+        # refusal is not a census site.
+        self.assertEqual(len(sites), 8,
                          "one case per wrap site, and every wrap site has one")
         for label, refuse, fragment, guidance in sites:
             with self.subTest(label):
                 said = refuse().rstrip("\n")
                 self.assertIn(fragment, said, "the fixture missed its site")
                 self.assertTrue(said.endswith(" — " + guidance), said)
+
+    def test_every_post_write_failure_birth_site_is_classed_outcome_unknown(self):
+        with patch.object(
+                antiphon.subprocess, "run",
+                side_effect=subprocess.TimeoutExpired("codex", 15)):
+            ok, detail = antiphon._queue_codex(self.UUID, "hello")
+        self.assertFalse(ok)
+        self.assertIs(getattr(detail, "delivery_unknown", False), True)
+
+        decode_error = UnicodeDecodeError("utf-8", b"\xff", 0, 1, "bad")
+        with patch.object(antiphon.subprocess, "run", side_effect=decode_error):
+            ok, detail = antiphon._queue_codex(self.UUID, "hello")
+        self.assertFalse(ok)
+        self.assertIs(getattr(detail, "delivery_unknown", False), True)
+
+        cases = [
+            self._LiveSocket(breaks=OSError(errno.EPIPE, "Broken pipe")),
+            self._LiveSocket(answer=b"not json at all"),
+            self._LiveSocket(answer=b"[]"),
+            self._LiveSocket(answer=b'{"ok": true}'),
+            self._LiveSocket(answer=(
+                b'{"ok": true, "message_id": '
+                b'"00000000-0000-0000-0000-000000000000"}')),
+            self._LiveSocket(answer=json.dumps({
+                "ok": 1, "message_id": self.UUID,
+            }).encode()),
+        ]
+        for channel_socket in cases:
+            with self.subTest(socket=type(channel_socket).__name__), \
+                 tempfile.TemporaryDirectory() as project, \
+                 patch.object(antiphon.socket, "socket", channel_socket):
+                antiphon.peers.register(project, "claude", "ui", "/tmp/ui.sock")
+                ok, detail = antiphon.send_to_claude(
+                    project, "hello", "ui", sender_alias="build",
+                    message_id=self.UUID)
+            self.assertFalse(ok)
+            self.assertIs(getattr(detail, "delivery_unknown", False), True)
+
+    def test_a_listener_refusal_with_non_utf8_error_is_safe_on_every_surface(self):
+        response = (b'{"ok":false,"error":"\\ud800",'
+                    b'"refusal_class":"no-peer"}')
+
+        with tempfile.TemporaryDirectory() as project:
+            antiphon.peers.register(project, "claude", "api", "/tmp/api.sock")
+            with patch.object(antiphon.socket, "socket",
+                              self._LiveSocket(answer=response)):
+                ok, detail = antiphon.send_to_claude(
+                    project, "hello", "api", sender_alias="build",
+                    message_id=self.UUID)
+            self.assertFalse(ok)
+            self.assertEqual(str(detail), "\\ud800")
+            self.assertEqual(detail.refusal_class, "no-peer")
+            str(detail).encode("utf-8")
+
+            with patch.object(antiphon.socket, "socket",
+                              self._LiveSocket(answer=response)):
+                code, out, err = self._reply(
+                    project, {"text": "hello", "kind": "claude",
+                              "to": "api", "sender_alias": "ui"})
+            self.assertEqual((code, out), (1, ""))
+            self.assertIn("\\ud800", err)
+            self.assertNotIn("Traceback", err)
+            err.encode("utf-8")
+
+            with patch.object(antiphon.socket, "socket",
+                              self._LiveSocket(answer=response)), \
+                 contextlib.redirect_stderr(io.StringIO()):
+                answers = AntiphonTest._run_mcp(
+                    project, AntiphonTest._call(
+                        "antiphon_send", text="hello", to="api"))
+            result = answers[0]["result"]
+            self.assertIs(result.get("isError"), True)
+            self.assertIn("\\ud800", result["content"][0]["text"])
+            json.dumps(answers, ensure_ascii=False).encode("utf-8")
+
+    def test_a_pre_exec_embedded_nul_is_a_definite_refusal_not_a_traceback(self):
+        with patch.object(
+                antiphon.subprocess, "run",
+                side_effect=ValueError("embedded null byte")):
+            ok, detail = antiphon._queue_codex(self.UUID, "hello\0world")
+        self.assertFalse(ok)
+        self.assertIn("could not be started", detail)
+        self.assertIn("embedded null byte", detail)
+        self.assertIs(getattr(detail, "delivery_unknown", False), False)
+
+    def test_a_pre_exec_lone_surrogate_is_a_definite_refusal(self):
+        """argv encoding fails before a child can accept any queue row."""
+        ok, detail = antiphon._queue_codex(self.UUID, "hello\ud800world")
+        self.assertFalse(ok)
+        self.assertIn("could not be started", detail)
+        self.assertIn("UnicodeEncodeError", detail)
+        self.assertIs(getattr(detail, "delivery_unknown", False), False)
+
+    def test_every_public_send_boundary_rejects_non_utf8_text_before_mutation(self):
+        """A JSON string may contain an unpaired surrogate even though UTF-8
+        cannot. Every interactive boundary rejects that value in fixed prose,
+        before it can create a task, ledger row, attachment, or transport call.
+        """
+        bad = "hello\ud800world"
+        self.assertIsNone(antiphon._utf8_bytes("low\udc00surrogate"))
+        self.assertEqual(antiphon._utf8_bytes("valid 😀"),
+                         "valid 😀".encode("utf-8"))
+
+        with tempfile.TemporaryDirectory() as project, \
+             patch.object(antiphon, "send_to_codex") as send_codex, \
+             patch.object(antiphon, "send_to_claude") as send_claude, \
+             patch.object(antiphon, "_spill") as spill, \
+             patch.object(antiphon, "_record_delivery") as dedupe, \
+             patch.object(antiphon.ledger, "record_sent") as sent, \
+             patch.object(antiphon.ledger, "record_unknown") as unknown, \
+             patch.object(antiphon.ledger, "record_refused") as refused, \
+             patch.object(antiphon.workers, "new_task") as new_task, \
+             patch.object(antiphon.workers, "accept") as accept, \
+             patch.object(antiphon.workers, "start") as start:
+            reply_results = [
+                self._reply(project, {"text": bad, "to": "build"}),
+                self._reply(project, {
+                    "text": bad, "kind": "claude", "to": "api",
+                    "sender_alias": "ui"}),
+            ]
+            for code, out, err in reply_results:
+                self.assertEqual((code, out), (1, ""))
+                self.assertEqual(
+                    err, "reply: message text must be valid UTF-8; remove "
+                         "unpaired Unicode surrogates\n")
+
+            for kind in ("claude", "codex"):
+                result = antiphon._send_tool(
+                    project, bad, "api" if kind == "claude" else "build",
+                    "ui", kind)
+                self.assertIs(result.get("isError"), True)
+                self.assertEqual(
+                    result["content"][0]["text"],
+                    "message text must be valid UTF-8; remove unpaired "
+                    "Unicode surrogates")
+
+            for payload in (
+                    {"text": bad, "kind": "claude", "to": "opus"},
+                    {"text": bad, "kind": "claude"}):
+                ok, detail = antiphon._delegate(
+                    project, payload, sender="build", side="codex")
+                self.assertFalse(ok)
+                self.assertEqual(
+                    detail, "not delegated: message text must be valid UTF-8; "
+                            "remove unpaired Unicode surrogates")
+
+            for mutation in (send_codex, send_claude, spill, dedupe, sent,
+                             unknown, refused, new_task, accept, start):
+                mutation.assert_not_called()
+            self.assertFalse(os.path.exists(os.path.join(project, ".antiphon")))
+
+        with tempfile.TemporaryDirectory() as project, \
+             patch.object(antiphon.socket, "socket") as opened:
+            ok, detail = antiphon.send_to_claude(
+                project, bad, "api", sender_alias="build",
+                message_id=self.UUID, sender_kind="codex")
+            self.assertFalse(ok)
+            self.assertEqual(
+                str(detail), "message text must be valid UTF-8; remove unpaired "
+                             "Unicode surrogates")
+            self.assertEqual(getattr(detail, "refusal_class", None), "transport")
+            self.assertIs(getattr(detail, "delivery_unknown", False), False)
+            opened.assert_not_called()
+            self.assertFalse(os.path.exists(os.path.join(project, ".antiphon")))
+
+        for field, value in (("sender_alias", "build\ud800"),
+                             ("message_id", "id\udc00")):
+            with self.subTest(field=field), \
+                 tempfile.TemporaryDirectory() as project, \
+                 patch.object(antiphon.socket, "socket") as opened:
+                arguments = {
+                    "alias": "api", "sender_alias": "build",
+                    "message_id": self.UUID, "sender_kind": "codex",
+                }
+                arguments[field] = value
+                ok, detail = antiphon.send_to_claude(
+                    project, "valid text", **arguments)
+                self.assertFalse(ok)
+                self.assertEqual(
+                    str(detail), "delivery metadata must be valid UTF-8; remove "
+                                 "unpaired Unicode surrogates")
+                opened.assert_not_called()
+
+    def test_reply_and_tool_reject_non_utf8_recipient_before_large_message_state(self):
+        """Recipient metadata is validated before cwd discovery, attempt ids,
+        attachment spill, or either transport -- even when otherwise-valid
+        text would take the oversized-message road.
+        """
+        bad_recipient = "api\ud800"
+        text = "x" * 10_000
+
+        for kind in ("claude", "codex"):
+            with self.subTest(surface="reply", kind=kind), \
+                 tempfile.TemporaryDirectory() as project, \
+                 patch.object(antiphon, "project_dir",
+                              return_value=project) as project_root, \
+                 patch.object(antiphon, "_oversized_for_queue",
+                              return_value=True), \
+                 patch.object(antiphon, "_oversized_for_claude",
+                              return_value=True), \
+                 patch.object(antiphon, "_spill") as spill, \
+                 patch.object(antiphon, "delivery_id") as attempt_id, \
+                 patch.object(antiphon, "send_to_codex") as send_codex, \
+                 patch.object(antiphon, "send_to_claude") as send_claude, \
+                 patch.object(
+                     antiphon.sys, "stdin", io.StringIO(json.dumps({
+                         "text": text, "kind": kind, "to": bad_recipient,
+                     }))), \
+                 contextlib.redirect_stdout(io.StringIO()) as output, \
+                 contextlib.redirect_stderr(io.StringIO()) as error:
+                code = antiphon.reply()
+
+            self.assertEqual(code, 1)
+            self.assertEqual(output.getvalue(), "")
+            self.assertEqual(
+                error.getvalue(),
+                "reply: recipient name must be valid UTF-8; remove unpaired "
+                "Unicode surrogates\n")
+            project_root.assert_not_called()
+            spill.assert_not_called()
+            attempt_id.assert_not_called()
+            send_codex.assert_not_called()
+            send_claude.assert_not_called()
+            self.assertFalse(os.path.exists(os.path.join(project, ".antiphon")))
+
+            with self.subTest(surface="tool", kind=kind), \
+                 tempfile.TemporaryDirectory() as project, \
+                 patch.object(antiphon, "_oversized_for_queue",
+                              return_value=True), \
+                 patch.object(antiphon, "_oversized_for_claude",
+                              return_value=True), \
+                 patch.object(antiphon, "_spill") as spill, \
+                 patch.object(antiphon, "delivery_id") as attempt_id, \
+                 patch.object(antiphon, "send_to_codex") as send_codex, \
+                 patch.object(antiphon, "send_to_claude") as send_claude:
+                result = antiphon._send_tool(
+                    project, text, bad_recipient, "ui", kind)
+
+            self.assertIs(result.get("isError"), True)
+            self.assertEqual(
+                result["content"][0]["text"],
+                "recipient name must be valid UTF-8; remove unpaired "
+                "Unicode surrogates")
+            spill.assert_not_called()
+            attempt_id.assert_not_called()
+            send_codex.assert_not_called()
+            send_claude.assert_not_called()
+            self.assertFalse(os.path.exists(os.path.join(project, ".antiphon")))
+
+        for recipient in ("bad name", ""):
+            for kind in ("claude", "codex"):
+                with self.subTest(surface="reply", kind=kind,
+                                  recipient=recipient), \
+                     tempfile.TemporaryDirectory() as project, \
+                     patch.object(antiphon, "project_dir",
+                                  return_value=project) as project_root, \
+                     patch.object(antiphon, "_oversized_for_queue",
+                                  return_value=True), \
+                     patch.object(antiphon, "_oversized_for_claude",
+                                  return_value=True), \
+                     patch.object(antiphon, "_spill") as spill, \
+                     patch.object(antiphon, "delivery_id") as attempt_id, \
+                     patch.object(antiphon, "send_to_codex") as send_codex, \
+                     patch.object(antiphon, "send_to_claude") as send_claude, \
+                     patch.object(
+                         antiphon.sys, "stdin", io.StringIO(json.dumps({
+                             "text": text, "kind": kind, "to": recipient,
+                         }))), \
+                     contextlib.redirect_stdout(io.StringIO()) as output, \
+                     contextlib.redirect_stderr(io.StringIO()) as error:
+                    code = antiphon.reply()
+                self.assertEqual(code, 1)
+                self.assertEqual(output.getvalue(), "")
+                self.assertIn("reply:", error.getvalue())
+                project_root.assert_not_called()
+                spill.assert_not_called()
+                attempt_id.assert_not_called()
+                send_codex.assert_not_called()
+                send_claude.assert_not_called()
+                self.assertFalse(os.path.exists(
+                    os.path.join(project, ".antiphon")))
+
+                with self.subTest(surface="tool", kind=kind,
+                                  recipient=recipient), \
+                     tempfile.TemporaryDirectory() as project, \
+                     patch.object(antiphon, "_oversized_for_queue",
+                                  return_value=True), \
+                     patch.object(antiphon, "_oversized_for_claude",
+                                  return_value=True), \
+                     patch.object(antiphon, "_spill") as spill, \
+                     patch.object(antiphon, "delivery_id") as attempt_id, \
+                     patch.object(antiphon, "send_to_codex") as send_codex, \
+                     patch.object(antiphon, "send_to_claude") as send_claude:
+                    result = antiphon._send_tool(
+                        project, text, recipient, "ui", kind)
+                self.assertIs(result.get("isError"), True)
+                spill.assert_not_called()
+                attempt_id.assert_not_called()
+                send_codex.assert_not_called()
+                send_claude.assert_not_called()
+                self.assertFalse(os.path.exists(
+                    os.path.join(project, ".antiphon")))
+
+    def test_stop_push_persists_a_safe_refusal_for_non_utf8_text(self):
+        """The Stop wrapper gets the ordinary definite-refusal semantics: no
+        transport or attachment, one truthful ledger row, and no traceback.
+        Its preview is UTF-8-safe so the next passive page can render it.
+        """
+        bad = "@claude:api hello\ud800world"
+        with tempfile.TemporaryDirectory() as project, \
+             patch.object(antiphon.os.path, "exists", return_value=True), \
+             patch.object(antiphon, "_codex_turn", return_value=(bad, "turn-1")), \
+             patch.object(antiphon, "claimed_alias", return_value="build"), \
+             patch.object(antiphon.socket, "socket") as opened, \
+             patch.object(antiphon, "_spill") as spill, \
+             patch.object(antiphon.sys, "stdin", io.StringIO(json.dumps({
+                 "cwd": project, "transcript_path": "/tmp/transcript",
+                 "turn_id": "turn-1"}))), \
+             contextlib.redirect_stdout(io.StringIO()), \
+             contextlib.redirect_stderr(io.StringIO()) as error:
+            code = antiphon.push("claude")
+            rows = ledger.entries(project)
+
+        self.assertEqual(code, 0)
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["state"], "refused")
+        self.assertEqual(
+            rows[0]["reason"], "message text must be valid UTF-8; remove "
+                               "unpaired Unicode surrogates")
+        self.assertEqual(rows[0]["preview"], "hello\\ud800world")
+        self.assertIn("delivery failed", error.getvalue())
+        self.assertNotIn("Traceback", error.getvalue())
+        opened.assert_not_called()
+        spill.assert_not_called()
+        self.assertFalse(os.path.exists(os.path.join(
+            project, ".antiphon", "messages")))
+
+    def test_stop_push_persists_a_safe_refusal_for_non_utf8_recipient(self):
+        """The marker parser intentionally preserves raw recipient text for
+        routing. Its refusal path must not put an unpaired surrogate back into
+        stderr or the UTF-8 ledger file.
+        """
+        bad = "@claude:api\ud800 hello"
+        with tempfile.TemporaryDirectory() as project, \
+             patch.object(antiphon.os.path, "exists", return_value=True), \
+             patch.object(antiphon, "_codex_turn", return_value=(bad, "turn-1")), \
+             patch.object(antiphon, "claimed_alias", return_value="build"), \
+             patch.object(antiphon.socket, "socket") as opened, \
+             patch.object(antiphon.sys, "stdin", io.StringIO(json.dumps({
+                 "cwd": project, "transcript_path": "/tmp/transcript",
+                 "turn_id": "turn-1"}))), \
+             contextlib.redirect_stdout(io.StringIO()), \
+             contextlib.redirect_stderr(io.StringIO()) as error:
+            code = antiphon.push("claude")
+            rows = ledger.entries(project)
+
+        self.assertEqual(code, 0)
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["state"], "refused")
+        self.assertEqual(
+            rows[0]["reason"], "recipient name must be valid UTF-8; remove "
+                               "unpaired Unicode surrogates")
+        self.assertEqual(rows[0]["to_alias"], "api\\ud800")
+        self.assertEqual(rows[0]["preview"], "hello")
+        self.assertNotIn("Traceback", error.getvalue())
+        opened.assert_not_called()
+
+    def test_claude_stop_rejects_a_non_utf8_codex_recipient_safely(self):
+        """The opposite Stop marker family owns the same metadata boundary."""
+        bad = "@codex:api\udc00 hello"
+        with tempfile.TemporaryDirectory() as project, \
+             patch.object(antiphon.os.path, "exists", return_value=True), \
+             patch.object(antiphon, "_claude_turn", return_value=(bad, "turn-1")), \
+             patch.object(antiphon, "claimed_alias", return_value="ui"), \
+             patch.object(antiphon, "send_to_codex") as queued, \
+             patch.object(antiphon.sys, "stdin", io.StringIO(json.dumps({
+                 "cwd": project, "transcript_path": "/tmp/transcript"}))), \
+             contextlib.redirect_stdout(io.StringIO()), \
+             contextlib.redirect_stderr(io.StringIO()) as error:
+            code = antiphon.push("codex")
+            rows = ledger.entries(project)
+
+        self.assertEqual(code, 0)
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["state"], "refused")
+        self.assertEqual(rows[0]["to_kind"], "codex")
+        self.assertEqual(rows[0]["to_alias"], "api\\udc00")
+        self.assertEqual(rows[0]["preview"], "hello")
+        self.assertNotIn("Traceback", error.getvalue())
+        queued.assert_not_called()
 
     # ---- everything else holds still ----
 
@@ -18825,11 +20827,10 @@ class RefusedSendHonestyTest(unittest.TestCase):
             "reply: not delivered: no live codex peer named 'nobody-here'; "
             "live peers: build, review\n")))
         self.assertEqual(unusable, (1, "", (
-            "reply: not delivered: the supplied recipient is not a usable peer name; "
-            "live codex peers: build, review\n")))
+            "reply: not delivered: the supplied recipient is not a usable peer name\n")))
         self.assertEqual(impostor, (1, "", (
             "reply: not delivered: the supplied recipient is not a usable peer "
-            "name; live codex peers: build, review\n")))
+            "name\n")))
 
         with tempfile.TemporaryDirectory() as project:
             self._codex_peer(project, "build", "300:build")     # no session yet
@@ -18866,7 +20867,7 @@ class RefusedSendHonestyTest(unittest.TestCase):
             "Not delivered to Claude: not delivered: no live claude peer named "
             "'nobody-here'; live peers: api, ui",
             "Not delivered to Claude: not delivered: the supplied recipient is "
-            "not a usable peer name; live claude peers: api, ui",
+            "not a usable peer name",
         ])
         self.assertTrue(all(r.get("isError") for r in said))
 
@@ -19234,9 +21235,9 @@ class AttachmentSpillTest(unittest.TestCase):
             self.assertEqual(self._files(project), [])
             self.assertIn("attachment", err.lower())
 
-    def test_the_park_holds_the_envelope(self):
-        """The park takes the BARE envelope — what `deliver_batches` compares —
-        on both tool arms, and the original text enters no fingerprint."""
+    def test_the_park_holds_the_original_marker_text(self):
+        """The park fingerprints what the user may repeat at Stop, not the
+        generated attachment envelope that only the transport sees."""
         with tempfile.TemporaryDirectory() as project:
             antiphon.peers.register(project, "claude", "ui", "/tmp/ui.sock")
             channel = self._Recorder()
@@ -19245,24 +21246,18 @@ class AttachmentSpillTest(unittest.TestCase):
             envelope = json.loads(channel.payloads[0].decode())["content"]
             park = antiphon.parked_deliveries(
                 antiphon.read_cursor(project, "codex")["last_pushed_claude"])
-            self.assertEqual(park["@ui"],
-                             antiphon.batch_fingerprint([envelope]))
-            self.assertNotEqual(park["@ui"], antiphon.batch_fingerprint(
-                [self.ASCII_BAND]), "the original enters no fingerprint")
+            self.assertEqual(park["@ui"], antiphon.batch_fingerprint(
+                [self.ASCII_BAND]))
+            self.assertNotEqual(park["@ui"],
+                                antiphon.batch_fingerprint([envelope]))
 
-            # And the giant echo that ends the same turn is not suppressed by
-            # that park — it is refused, by push's own unchanged oversize
-            # behaviour, which `test_a_failed_push_stays_byte_identical` pins
-            # byte for byte. The words still travel: the visible reply carries
-            # them through the passive pages.
+            # The same giant marker at Stop is the direct call's visible echo,
+            # so the original-text park consumes it without a second socket
+            # attempt or an oversize refusal.
             code, printed = self._push_live(
                 project, "claude", "@claude:ui " + self.ASCII_BAND)
             self.assertEqual(code, 0)
-            self.assertTrue(printed.startswith(
-                "antiphon: delivery failed — message is "), printed)
-            self.assertTrue(printed.endswith(
-                "bytes; the channel accepts at most {}\n".format(
-                    antiphon.MAX_CHANNEL_BYTES)), printed)
+            self.assertEqual(printed, "")
 
         # `reply()` parks the bare text while it sends the composed one, and
         # the two differ by the measured 80-byte `CHANNEL_LABEL` + queue label.
@@ -19281,11 +21276,11 @@ class AttachmentSpillTest(unittest.TestCase):
             self.assertEqual(len(prefix), 84)
             park = antiphon.parked_deliveries(
                 antiphon.read_cursor(project, "claude")["last_pushed_codex"])
-            self.assertEqual(park["@build"], antiphon.batch_fingerprint([bare]))
+            self.assertEqual(park["@build"],
+                             antiphon.batch_fingerprint(["y" * 4_000]))
+            self.assertNotEqual(park["@build"], antiphon.batch_fingerprint([bare]))
             self.assertNotEqual(park["@build"],
                                 antiphon.batch_fingerprint([composed]))
-            self.assertNotEqual(park["@build"],
-                                antiphon.batch_fingerprint(["y" * 4_000]))
 
     def test_above_the_attachment_cap_the_guidance_returns(self):
         """Over `ATTACHMENT_MAX` no store road is left, so the send falls
@@ -19481,6 +21476,34 @@ class AttachmentReceiptTest(unittest.TestCase):
             self.assertEqual(len(names), 4)
             self.assertEqual(len(self._files(project)), 4)
 
+    def test_a_file_whose_mtime_cannot_refresh_is_never_reused(self):
+        """The refreshed mtime protects a delivered reuse whose ledger row is
+        delayed or lost. Without that write, its envelope needs a fresh file.
+        """
+        text = "y" * 4_000
+        with tempfile.TemporaryDirectory() as project:
+            self._codex_peer(project, "build", "300:build", self.UUID)
+            queued = []
+            with self._spills_over(500), self._queue_recorder(queued):
+                first = json.loads(self._reply(
+                    project, {"text": text, "to": "build",
+                              "sender_alias": "ui"})[1])
+                old_path = os.path.join(
+                    project, ".antiphon", "messages", first["attachment"])
+                aged = time.time() - 3 * 86400
+                os.utime(old_path, (aged, aged))
+                with patch.object(antiphon.os, "utime",
+                                  side_effect=OSError("mtime refused")):
+                    second = json.loads(self._reply(
+                        project, {"text": text, "to": "build",
+                                  "sender_alias": "ui"})[1])
+
+            self.assertNotEqual(second["attachment"], first["attachment"])
+            self.assertEqual(len(self._files(project)), 2)
+            self.assertNotIn(old_path, queued[1][-1],
+                             "no new envelope points at the stale clock")
+            self.assertEqual(os.stat(old_path).st_mtime, aged)
+
     def test_a_failed_resend_never_removes_the_file_the_first_envelope_names(self):
         """Review 2026-09-03, critical: the first envelope is in Codex's queue,
         the same words are sent again and reuse the file, the second send is
@@ -19517,7 +21540,7 @@ class AttachmentReceiptTest(unittest.TestCase):
             with self._spills_over(500), self._queue_recorder(queued):
                 first = json.loads(self._reply(
                     project, {"text": text, "to": "build", "sender_alias": "ui"})[1])
-                ledger.mark_read(project, first["attachment"], time.time() - 7200,
+                ledger.mark_read(project, first["attachment"], time.time(),
                                  to_kind="codex", reader_alias="build")
                 second = json.loads(self._reply(
                     project, {"text": text, "to": "build", "sender_alias": "ui"})[1])
@@ -19525,13 +21548,38 @@ class AttachmentReceiptTest(unittest.TestCase):
                                 "a read file's grace would collect the fresh envelope")
             self.assertEqual(len(self._files(project)), 2)
 
+    def test_a_pending_read_whose_row_update_failed_is_not_reused(self):
+        text = "y" * 4_000
+        with tempfile.TemporaryDirectory() as project:
+            self._codex_peer(project, "build", "300:build", self.UUID)
+            queued = []
+            with self._spills_over(500), self._queue_recorder(queued):
+                first = json.loads(self._reply(
+                    project, {"text": text, "to": "build",
+                              "sender_alias": "ui"})[1])
+                with patch.object(ledger, "_write", return_value=False):
+                    self.assertEqual(
+                        ledger._mark_read(
+                            project, first["attachment"], time.time(),
+                            to_kind="codex", reader_alias="build"),
+                        "pending")
+                second = json.loads(self._reply(
+                    project, {"text": text, "to": "build",
+                              "sender_alias": "ui"})[1])
+
+            self.assertNotEqual(first["attachment"], second["attachment"])
+            self.assertEqual(len(self._files(project)), 2)
+
     def test_a_read_attachment_is_collected_an_hour_after_its_receipt(self):
         with tempfile.TemporaryDirectory() as project:
             fresh, _ = antiphon.write_attachment(project, "words", "ui", self.UUID)
             old, _ = antiphon.write_attachment(project, "other words", "ui", self.OTHER)
-            self._entry(project, self.UUID, os.path.basename(fresh))
-            self._entry(project, self.OTHER, os.path.basename(old))
             now = time.time()
+            created = now - 4 * 3600
+            os.utime(fresh, (created, created))
+            os.utime(old, (created, created))
+            self._entry(project, self.UUID, os.path.basename(fresh), at=now - 3 * 3600)
+            self._entry(project, self.OTHER, os.path.basename(old), at=now - 3 * 3600)
             ledger.mark_read(project, os.path.basename(fresh), now - 600, reader_alias="build")
             ledger.mark_read(project, os.path.basename(old), now - 2 * 3600, reader_alias="build")
             said = self._sweep(project, now)
@@ -19541,6 +21589,27 @@ class AttachmentReceiptTest(unittest.TestCase):
             self.assertNotIn("expired", said)
             self.assertIsNone(ledger.read_entry(project, self.OTHER)["expired_unread_at"])
             self.assertEqual(antiphon.ATTACHMENT_READ_GRACE, 3600)
+
+    def test_a_post_read_reuse_touch_without_a_row_waits_for_ttl(self):
+        """A process can reuse the file and die after transport but before its
+        row. The refreshed mtime is the only durable clue; read grace must not
+        delete the new envelope's content."""
+        with tempfile.TemporaryDirectory() as project:
+            path, _ = antiphon.write_attachment(project, "words", "ui", self.UUID)
+            name = os.path.basename(path)
+            now = time.time()
+            self._entry(project, self.UUID, name, at=now - 3 * 3600)
+            read_at = now - 2 * 3600
+            ledger.mark_read(project, name, read_at,
+                             to_kind="codex", reader_alias="build")
+            # A coarse filesystem can collapse a later reuse touch onto the
+            # exact receipt timestamp; equality must stay conservative too.
+            os.utime(path, (read_at, read_at))
+
+            said = self._sweep(project, now)
+            self.assertTrue(os.path.exists(path),
+                            "a post-read file touch is a possible untracked reuse")
+            self.assertEqual(said, "")
 
     def test_an_unread_attachment_expires_on_the_ttl_and_its_sender_hears_about_it(self):
         with tempfile.TemporaryDirectory() as project:
@@ -19587,7 +21656,7 @@ class AttachmentReceiptTest(unittest.TestCase):
             unread, _ = antiphon.write_attachment(project, "other", "ui", self.OTHER)
             self._entry(project, self.UUID, os.path.basename(read))
             self._entry(project, self.OTHER, os.path.basename(unread))
-            ledger.mark_read(project, os.path.basename(read), time.time() - 7200,
+            ledger.mark_read(project, os.path.basename(read), time.time(),
                              reader_alias="build")
             line = antiphon.attachment_report(project)
             self.assertIn("2 parked", line)

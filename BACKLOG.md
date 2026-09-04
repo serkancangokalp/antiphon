@@ -1,6 +1,6 @@
 # Antiphon product backlog
 
-Last reviewed: 2026-09-03
+Last reviewed: 2026-09-04
 
 ## Start here
 
@@ -2236,23 +2236,45 @@ messages in 525 files and 1,515 Codex user messages in 209 files;
 the Codex set on that evidence, and the census now also counts 18 AGENTS.md
 injections, 4,463 external-agent calls and 4,336 results on the Codex side,
 6 compact summaries and 14 interruption literals on the Claude side), and
-nothing else. They will go
+nothing else. A 2026-09-04 candidate fixes the old census's scope: Claude
+production is now the 98 immediate transcripts across its project directories,
+while 448 deeper files are reported separately as `excluded`; all five observed
+`fork-boilerplate` tags were excluded and none occurred in production's 846
+eligible user messages. Codex reported 281 then 282 production rollout files
+as another session appeared, zero
+excluded JSONL files, and 1,739 eligible user messages. These scoped counts are
+not numerically comparable to the older flat recursive totals. A later exact-
+scope check also excludes Codex rollouts below dot-prefixed directories, just
+as production's recursive glob does. They will go
 stale as each host adds, renames or drops its own wrapper tags. Re-run before
 every release with:
 
+Unsafe inventory entries contribute to the side-wide `refused_paths` total;
+candidate-shaped entries also contribute to their would-be scope's
+`refused_files`, together with open races. Those refusal counts overlap and
+must not be added together.
+Each side also reports a bounded `root_error` and `unsupported_platform` flag:
+an existing empty host root is a truthful zero, while a missing, unreadable,
+wrong-type, I/O-failed, or unsupported root makes the census command exit
+non-zero after emitting its aggregate JSON.
+
 ```sh
 python3 test/host_wrapper_census.py \
-  --claude-root "$HOME/.claude/projects" \
+  --claude-projects-root "$HOME/.claude/projects" \
   --codex-root "$HOME/.codex/sessions"
 ```
 
-The utility prints aggregate counts only — never transcript text or individual
-paths. Review its tag keys, then:
+The utility prints bounded aggregate counts only — never transcript text or
+individual paths. `promptSource` is reported only as `system`, `sdk`, `typed`,
+`queued`, `suggestion_accepted`, `<absent>`, `<non-string>`, or `<other>`; an
+unknown transcript value is never copied into an output key. Tag names are
+limited to 64 characters and 256 keys, with fixed `<overlong-tag>` and
+`<additional-tags>` buckets for the remainder. Review its tag keys, then:
 
 - count every production-eligible, non-meta, non-empty Claude `type=user`
   message and Codex `response_item/message/role=user` message whose joined text
-  opens with `<`, split by side, each one carrying its `promptSource` value (or
-  its absence);
+  opens with `<`, split by side, each one carrying its bounded `promptSource`
+  category;
 - for every opening tag that turns up, decide host bookkeeping or a person's
   own words before touching either set — a tag seen on only one side stays out
   of the other's;

@@ -1,0 +1,225 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: test / ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: floor-linux
+            os: ubuntu-24.04
+            python: 3.9.25
+            node: 20.20.2
+          - name: current-linux
+            os: ubuntu-24.04
+            python: 3.14.7
+            node: 26.8.1
+          - name: lts-macos-arm
+            os: macos-15
+            python: 3.14.7
+            node: 24.20.0
+    steps:
+      - name: Check out the complete history
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Set up Python ${{ matrix.python }}
+        uses: actions/setup-python@e797f83bcb11b83ae66e0230d6156d7c80228e7c # v6.0.0
+        with:
+          python-version: ${{ matrix.python }}
+
+      - name: Set up Node ${{ matrix.node }}
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: ${{ matrix.node }}
+          package-manager-cache: false
+
+      - name: Prove the requested runtimes and history
+        env:
+          EXPECTED_PYTHON: ${{ matrix.python }}
+          EXPECTED_NODE: v${{ matrix.node }}
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import os, platform
+          actual = platform.python_version()
+          expected = os.environ["EXPECTED_PYTHON"]
+          if actual != expected:
+              raise SystemExit("Python mismatch: %s != %s" % (actual, expected))
+          print("Python " + actual)
+          PY
+          node -e 'if (process.version !== process.env.EXPECTED_NODE) { throw new Error(`${process.version} != ${process.env.EXPECTED_NODE}`); } console.log(process.version)'
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          test "$(git rev-parse --is-shallow-repository)" = false
+          git cat-file -e 'f0c529f^{commit}'
+
+      - name: Install the locked dependency graph
+        run: npm ci --ignore-scripts --audit=false --fund=false
+
+      - name: Run the Python and MCP protocol suites
+        env:
+          PYTHONUTF8: "1"
+          TZ: UTC
+        run: |
+          set -euo pipefail
+          test_home="$RUNNER_TEMP/antiphon-test-home"
+          test_tmp="$RUNNER_TEMP/antiphon-test-tmp"
+          mkdir -p "$test_home" "$test_tmp"
+          HOME="$test_home" TMPDIR="$test_tmp" npm test
+          python3 -m unittest discover -v -s test/ci -p 'test_*.py'
+
+      - name: Prove tests did not change tracked bytes
+        run: |
+          set -euo pipefail
+          git diff --check
+          git diff --exit-code
+          git diff --cached --exit-code
+
+  package:
+    name: static checks and exact-SHA package
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - name: Check out the exact workflow SHA
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Set up Python 3.14.7
+        uses: actions/setup-python@e797f83bcb11b83ae66e0230d6156d7c80228e7c # v6.0.0
+        with:
+          python-version: 3.14.7
+
+      - name: Set up Node 24.20.0
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 24.20.0
+          package-manager-cache: false
+
+      - name: Run static checks
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          python3 -m py_compile bin/antiphon lib/*.py test/fixtures/peers_0_3_3.py
+          node --check lib/channel.mjs
+          node --check lib/identity.mjs
+          node --check test/channel.test.mjs
+          node --check test/fixtures/mixed_lib.mjs
+          bash -n test/e2e/*.sh
+          empty_tree="$(git hash-object -t tree /dev/null)"
+          git diff --check "$empty_tree" "$GITHUB_SHA"
+          git diff --check
+          git diff --exit-code
+          git diff --cached --exit-code
+
+      - name: Pack immutable bytes from the workflow SHA
+        run: |
+          set -euo pipefail
+          source_dir="$RUNNER_TEMP/exact-source"
+          artifact_dir="$RUNNER_TEMP/package-artifact"
+          mkdir -p "$source_dir" "$artifact_dir"
+          git archive --format=tar "$GITHUB_SHA" | tar -xf - -C "$source_dir"
+          (
+            cd "$source_dir"
+            npm pack --ignore-scripts --json --pack-destination "$artifact_dir" \
+              > "$artifact_dir/pack.json"
+          )
+          tarball="$(python3 - "$artifact_dir/pack.json" "$artifact_dir" <<'PY'
+          import json, os, sys
+          manifest, directory = sys.argv[1:]
+          rows = json.load(open(manifest, encoding="utf-8"))
+          if not isinstance(rows, list) or len(rows) != 1:
+              raise SystemExit("npm pack did not describe exactly one artifact")
+          filename = rows[0].get("filename")
+          if not isinstance(filename, str) or os.path.basename(filename) != filename:
+              raise SystemExit("npm pack returned an unsafe filename")
+          path = os.path.join(directory, filename)
+          if not os.path.isfile(path) or os.path.islink(path):
+              raise SystemExit("npm pack did not create a regular tarball")
+          print(path)
+          PY
+          )"
+          python3 - "$tarball" "$artifact_dir/tarball.sha256" <<'PY'
+          import hashlib, sys
+          source, target = sys.argv[1:]
+          digest = hashlib.sha256()
+          with open(source, "rb") as stream:
+              for block in iter(lambda: stream.read(1024 * 1024), b""):
+                  digest.update(block)
+          with open(target, "w", encoding="ascii") as stream:
+              stream.write(digest.hexdigest() + "\n")
+          PY
+          printf '%s\n' "$GITHUB_SHA" > "$artifact_dir/workflow.sha"
+          cp "$source_dir/test/ci/installed_tarball_smoke.py" "$artifact_dir/"
+          printf 'packed workflow SHA %s\n' "$GITHUB_SHA"
+
+      - name: Upload the exact-SHA package
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
+        with:
+          name: antiphon-${{ github.sha }}
+          path: ${{ runner.temp }}/package-artifact
+          if-no-files-found: error
+          retention-days: 3
+          compression-level: 0
+
+  installed-tarball:
+    name: installed tarball / floor-linux
+    needs: package
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      # Deliberately no actions/checkout step: an accidental checkout makes the
+      # verifier refuse before npm runs.
+      - name: Set up Python 3.9.25
+        uses: actions/setup-python@e797f83bcb11b83ae66e0230d6156d7c80228e7c # v6.0.0
+        with:
+          python-version: 3.9.25
+
+      - name: Set up Node 20.20.2
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 20.20.2
+          package-manager-cache: false
+
+      - name: Download only the exact-SHA package artifact
+        uses: actions/download-artifact@018cc2cf5baa6db3ef3c5f8a56943fffe632ef53 # v6.0.0
+        with:
+          name: antiphon-${{ github.sha }}
+          path: ${{ runner.temp }}/package-artifact
+
+      - name: Install and exercise only the packaged bytes
+        env:
+          NPM_CONFIG_CACHE: ${{ runner.temp }}/npm-smoke-cache
+          PYTHONUTF8: "1"
+          TZ: UTC
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          tarballs=("$RUNNER_TEMP"/package-artifact/antiphon-*.tgz)
+          test "${#tarballs[@]}" -eq 1
+          IFS= read -r packaged_sha < "$RUNNER_TEMP/package-artifact/workflow.sha"
+          test "$packaged_sha" = "$GITHUB_SHA"
+          python3 "$RUNNER_TEMP/package-artifact/installed_tarball_smoke.py" \
+            --tarball "${tarballs[0]}" \
+            --checksum-file "$RUNNER_TEMP/package-artifact/tarball.sha256" \
+            --prefix "$RUNNER_TEMP/installed-prefix" \
+            --workspace "$GITHUB_WORKSPACE"

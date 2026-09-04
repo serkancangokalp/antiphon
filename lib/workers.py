@@ -34,6 +34,7 @@ docs/superpowers/specs/2026-09-03-managed-workers-design.md.
 import contextlib
 import fcntl
 import json
+import math
 import os
 import re
 import shutil
@@ -44,7 +45,10 @@ import tempfile
 import time
 import uuid
 
-TASK_VERSION = 1
+import peers
+
+LEGACY_TASK_VERSION = 1
+TASK_VERSION = 2
 TASK_TTL = 7 * 24 * 3600
 MAX_WORKERS = 4
 DEFAULT_TIMEOUT = 900
@@ -52,8 +56,10 @@ MAX_TIMEOUT = 3600
 # Seconds an `accepted` record may wait for its `start` before a sweep
 # treats it as a start that died mid-way.
 START_PATIENCE = 60
-STATES = ("accepted", "running", "completed", "failed", "cancelled",
-          "timed_out", "blocked", "handed")
+LEGACY_STATES = ("accepted", "running", "completed", "failed", "cancelled",
+                 "timed_out", "blocked", "handed")
+V2_STATES = ("handing", "tracking_incomplete", "delivery_refused")
+STATES = LEGACY_STATES + V2_STATES
 KINDS = ("claude", "codex")
 CLASSES = ("read", "write")
 MAX_TIME = float(2 ** 40)
@@ -131,16 +137,28 @@ def _int_or_none(value, floor=0):
     return value is None or (type(value) is int and value >= floor)
 
 
+def _utf8_string(value):
+    if not isinstance(value, str):
+        return False
+    try:
+        value.encode("utf-8")
+    except UnicodeEncodeError:
+        return False
+    return True
+
+
 def _valid(record, expected_id):
     if not isinstance(record, dict) or set(record) != KEYS:
         return False
-    if record["version"] != TASK_VERSION or type(record["version"]) is not int:
+    version = record["version"]
+    if type(version) is not int or version not in (LEGACY_TASK_VERSION, TASK_VERSION):
         return False
     if record["id"] != expected_id or not TASK_ID.fullmatch(expected_id):
         return False
     if record["kind"] not in KINDS or record["task_class"] not in CLASSES:
         return False
-    if record["state"] not in STATES:
+    allowed_states = LEGACY_STATES if version == LEGACY_TASK_VERSION else V2_STATES
+    if record["state"] not in allowed_states:
         return False
     if not (isinstance(record["sha256"], str) and SHA256_HEX.fullmatch(record["sha256"])):
         return False
@@ -158,15 +176,20 @@ def _valid(record, expected_id):
     if not _int_or_none(record["pid"], 1):
         return False
     if record["birth"] is not None and not (
-            isinstance(record["birth"], str) and 0 < len(record["birth"]) <= 80):
+            _utf8_string(record["birth"]) and 0 < len(record["birth"]) <= 80):
         return False
     if record["base"] is not None and not (
             isinstance(record["base"], str) and GIT_SHA.fullmatch(record["base"])):
         return False
     if record["exit_code"] is not None and (type(record["exit_code"]) is not int):
         return False
-    if record["to"] is not None and not (isinstance(record["to"], str) and record["to"]):
+    if record["to"] is not None and not (
+            _utf8_string(record["to"]) and record["to"]):
         return False
+    if record["state"] in ("handing", "handed", "tracking_incomplete",
+                           "delivery_refused"):
+        if not peers.valid_name(record["to"]):
+            return False
     return all(_time_or_none(record[key]) for key in OPTIONAL_TIMES)
 
 
@@ -189,7 +212,11 @@ def read_task(cwd, task_id):
         return None
     try:
         record = json.loads(raw.decode("utf-8"), object_pairs_hook=_no_duplicate_keys)
-    except (ValueError, UnicodeDecodeError):
+    except Exception:       # noqa: BLE001 — malformed task state is never control flow
+        # A few kilobytes of nested arrays can raise RecursionError even below
+        # RECORD_CEILING. Match the delivery ledger's fail-closed reader: any
+        # decoder failure makes this one record invalid and never escapes into
+        # status, doctor, pruning, or handoff read-back.
         return None
     return record if _valid(record, task_id) else None
 
@@ -223,32 +250,47 @@ def _write(cwd, record):
             os.fchmod(handle.fileno(), 0o600)
             json.dump(record, handle, ensure_ascii=False, separators=(",", ":"))
         os.replace(tmp, _path(cwd, record["id"]))
-    except OSError:
+    except Exception:
+        # Validation keeps normal records serializable, but a serializer or
+        # encoding failure must not strand a temporary file in the owned task
+        # directory. Preserve the original exception for the caller.
         with contextlib.suppress(OSError):
             os.unlink(tmp)
         raise
 
 
 def _bounded_timeout(timeout):
-    if not isinstance(timeout, (int, float)) or isinstance(timeout, bool) or timeout <= 0:
+    if (not isinstance(timeout, (int, float)) or isinstance(timeout, bool)
+            or (isinstance(timeout, float) and not math.isfinite(timeout))
+            or timeout <= 0):
         return DEFAULT_TIMEOUT
     return max(1, min(int(round(timeout)), MAX_TIMEOUT))
 
 
 def new_task(cwd, *, kind, task_class, sha256, size, parent=None,
-             timeout=DEFAULT_TIMEOUT, hop=1, to=None, task_id=None):
-    """A fresh `accepted` record, written. Raises ValueError for a shape the
-    store refuses and OSError for a store it cannot use. `task_id`, when the
-    caller already put it on a message, must be a uuid."""
+             timeout=DEFAULT_TIMEOUT, hop=1, to=None, task_id=None,
+             state="accepted"):
+    """A fresh `accepted` worker or `handing` peer record, written.
+
+    Raises ValueError for a shape the store refuses and OSError for a store it
+    cannot use. `task_id`, when the caller already put it on a message, must be
+    a uuid. A hand-off is prepared separately so it consumes no worker slot and
+    cannot be mistaken for a worker whose start died.
+    """
     if kind not in KINDS:
         raise ValueError(f"kind must be one of {KINDS}")
     if task_class not in CLASSES:
         raise ValueError(f"task must be one of {CLASSES}")
+    if state not in ("accepted", "handing"):
+        raise ValueError("a new task must be accepted or handing")
+    if state == "handing" and not to:
+        raise ValueError("a handing task must name its peer")
     if task_id is not None and not (isinstance(task_id, str) and TASK_ID.fullmatch(task_id)):
         raise ValueError("a task id is a uuid")
     record = {
-        "version": TASK_VERSION, "id": task_id or str(uuid.uuid4()), "kind": kind,
-        "task_class": task_class, "state": "accepted", "sha256": sha256,
+        "version": (TASK_VERSION if state in V2_STATES else LEGACY_TASK_VERSION),
+        "id": task_id or str(uuid.uuid4()), "kind": kind,
+        "task_class": task_class, "state": state, "sha256": sha256,
         "size": size, "parent": parent, "timeout": _bounded_timeout(timeout),
         "hop": hop, "created_at": time.time(), "pid": None, "birth": None,
         "base": None, "exit_code": None, "to": to,
@@ -272,24 +314,35 @@ def _locked(cwd):
         yield False
         return
     try:
-        fcntl.flock(fd, fcntl.LOCK_EX)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX)
+        except OSError:
+            yield False
+            return
         try:
             yield True
         finally:
-            fcntl.flock(fd, fcntl.LOCK_UN)
+            with contextlib.suppress(OSError):
+                fcntl.flock(fd, fcntl.LOCK_UN)
     finally:
-        os.close(fd)
+        with contextlib.suppress(OSError):
+            os.close(fd)
 
 
 def update_task(cwd, task_id, mutate):
     """Read-modify-write under the store's lock; an update that breaks the
     record is refused and nothing is written."""
-    with _locked(cwd):
+    with _locked(cwd) as held:
+        if not held:
+            return False
         record = read_task(cwd, task_id)
         if record is None:
             return False
         changed = dict(record)
         mutate(changed)
+        changed["version"] = (
+            TASK_VERSION if changed.get("state") in V2_STATES
+            else LEGACY_TASK_VERSION)
         if not _valid(changed, task_id):
             return False
         if changed == record:
@@ -311,9 +364,24 @@ def _diff_path(cwd, task_id):
 
 
 def _discard_record(cwd, task_id):
-    for path in (_path(cwd, task_id), _diff_path(cwd, task_id)):
-        with contextlib.suppress(OSError):
+    """Remove one task's durable files and say whether both are absent.
+
+    Callers that report a refused peer hand-off need this answer: silently
+    ignoring an unlink failure leaves a `handing` record that looks like an
+    outcome nobody actually knows.
+    """
+    # Ancillary evidence goes first and the state-bearing JSON goes last. If
+    # any earlier unlink fails, callers can still turn that record into an
+    # explicit `delivery_refused` instead of being left with an unreadable id.
+    paths = (_diff_path(cwd, task_id), _path(cwd, task_id))
+    for path in paths:
+        try:
             os.unlink(path)
+        except FileNotFoundError:
+            pass
+        except OSError:
+            return False
+    return not any(os.path.lexists(path) for path in paths)
 
 
 def prune(cwd, now):
@@ -848,6 +916,21 @@ def _bounded_wait(wait):
 def _handed(record, verb):
     """The refusal for a lifecycle action on a task that has no worker here:
     it was handed to a peer, whose work is its own."""
+    if record["state"] == "tracking_incomplete":
+        return Refused(
+            f"not {verb}: task {record['id']} reached the {record['kind']} peer "
+            f"{record['to']!r}, but tracking is incomplete and there is no "
+            "worker here; the peer may already act on it")
+    if record["state"] == "handing":
+        return Refused(
+            f"not {verb}: task {record['id']} hand-off tracking is incomplete "
+            f"for the {record['kind']} peer {record['to']!r} and there is no "
+            "worker here; the peer may already act on it")
+    if record["state"] == "delivery_refused":
+        return Refused(
+            f"not {verb}: delivery of task {record['id']} to the "
+            f"{record['kind']} peer {record['to']!r} was refused and there is "
+            "no worker here")
     return Refused(f"not {verb}: task {record['id']} was handed to the {record['kind']} "
                    f"peer {record['to']!r} and has no worker here; its answer comes in "
                    "the peer's own words (antiphon status shows the receipt), and only "
@@ -865,7 +948,8 @@ def result(cwd, task_id, wait=0):
     wait = _bounded_wait(wait)
     deadline = time.time() + wait
     record = status(cwd, task_id)
-    if record is not None and record["state"] == "handed":
+    if record is not None and record["state"] in (
+            "handing", "handed", "tracking_incomplete", "delivery_refused"):
         raise _handed(record, "collected")
     while record is not None and record["state"] == "running" and time.time() < deadline:
         time.sleep(0.1)
@@ -949,7 +1033,8 @@ def cancel(cwd, task_id):
     record = status(cwd, task_id)
     if record is None:
         return None
-    if record["state"] == "handed":
+    if record["state"] in (
+            "handing", "handed", "tracking_incomplete", "delivery_refused"):
         raise _handed(record, "cancelled")
     if record["state"] == "running":
         _kill_group(record["pid"])
@@ -961,7 +1046,9 @@ def cancel(cwd, task_id):
 def sweep(cwd, now):
     """Remove the directories of collected results and of expired tasks,
     never a running worker's; stop a worker past its timeout without waiting
-    for it; drop an `accepted` record whose start died. Then prune."""
+    for it; drop an `accepted` record whose worker start died. A `handing`
+    record is peer-delivery evidence, not a pending worker start, and survives
+    until the ordinary task TTL. Then prune."""
     for record in tasks(cwd):
         if record["state"] == "accepted":
             if now - record["created_at"] > START_PATIENCE:

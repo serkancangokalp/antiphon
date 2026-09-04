@@ -5,6 +5,7 @@ Two terminals, two separate agents: what you tell one, the other finds out.
 
 Usage:
   antiphon setup               # installs the hook on both sides
+  antiphon launch <host>       # starts claude or codex with Antiphon's requirements
   antiphon status              # shows what's happening on both sides (for humans)
   antiphon doctor              # read-only checkup: why is the bridge quiet?
   antiphon doctor --fix        # writes project configuration only, then re-checks
@@ -49,6 +50,7 @@ import fcntl
 import hashlib
 import heapq
 import itertools
+import io
 import json
 import math
 import os
@@ -266,6 +268,42 @@ def group_by_families(text):
     family opened is a block here too; one syntax failure raises for both.
     """
     return {family: group_by_recipient(family, text) for family in MARKER_SIDES}
+
+
+UTF8_TEXT_REFUSAL = (
+    "message text must be valid UTF-8; remove unpaired Unicode surrogates")
+UTF8_RECIPIENT_REFUSAL = (
+    "recipient name must be valid UTF-8; remove unpaired Unicode surrogates")
+UTF8_METADATA_REFUSAL = (
+    "delivery metadata must be valid UTF-8; remove unpaired Unicode surrogates")
+
+
+def _utf8_bytes(text):
+    """Strict UTF-8 bytes, or ``None`` for a JSON-valid lone surrogate.
+
+    Python's JSON decoder deliberately accepts escaped lone surrogates. They
+    are not Unicode scalar values and cannot be encoded for argv, a socket, an
+    attachment, or the delivery ledger. Interactive boundaries call this
+    before those side effects and answer in fixed, always-printable prose.
+    """
+    try:
+        return text.encode("utf-8")
+    except UnicodeEncodeError:
+        return None
+
+
+def _unusable_recipient_detail(alias):
+    """Stable refusal for an explicit alias rejected before project I/O."""
+    if peers.looks_like_session_id(alias):
+        return ("not delivered: a host session id is diagnostic identity, "
+                "not a usable peer name; restart the intended terminal with "
+                "ANTIPHON_NAME set")
+    return "not delivered: the supplied recipient is not a usable peer name"
+
+
+def _utf8_safe_text(text):
+    """Preserve valid text and spell invalid code units as ASCII escapes."""
+    return text.encode("utf-8", "backslashreplace").decode("utf-8")
 
 
 def batch_fingerprint(messages):
@@ -1937,6 +1975,8 @@ def _open_safe_source(root, candidate, cwd):
                 source.close()
                 return SourceRefusal("project-mismatch")
         return source
+    except NotImplementedError:
+        return SourceRefusal("unsupported-platform")
     except (ValueError, UnicodeError):
         return SourceRefusal("invalid-candidate")
     except OSError as error:
@@ -4344,7 +4384,26 @@ def _ordered_records(events):
     return records
 
 
-def _render_record(record, side, join=None):
+def _record_clock(epoch, today):
+    """One local record clock, with a date whenever HH:MM is ambiguous.
+
+    The page has always rendered local time. Keep that interpretation and the
+    compact same-day shape, but never let a record from another calendar day
+    masquerade as something that happened today. An absolute date also stays
+    honest for future host clocks and timestamp-zero parser fallbacks; no
+    relative age is inferred.
+    """
+    try:
+        happened = datetime.fromtimestamp(epoch)
+    except (ValueError, OverflowError, OSError):
+        return "time unavailable"
+    if happened.date() == today:
+        return f"{happened.hour:02d}:{happened.minute:02d}"
+    return (f"{happened.year:04d}-{happened.month:02d}-{happened.day:02d} "
+            f"{happened.hour:02d}:{happened.minute:02d}")
+
+
+def _render_record(record, side, join=None, *, today):
     """Render one completed source record without cutting its non-tool text."""
     # A `you`-kind event is what the other side received as input — including
     # host text no human wrote — so the label names the slot, not an author.
@@ -4377,7 +4436,7 @@ def _render_record(record, side, join=None):
     def flush_run():
         nonlocal run_kind, run_time, run_texts
         if run_kind is not None:
-            clock = datetime.fromtimestamp(run_time).strftime("%H:%M")
+            clock = _record_clock(run_time, today)
             pieces.append("[{}] {}:\n{}".format(
                 clock, labels.get(run_kind, run_kind), "\n\n".join(run_texts)))
             run_kind = None
@@ -4416,8 +4475,9 @@ def _append_page_section(text, section):
 
 
 def _render_page(side, records, has_more, replay_reason, join=None,
-                 discovery=None, skipped=None):
+                 discovery=None, skipped=None, today=None):
     """Render the exact visible envelope whose UTF-8 size is page-bounded."""
+    today = datetime.now().date() if today is None else today
     # Over the SELECTED records, never the candidates. The measured shape of a
     # real page is two sources discovered and one delivered — 55 of 60 — and a
     # count taken over the candidates would relabel every one of them for a
@@ -4459,7 +4519,8 @@ def _render_page(side, records, has_more, replay_reason, join=None,
     if replay_reason is not None:
         text = _append_page_section(text, REPLAY_NOTICES[replay_reason])
     for record in records:
-        text = _append_page_section(text, _render_record(record, side, join))
+        text = _append_page_section(
+            text, _render_record(record, side, join, today=today))
     if has_more:
         if side == "codex":
             text = _append_page_section(
@@ -4505,7 +4566,10 @@ def _render_page(side, records, has_more, replay_reason, join=None,
             relayed += ("A parenthesised session label after the recipient "
                         "names which live session's line it is. ")
         closing = relayed + closing
-    return _append_page_section(text, closing)
+    # JSON permits escaped lone surrogates even though the UTF-8 page does
+    # not. Keep such host/user text visible as an ASCII escape rather than
+    # letting one record crash the byte-budget check or the hook's stdout.
+    return _utf8_safe_text(_append_page_section(text, closing))
 
 
 def _page_frontier(records, selected, scanned):
@@ -4530,8 +4594,11 @@ def _page_frontier(records, selected, scanned):
 
 
 def _build_page(events, scanned, side, replay_reason=None, join=None,
-                discovery=None, next_lane="active", skipped=None):
+                discovery=None, next_lane="active", skipped=None, today=None):
     """Build one bounded, whole-record page and its safe source frontier."""
+    # One page is formatted against one local date even if a large budget loop
+    # happens to cross midnight.
+    today = datetime.now().date() if today is None else today
     if replay_reason not in REPLAY_NOTICES and replay_reason is not None:
         raise ValueError("unknown replay reason")
     records = _ordered_records(events)
@@ -4539,7 +4606,7 @@ def _build_page(events, scanned, side, replay_reason=None, join=None,
         if not scanned:
             if discovery is not None and discovery.state == "degraded":
                 text = _render_page(side, [], False, replay_reason,
-                                    NO_SESSION_JOIN, discovery, skipped)
+                                    NO_SESSION_JOIN, discovery, skipped, today)
                 return text, None, 0
             return "", None, 0
         if replay_reason is None:
@@ -4547,7 +4614,7 @@ def _build_page(events, scanned, side, replay_reason=None, join=None,
                 # Nothing left inside the window, but something was skipped
                 # to get here: a page that says so, never a silent advance.
                 text = _render_page(side, [], False, None, NO_SESSION_JOIN,
-                                    discovery, skipped)
+                                    discovery, skipped, today)
                 return text, PageAdvance(
                     dict(scanned), False, None, next_lane), 0
             return "", PageAdvance(
@@ -4556,7 +4623,7 @@ def _build_page(events, scanned, side, replay_reason=None, join=None,
         # replay would have used says the same thing; passing the empty one
         # says it where a reader can see it.
         text = _render_page(side, [], False, replay_reason, NO_SESSION_JOIN,
-                            discovery, skipped)
+                            discovery, skipped, today)
         return text, PageAdvance(
             dict(scanned), False, replay_reason, next_lane), 0
 
@@ -4579,7 +4646,7 @@ def _build_page(events, scanned, side, replay_reason=None, join=None,
             dead if scheduled == "active" else active))
         candidate = _render_page(
             side, candidates[:length], has_more, replay_reason,
-            join, discovery, skipped)
+            join, discovery, skipped, today)
         if len(candidate.encode("utf-8")) <= PAGE_BUDGET:
             selected = length
             text = candidate
@@ -4589,7 +4656,7 @@ def _build_page(events, scanned, side, replay_reason=None, join=None,
         has_more = selected < len(candidates) or mixed
         text = _render_page(
             side, candidates[:selected], has_more,
-            replay_reason, join, discovery, skipped)
+            replay_reason, join, discovery, skipped, today)
 
     chosen = candidates[:selected]
     has_more = selected < len(candidates) or mixed
@@ -4819,12 +4886,16 @@ def hook(side="claude"):
             # The parser's own high-water mark still has to move, or a
             # source with nothing visible in it (filtered records, or one a
             # v1 cursor just placed) is read again from scratch every turn.
-            if not _advance_page_cursor(
+            receipts_durable = (not receipts or _ledger_call(
+                "receipts", lambda: ledger.record_receipts(
+                    cwd, receipts, read_by=source_kind)) is True)
+            if not receipts_durable:
+                print("antiphon: receipt evidence was not durable; cursor "
+                      "progress was kept for retry", file=sys.stderr)
+            elif not _advance_page_cursor(
                     cwd, side, cursor, side, positions, advance):
                 print("antiphon: nothing to show, but could not record cursor "
                       "progress", file=sys.stderr)
-            _ledger_call("receipts", lambda: ledger.record_receipts(
-                cwd, receipts, read_by=source_kind))
             return 0
 
         shown = notices[:NOTICE_LIMIT]
@@ -4855,9 +4926,13 @@ def hook(side="claude"):
             return 1
         _ledger_call("notices", lambda: ledger.mark_reported(
             cwd, [delivery for delivery, _words in shown], time.time()))
-        _ledger_call("receipts", lambda: ledger.record_receipts(
-            cwd, receipts, read_by=source_kind))
-        if not _advance_page_cursor(
+        receipts_durable = (not receipts or _ledger_call(
+            "receipts", lambda: ledger.record_receipts(
+                cwd, receipts, read_by=source_kind)) is True)
+        if not receipts_durable:
+            print("antiphon: context delivered, but receipt evidence was not "
+                  "durable; cursor progress was kept for retry", file=sys.stderr)
+        elif not _advance_page_cursor(
                 cwd, side, cursor, side, positions, advance):
             # The page WAS delivered, so the exit code stays 0: a non-zero
             # exit suppresses plain-text stdout as context, and whether it
@@ -5416,6 +5491,36 @@ def _push_batches(cwd, side, target, key, grouped, turn_key, input_data):
     who = claimed_alias(cwd, side, input_data.get("session_id"))
     can_reply = reply_available(cwd, side, who)
 
+    # A JSON transcript may legally spell a lone surrogate even though no
+    # UTF-8 transport or durable text file can carry it. Refuse each affected
+    # batch before fingerprinting (which also encodes), opening a socket, or
+    # touching the attachment store. Like every other definite Stop refusal,
+    # it gets one safe ledger row so the sender can see it on the next page.
+    for recipient in list(batches):
+        outgoing = "\n".join(batches[recipient])
+        invalid_recipient = (recipient is not None
+                             and _utf8_bytes(recipient) is None)
+        invalid_text = _utf8_bytes(outgoing) is None
+        if not invalid_recipient and not invalid_text:
+            continue
+        batches.pop(recipient)
+        reason = (UTF8_RECIPIENT_REFUSAL if invalid_recipient
+                  else UTF8_TEXT_REFUSAL)
+        safe_recipient = (_utf8_safe_text(recipient)
+                          if invalid_recipient else recipient)
+        print(f"antiphon: delivery failed — {reason}",
+              file=sys.stderr)
+        if not ledger.record_refused(
+                cwd, delivery_id(), sender=who or NO_ALIAS, to_kind=target,
+                to_alias=redact_private(safe_recipient), reason=reason,
+                preview=redact_private(_utf8_safe_text(outgoing)),
+                sender_kind=side):
+            print("antiphon: the delivery ledger could not record the refusal",
+                  file=sys.stderr)
+    if not batches:
+        return _retire_park(cwd, side, key,
+                            parked_deliveries(read_cursor(cwd, side).get(key)))
+
     if same_kind:
         for recipient in list(batches):
             if recipient is None:
@@ -5439,9 +5544,34 @@ def _push_batches(cwd, side, target, key, grouped, turn_key, input_data):
             return _retire_park(cwd, side, key,
                                 parked_deliveries(read_cursor(cwd, side).get(key)))
 
+    unknown_untracked = False
+    protected = {}
+
     def deliver(recipient, messages):
+        nonlocal unknown_untracked
         outgoing = "\n".join(messages)
+        slot = "" if recipient is None else f"@{recipient}"
+        fingerprint = push_fingerprint(turn_key, messages)
+        previous = ledger.find_stop_outcome(
+            cwd, side=side, key=key, slot=slot, fingerprint=fingerprint)
+        if previous is not None:
+            protected[(slot, fingerprint)] = previous["delivery_id"]
+            named = f":{recipient}" if recipient else ""
+            print(f"antiphon: the {target.title()}{named} outcome for this "
+                  "exact turn is already recorded; not retrying automatically",
+                  file=sys.stderr)
+            return True
         attempt = delivery_id()       # but each attempt is its own attempt
+
+        def remember_stop_outcome():
+            if ledger.record_stop_outcome(
+                    cwd, side=side, key=key, slot=slot,
+                    fingerprint=fingerprint, delivery_id=attempt):
+                protected[(slot, fingerprint)] = attempt
+                return True
+            return False
+
+        attempted_at = time.time()
         if target == "codex":
             # The label names the sender's kind: a Codex peer reading another
             # Codex session's words must not take them for Claude's.
@@ -5463,9 +5593,30 @@ def _push_batches(cwd, side, target, key, grouped, turn_key, input_data):
                     transport="queue" if target == "codex" else "channel",
                     proof=(detail or "registered") if target == "codex" else "channel",
                     sha256=hashlib.sha256(outgoing.encode()).hexdigest(),
-                    size=len(outgoing.encode()), sender_kind=side):
+                    size=len(outgoing.encode()), sender_kind=side,
+                    at=attempted_at):
                 print("antiphon: the delivery ledger could not record the delivery",
                       file=sys.stderr)
+            remember_stop_outcome()
+        elif getattr(detail, "delivery_unknown", False):
+            # Bytes may already be in the peer's transcript. Treat the marker
+            # as consumed so a later Stop hook cannot duplicate it, retain an
+            # honest ledger state that a receipt can resolve, and tell the
+            # sender on its next page (this hook's stderr is not visible).
+            print(f"antiphon: delivery outcome unknown for {target.title()}{named} "
+                  f"(id {attempt}); not retrying automatically", file=sys.stderr)
+            if not ledger.record_unknown(
+                    cwd, attempt, sender=who or NO_ALIAS, to_kind=target,
+                    to_alias=recipient,
+                    transport="queue" if target == "codex" else "channel",
+                    sha256=hashlib.sha256(outgoing.encode()).hexdigest(),
+                    size=len(outgoing.encode()), reason=redact_private(str(detail)),
+                    preview=redact_private(outgoing), sender_kind=side,
+                    at=attempted_at):
+                unknown_untracked = True
+                print("antiphon: the delivery ledger could not record the unknown outcome",
+                      file=sys.stderr)
+            remember_stop_outcome()
         else:
             # Returning False leaves this recipient's fingerprint where it was,
             # so the line is offered again next turn instead of being recorded
@@ -5492,7 +5643,7 @@ def _push_batches(cwd, side, target, key, grouped, turn_key, input_data):
                     sender_kind=side):
                 print("antiphon: the delivery ledger could not record the refusal",
                       file=sys.stderr)
-        return ok
+        return ok or getattr(detail, "delivery_unknown", False)
 
     # The send happens here, outside any lock — reversing an earlier ruling
     # that held it inside, on the grounds that read-check-send-record is one
@@ -5585,13 +5736,30 @@ def _push_batches(cwd, side, target, key, grouped, turn_key, input_data):
         # would.
         missed = ", ".join(sorted(
             "(unaddressed)" if slot == "" else slot[1:] for slot in delivered))
-        print(f"antiphon: sent to {target} but could not record delivery for "
-              f"{missed} in {state_path(cwd, side)}; a duplicate send is "
-              "possible next turn", file=sys.stderr)
+        protected_slots = {
+            slot for (slot, fingerprint), _attempt in protected.items()
+            if delivered.get(slot) == fingerprint}
+        if set(delivered).issubset(protected_slots):
+            print(f"antiphon: sent to {target} but could not promote delivery "
+                  f"for {missed} in {state_path(cwd, side)}; exact suppression "
+                  "evidence was retained, so it will not be retried "
+                  "automatically", file=sys.stderr)
+        else:
+            print(f"antiphon: sent to {target} but could not record delivery for "
+                  f"{missed} in {state_path(cwd, side)}; a duplicate send is "
+                  "possible next turn", file=sys.stderr)
         if observed:
             print(PARK_LEFT_BEHIND, file=sys.stderr)
         return 1
-    return 0
+    for (slot, fingerprint), attempt in protected.items():
+        if delivered.get(slot) == fingerprint:
+            ledger.clear_stop_outcome(
+                cwd, side=side, key=key, slot=slot,
+                fingerprint=fingerprint, delivery_id=attempt)
+    # The marker fingerprint is durable, so retry remains suppressed. But if
+    # its only receipt-resolvable unknown entry was lost, make the hook fail
+    # visibly instead of leaving that fact only on exit-0 stderr.
+    return 1 if unknown_untracked else 0
 
 
 # Private shapes, and the one place that removes them.
@@ -5652,7 +5820,8 @@ def redact_refusal(refusal, limit=None):
     """Redact a refusal without costing it the class a caller acts on."""
     cleaned = redact_private(str(refusal), limit)
     given = getattr(refusal, "refusal_class", None)
-    return _ClassifiedRefusal(cleaned, given) if given else cleaned
+    unknown = getattr(refusal, "delivery_unknown", False)
+    return _ClassifiedRefusal(cleaned, given, unknown) if given else cleaned
 
 
 class _ClassifiedRefusal(str):
@@ -5671,11 +5840,12 @@ class _ClassifiedRefusal(str):
     by anybody remembering to exclude it.
     """
 
-    __slots__ = ("refusal_class",)
+    __slots__ = ("refusal_class", "delivery_unknown")
 
-    def __new__(cls, detail, refusal_class):
+    def __new__(cls, detail, refusal_class, delivery_unknown=False):
         refusal = super().__new__(cls, detail)
         refusal.refusal_class = refusal_class
+        refusal.delivery_unknown = bool(delivery_unknown)
         return refusal
 
 
@@ -5735,6 +5905,31 @@ def _queue_codex(session, message):
         return False, _ClassifiedRefusal(
             f"codex queue could not be started: "
             f"{e.strerror or type(e).__name__}", "transport")
+    except UnicodeEncodeError as e:
+        # Python encodes argv before exec. A lone surrogate (or another argv
+        # encoding failure) therefore cannot have created a child or queued a
+        # row, so this stays a definite refusal and is safe to retry.
+        return False, _ClassifiedRefusal(
+            f"codex queue could not be started: {type(e).__name__}",
+            "transport")
+    except UnicodeDecodeError as e:
+        # With text-mode capture, decoding happens after the child may have
+        # accepted the queue row. This is an unknown outcome, never a retryable
+        # pre-exec refusal.
+        return False, _ClassifiedRefusal(
+            f"{type(e).__name__}", "transport", delivery_unknown=True)
+    except ValueError as e:
+        # `subprocess` rejects an argv containing NUL before exec. Nothing can
+        # have reached the host, but the exception still belongs in the normal
+        # refusal surface rather than escaping a hook as a traceback.
+        return False, _ClassifiedRefusal(
+            "codex queue could not be started: "
+            + redact_private(str(e), 200), "transport")
+    except subprocess.TimeoutExpired as e:
+        # The process existed and may have accepted the row before our wait
+        # expired. Retrying can therefore duplicate somebody's task.
+        return False, _ClassifiedRefusal(
+            f"{type(e).__name__}", "transport", delivery_unknown=True)
     except subprocess.SubprocessError as e:
         return False, _ClassifiedRefusal(f"{type(e).__name__}", "transport")
     if result.returncode != 0:
@@ -6067,7 +6262,7 @@ def _request_claude_reassert(cwd, alias):
         return False
     try:
         result = json.loads(reply_bytes.decode())
-    except (UnicodeDecodeError, json.JSONDecodeError):
+    except (UnicodeDecodeError, json.JSONDecodeError, RecursionError):
         return False
     pid = result.get("pid") if isinstance(result, dict) else None
     if not (isinstance(pid, int) and not isinstance(pid, bool) and pid > 0
@@ -6134,6 +6329,8 @@ def send_to_claude(cwd, text, alias=None, sender_alias=None, message_id=None,
     exact shape every listener already reads and an old listener, which knows
     no such key, keeps reading the payload it always did.
     """
+    if _utf8_bytes(text) is None:
+        return False, _ClassifiedRefusal(UTF8_TEXT_REFUSAL, "transport")
     request = {
         "content": text,
         "message_id": message_id or delivery_id(),
@@ -6141,7 +6338,13 @@ def send_to_claude(cwd, text, alias=None, sender_alias=None, message_id=None,
     }
     if sender_kind == "claude":
         request["sender_kind"] = "claude"
-    payload = json.dumps(request, ensure_ascii=False).encode()
+    try:
+        payload = json.dumps(request, ensure_ascii=False).encode()
+    except UnicodeEncodeError:
+        # Public callers validate content and names, but this transport is also
+        # called directly by Stop hooks. Defend its whole wire envelope so a
+        # malformed sender/id cannot open a socket or escape as a traceback.
+        return False, _ClassifiedRefusal(UTF8_METADATA_REFUSAL, "transport")
     if len(payload) > MAX_CHANNEL_BYTES:
         # Refused before any socket is opened, so not a transport failure — but
         # the visible reply is exactly where an oversized text still travels
@@ -6235,19 +6438,26 @@ def send_to_claude(cwd, text, alias=None, sender_alias=None, message_id=None,
     except OSError as error:
         return False, _ClassifiedRefusal(
             "Claude MCP Channel is down: "
-            f"{error.strerror or type(error).__name__}", "transport")
+            f"{error.strerror or type(error).__name__}", "transport",
+            delivery_unknown=True)
     try:
         result = json.loads(reply_bytes.decode())
-    except (UnicodeDecodeError, json.JSONDecodeError):
+    except (UnicodeDecodeError, json.JSONDecodeError, RecursionError):
         return False, _ClassifiedRefusal(
-            "Claude MCP Channel returned an invalid response", "transport")
+            "Claude MCP Channel returned an invalid response", "transport",
+            delivery_unknown=True)
     if not isinstance(result, dict):
         # Decoded, and not an answer: `[]` and `null` are valid JSON and `.get`
         # on either raises out of a path whose caller is only ever told success
         # or a reason.
         return False, _ClassifiedRefusal(
-            "Claude MCP Channel returned an invalid response", "transport")
-    if not result.get("ok"):
+            "Claude MCP Channel returned an invalid response", "transport",
+            delivery_unknown=True)
+    if result.get("ok") is not True and result.get("ok") is not False:
+        return False, _ClassifiedRefusal(
+            "Claude MCP Channel returned an invalid response", "transport",
+            delivery_unknown=True)
+    if result.get("ok") is False:
         # A class the listener supplied is kept. "The socket failed" and "that
         # alias is not this session any more" call for different actions, and
         # only the second tells a sender to reconnect; recasting everything as
@@ -6255,10 +6465,18 @@ def send_to_claude(cwd, text, alias=None, sender_alias=None, message_id=None,
         supplied = result.get("refusal_class")
         # Redact before the cut: a truncation taken first can leave half a
         # session id behind and a whole-shape check would pass over it.
+        cleaned = _utf8_safe_text(redact_private(
+            str(result.get("error") or "channel delivery failed")))[:200]
         return False, _ClassifiedRefusal(
-            redact_private(str(result.get("error")
-                               or "channel delivery failed"), 200),
+            cleaned,
             supplied if supplied in LISTENER_REFUSAL_CLASSES else "transport")
+    if result.get("message_id") != request["message_id"]:
+        # The bytes were already written.  A missing or different attempt id
+        # can be a stale reply, so it is not evidence that this message was
+        # accepted and it is not safe to retry automatically either.
+        return False, _ClassifiedRefusal(
+            "Claude MCP Channel returned an invalid response", "transport",
+            delivery_unknown=True)
     # A listener that understood the sender's kind echoes it; one from before
     # same-kind sends does not, and will show this Claude sender as Codex.
     # Said to the caller, never a refusal: the words did arrive.
@@ -6634,6 +6852,11 @@ def sweep_attachments(cwd, now=None):
         name = os.path.basename(path)
         age = now - info.st_mtime
         read_at = reads.get(name)
+        # Reuse refreshes mtime before transport. If that process dies before
+        # its delivery row, a post-read mtime is the only durable evidence of
+        # a possible new envelope; keep the file for the full TTL.
+        if read_at is not None and read_at <= info.st_mtime:
+            read_at = None
         if read_at is not None:
             since_read = now - read_at
             if since_read <= ATTACHMENT_READ_GRACE:
@@ -6720,11 +6943,17 @@ def _delivery_report(cwd, now=None):
 
     Counts only — no id, no alias, no words: what left and was never seen in
     the peer's transcript (and how long the oldest has waited), what was
-    seen, and what never left, with how many of those refusals the sender's
-    own page has not carried yet."""
+    seen, what had an unknown transport outcome, and what never left, with
+    how many notices the sender's own page has not carried yet."""
     now = time.time() if now is None else now
     rows = ledger.entries(cwd)
-    if not rows:
+    stop_health = ledger.stop_outcome_health(cwd, now)
+    receipt_health = ledger.pending_receipt_health(cwd, now)
+    if (not rows and not stop_health["pending"] and not stop_health["invalid"]
+            and not stop_health["store_invalid"]
+            and not receipt_health["pending"] and not receipt_health["invalid"]
+            and not receipt_health["store_invalid"]
+            and not receipt_health["diagnostics_invalid"]):
         return "Deliveries:         none on the ledger"
     waiting = [now - row["sent_at"] for row in rows
                if row["state"] == "sent" and row["received_at"] is None]
@@ -6736,7 +6965,12 @@ def _delivery_report(cwd, now=None):
     received = sum(1 for row in rows
                    if row["state"] == "sent" and row["received_at"] is not None)
     refused = [row for row in rows if row["state"] == "refused"]
-    unreported = sum(1 for row in refused if row["reported_at"] is None)
+    refused_unreported = sum(
+        1 for row in refused if row["reported_at"] is None)
+    unknown = [(row, max(0.0, now - row["sent_at"]))
+               for row in rows if row["state"] == "unknown"]
+    unknown_recent = [row for row, age in unknown if age <= PAGE_HORIZON]
+    unknown_beyond = [row for row, age in unknown if age > PAGE_HORIZON]
     parts = []
     if recent:
         parts.append(f"{len(recent)} awaiting receipt "
@@ -6747,9 +6981,52 @@ def _delivery_report(cwd, now=None):
                      "never seen)")
     if received:
         parts.append(f"{received} received")
+    if unknown_recent:
+        unreported = sum(1 for row in unknown_recent
+                         if row["reported_at"] is None)
+        parts.append(f"{len(unknown_recent)} outcome unknown" + (
+            f" ({unreported} not yet reported to the sender)"
+            if unreported else ""))
+    if unknown_beyond:
+        unreported = sum(1 for row in unknown_beyond
+                         if row["reported_at"] is None)
+        parts.append(
+            f"{len(unknown_beyond)} unknown outcome"
+            f"{'s' if len(unknown_beyond) != 1 else ''} before the "
+            f"{PAGE_HORIZON // 3600}-hour page horizon (a receipt that old "
+            "is never seen"
+            + (f"; {unreported} not yet reported to the sender"
+               if unreported else "") + ")")
     if refused:
         parts.append(f"{len(refused)} refused" + (
-            f" ({unreported} not yet reported to the sender)" if unreported else ""))
+            f" ({refused_unreported} not yet reported to the sender)"
+            if refused_unreported else ""))
+    if stop_health["pending"]:
+        count = stop_health["pending"]
+        parts.append(
+            f"{count} exact Stop outcome"
+            f"{'s' if count != 1 else ''} retained after a cursor write "
+            f"failure (oldest {_age_words(stop_health['oldest'])}; automatic "
+            "retry suppressed)")
+    if stop_health["invalid"]:
+        count = stop_health["invalid"]
+        parts.append(f"{count} invalid Stop suppression record"
+                     f"{'s' if count != 1 else ''}")
+    if stop_health["store_invalid"]:
+        parts.append("Stop suppression store unusable")
+    if receipt_health["pending"]:
+        count = receipt_health["pending"]
+        parts.append(
+            f"{count} receipt proof{'s' if count != 1 else ''} retained for "
+            "sender-row reconciliation")
+    if receipt_health["invalid"]:
+        count = receipt_health["invalid"]
+        parts.append(f"{count} invalid pending receipt record"
+                     f"{'s' if count != 1 else ''}")
+    if receipt_health["store_invalid"]:
+        parts.append("pending receipt store unusable")
+    if receipt_health["diagnostics_invalid"]:
+        parts.append("pending receipt diagnostics invalid")
     return "Deliveries:         " + ", ".join(parts)
 
 
@@ -6777,7 +7054,7 @@ def attachment_report(cwd, now=None):
         attachments, _foreign = _attachment_entries(cwd)
         read = sum(1 for path, info in attachments
                    if now - info.st_mtime <= ATTACHMENT_TTL
-                   and os.path.basename(path) in reads)
+                   and reads.get(os.path.basename(path), -1) > info.st_mtime)
         line += f"; {read} with a read receipt, {parked - read} without"
     if foreign:
         noun = "entry" if foreign == 1 else "entries"
@@ -6919,10 +7196,10 @@ def _spill_locked(cwd, text, alias, message_id, size, recipient=None):
             # the file's clock, so "eligible for removal 7 days after it was
             # written" is true of this envelope too.
             path = os.path.join(store, existing)
-            with contextlib.suppress(OSError):
-                os.utime(path, None)
-            return _Attachment(attachment_envelope(path, digest, size, alias),
-                               path, size, True), None
+            if _refresh_reusable_attachment(path):
+                return _Attachment(
+                    attachment_envelope(path, digest, size, alias),
+                    path, size, True), None
     parked, held, oldest, _foreign = attachment_usage(cwd)
     if held + size > ATTACHMENT_QUOTA:
         # Nothing is evicted to make room. An unexpired attachment is somebody
@@ -6945,6 +7222,113 @@ def _spill_locked(cwd, text, alias, message_id, size, recipient=None):
                       f"{attachment_dir(cwd)}: {error}")
     return _Attachment(attachment_envelope(path, digest, size, alias), path,
                        size), None
+
+
+def _refresh_reusable_attachment(path):
+    """Refresh exactly one regular file without following a raced symlink."""
+    flags = (os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+             | getattr(os, "O_NONBLOCK", 0))
+    fd = None
+    try:
+        fd = os.open(path, flags)
+        before = os.fstat(fd)
+        if not stat.S_ISREG(before.st_mode):
+            return False
+        os.utime(fd, None)
+        after = os.fstat(fd)
+        named = os.stat(path, follow_symlinks=False)
+        return (stat.S_ISREG(after.st_mode) and stat.S_ISREG(named.st_mode)
+                and (after.st_dev, after.st_ino)
+                == (named.st_dev, named.st_ino))
+    except (OSError, TypeError, NotImplementedError):
+        return False
+    finally:
+        if fd is not None:
+            with contextlib.suppress(OSError):
+                os.close(fd)
+
+
+def _unknown_delivery(cwd, message_id, *, sender, sender_kind, to_kind,
+                      to_alias, transport, text, detail, attachment=None,
+                      dedupe_recorded=True, at=None):
+    """Record and describe a send whose acknowledgement disappeared.
+
+    The attempt id already travelled with the bytes. Keeping that id and any
+    parked content is the only safe response: calling it refused or inviting a
+    retry could duplicate the message, while deleting the attachment could
+    strand an envelope the peer already received.
+    """
+    sender_name = sender or NO_ALIAS
+    # Make the pre-transport instant an explicit part of this helper's
+    # contract even for older internal callers that omit it. Receipt matching
+    # and sidecar expiry both depend on this exact value surviving the write.
+    at = time.time() if at is None else at
+    reason = redact_private(str(detail))
+    preview = redact_private(text)
+    digest = hashlib.sha256(text.encode()).hexdigest()
+    size = len(text.encode())
+    written = ledger.record_unknown(
+        cwd, message_id, sender=sender_name, sender_kind=sender_kind,
+        to_kind=to_kind, to_alias=to_alias, transport=transport,
+        sha256=digest, size=size, attachment=attachment,
+        reason=reason, preview=preview, at=at)
+    entry = ledger.read_entry(cwd, message_id) if written else None
+    common = {
+        "id": message_id, "sender": sender_name,
+        "sender_kind": sender_kind, "to_kind": to_kind,
+        "to_alias": to_alias, "transport": transport,
+        "proof": "unproven", "sha256": digest, "size": size,
+        "attachment": attachment, "sent_at": at,
+    }
+    immutable_match = entry is not None and all(
+        entry.get(key) == value for key, value in common.items())
+    still_unknown = immutable_match and all((
+        entry.get("version") == ledger.LEDGER_VERSION,
+        entry.get("state") == "unknown",
+        entry.get("reason") == str(reason)[:ledger.REASON_LENGTH],
+        entry.get("preview") == " ".join(str(preview).split())[
+            :ledger.PREVIEW_LENGTH],
+    ))
+    receipt_won = immutable_match and all((
+        entry.get("version") == ledger.LEGACY_LEDGER_VERSION,
+        entry.get("state") == "sent",
+        entry.get("reason") is None,
+        entry.get("preview") is None,
+        (entry.get("received_at") is not None
+         or entry.get("read_at") is not None),
+    ))
+    recorded = bool(written and (still_unknown or receipt_won))
+    target = f"{ledger.LABEL[to_kind]} peer {to_alias!r}" if to_alias else (
+        f"the {ledger.LABEL[to_kind]} peer")
+    if receipt_won:
+        words = (
+            f"The transport acknowledgement was lost for {target} "
+            f"(id {message_id}), but the peer's transcript already proves "
+            "receipt; do not retry.")
+        outcome = "received"
+    else:
+        words = (
+            f"Delivery outcome unknown for {target} (id {message_id}): the "
+            "transport acknowledgement was lost after bytes may have left; do not "
+            "retry automatically because the peer may already have received it.")
+        outcome = "unknown"
+        if attachment:
+            words += " The parked attachment was retained for that possible receiver."
+    if not recorded:
+        words += LEDGER_UNWRITTEN
+    if not dedupe_recorded:
+        words += DEDUPE_UNWRITTEN
+    return {
+        "outcome": outcome, "id": message_id, "to": to_alias,
+        "attachment": attachment, "recorded": recorded,
+        "dedupe_recorded": dedupe_recorded, "text": words,
+    }
+
+
+def _unknown_tool_result(answer):
+    """A completed tool call with an indeterminate transport outcome."""
+    return {"content": [{"type": "text",
+                          "text": json.dumps(answer, ensure_ascii=False)}]}
 
 
 def reply(*_):
@@ -6970,8 +7354,21 @@ def reply(*_):
         print(f"reply: to must be a string naming one live {kind.title()} peer",
               file=sys.stderr)
         return 1
+    if to is not None and _utf8_bytes(to) is None:
+        print(f"reply: {UTF8_RECIPIENT_REFUSAL}", file=sys.stderr)
+        return 1
+    if kind == "claude" and (not to or to == NO_ALIAS):
+        print("reply: to is required — a reply to another Claude session names "
+              "its peer", file=sys.stderr)
+        return 1
+    if to is not None and not peers.valid_name(to):
+        print(f"reply: {_unusable_recipient_detail(to)}", file=sys.stderr)
+        return 1
     cwd = project_dir()
     text = text.strip()
+    if _utf8_bytes(text) is None:
+        print(f"reply: {UTF8_TEXT_REFUSAL}", file=sys.stderr)
+        return 1
     # `channel.mjs` passes the peer name it validated for itself.
     who = sender_alias(input_data.get("sender_alias"))
     if kind == "claude":
@@ -6995,8 +7392,19 @@ def reply(*_):
             return 1
         outgoing, parked = attachment.envelope, attachment
         composed = f"{CHANNEL_LABEL} {label} {outgoing}"
+    attempted_at = time.time()
     ok, detail = send_to_codex(cwd, composed, to, sender=who)
     if not ok:
+        if getattr(detail, "delivery_unknown", False):
+            attachment = os.path.basename(parked.path) if parked is not None else None
+            dedupe_recorded = _record_delivery(cwd, "codex", text, to)
+            print(json.dumps(_unknown_delivery(
+                cwd, message_id, sender=who, sender_kind="claude",
+                to_kind="codex", to_alias=to, transport="queue", text=text,
+                detail=detail, attachment=attachment,
+                dedupe_recorded=dedupe_recorded,
+                at=attempted_at), ensure_ascii=False))
+            return 0
         # Never a reused file: the first envelope, already delivered, names it.
         if parked is not None and not parked.reused:
             drop_attachment(cwd, parked.path)
@@ -7008,7 +7416,7 @@ def reply(*_):
     # The BARE text, which is the shape `deliver_batches` compares: push
     # fingerprints bare marker lines, never composed ones, so parking the
     # composed string would leave the park matching nothing.
-    _record_delivery(cwd, "codex", outgoing, to)
+    dedupe_recorded = _record_delivery(cwd, "codex", text, to)
     # What actually happened, for the ledger and for the caller. A queue
     # accepting a row is not the peer reading it — measured, a row sat in an
     # open app-hosted thread's queue for over an hour — so the word is
@@ -7020,11 +7428,13 @@ def reply(*_):
         to_alias=to, transport="queue", proof=detail or "registered",
         sha256=hashlib.sha256(text.encode()).hexdigest(),
         size=len(text.encode()), attachment=attachment,
-        sender_kind="claude")
+        sender_kind="claude", at=attempted_at)
     print(json.dumps({"queued": True, "id": message_id, "proof": detail or "registered",
                       "to": to, "attachment": attachment, "recorded": recorded,
+                      "dedupe_recorded": dedupe_recorded,
                       "text": queued_words(to, message_id, detail or "registered",
-                                           attachment) + LEDGER_UNWRITTEN * (not recorded)}))
+                                           attachment) + LEDGER_UNWRITTEN * (not recorded)
+                              + DEDUPE_UNWRITTEN * (not dedupe_recorded)}))
     return 0
 
 
@@ -7049,9 +7459,22 @@ def _reply_to_claude(cwd, text, to, who):
             print(f"reply: {refusal}", file=sys.stderr)
             return 1
         outgoing, parked = attachment.envelope, attachment
+    attempted_at = time.time()
     ok, detail = send_to_claude(cwd, outgoing, to, sender_alias=who,
                                 message_id=message_id, sender_kind="claude")
     if not ok:
+        if getattr(detail, "delivery_unknown", False):
+            attachment = os.path.basename(parked.path) if parked is not None else None
+            dedupe_recorded = _record_delivery(
+                cwd, "claude", text, to,
+                key=SAME_KIND_KEY.format(kind="claude"), side="claude")
+            print(json.dumps(_unknown_delivery(
+                cwd, message_id, sender=who, sender_kind="claude",
+                to_kind="claude", to_alias=to, transport="channel", text=text,
+                detail=detail, attachment=attachment,
+                dedupe_recorded=dedupe_recorded,
+                at=attempted_at), ensure_ascii=False))
+            return 0
         # Never a reused file: the first envelope, already delivered, names it.
         if parked is not None and not parked.reused:
             drop_attachment(cwd, parked.path)
@@ -7059,14 +7482,16 @@ def _reply_to_claude(cwd, text, to, who):
               file=sys.stderr)
         return 1
     old_listener = detail == OLD_LISTENER
-    _record_delivery(cwd, "claude", outgoing, to,
-                     key=SAME_KIND_KEY.format(kind="claude"), side="claude")
+    dedupe_recorded = _record_delivery(
+        cwd, "claude", text, to,
+        key=SAME_KIND_KEY.format(kind="claude"), side="claude")
     attachment = os.path.basename(parked.path) if parked is not None else None
     recorded = ledger.record_sent(
         cwd, message_id, sender=who or NO_ALIAS, to_kind="claude",
         to_alias=to, transport="channel", proof="channel",
         sha256=hashlib.sha256(text.encode()).hexdigest(),
-        size=len(text.encode()), attachment=attachment, sender_kind="claude")
+        size=len(text.encode()), attachment=attachment, sender_kind="claude",
+        at=attempted_at)
     words = (f"Delivered to the Claude Code peer {to!r} (id {message_id}); "
              "antiphon status shows when its transcript received it.")
     if attachment:
@@ -7076,9 +7501,12 @@ def _reply_to_claude(cwd, text, to, who):
         words += OLD_LISTENER_WORDS
     if not recorded:
         words += LEDGER_UNWRITTEN
+    if not dedupe_recorded:
+        words += DEDUPE_UNWRITTEN
     print(json.dumps({"queued": False, "delivered": True, "id": message_id,
                       "proof": "channel", "to": to, "attachment": attachment,
-                      "recorded": recorded, "text": words}))
+                      "recorded": recorded, "dedupe_recorded": dedupe_recorded,
+                      "text": words}))
     return 0
 
 
@@ -7087,6 +7515,9 @@ def _reply_to_claude(cwd, text, to, who):
 # about a delivery status will never know.
 LEDGER_UNWRITTEN = (" (the delivery ledger could not be written, so status will "
                     "not show this one)")
+DEDUPE_UNWRITTEN = (
+    " Automatic Stop-marker suppression could not be recorded; do not end "
+    "this turn with the same addressed marker or it may be sent again.")
 
 
 def queued_words(to, message_id, proof, attachment=None):
@@ -7130,22 +7561,36 @@ def _send_tool_to_codex(cwd, text, to, who):
             return _tool_error(f"Not delivered to Codex: {refusal}")
         outgoing, parked = attachment.envelope, attachment
         composed = f"{CHANNEL_LABEL_CODEX} {label} {outgoing}"
+    attempted_at = time.time()
     ok, detail = send_to_codex(cwd, composed, to, sender=who)
     if not ok:
+        if getattr(detail, "delivery_unknown", False):
+            attachment = os.path.basename(parked.path) if parked is not None else None
+            dedupe_recorded = _record_delivery(
+                cwd, "codex", text, to,
+                key=SAME_KIND_KEY.format(kind="codex"), side="codex")
+            return _unknown_tool_result(_unknown_delivery(
+                cwd, message_id, sender=who, sender_kind="codex",
+                to_kind="codex", to_alias=to, transport="queue", text=text,
+                detail=detail, attachment=attachment,
+                dedupe_recorded=dedupe_recorded, at=attempted_at))
         if parked is not None and not parked.reused:
             drop_attachment(cwd, parked.path)
         return _tool_error(f"Not delivered to Codex: {detail}")
-    _record_delivery(cwd, "codex", outgoing, to,
-                     key=SAME_KIND_KEY.format(kind="codex"), side="codex")
+    dedupe_recorded = _record_delivery(
+        cwd, "codex", text, to,
+        key=SAME_KIND_KEY.format(kind="codex"), side="codex")
     attachment = os.path.basename(parked.path) if parked is not None else None
     recorded = ledger.record_sent(
         cwd, message_id, sender=who or NO_ALIAS, to_kind="codex", to_alias=to,
         transport="queue", proof=detail or "registered",
         sha256=hashlib.sha256(text.encode()).hexdigest(),
-        size=len(text.encode()), attachment=attachment, sender_kind="codex")
+        size=len(text.encode()), attachment=attachment, sender_kind="codex",
+        at=attempted_at)
     return {"content": [{"type": "text", "text": (
         queued_words(to, message_id, detail or "registered", attachment)
-        + (LEDGER_UNWRITTEN if not recorded else ""))}]}
+        + (LEDGER_UNWRITTEN if not recorded else "")
+        + (DEDUPE_UNWRITTEN if not dedupe_recorded else ""))}]}
 
 
 def _record_delivery(cwd, target, text, alias=None, key=None, side=None):
@@ -7195,7 +7640,7 @@ def _record_delivery(cwd, target, text, alias=None, key=None, side=None):
         cursor[key] = forget_superseded(sent)
         return cursor
 
-    update_cursor(cwd, side, mutate)
+    return update_cursor(cwd, side, mutate)
 
 
 def register_peer(*_):
@@ -7299,11 +7744,14 @@ DELEGATE_DESCRIPTION = (
     "task as for a write task, so it sees committed work and not your "
     "uncommitted changes; in a plain directory a read task runs in the project "
     "and a write task is refused. Or, with `to`, a read task handed to a running "
-    "named peer over the ordinary addressed send. Every result names the "
-    "worker; the bridge never merges its work, never widens its permissions, "
+    "named peer over the ordinary addressed send. A hand-off uses the same "
+    "attempt id for task and delivery; if post-send tracking is incomplete, "
+    "its result says not to retry because the peer may already act. A fresh-worker "
+    "result names the worker and is collected with antiphon_task; a hand-off result "
+    "names the peer and is not collected by id — its answer arrives in that peer's "
+    "own words. The bridge never merges its work, never widens its permissions, "
     "and refuses a delegation from a session already at the hop budget "
-    "(ANTIPHON_HOP_BUDGET, default 1). Collect with antiphon_task(id, "
-    "\"result\", wait).")
+    "(ANTIPHON_HOP_BUDGET, default 1).")
 
 TASK_DESCRIPTION = (
     "The lifecycle of a delegated task by id: status, result (with a bounded "
@@ -7314,8 +7762,10 @@ TASK_DESCRIPTION = (
     "worker's directory goes on the next hook after its result was collected, "
     "or on cancel; the task's record, and a diff too large to inline that is "
     "written beside it, stay a week — nothing goes while the worker runs. A "
-    "handed task has no worker here: result and cancel are refused for it, and "
-    "only the peer can be told to stop.")
+    "`handing`, `handed`, `tracking_incomplete`, or `delivery_refused` task "
+    "has no worker here: result and cancel are refused for it; unless delivery "
+    "is explicitly refused, the peer may already act, and only the peer can be "
+    "told to stop.")
 
 RETRIEVE_DESCRIPTION = (
     "Read-only, write-free retrieval of the complete tool invocation named by a "
@@ -7346,7 +7796,11 @@ TOOLS = [{
                     "work over and carry on. It does not block: call `antiphon_read` "
                     "later in the same turn to pick up whatever Claude did. Name the "
                     "peer with `to` when more than one is live; with a single peer "
-                    "you can leave it out."),
+                    "you can leave it out. If bytes may have left but the transport "
+                    "acknowledgement is lost, the result returns the attempt id and "
+                    "an unknown outcome with an explicit do-not-retry warning — "
+                    "unless the peer's transcript already proves receipt, in which "
+                    "case it returns received."),
     "inputSchema": {
         "type": "object",
         "properties": {
@@ -7470,7 +7924,17 @@ def _send_tool(cwd, text, to=None, sender=None, kind="claude"):
         return _tool_error("kind must be claude or codex")
     if to is not None and not isinstance(to, str):
         return _tool_error(f"to must be a string naming one live {kind.title()} peer")
+    if to is not None and _utf8_bytes(to) is None:
+        return _tool_error(UTF8_RECIPIENT_REFUSAL)
+    if kind == "codex" and (not to or to == NO_ALIAS):
+        return _tool_error("to is required: a message to another Codex session "
+                           "names its peer")
+    if to is not None and not peers.valid_name(to):
+        return _tool_error(
+            f"Not delivered to {kind.title()}: {_unusable_recipient_detail(to)}")
     text = text.strip()
+    if _utf8_bytes(text) is None:
+        return _tool_error(UTF8_TEXT_REFUSAL)
     who = sender_alias(sender)
     if kind == "codex":
         return _send_tool_to_codex(cwd, text, to, who)
@@ -7486,9 +7950,18 @@ def _send_tool(cwd, text, to=None, sender=None, kind="claude"):
         if refusal is not None:
             return _tool_error(f"Not delivered to Claude: {refusal}")
         outgoing, parked = attachment.envelope, attachment
+    attempted_at = time.time()
     ok, detail = send_to_claude(cwd, outgoing, to, sender_alias=who,
                                 message_id=message_id)
     if not ok:
+        if getattr(detail, "delivery_unknown", False):
+            attachment = os.path.basename(parked.path) if parked is not None else None
+            dedupe_recorded = _record_delivery(cwd, "claude", text, to)
+            return _unknown_tool_result(_unknown_delivery(
+                cwd, message_id, sender=who, sender_kind="codex",
+                to_kind="claude", to_alias=to, transport="channel", text=text,
+                detail=detail, attachment=attachment,
+                dedupe_recorded=dedupe_recorded, at=attempted_at))
         # Never a reused file: the first envelope, already delivered, names it.
         if parked is not None and not parked.reused:
             drop_attachment(cwd, parked.path)
@@ -7496,14 +7969,14 @@ def _send_tool(cwd, text, to=None, sender=None, kind="claude"):
         # result and ids are deliberately unreachable by Claude's pull page.
         return _tool_error(f"Not delivered to Claude: "
                            f"{_guided(detail, 'only a tool-name line')}")
-    _record_delivery(cwd, "claude", outgoing, to)
+    dedupe_recorded = _record_delivery(cwd, "claude", text, to)
     recorded = ledger.record_sent(
         cwd, message_id, sender=who or NO_ALIAS, to_kind="claude",
         to_alias=to, transport="channel", proof="channel",
         sha256=hashlib.sha256(text.encode()).hexdigest(),
         size=len(text.encode()),
         attachment=(os.path.basename(parked.path) if parked is not None else None),
-        sender_kind="codex")
+        sender_kind="codex", at=attempted_at)
     unwritten = LEDGER_UNWRITTEN if not recorded else ""
     # Naming the peer back is what lets the sender notice it addressed the wrong
     # one. With a single peer there is nothing to distinguish, so the old
@@ -7519,10 +7992,12 @@ def _send_tool(cwd, text, to=None, sender=None, kind="claude"):
             f"Delivered to the Claude Code {where} (id {message_id}) as an "
             f"attachment: the message was too large for the channel, so its "
             f"{parked.size} bytes are parked at {parked.path} and an envelope "
-            f"naming that file went in its place; {receipt}.{unwritten}")}]}
+            f"naming that file went in its place; {receipt}.{unwritten}"
+            f"{DEDUPE_UNWRITTEN if not dedupe_recorded else ''}")}]}
     return {"content": [{"type": "text",
                          "text": f"Delivered to the Claude Code {where} "
-                                 f"(id {message_id}); {receipt}.{unwritten}"}]}
+                                 f"(id {message_id}); {receipt}.{unwritten}"
+                                 f"{DEDUPE_UNWRITTEN if not dedupe_recorded else ''}"}]}
 
 
 def _retrieve_tool(cwd, public_id):
@@ -8087,19 +8562,25 @@ def _mcp_serve(cwd, alias=None):
                         delivered = _mcp_result(mid, output)
                         if oversized:
                             continue
-                        if delivered:
+                        receipts_durable = True
+                        if delivered and receipts:
                             # The same rule as the hook: the cursor is about
                             # to move past the records that carried these.
-                            _ledger_call("receipts", lambda: ledger.record_receipts(
-                                cwd, receipts, read_by="claude"))
-                        if not text and delivered:
+                            receipts_durable = (_ledger_call(
+                                "receipts", lambda: ledger.record_receipts(
+                                    cwd, receipts, read_by="claude")) is True)
+                            if not receipts_durable:
+                                print("antiphon: receipt evidence was not durable; "
+                                      "cursor progress was kept for retry",
+                                      file=sys.stderr)
+                        if not text and delivered and receipts_durable:
                             if not _advance_page_cursor(
                                     cwd, "codex", cursor, "codex", positions,
                                     advance):
                                 print("antiphon: could not record progress "
                                       "in the cursor",
                                       file=sys.stderr)
-                        elif delivered:
+                        elif delivered and receipts_durable:
                             if not _advance_page_cursor(
                                     cwd, "codex", cursor, "codex", positions,
                                     advance):
@@ -8405,19 +8886,24 @@ RECOVERY_RULE = (
     "`reply_to=<unavailable>`, do not reply to that `from` alias: it belongs "
     "to a different session.")
 
+RECORD_TIME_RULE = (
+    "Times use `[HH:MM]` today, `[YYYY-MM-DD HH:MM]` otherwise, or "
+    "`[time unavailable]` on clock failure. ")
+
 AGENTS_RULE = ("\n## The Antiphon bridge\n\n"
-               "You work alongside Claude Code here. Its side is injected into "
-               "your context at the start of each turn as one page of completed "
-               "records, oldest first — project-wide awareness, not mail "
-               "addressed to you, possibly several Claude sessions under one "
-               "label. `has_more: true` means more is waiting: call "
+               "You work with Claude Code. Each turn gets one page of its "
+               "completed records, oldest first — project-wide awareness, not "
+               "mail; sessions may share a label. "
+               "`has_more: true` means more is waiting: call "
                "`antiphon_read` again, or let later turns drain it, until "
                "`has_more: false`, whose `has_more_scope: catalogued project "
                "sources` covers the durable catalog only when no `discovery: "
                "building` or `discovery: degraded` line says the boundary is "
                "incomplete. A page never carries a record older than 24 hours "
                "before the newest record in Claude's transcripts; what that "
-               "left behind is announced on the page as `skipped:`. A page with "
+               "left behind is announced on the page as `skipped:`. "
+               + RECORD_TIME_RULE +
+               "A page with "
                "a replay notice re-delivers history after "
                "an upgrade or cursor recovery and can carry duplicates until the "
                "notice disappears. If the next record is larger than a page, "
@@ -8485,7 +8971,7 @@ CLAUDE_RULE = ("\n## The Antiphon bridge\n\n"
                "degraded` line says the boundary is incomplete. A page never "
                "carries a record older than 24 hours before the newest record "
                "in Codex's transcripts; what that left behind is announced on "
-               "the page as `skipped:`. "
+               "the page as `skipped:`. " + RECORD_TIME_RULE
                + TOOL_RETRIEVAL_RULE + "\n\n"
                "Events straight from that agent are marked "
                "`<channel source=\"antiphon\" sender=\"codex\" "
@@ -9139,15 +9625,15 @@ def setup():
                 continue
         print(f"{'✓' if new_text != current else '·'} {name} rule {status_word}: {target}")
 
-    print("\n— One last step: Codex hooks need a one-time security approval.")
-    print("  Open `codex` in this directory; approve the hook at the 'New hook - review required' prompt.")
+    print("\n— Start the two agents:")
+    print("  antiphon launch claude")
+    print("  antiphon launch codex")
+    print("  Approve the Codex hook at the 'New hook - review required' prompt.")
     print("  Approval is granted once and then persists (it asks again only if the file changes).")
-    print("\n— Start Claude with the channel enabled:")
-    print("  claude --dangerously-load-development-channels server:antiphon")
-    print("  In the research preview, the first launch needs both a development channel and an MCP approval.")
+    print("  Claude's research preview may also ask for a development-channel and MCP approval.")
     print("\n— More than one terminal? Explicit names are recommended:")
-    print("  ANTIPHON_NAME=ui claude --dangerously-load-development-channels server:antiphon")
-    print("  ANTIPHON_NAME=build codex")
+    print("  antiphon launch claude --name ui")
+    print("  antiphon launch codex --name build")
     print("  Antiphon may assign an automatic auto- alias after host identity is proved.")
     print("  ANTIPHON_NAME overrides it and remains the clearest choice for several")
     print("  terminals; a bare send is refused when more than one candidate is live.")
@@ -9158,6 +9644,169 @@ def setup():
               "  Fix them, then run `antiphon setup` again.", file=sys.stderr)
         return 1
     return 0
+
+
+# ---------- guided host launch ----------
+
+LAUNCH_USAGE = (
+    "usage: antiphon launch claude|codex [--name NAME] [-- HOST_ARGS...]")
+CLAUDE_CHANNEL_FLAG = "--dangerously-load-development-channels"
+CLAUDE_INCOMPATIBLE_LAUNCH_FLAGS = (
+    "--bare", "--no-session-persistence", "--restricted", "--safe-mode",
+    "--setting-sources", "--strict-mcp-config", "--worktree",
+)
+CODEX_INCOMPATIBLE_LAUNCH_FLAGS = ("--cd",)
+CLAUDE_INCOMPATIBLE_LAUNCH_ENV = (
+    "CLAUDE_CODE_SAFE_MODE", "CLAUDE_CODE_SIMPLE", "CLAUDE_CODE_RESTRICTED",
+)
+LAUNCH_TRUE_VALUES = frozenset(("1", "true", "yes", "on"))
+
+
+def _launch_error(message, code=2):
+    print(f"antiphon launch: {message}", file=sys.stderr)
+    return code
+
+
+def _launch_configuration_ready(cwd):
+    """Whether setup's complete shape is present, without printing or writing.
+
+    Doctor owns the configuration contract. Reusing its exact reader keeps a
+    launch preflight from accepting a shape doctor would reject, while the
+    redirected report prevents seven diagnostic lines from preceding every
+    successful interactive host session.
+    """
+    report = _Report()
+    with contextlib.redirect_stdout(io.StringIO()):
+        _doctor_config(report, cwd, _config_state(cwd))
+    return not report.broken
+
+
+def _incompatible_launch_flag(host, host_args):
+    """One host option that defeats the already-checked project boundary.
+
+    An exact host-side ``--`` ends option parsing, so a later token with the
+    same spelling is literal prompt content and remains untouched.
+    """
+    for argument in host_args:
+        if argument == "--":
+            break
+        flags = (CLAUDE_INCOMPATIBLE_LAUNCH_FLAGS if host == "claude"
+                 else CODEX_INCOMPATIBLE_LAUNCH_FLAGS)
+        for flag in flags:
+            if argument == flag or argument.startswith(flag + "="):
+                return flag
+        if host == "claude" and argument.startswith("-w"):
+            return "-w"
+        if host == "codex" and argument.startswith("-C"):
+            return "-C"
+    return None
+
+
+def launch(*args):
+    """Exec Claude Code or Codex with Antiphon's one required host setup."""
+    if not args:
+        print(LAUNCH_USAGE, file=sys.stderr)
+        return 2
+    host, rest = args[0], list(args[1:])
+    if host not in ("claude", "codex"):
+        return _launch_error("host must be claude or codex; " + LAUNCH_USAGE)
+
+    if "--" in rest:
+        boundary = rest.index("--")
+        options, host_args = rest[:boundary], rest[boundary + 1:]
+    else:
+        options, host_args = rest, []
+
+    requested = None
+    index = 0
+    while index < len(options):
+        option = options[index]
+        if option != "--name":
+            return _launch_error(
+                f"unknown option {option!r}; put host arguments after an exact `--`")
+        if requested is not None:
+            return _launch_error("--name may be passed once")
+        if index + 1 >= len(options):
+            return _launch_error("--name needs a value")
+        requested = options[index + 1].strip().lower()
+        if not peers.valid_name(requested):
+            return _launch_error(
+                "name is not usable; use lower-case letters, digits, `_` and `-`, "
+                "starting with a letter or digit, at most 32 characters")
+        index += 2
+
+    existing = peers.explicit_name()
+    if (requested is None and "ANTIPHON_NAME" in os.environ
+            and not peers.valid_name(existing)):
+        return _launch_error(
+            "ANTIPHON_NAME is not usable; fix or unset it before launching")
+    host_option_end = host_args.index("--") if "--" in host_args else len(host_args)
+    host_options = host_args[:host_option_end]
+    if host == "claude" and any(
+            argument == CLAUDE_CHANNEL_FLAG
+            or argument.startswith(CLAUDE_CHANNEL_FLAG + "=")
+            for argument in host_options):
+        return _launch_error(
+            "this command already supplies the Antiphon development channel; "
+            f"remove `{CLAUDE_CHANNEL_FLAG}` from arguments after `--`")
+    incompatible = _incompatible_launch_flag(host, host_args)
+    if incompatible is not None:
+        return _launch_error(
+            f"host option `{incompatible}` is not compatible with a ready "
+            "Antiphon session; remove it or start the host manually without "
+            "`antiphon launch`")
+    if host == "claude":
+        incompatible_env = next(
+            (name for name in CLAUDE_INCOMPATIBLE_LAUNCH_ENV
+             if os.environ.get(name, "").strip().lower()
+             in LAUNCH_TRUE_VALUES), None)
+        if incompatible_env is not None:
+            return _launch_error(
+                f"environment variable `{incompatible_env}` disables Claude's "
+                "configured Antiphon surfaces; unset it, then retry, or start "
+                "the intentionally incompatible host manually")
+
+    try:
+        process_cwd = os.path.abspath(os.getcwd())
+    except OSError as error:
+        return _launch_error(
+            "the current directory is unavailable "
+            f"({error.strerror or type(error).__name__})", code=1)
+    cwd = project_dir()
+    if os.path.realpath(cwd) != os.path.realpath(process_cwd):
+        return _launch_error(
+            "`ANTIPHON_CWD` points to a different project than the current "
+            "directory; change to that project or unset it and run "
+            "`antiphon setup` here, then retry", code=1)
+
+    executable = _which(host)
+    if not executable:
+        return _launch_error(f"`{host}` was not found on PATH", code=1)
+    if not _launch_configuration_ready(cwd):
+        return _launch_error(
+            "project configuration is incomplete; run `antiphon setup`, then retry",
+            code=1)
+
+    environment = dict(os.environ)
+    if "ANTIPHON_CWD" in environment:
+        # Preserve the explicit boundary but make it absolute before the host
+        # can change directories internally and reinterpret a relative value.
+        environment["ANTIPHON_CWD"] = cwd
+    if requested is not None:
+        environment["ANTIPHON_NAME"] = requested
+    argv = [executable]
+    if host == "claude":
+        argv.extend((CLAUDE_CHANNEL_FLAG, "server:antiphon"))
+    argv.extend(host_args)
+    try:
+        # `_which` returned an absolute path. Execute that exact file rather
+        # than asking PATH a second time after the preflight decision.
+        os.execve(executable, argv, environment)
+    except OSError as error:
+        return _launch_error(
+            f"could not start `{host}` ({error.strerror or type(error).__name__})",
+            code=1)
+    return 0                         # reached only by a test double for exec
 
 
 # ---------- status, for humans ----------
@@ -9543,7 +10192,7 @@ def _banner_key(banner):
 def _package_root():
     """The directory holding `package.json` for the copy running right now.
 
-    `realpath` because `bin/antiphon.mjs` hands Python an unnormalised
+    `realpath` because the installed dispatcher can hand Python an unnormalised
     `bin/../lib/antiphon.py`, and because a Homebrew or `npm link` shim on PATH
     resolves into a completely different tree — measured, comparing the
     unresolved paths calls a working `npm link` install broken."""
@@ -9824,12 +10473,18 @@ def _doctor_install(report, hooks_configured):
 
 
 # The two long-lived servers this package runs, by the script in their argv.
-# The wrapper (`node …/bin/antiphon mcp`) only spawns and is not matched.
+# A legacy Node dispatcher (`node …/bin/antiphon mcp`) only spawned and is not
+# matched; the current Python dispatcher execs the server entrypoint itself.
 _PY_SERVER = re.compile(r"(\S+/lib/antiphon\.py)\s+mcp(?:\s|$)")
 _NODE_SERVER = re.compile(r"(\S+/lib/channel\.mjs)(?:\s|$)")
 # What a server loads once at start. A change to any of these after that
 # start is code the process is provably not running.
-CODE_FILES = ("lib/antiphon.py", "lib/peers.py", "lib/channel.mjs", "package.json")
+CODE_FILES = (
+    "lib/antiphon.py", "lib/peers.py", "lib/ledger.py", "lib/workers.py",
+    "lib/channel.mjs", "lib/identity.mjs", "package.json",
+)
+CODE_SIGNATURE_FILE_LIMIT = 4 * 1024 * 1024
+CODE_SIGNATURE_TOTAL_LIMIT = 16 * 1024 * 1024
 
 
 def _parse_process_table(text):
@@ -9899,6 +10554,58 @@ def _code_changed_at(root):
     return latest
 
 
+def _code_signature(root):
+    """A bounded identity for every byte a long-lived server can load.
+
+    Same package versions do not imply same bytes.  Doctor uses this only to
+    compare an in-scope registered server from one install with the active
+    hook install; any missing, unsafe, changing, oversized, or unreadable file
+    makes equivalence unproved rather than hashing a partial tree.
+    """
+    digest = hashlib.sha256()
+    total = 0
+    for name in CODE_FILES:
+        path = os.path.join(root, name)
+        fd = None
+        try:
+            if not hasattr(os, "O_NOFOLLOW") and os.path.islink(path):
+                return None
+            fd = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+            before = os.fstat(fd)
+            if (not stat.S_ISREG(before.st_mode)
+                    or before.st_size < 0
+                    or before.st_size > CODE_SIGNATURE_FILE_LIMIT
+                    or total + before.st_size > CODE_SIGNATURE_TOTAL_LIMIT):
+                return None
+            encoded = name.encode("utf-8")
+            digest.update(len(encoded).to_bytes(4, "big"))
+            digest.update(encoded)
+            digest.update(before.st_size.to_bytes(8, "big"))
+            measured = 0
+            while True:
+                block = os.read(fd, min(1024 * 1024,
+                                        CODE_SIGNATURE_FILE_LIMIT - measured + 1))
+                if not block:
+                    break
+                measured += len(block)
+                if measured > before.st_size:
+                    return None
+                digest.update(block)
+            after = os.fstat(fd)
+            identity = lambda value: (value.st_dev, value.st_ino,
+                                      value.st_size, value.st_mtime_ns)
+            if measured != before.st_size or identity(after) != identity(before):
+                return None
+            total += measured
+        except (OSError, UnicodeError, OverflowError):
+            return None
+        finally:
+            if fd is not None:
+                with contextlib.suppress(OSError):
+                    os.close(fd)
+    return digest.hexdigest()
+
+
 def _when(stamp):
     local = time.localtime(stamp)
     if local[:3] == time.localtime()[:3]:
@@ -9955,11 +10662,14 @@ def _doctor_running(report, cwd):
     found = _which("antiphon")
     install = (os.path.dirname(os.path.dirname(os.path.realpath(found)))
                if found else _package_root())
+    install_real = os.path.realpath(install)
+    install_signature = _code_signature(install)
     here = _package_root()
     fresh, elsewhere = 0, 0
     for pid, started, side, script in sorted(servers):
         root = os.path.dirname(os.path.dirname(script))
-        if pid not in registered and os.path.realpath(root) != os.path.realpath(install):
+        root_real = os.path.realpath(root)
+        if pid not in registered and root_real != install_real:
             elsewhere += 1
             continue
         who = (f'{side} "{names[pid]}" pid {pid}' if pid in names
@@ -9971,14 +10681,24 @@ def _doctor_running(report, cwd):
             report.bad(f"running: {who} runs from {root}, {where} — an orphan; "
                        "stop it")
             continue
+        restart = ("restart that Claude Code session, or reconnect the "
+                   "antiphon MCP server" if side == "claude channel"
+                   else "restart that Codex session")
         if int(changed) > started:
             origin = "" if os.path.realpath(root) == here else f" (from {root})"
-            restart = ("restart that Claude Code session, or reconnect the "
-                       "antiphon MCP server" if side == "claude channel"
-                       else "restart that Codex session")
             report.bad(f"running: {who} started {_when(started)}, its code "
                        f"changed {_when(changed)}{origin} — {restart}")
             continue
+        if root_real != install_real:
+            serving_signature = _code_signature(root)
+            if install_signature is None or serving_signature is None:
+                report.bad(f"running: {who}'s code equivalence to the active "
+                           f"hook install could not be proved — {restart}")
+                continue
+            if serving_signature != install_signature:
+                report.bad(f"running: {who} runs a different code copy from "
+                           f"the active hooks — {restart}")
+                continue
         fresh += 1
     if fresh:
         report.ok(f"running: {fresh} server(s) on their current code")
@@ -10002,10 +10722,9 @@ def _doctor_interpreters(report):
         report.bad("python: this run is %d.%d.%d, below the %s floor"
                    % (running + (floor,)))
 
-    # `bin/antiphon.mjs` spawns a bare `python3`, so the interpreter every hook
-    # gets is whatever PATH resolves — measured on this machine, Anaconda 3.14
-    # rather than the /usr/bin 3.9 the suite runs under. Reporting only
-    # `sys.version_info` answers a different question from the diagnostic one.
+    # The dispatcher's shebang resolves a `python3`, so the interpreter every
+    # hook gets is whatever PATH resolves. Reporting only `sys.version_info`
+    # answers a different question from the diagnostic one.
     hook_python = _which("python3")
     if not hook_python:
         report.bad("python: PATH has no `python3` — every hook the wrapper "
@@ -10364,7 +11083,14 @@ def _doctor_deliveries(report, cwd):
     an hour while the tool had said delivered. A note, never ✗ — a peer that
     has not taken a turn is not a fault — and read-only: the ledger is read,
     never marked, by a diagnosis."""
-    ages = [age for _entry, age in ledger.awaiting_receipt(cwd, time.time())]
+    waiting = ledger.awaiting_receipt(cwd, time.time())
+    ages = [age for entry, age in waiting if entry["state"] == "sent"]
+    unknown = [(entry, age) for entry, age in waiting
+               if entry["state"] == "unknown"]
+    unknown_recent = [(entry, age) for entry, age in unknown
+                      if age <= PAGE_HORIZON]
+    unknown_beyond = [(entry, age) for entry, age in unknown
+                      if age > PAGE_HORIZON]
     late = [age for age in ages if RECEIPT_PATIENCE < age <= PAGE_HORIZON]
     beyond = [age for age in ages if age > PAGE_HORIZON]
     horizon = (f"{len(beyond)} older than the {PAGE_HORIZON // 3600}-hour page "
@@ -10380,6 +11106,69 @@ def _doctor_deliveries(report, cwd):
                     + (f"; {horizon}" if horizon else ""))
     elif beyond:
         report.note(f"deliveries: {horizon} — not a fault this diagnosis can judge")
+    if unknown_recent:
+        report.note(
+            f"deliveries: {len(unknown_recent)} transport outcome"
+            f"{'s are' if len(unknown_recent) != 1 else ' is'} unknown within "
+            "the receipt horizon; do not retry "
+            "automatically — a later peer transcript receipt can resolve it")
+    if unknown_beyond:
+        report.note(
+            f"deliveries: {len(unknown_beyond)} unknown transport outcome"
+            f"{'s are' if len(unknown_beyond) != 1 else ' is'} older than the "
+            f"{PAGE_HORIZON // 3600}-hour page horizon; a receipt that old can "
+            "no longer be observed — do not retry automatically")
+    receipt_health = ledger.pending_receipt_health(cwd)
+    if receipt_health["store_invalid"]:
+        report.bad(
+            "delivery receipts: pending-receipt store is not a readable plain "
+            "directory; the affected page cursor cannot advance safely — "
+            "repair permissions or replace "
+            ".antiphon/deliveries/pending-receipts with a private directory")
+    if receipt_health["invalid"]:
+        count = receipt_health["invalid"]
+        report.bad(
+            f"delivery receipts: {count} pending-receipt record"
+            f"{'s are' if count != 1 else ' is'} invalid; the affected page "
+            "cursor cannot advance safely — inspect and remove invalid files "
+            "under .antiphon/deliveries/pending-receipts")
+    if receipt_health["diagnostics_invalid"]:
+        report.bad("delivery receipts: pending-receipt diagnostics are invalid; "
+                   "receipt loss cannot be accounted for")
+    if receipt_health["pending"]:
+        count = receipt_health["pending"]
+        report.note(
+            f"delivery receipts: {count} receipt proof"
+            f"{'s are' if count != 1 else ' is'} retained for sender-row "
+            f"reconciliation (oldest {_age_words(receipt_health['oldest'])})")
+    lost = receipt_health["evicted"] + receipt_health["expired"]
+    if lost:
+        report.note(
+            f"delivery receipts: {lost} bounded pending proof"
+            f"{'s were' if lost != 1 else ' was'} retired "
+            f"({receipt_health['evicted']} capacity, "
+            f"{receipt_health['expired']} expired); an unusually late sender "
+            "may retain an unresolved delivery")
+    stop_health = ledger.stop_outcome_health(cwd)
+    if stop_health["store_invalid"]:
+        report.bad(
+            "Stop suppression store is not a readable plain directory; "
+            "automatic retry safety cannot be proved — repair permissions or "
+            "replace .antiphon/deliveries/stop-outcomes with a private directory")
+    if stop_health["invalid"]:
+        count = stop_health["invalid"]
+        report.bad(
+            f"Stop suppression: {count} invalid exact outcome record"
+            f"{'s' if count != 1 else ''}; automatic retry safety cannot be "
+            "proved for the affected turn — inspect and remove invalid files "
+            "under .antiphon/deliveries/stop-outcomes")
+    if stop_health["pending"]:
+        count = stop_health["pending"]
+        report.note(
+            f"Stop suppression: {count} exact Stop outcome"
+            f"{'s are' if count != 1 else ' is'} retained after a cursor write "
+            f"failure (oldest {_age_words(stop_health['oldest'])}); automatic "
+            "retry is suppressed")
 
 
 def _doctor_codex_tool_shapes(report, cwd):
@@ -11607,6 +12396,68 @@ def print_summary(side="claude"):
 # ---------- managed workers: delegate, and follow a task by id ----------
 
 TASK_MARK = "[Antiphon task {task_id}]"
+# These are the only conservative post-transport states the Node wrapper may
+# return to an agent.  A contract test reads its literal set so adding a Python
+# outcome cannot silently turn delivered work into a retryable wrapper error.
+INCOMPLETE_HANDOFF_STATES = ("handing", "tracking_incomplete", "missing")
+
+
+def _update_handoff_state(cwd, task_id, state):
+    """A total post-transport task transition.
+
+    Once a peer can know the id, a task-store syscall failure is tracking
+    damage, not permission to lose the public result or retry the transport.
+    """
+    try:
+        return workers.update_task(
+            cwd, task_id, lambda changed: changed.update(state=state))
+    except OSError:
+        return False
+
+
+def _abandon_handoff(cwd, task_id, detail):
+    """Finish a definitely unsent hand-off preparation without lying.
+
+    The normal case removes the private preparation. If removal itself fails,
+    retain an explicit `delivery_refused` state so `status` cannot make a
+    definite refusal look like an in-flight send.
+    """
+    if workers._discard_record(cwd, task_id):
+        return False, f"not delegated: {detail}"
+    _update_handoff_state(cwd, task_id, "delivery_refused")
+    retained = workers.read_task(cwd, task_id)
+    state = retained["state"] if retained is not None else "unreadable"
+    return False, (
+        f"not delegated: {detail}; local preparation cleanup was incomplete; "
+        f"task {task_id} remains in state {state!r} and was not delivered")
+
+
+def _incomplete_handoff(cwd, task_id, *, kind, to, task_class, transport,
+                        outcome_unknown=False):
+    """Keep a peer-visible id after transport can no longer be rolled back."""
+    _update_handoff_state(cwd, task_id, "tracking_incomplete")
+    retained = workers.read_task(cwd, task_id)
+    retained_state = retained["state"] if retained is not None else "missing"
+    if retained_state not in INCOMPLETE_HANDOFF_STATES:
+        # The peer may already act.  An unexpected durable read-back is still
+        # tracking damage, never permission for the wrapper to reject the
+        # response and invite a duplicate delivery.
+        retained_state = "tracking_incomplete"
+    if outcome_unknown:
+        movement = "may have been queued" if transport == "queue" else "may have been delivered"
+    else:
+        movement = "was queued" if transport == "queue" else "was delivered"
+    words = (
+        f"Task message {task_id} {movement} for {ledger.LABEL[kind]} peer "
+        f"{to!r}, but tracking is incomplete; do not retry automatically "
+        "because the peer may already act on it.")
+    if retained is None:
+        words += " Its local task record is missing."
+    return True, {
+        "task_id": task_id, "delivery_id": task_id,
+        "state": retained_state, "tracking": "incomplete",
+        "to": to, "kind": kind, "task_class": task_class, "text": words,
+    }
 
 
 def _delegate(cwd, payload, sender=None, side=None, env=None):
@@ -11616,25 +12467,32 @@ def _delegate(cwd, payload, sender=None, side=None, env=None):
     theirs; the CLI does not); `kind` defaults to the other side. With `to`,
     the task is handed to that running named peer of `kind` over the ordinary
     addressed send and recorded as `handed`; without it a fresh worker of
-    `kind` is started (lib/workers.py). Every refusal names its reason and
-    leaves no record."""
+    `kind` is started (lib/workers.py). A normal pre-transport refusal names
+    its reason and removes its private preparation; if that cleanup itself
+    fails, the preparation is retained visibly as `delivery_refused`."""
     env = os.environ if env is None else env
     text = payload.get("text")
     if not isinstance(text, str) or not text.strip():
         return False, "not delegated: the task text is empty"
     text = text.strip()
+    text_bytes = _utf8_bytes(text)
+    if text_bytes is None:
+        return False, f"not delegated: {UTF8_TEXT_REFUSAL}"
+    kind_present = "kind" in payload
     kind = payload.get("kind")
-    if kind is None and side in OTHER_SIDE:
+    if not kind_present and side in OTHER_SIDE:
         kind = OTHER_SIDE[side][0]
     if kind not in workers.KINDS:
         return False, "not delegated: name a kind (claude or codex)"
-    task_class = payload.get("task") or "read"
+    task_class = payload.get("task") if "task" in payload else "read"
     if task_class not in workers.CLASSES:
         return False, "not delegated: task must be read or write"
     to = payload.get("to")
-    if to is not None and (not isinstance(to, str) or not to.strip() or to == NO_ALIAS):
-        return False, "not delegated: to must name a running peer"
+    if to is not None and not peers.valid_name(to):
+        return False, "not delegated: to must be a usable peer name"
     timeout = payload.get("timeout")
+    if isinstance(timeout, float) and not math.isfinite(timeout):
+        return False, "not delegated: timeout must be a finite number of seconds"
     timeout = timeout if isinstance(timeout, (int, float)) and not isinstance(timeout, bool) \
         else workers.DEFAULT_TIMEOUT
     if to and side is None:
@@ -11654,13 +12512,24 @@ def _delegate(cwd, payload, sender=None, side=None, env=None):
         return False, str(refusal)
     sender_side = side or OTHER_SIDE[kind][0]
     who = sender_alias(sender) if sender is not None else claimed_alias(cwd, sender_side, None)
-    digest = hashlib.sha256(text.encode()).hexdigest()
-    size = len(text.encode())
+    digest = hashlib.sha256(text_bytes).hexdigest()
+    size = len(text_bytes)
     hop = workers.current_hop(env) + 1
     if to:
-        # Sent first, recorded after: a refusal leaves no record. The task id
-        # is on the message and on the ledger, so the peer's receipt names it.
+        # Prepare first, without holding the task lock over transport. A task
+        # store that cannot describe the hand-off must stop it before the peer
+        # can act; a transport refusal discards this private preparation.
         task_id = delivery_id()
+        try:
+            prepared = workers.new_task(
+                cwd, kind=kind, task_class=task_class, sha256=digest,
+                size=size, timeout=timeout, hop=hop, to=to,
+                task_id=task_id, state="handing")
+        except (ValueError, OSError) as error:
+            return False, f"not delegated: {error}"
+        if workers.read_task(cwd, task_id) != prepared:
+            return _abandon_handoff(
+                cwd, task_id, "the task preparation could not be read back")
         mark = TASK_MARK.format(task_id=task_id)
         # The mark stays outside the parked file: an envelope names the task
         # too, so the peer knows what it is before it reads the words.
@@ -11672,10 +12541,11 @@ def _delegate(cwd, payload, sender=None, side=None, env=None):
                 attachment, refusal = _spill(cwd, text, who, task_id,
                                              recipient=(kind, to, sender_side))
                 if refusal is not None:
-                    return False, f"not delegated: {refusal}"
+                    return _abandon_handoff(cwd, task_id, refusal)
                 outgoing, parked = f"{mark} {attachment.envelope}", attachment
                 composed = (f"{SIDE_LABELS[sender_side][1]} "
                             f"{queue_label(who, task_id, True)} {outgoing}")
+            attempted_at = time.time()
             ok, detail = send_to_codex(cwd, composed, to, sender=who)
             transport, proof = "queue", (detail or "registered")
             how = "queued for it; Codex reads its queue at its next turn"
@@ -11685,30 +12555,114 @@ def _delegate(cwd, payload, sender=None, side=None, env=None):
                 attachment, refusal = _spill(cwd, text, who, task_id,
                                              recipient=(kind, to, sender_side))
                 if refusal is not None:
-                    return False, f"not delegated: {refusal}"
+                    return _abandon_handoff(cwd, task_id, refusal)
                 outgoing, parked = f"{mark} {attachment.envelope}", attachment
+            attempted_at = time.time()
             ok, detail = send_to_claude(cwd, outgoing, to, sender_alias=who,
                                         message_id=task_id, sender_kind=sender_side)
             transport, proof = "channel", "channel"
             how = "delivered to its channel"
         if not ok:
+            if getattr(detail, "delivery_unknown", False):
+                attachment_name = os.path.basename(parked.path) if parked else None
+                unknown_reason = redact_private(str(detail))
+                unknown_preview = redact_private(text)
+                unknown_written = ledger.record_unknown(
+                    cwd, task_id, sender=who or NO_ALIAS, sender_kind=sender_side,
+                    to_kind=kind, to_alias=to, transport=transport,
+                    sha256=digest, size=size, attachment=attachment_name,
+                    reason=unknown_reason, preview=unknown_preview,
+                    at=attempted_at)
+                unknown_record = (
+                    ledger.read_entry(cwd, task_id) if unknown_written else None)
+                unknown_common = {
+                    "id": task_id, "sender": who or NO_ALIAS,
+                    "sender_kind": sender_side, "to_kind": kind,
+                    "to_alias": to, "transport": transport,
+                    "proof": "unproven",
+                    "sha256": digest, "size": size,
+                    "attachment": attachment_name,
+                    "sent_at": attempted_at,
+                }
+                immutable_match = unknown_record is not None and all(
+                    unknown_record.get(key) == value
+                    for key, value in unknown_common.items())
+                still_unknown = immutable_match and all((
+                    unknown_record.get("version") == ledger.LEDGER_VERSION,
+                    unknown_record.get("state") == "unknown",
+                    unknown_record.get("reason") == str(unknown_reason)[
+                        :ledger.REASON_LENGTH],
+                    unknown_record.get("preview") == " ".join(
+                        str(unknown_preview).split())[:ledger.PREVIEW_LENGTH],
+                ))
+                receipt_won = immutable_match and all((
+                    unknown_record.get("version") == ledger.LEGACY_LEDGER_VERSION,
+                    unknown_record.get("state") == "sent",
+                    unknown_record.get("reason") is None,
+                    unknown_record.get("preview") is None,
+                    (unknown_record.get("received_at") is not None
+                     or unknown_record.get("read_at") is not None),
+                ))
+                unknown_tracked = bool(unknown_written and (
+                    still_unknown or receipt_won))
+                incomplete = _incomplete_handoff(
+                    cwd, task_id, kind=kind, to=to, task_class=task_class,
+                    transport=transport, outcome_unknown=True)
+                incomplete[1]["delivery_recorded"] = unknown_tracked
+                if not unknown_tracked:
+                    incomplete[1]["text"] += LEDGER_UNWRITTEN
+                return incomplete
             if parked is not None and not parked.reused:
                 drop_attachment(cwd, parked.path)
-            return False, f"not delegated: {redact_private(str(detail))}"
-        try:
-            workers.new_task(cwd, kind=kind, task_class=task_class, sha256=digest,
-                             size=size, timeout=timeout, hop=hop, to=to, task_id=task_id)
-            workers.update_task(cwd, task_id, lambda changed: changed.update(state="handed"))
-        except (ValueError, OSError) as error:
-            print(f"antiphon: the task was handed but not recorded: {error}", file=sys.stderr)
-        ledger.record_sent(cwd, task_id, sender=who or NO_ALIAS, to_kind=kind, to_alias=to,
-                           transport=transport, proof=proof, sha256=digest, size=size,
-                           attachment=(os.path.basename(parked.path) if parked else None),
-                           sender_kind=sender_side)
+            return _abandon_handoff(cwd, task_id, redact_private(str(detail)))
+        old_listener = detail == OLD_LISTENER
+        attachment_name = os.path.basename(parked.path) if parked else None
+        sender_name = who or NO_ALIAS
+        ledger_written = ledger.record_sent(
+            cwd, task_id, sender=sender_name, to_kind=kind, to_alias=to,
+            transport=transport, proof=proof, sha256=digest, size=size,
+            attachment=attachment_name,
+            sender_kind=sender_side, at=attempted_at)
+        delivery_record = ledger.read_entry(cwd, task_id) if ledger_written else None
+        expected_delivery = {
+            "id": task_id, "sender": sender_name, "sender_kind": sender_side,
+            "to_kind": kind, "to_alias": to, "transport": transport,
+            "proof": proof, "state": "sent", "sha256": digest,
+            "size": size, "attachment": attachment_name,
+            "sent_at": attempted_at,
+        }
+        delivery_tracked = delivery_record is not None and all(
+            delivery_record.get(key) == value
+            for key, value in expected_delivery.items())
+        # Only a read-back-validated ledger may move the preparation to
+        # `handed`. If the ledger write lies or cannot be read back, the task
+        # remains visibly incomplete instead of briefly claiming finality.
+        task_written = delivery_tracked and _update_handoff_state(
+            cwd, task_id, "handed")
+        task_record = workers.read_task(cwd, task_id) if task_written else None
+        expected_task = dict(
+            prepared, state="handed", version=workers.LEGACY_TASK_VERSION)
+        tracked = task_record == expected_task and delivery_tracked
+        if not tracked:
+            # The transport already succeeded, so the id printed inside the
+            # peer's message must keep resolving locally. This state consumes
+            # no worker slot and is terminal from the bridge's perspective. If
+            # even this transition cannot be written, the existing `handing`
+            # record remains an honest incomplete preparation rather than
+            # disappearing after its words left.
+            incomplete = _incomplete_handoff(
+                cwd, task_id, kind=kind, to=to, task_class=task_class,
+                transport=transport)
+            if old_listener:
+                incomplete[1]["text"] += OLD_LISTENER_WORDS
+            return incomplete
         words = (f"Handed task {task_id} to {ledger.LABEL[kind]} peer {to!r} ({how}); "
                  "antiphon status shows the receipt, and the peer answers in its own "
                  "words — nothing is collected by id.")
-        return True, {"task_id": task_id, "state": "handed", "to": to, "kind": kind,
+        if old_listener:
+            words += OLD_LISTENER_WORDS
+        return True, {"task_id": task_id, "delivery_id": task_id,
+                      "state": "handed", "to": to, "kind": kind,
                       "task_class": task_class, "text": words}
     try:
         record = workers.accept(cwd, kind=kind, task_class=task_class, sha256=digest,
@@ -11740,7 +12694,8 @@ def _delegate_tool(cwd, arguments, sender, side):
     ok, answer = _delegate(cwd, arguments, sender, side)
     if not ok:
         return _tool_error(f"Not delegated: {answer[len('not delegated: '):] if answer.startswith('not delegated: ') else answer}")
-    return {"content": [{"type": "text", "text": answer["text"]}]}
+    return {"content": [{"type": "text",
+                          "text": json.dumps(answer, indent=1, ensure_ascii=False)}]}
 
 
 # Seconds the Codex MCP server may wait inside one antiphon_task result call.
@@ -11813,7 +12768,7 @@ def task(*args):
     if action == "delegate":
         try:
             payload = json.load(sys.stdin)
-        except (json.JSONDecodeError, ValueError):
+        except (json.JSONDecodeError, ValueError, RecursionError):
             payload = {}
         if not isinstance(payload, dict):
             payload = {}
@@ -11859,7 +12814,8 @@ def task(*args):
 
 
 COMMANDS = {
-    "setup": setup, "status": status, "doctor": doctor, "catch-up": catch_up,
+    "setup": setup, "launch": launch, "status": status, "doctor": doctor,
+    "catch-up": catch_up,
     "task": task,
     "sources": sources, "retrieve": retrieve,
     "hook": hook, "summary": print_summary,

@@ -1,0 +1,38 @@
+#!/usr/bin/env python3
+"""Installed Antiphon dispatcher; every long-lived target replaces this process."""
+
+import os
+import shutil
+import sys
+
+
+HERE = os.path.dirname(os.path.realpath(__file__))
+ROOT = os.path.dirname(HERE)
+
+
+def _exec(executable, argv, label):
+    try:
+        os.execv(executable, argv)
+    except OSError as error:
+        print(f"antiphon: could not start {label}: {error.strerror or error}",
+              file=sys.stderr)
+        return 1
+
+
+def main():
+    arguments = sys.argv[1:]
+    if arguments[:1] == ["channel"]:
+        node = shutil.which("node")
+        if node is None:
+            print("antiphon: node was not found on PATH", file=sys.stderr)
+            return 1
+        return _exec(
+            node, [node, os.path.join(ROOT, "lib", "channel.mjs"),
+                   *arguments[1:]], "the channel server")
+    script = os.path.join(ROOT, "lib", "antiphon.py")
+    return _exec(sys.executable, [sys.executable, script, *arguments],
+                 "the Python bridge")
+
+
+if __name__ == "__main__":
+    sys.exit(main() or 0)
