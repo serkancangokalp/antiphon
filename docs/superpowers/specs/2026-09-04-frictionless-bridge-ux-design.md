@@ -269,9 +269,13 @@ use proves the need; transcript inference is out of scope.
 - The census reports all files discovered beneath each supplied root, but
   splits statistics into `production` and `excluded` scopes.
 - The Claude input is the host's projects root. Its `production` scope is the
-  union of immediate `*.jsonl` files inside each immediate project directory;
-  deeper files such as `project/subagents/*.jsonl` are `excluded`, matching
-  production's per-project discovery.
+  union of immediate names ending in `.jsonl` inside each immediate project
+  directory. This is a suffix rule, not a shell-glob dotfile rule: immediate
+  dot-prefixed and zero-length JSONL files stay candidates, matching the
+  durable catalog's monotone authority. Recent fallback uses the same set but
+  gives filesystem-safe, visible, non-empty regular transcripts priority. Deeper files such as
+  `project/subagents/*.jsonl` are `excluded`, matching production's per-project
+  discovery.
 - Codex `production` contains recursive `rollout-*.jsonl` files only. Other
   JSONL files are `excluded`, matching production discovery.
 - Each scope independently reports file count, malformed lines, user messages,

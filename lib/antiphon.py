@@ -2514,6 +2514,46 @@ def _directory_stamp(path):
         return None
 
 
+def _claude_candidate_names(directory):
+    """Return every immediate name ending in ``.jsonl``.
+
+    The durable catalog has always treated the suffix as the candidate rule,
+    including dot-prefixed and zero-length entries. Keeping the rule at the
+    name boundary also preserves catalog enumeration's names-only contract.
+    """
+    try:
+        with os.scandir(directory) as stream:
+            return [entry.name for entry in stream
+                    if entry.name.endswith(".jsonl")]
+    except OSError:
+        return None
+
+
+def _ordered_claude_candidate_paths(directory):
+    """Order the shared candidate set for bounded fallback discovery."""
+    names = _claude_candidate_names(directory)
+    if names is None:
+        return None
+    candidates = []
+    for name in names:
+        path = os.path.join(directory, name)
+        try:
+            info = os.lstat(path)
+            mtime = info.st_mtime
+            ordinary = (_filesystem_safe_relative(name)
+                        and not name.startswith(".")
+                        and stat.S_ISREG(info.st_mode)
+                        and info.st_size > 0)
+        except OSError:
+            # The name is still a candidate.  The descriptor-safe opener owns
+            # the final classification and will report the raced metadata.
+            mtime = 0.0
+            ordinary = False
+        candidates.append((path, mtime, ordinary))
+    candidates.sort(key=lambda item: (not item[2], -item[1], item[0]))
+    return [path for path, _mtime, _ordinary in candidates]
+
+
 def _enumerate_catalog_candidates(cwd, kind):
     """Capture names only; transcript descriptors are opened by the batch."""
     if kind == "claude":
@@ -2521,10 +2561,8 @@ def _enumerate_catalog_candidates(cwd, kind):
         if not directory:
             return CatalogEnumeration(kind, (), None)
         prefix = os.path.relpath(directory, CLAUDE_PROJECTS)
-        try:
-            names = [entry.name for entry in os.scandir(directory)
-                     if entry.name.endswith(".jsonl")]
-        except OSError:
+        names = _claude_candidate_names(directory)
+        if names is None:
             return None
         relative = tuple(sorted(os.path.join(prefix, name) for name in names))
         return CatalogEnumeration(kind, relative, _directory_stamp(directory))
@@ -3605,8 +3643,9 @@ def _find_claude_project_dir(cwd):
     candidates.sort(key=mtime, reverse=True)               # most recently used first
     for directory in candidates:
         prefix = os.path.relpath(directory, CLAUDE_PROJECTS)
-        transcripts = sorted(glob.glob(os.path.join(directory, "*.jsonl")),
-                             key=mtime, reverse=True)
+        transcripts = _ordered_claude_candidate_paths(directory)
+        if transcripts is None:
+            continue
         for path in transcripts[:3]:
             discovered = _discovered_source_path(
                 path, CLAUDE_PROJECTS, "claude", prefix)
@@ -3635,18 +3674,12 @@ def claude_transcripts(cwd):
     directory = claude_project_dir(cwd)
     if not directory:
         return []
-    files = []
-    for path in glob.glob(os.path.join(directory, "*.jsonl")):
-        try:
-            info = os.lstat(path)
-        except OSError:
-            continue
-        if info.st_size > 0 or stat.S_ISLNK(info.st_mode):
-            files.append((info.st_mtime, path))
-    files.sort(key=lambda item: item[0], reverse=True)
+    paths = _ordered_claude_candidate_paths(directory)
+    if paths is None:
+        return []
     prefix = os.path.relpath(directory, CLAUDE_PROJECTS)
     return [_discovered_source_path(path, CLAUDE_PROJECTS, "claude", prefix)
-            for _mtime, path in files]
+            for path in paths]
 
 
 def claude_events(cwd, positions=None, since=None, visible_record_limit=None,

@@ -138,6 +138,11 @@
   open with component-by-component no-follow descriptors, then use each Claude
   project's immediate transcripts plus Codex's recursive rollout files;
   filesystem names outside strict UTF-8 are refused before content read.**
+- [x] **Step 3a: Bind Claude's candidate boundary across all three readers.**
+  Direct fallback, durable enumeration, and the census use the same immediate
+  `.jsonl` suffix rule, including dot-prefixed and zero-length candidates.
+  Filesystem-safe, visible, non-empty regular files retain fallback priority, and a single
+  fixture compares the three admitted sets.
 - [x] **Step 4: Run the real aggregate census and record scoped counts.** The
   2026-09-04 release-corpus refresh found Claude 98 production / 448 excluded
   files, with all five `fork-boilerplate` tags excluded, and Codex 281
