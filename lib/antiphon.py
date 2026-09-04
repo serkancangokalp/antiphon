@@ -6943,7 +6943,7 @@ def _worker_report(cwd):
     missing_receipts = sum(
         1 for record in records
         if workers.accepted_start_recovery(cwd, record)
-        == "git_completion_receipt_missing")
+        == workers.START_RECOVERY_GIT_MISSING)
     if missing_receipts:
         noun = "task has" if missing_receipts == 1 else "tasks have"
         line += (f"; {missing_receipts} accepted {noun} an unresolved Git "
@@ -11201,7 +11201,7 @@ def _doctor_workers(report, cwd):
         recovery = workers.accepted_start_recovery(cwd, record)
         if recovery is not None:
             recoveries[recovery].append(record)
-    missing_records = recoveries["git_completion_receipt_missing"]
+    missing_records = recoveries[workers.START_RECOVERY_GIT_MISSING]
     missing = len(missing_records)
     if missing:
         noun = "task has" if missing == 1 else "tasks have"
@@ -11212,7 +11212,7 @@ def _doctor_workers(report, cwd):
             "and worker slot is kept; do not retry or delete it automatically; "
             "run `antiphon task status <id>` and follow README `Recovering a "
             "missing Git completion receipt`")
-    unknown = len(recoveries["unknown"])
+    unknown = len(recoveries[workers.START_RECOVERY_UNKNOWN])
     if unknown:
         noun = "task has" if unknown == 1 else "tasks have"
         report.note(
@@ -12821,9 +12821,9 @@ def _task_lines(records, cwd=None):
                 f"{record['state']:<9} {when}")
         recovery = (workers.accepted_start_recovery(cwd, record)
                     if cwd is not None else None)
-        if recovery == "git_completion_receipt_missing":
+        if recovery == workers.START_RECOVERY_GIT_MISSING:
             line += "  [Git completion receipt missing; manual intervention required]"
-        elif recovery == "unknown":
+        elif recovery == workers.START_RECOVERY_UNKNOWN:
             line += "  [start-recovery evidence unreadable; do not retry]"
         lines.append(line)
     return lines

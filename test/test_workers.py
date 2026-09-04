@@ -954,6 +954,37 @@ class AdapterTest(unittest.TestCase):
         workers.check_hop({})
         workers.check_hop({"ANTIPHON_HOP": "1", "ANTIPHON_HOP_BUDGET": "2"})
 
+    def test_a_child_hop_must_fit_the_cross_runtime_integer_contract(self):
+        maximum = workers.MAX_SAFE_INTEGER
+        self.assertEqual(
+            workers.hop_budget({"ANTIPHON_HOP_BUDGET": str(maximum + 99)}),
+            maximum)
+        workers.check_hop({
+            "ANTIPHON_HOP": str(maximum - 1),
+            "ANTIPHON_HOP_BUDGET": str(maximum),
+        })
+        with self.assertRaisesRegex(workers.Refused, "largest supported hop"):
+            workers.check_hop({
+                "ANTIPHON_HOP": str(maximum),
+                "ANTIPHON_HOP_BUDGET": str(maximum + 1),
+            })
+
+    def test_task_integer_fields_are_bounded_for_the_node_reader(self):
+        with tempfile.TemporaryDirectory() as project:
+            record = workers.new_task(
+                project, kind="codex", task_class="read", sha256=SHA,
+                size=workers.MAX_SAFE_INTEGER, hop=workers.MAX_SAFE_INTEGER)
+            self.assertEqual(workers.read_task(project, record["id"]), record)
+            for field, value in (
+                    ("size", workers.MAX_SAFE_INTEGER + 1),
+                    ("hop", workers.MAX_SAFE_INTEGER + 1),
+                    ("pid", workers.MAX_PID + 1),
+                    ("exit_code", workers.MAX_SAFE_INTEGER + 1),
+                    ("exit_code", -workers.MAX_SAFE_INTEGER - 1)):
+                changed = dict(record, **{field: value})
+                with self.subTest(field=field, value=value):
+                    self.assertFalse(workers._valid(changed, record["id"]))
+
     def test_a_hop_that_is_not_a_count_is_refused_never_read_as_zero(self):
         """Review 2026-09-03: a negative or nonsense `ANTIPHON_HOP` read as
         hop 0, which is the top of the budget — a session carrying one is
@@ -2483,14 +2514,17 @@ class LifecycleTest(unittest.TestCase):
             self.assertEqual((final["state"], final["exit_code"]),
                              ("outcome_unknown", None))
 
-    def test_an_unrepresentable_pid_is_unknown_and_never_signalled(self):
+    def test_an_unreadable_process_snapshot_is_unknown_and_never_signalled(self):
         with tempfile.TemporaryDirectory() as project:
             record = workers.new_task(
                 project, kind="codex", task_class="read", sha256=SHA,
                 size=1, timeout=1)
             workers.update_task(project, record["id"], lambda changed: changed.update(
-                state="running", pid=10 ** 100, birth="recorded birth", started_at=1.0))
-            with patch.object(workers, "_kill_group") as kill:
+                state="running", pid=workers.MAX_PID,
+                birth="recorded birth", started_at=1.0))
+            with patch.object(workers.os, "kill", return_value=None), \
+                 patch.object(workers, "_process_snapshot", return_value=None), \
+                 patch.object(workers, "_kill_group") as kill:
                 final = workers.reported_status(project, record["id"], now=3.0)
             kill.assert_not_called()
             self.assertEqual(final["state"], "running")

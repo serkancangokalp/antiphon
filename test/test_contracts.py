@@ -716,6 +716,76 @@ class ShippedContractTest(unittest.TestCase):
                 " ".join(antiphon.workers.adapter(kind, task_class, "x", "t"))
                 for kind in ("claude", "codex") for task_class in ("read", "write")))
 
+    def test_task_result_schema_is_one_contract_across_python_and_node(self):
+        """Task actions mutate or collect before stdout crosses runtimes.
+
+        The Node reader therefore mirrors the Python writer's enums, durable
+        row keys and evidence ceilings. A state added to only one side must be
+        a loud contract failure, never a post-action false refusal.
+        """
+        node = read("lib", "channel.mjs")
+
+        def array_constant(name, wrapped=False):
+            wrapper = r"new Set\(" if wrapped else ""
+            closer = r"\)" if wrapped else ""
+            found = re.search(
+                rf"const {name} = {wrapper}(\[[^\]]*\]){closer};", node,
+                re.DOTALL)
+            self.assertIsNotNone(found, name)
+            return json.loads(re.sub(r",\s*]", "]", found.group(1)))
+
+        def numeric_constant(name):
+            found = re.search(rf"const {name} = ([0-9_* +\-]+);", node)
+            self.assertIsNotNone(found, name)
+            return eval(found.group(1), {"__builtins__": {}}, {})
+
+        self.assertEqual(set(array_constant("TASK_STATES", wrapped=True)),
+                         set(antiphon.workers.STATES))
+        self.assertEqual(set(array_constant("TASK_V2_STATES", wrapped=True)),
+                         set(antiphon.workers.V2_STATES))
+        self.assertEqual(set(array_constant("TASK_TERMINAL_STATES", wrapped=True)),
+                         set(antiphon.workers.TERMINAL))
+        self.assertEqual(set(array_constant("TASK_CANCEL_STATES", wrapped=True)),
+                         set(antiphon.workers.TERMINAL) - {"outcome_unknown"})
+        self.assertEqual(
+            set(array_constant("TASK_START_RECOVERY_STATES", wrapped=True)),
+            set(antiphon.workers.START_RECOVERY_STATES))
+        self.assertEqual(set(array_constant("TASK_RECORD_KEYS")),
+                         set(antiphon.workers.KEYS))
+        self.assertEqual(array_constant("TASK_KINDS"),
+                         list(antiphon.workers.KINDS))
+        self.assertEqual(array_constant("TASK_CLASSES"),
+                         list(antiphon.workers.CLASSES))
+        self.assertEqual(numeric_constant("TASK_MAX_TIME"),
+                         antiphon.workers.MAX_TIME)
+        self.assertEqual(numeric_constant("TASK_MAX_INTEGER"),
+                         antiphon.workers.MAX_SAFE_INTEGER)
+        self.assertEqual(numeric_constant("TASK_MAX_PID"),
+                         antiphon.workers.MAX_PID)
+        self.assertEqual(numeric_constant("TASK_DIFF_CEILING"),
+                         antiphon.workers.DIFF_INLINE)
+        self.assertEqual(numeric_constant("TASK_TESTS_CEILING"),
+                         antiphon.workers.DIFF_INLINE)
+        self.assertEqual(numeric_constant("TASK_LOG_CEILING"),
+                         antiphon.workers.LOG_TAIL)
+        self.assertEqual(numeric_constant("TASK_PATH_CEILING"),
+                         antiphon.workers.RESULT_PATH_CEILING)
+        self.assertEqual(numeric_constant("TASK_DIAGNOSTIC_CEILING"),
+                         antiphon.workers.RESULT_DIAGNOSTIC_CEILING)
+        self.assertGreaterEqual(
+            numeric_constant("TASK_ACTION_TIMEOUT_MS"),
+            1_000 * (antiphon.workers.MAX_WAIT
+                     + antiphon.workers.RESULT_INTENT_TIMEOUT
+                     + antiphon.workers.RESULT_DIFF_TIMEOUT + 30),
+            "Node must outlive Python's maximum result wait and evidence work")
+        self.assertIn(
+            "timeout: isDelegate ? 60_000 : TASK_ACTION_TIMEOUT_MS", node)
+        for field in ("version", "size", "timeout", "hop", "pid", "exit_code"):
+            self.assertIn(f'wrapper, "{field}"', node,
+                          f"{field} needs positive lexical integer evidence")
+        self.assertIn('encoding: isDelegate ? "utf8" : "buffer"', node)
+        self.assertIn("parseStrictJsonRecord(stdout)", node)
+
     def test_every_surface_teaches_same_vendor_bridging(self):
         """A Claude session reaches another Claude session and a Codex
         session another Codex session, always by name; every surface says the

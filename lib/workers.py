@@ -90,6 +90,8 @@ STATES = LEGACY_STATES + V2_STATES
 KINDS = ("claude", "codex")
 CLASSES = ("read", "write")
 MAX_TIME = float(2 ** 40)
+MAX_SAFE_INTEGER = 2 ** 53 - 1
+MAX_PID = 2 ** 31 - 1
 RECORD_CEILING = 64 * 1024
 
 TASK_ID = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}")
@@ -117,6 +119,10 @@ LIVE_GIT_MUTATOR = b"git-mutator:"
 LIVE_CEILING = 96
 LOCAL_CONTROL_PREFIX = "antiphon-local:"
 STOP_INTENTS = ("cancelled", "timed_out")
+START_RECOVERY_GIT_MISSING = "git_completion_receipt_missing"
+START_RECOVERY_UNKNOWN = "unknown"
+START_RECOVERY_STATES = (
+    START_RECOVERY_GIT_MISSING, START_RECOVERY_UNKNOWN)
 WORKER_TERMINAL = ("completed", "failed", "cancelled", "timed_out", "blocked",
                    "outcome_unknown")
 TASK_STORE = "tasks-v2"
@@ -127,6 +133,13 @@ WORK_STORE = ".antiphon"
 GIT_CLEANUP_FILE = ".git-cleanup"
 GIT_CLEANUP_TOKEN = b"antiphon git-worktree cleanup v1\n"
 GITDIR_CEILING = 16 * 1024
+# Public result paths and their fixed-prefix diagnostics cross into Node.
+# Keep their wire bounds explicit rather than borrowing the Git-file parser's
+# similarly sized but unrelated ceiling.
+RESULT_PATH_CEILING = 16 * 1024
+RESULT_DIAGNOSTIC_CEILING = RESULT_PATH_CEILING + 512
+RESULT_INTENT_TIMEOUT = 30
+RESULT_DIFF_TIMEOUT = 60
 GIT_GUARDIAN_OUTPUT_CEILING = 64 * 1024
 LEGACY_FENCE_TOKEN = b"antiphon task-store v2 frozen\n"
 LEGACY_WRITABLE_MODE = 0o700
@@ -222,8 +235,9 @@ def _no_duplicate_keys(pairs):
     return dict(pairs)
 
 
-def _int_or_none(value, floor=0):
-    return value is None or (type(value) is int and value >= floor)
+def _int_or_none(value, floor=0, ceiling=MAX_SAFE_INTEGER):
+    return value is None or (
+        type(value) is int and floor <= value <= ceiling)
 
 
 def _utf8_string(value):
@@ -251,18 +265,20 @@ def _valid(record, expected_id):
         return False
     if not (isinstance(record["sha256"], str) and SHA256_HEX.fullmatch(record["sha256"])):
         return False
-    if type(record["size"]) is not int or record["size"] < 0:
+    if (type(record["size"]) is not int
+            or not 0 <= record["size"] <= MAX_SAFE_INTEGER):
         return False
     if record["parent"] is not None and not (
             isinstance(record["parent"], str) and TASK_ID.fullmatch(record["parent"])):
         return False
     if type(record["timeout"]) is not int or not 1 <= record["timeout"] <= MAX_TIMEOUT:
         return False
-    if type(record["hop"]) is not int or record["hop"] < 0:
+    if (type(record["hop"]) is not int
+            or not 0 <= record["hop"] <= MAX_SAFE_INTEGER):
         return False
     if not _time_or_none(record["created_at"]) or record["created_at"] is None:
         return False
-    if not _int_or_none(record["pid"], 1):
+    if not _int_or_none(record["pid"], 1, MAX_PID):
         return False
     if record["birth"] is not None and not (
             _utf8_string(record["birth"]) and 0 < len(record["birth"]) <= 80):
@@ -270,7 +286,9 @@ def _valid(record, expected_id):
     if record["base"] is not None and not (
             isinstance(record["base"], str) and GIT_SHA.fullmatch(record["base"])):
         return False
-    if record["exit_code"] is not None and (type(record["exit_code"]) is not int):
+    if (record["exit_code"] is not None
+            and (type(record["exit_code"]) is not int
+                 or not -MAX_SAFE_INTEGER <= record["exit_code"] <= MAX_SAFE_INTEGER)):
         return False
     if record["to"] is not None and not (
             _utf8_string(record["to"]) and record["to"]):
@@ -1292,7 +1310,7 @@ def hop_budget(env):
         value = int(str(env.get("ANTIPHON_HOP_BUDGET", "")).strip())
     except ValueError:
         return HOP_BUDGET_DEFAULT
-    return value if value >= 1 else HOP_BUDGET_DEFAULT
+    return min(value, MAX_SAFE_INTEGER) if value >= 1 else HOP_BUDGET_DEFAULT
 
 
 def _hop_value(env):
@@ -1335,6 +1353,11 @@ def check_hop(env, alias=None):
         raise Refused(f"not delegated: ANTIPHON_HOP={value!r} is not a hop count; "
                       "the bridge sets it to a non-negative integer, so a session "
                       "carrying anything else may not delegate")
+    if isinstance(value, int) and value >= MAX_SAFE_INTEGER:
+        raise Refused(
+            f"not delegated: ANTIPHON_HOP={value} cannot produce another "
+            f"cross-runtime task record; the largest supported hop is "
+            f"{MAX_SAFE_INTEGER - 1}")
     if is_worker_name(alias) and value is None:
         raise Refused(f"not delegated: this session is a managed worker ({alias}) "
                       "whose hop is not visible to its server, so it may not "
@@ -2498,7 +2521,7 @@ def accepted_start_recovery(cwd, record, now=None):
     except FileNotFoundError:
         return None
     except OSError:
-        return "unknown" if stale else None
+        return START_RECOVERY_UNKNOWN if stale else None
     try:
         try:
             fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
@@ -2507,16 +2530,16 @@ def accepted_start_recovery(cwd, record, now=None):
         except OSError as error:
             if error.errno in (errno.EACCES, errno.EAGAIN):
                 return None
-            return "unknown" if stale else None
+            return START_RECOVERY_UNKNOWN if stale else None
         marker = _read_live_bytes(fd)
         if _git_mutator_parts(marker) is not None:
-            return "git_completion_receipt_missing"
+            return START_RECOVERY_GIT_MISSING
         if marker is None:
-            return "unknown" if stale else None
+            return START_RECOVERY_UNKNOWN if stale else None
         if (marker in (b"", LIVE_STARTING, LIVE_ACTIVE)
                 or _published_parts(marker) is not None):
             return None
-        return "unknown" if stale else None
+        return START_RECOVERY_UNKNOWN if stale else None
     finally:
         with contextlib.suppress(OSError):
             fcntl.flock(fd, fcntl.LOCK_UN)
@@ -2595,7 +2618,7 @@ def _liveness_detail(observation):
 
 
 def _start_recovery_detail(recovery):
-    if recovery == "git_completion_receipt_missing":
+    if recovery == START_RECOVERY_GIT_MISSING:
         return GIT_START_RECEIPT_MISSING_DETAIL
     return START_RECOVERY_UNKNOWN_DETAIL
 
@@ -2905,9 +2928,10 @@ def _worktree_diff(cwd, record):
     # under the store that the worker edited is a change, and a pathspec on
     # the diff hid it from the evidence (release gate, round 3).
     if _git(work, "add", "-A", "--intent-to-add", "--", ".", f":!{WORK_STORE}",
-            timeout=30) is None:
+            timeout=RESULT_INTENT_TIMEOUT) is None:
         return None
-    done = _git(work, "diff", "--no-color", base, timeout=60)
+    done = _git(work, "diff", "--no-color", base,
+                timeout=RESULT_DIFF_TIMEOUT)
     if done is None or done.returncode != 0:
         return None
     return done.stdout.encode("utf-8", "surrogateescape") if isinstance(done.stdout, str) \
