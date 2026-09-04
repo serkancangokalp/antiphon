@@ -96,7 +96,10 @@ Timeouts: a task has a `timeout` (default 900 s, at most 3600 s). A Python
 supervisor owns a task-store live lock and binds its exit code into the marker
 before unlocking; its adapter is
 admitted only after the task record is durable and an `admit` → `ready` →
-`commit` handshake completes. Past the timeout, an exactly identified worker
+`commit` handshake completes. The trusted wrapper has five seconds to publish
+`ready`; a refusal includes the measured wait and its bounded pre-adapter log,
+and a late acknowledgement still cannot cross the separate commit gate. Past
+the timeout, an exactly identified worker
 is sent SIGTERM, then SIGKILL after 10 s, and is `timed_out` only when a signal
 was actually sent and death was proved. Unprovable liveness or ownership never
 authorizes a signal or a terminal guess: the v1 `running` record, directory and

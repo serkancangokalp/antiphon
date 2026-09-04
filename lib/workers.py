@@ -73,7 +73,11 @@ LEGACY_HANDOFF_PATIENCE = 60
 # is sampled. Without that identity Antiphon could keep it live, but could
 # never safely authorize timeout or cancellation signals after a pid reuse.
 START_IDENTITY_PATIENCE = 0.5
-START_ACTIVE_PATIENCE = 1.0
+# The trusted wrapper performs only marker publication before READY, but a
+# newly spawned process can remain unscheduled for more than a second on a
+# loaded host. The adapter still waits on the separate commit pipe, so this
+# wider observation window cannot admit work after a refusal.
+START_ACTIVE_PATIENCE = 5.0
 # A complete process-table snapshot can fail transiently while the adapter is
 # rapidly creating and reaping descendants. The supervisor retries only
 # inside this fixed window; persistent uncertainty still withholds outcome
@@ -1987,6 +1991,7 @@ def start(cwd, record, text, env=None):
                 os.close(gate_write)
             gate_write = None
     ready = False
+    ready_started = time.monotonic()
     try:
         readable, _writable, _exceptional = select.select(
             [ready_read], [], [], START_ACTIVE_PATIENCE)
@@ -1998,6 +2003,7 @@ def start(cwd, record, text, env=None):
             with contextlib.suppress(OSError):
                 os.close(ready_read)
             ready_read = None
+    ready_elapsed = time.monotonic() - ready_started
     if not ready:
         # The wrapper waits for the separate commit pipe after READY, so even
         # an acknowledgement racing this timeout cannot admit the adapter.
@@ -2008,8 +2014,12 @@ def start(cwd, record, text, env=None):
             raise Refused(
                 "not delegated: worker activation failed after another "
                 "lifecycle outcome was recorded")
+        wrapper_log = _log_tail(cwd, task_id).strip()
+        diagnostic = (f"wrapper log tail: {json.dumps(wrapper_log)}"
+                      if wrapper_log else "wrapper log was empty")
         _refuse(cwd, record,
-                "not delegated: the worker did not acknowledge its start",
+                "not delegated: the worker did not acknowledge its start "
+                f"after {ready_elapsed:.3f} s; {diagnostic}",
                 expected=started)
     try:
         os.write(commit_write, b"1")

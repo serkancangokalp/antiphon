@@ -155,7 +155,10 @@ recorded under one lock. A Python supervisor holds a protected per-worker
 marker from before admission until it binds and publishes the exit code;
 `delegate` returns only
 after an `admit` → `ready` → `commit` handshake, so a refused start cannot run
-its adapter later. A worker whose exit is proved gives its slot back the
+its adapter later. The trusted wrapper gets a five-second scheduling window to
+publish `ready`; a refusal reports the measured wait and its bounded
+pre-adapter log, while the separate commit gate still prevents late work. A
+worker whose exit is proved gives its slot back the
 moment another is asked for; one whose exact process identity is proved is
 stopped at its timeout by the next `status`, `result`, hook sweep or new
 delegation. A final protected-marker read after identity verification prevents

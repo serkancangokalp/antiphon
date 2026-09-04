@@ -1299,11 +1299,60 @@ class LifecycleTest(unittest.TestCase):
                 return [], [], []
 
             with patch.object(workers.select, "select", side_effect=timeout_after_ack):
-                with self.assertRaisesRegex(workers.Refused,
-                                            "did not acknowledge its start"):
+                with self.assertRaisesRegex(
+                        workers.Refused,
+                        r"did not acknowledge its start after [0-9.]+ s; "
+                        r"wrapper log (?:was empty|tail:)"):
                     workers.start(project, record, "do it", env=env)
             self.assertFalse(os.path.exists(marker))
             self.assertIsNone(workers.read_task(project, record["id"]))
+
+    def test_a_scheduled_wrapper_has_more_than_one_second_to_acknowledge(self):
+        """A loaded host may not schedule the gated wrapper immediately."""
+        with tempfile.TemporaryDirectory() as project, \
+             tempfile.TemporaryDirectory() as bin_dir:
+            self._stub(bin_dir, "codex", "exit 0")
+            record = workers.new_task(
+                project, kind="codex", task_class="read", sha256=SHA, size=1)
+            spawned = []
+            release = []
+            real_popen = workers.subprocess.Popen
+            real_write = workers.os.write
+
+            def observe_spawn(*args, **kwargs):
+                child = real_popen(*args, **kwargs)
+                if "_worker_wrapper" in args[0]:
+                    spawned.append(child)
+                return child
+
+            def release_child(child):
+                with contextlib.suppress(ProcessLookupError):
+                    os.kill(child.pid, signal.SIGCONT)
+
+            def pause_after_gate(descriptor, content):
+                if content == b"1" and spawned and not release:
+                    child = spawned[0]
+                    os.kill(child.pid, signal.SIGSTOP)
+                    timer = threading.Timer(1.25, release_child, args=(child,))
+                    timer.start()
+                    release.append(timer)
+                return real_write(descriptor, content)
+
+            try:
+                with patch.object(workers.subprocess, "Popen",
+                                  side_effect=observe_spawn), \
+                     patch.object(workers.os, "write",
+                                  side_effect=pause_after_gate):
+                    started = workers.start(
+                        project, record, "do it", env=self._env(bin_dir))
+                final = workers.result(project, started["id"], wait=5)
+                self.assertEqual((final["state"], final["exit_code"]),
+                                 ("completed", 0))
+            finally:
+                for timer in release:
+                    timer.join(3)
+                for child in spawned:
+                    release_child(child)
 
     def test_log_open_failure_closes_every_partial_start_descriptor(self):
         with tempfile.TemporaryDirectory() as project:
