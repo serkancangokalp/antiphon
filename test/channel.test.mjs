@@ -1429,14 +1429,14 @@ async function losingTheStdioClientEndsTheSession() {
 }
 
 async function theWrapperTakesItsChannelDownWithIt(signal) {
-  // The installed command is `antiphon channel`, a wrapper that spawns
-  // channel.mjs. It used to exit under a signal without passing it on, leaving
-  // the server orphaned under PPID 1 — which is how the real leak happened,
-  // not by anyone running lib/channel.mjs directly.
+  // The installed command is `antiphon channel`: the Python dispatcher execs
+  // channel.mjs so it shares the command's pid and signal fate. The former
+  // Node wrapper spawned it and could exit without passing a signal on,
+  // leaving the server orphaned under PPID 1 — how the real leak happened.
   const dir = await mkdtemp(join(tmpdir(), "antiphon-wrapper-"));
   const env = { ...process.env, ANTIPHON_CWD: dir };
   delete env.ANTIPHON_NAME;
-  const wrapper = spawn("node", ["bin/antiphon.mjs", "channel"],
+  const wrapper = spawn("bin/antiphon", ["channel"],
     { env, stdio: ["pipe", "pipe", "pipe"] });
   const socketPath = socketFor(dir, "");
   try {
@@ -1555,6 +1555,16 @@ try {
   await assert.rejects(
     () => client.callTool({ name: "antiphon_delegate", arguments: { text: "  " } }),
     /the task text is empty/, "refused before any process starts");
+  const tasksDir = join(projectDir, ".antiphon", "tasks");
+  const tasksBeforeBadTimeout = existsSync(tasksDir) ? readdirSync(tasksDir) : [];
+  await assert.rejects(
+    () => client.callTool({
+      name: "antiphon_delegate",
+      arguments: { text: "look", kind: "codex", to: "build", timeout: 1e309 },
+    }),
+    /timeout must be a finite number/,
+    "a non-finite timeout is refused before task or transport state");
+  assert.deepEqual(existsSync(tasksDir) ? readdirSync(tasksDir) : [], tasksBeforeBadTimeout);
   await assert.rejects(
     () => client.callTool({ name: "antiphon_task", arguments: { id: "nope", action: "status" } }),
     /unknown task id/);
@@ -1563,8 +1573,12 @@ try {
   });
   assert.equal(delegated.isError, undefined, JSON.stringify(delegated));
   const delegatedText = delegated.content[0].text;
-  const taskId = /Delegated task ([0-9a-f-]{36}) to a fresh codex worker/.exec(delegatedText)?.[1];
-  assert.ok(taskId, `a fresh codex worker by default from this side: ${delegatedText}`);
+  const delegatedPayload = JSON.parse(delegatedText);
+  const taskId = delegatedPayload.task_id;
+  assert.match(taskId, /^[0-9a-f-]{36}$/,
+    `a fresh codex worker by default from this side: ${delegatedText}`);
+  assert.equal(delegatedPayload.state, "running");
+  assert.match(delegatedPayload.text, /to a fresh codex worker/);
   const collected = await client.callTool({
     name: "antiphon_task", arguments: { id: taskId, action: "result", wait: 20 },
   });
@@ -1910,6 +1924,341 @@ try {
   await rm(projectDir, { recursive: true, force: true }).catch(() => {});
   await rm(stubDir, { recursive: true, force: true }).catch(() => {});
 }
+
+// An exit-zero child is not delegation evidence. In particular, an older or
+// broken Python dispatcher can print nothing or diagnostics that are not the
+// durable task object; the Claude-facing wrapper must fail closed rather than
+// inventing a task with the placeholder `<id>`.
+async function malformedDelegateResponsesAreNeverCalledDelegated() {
+  const realPython = execFileSync("python3", [
+    "-c", "import sys; print(sys.executable)",
+  ], { encoding: "utf8" }).trim();
+  const badCases = [
+    { output: "", arguments: { text: "review the diff" } },
+    { output: "not-json\n", arguments: { text: "review the diff" } },
+    {
+      output: JSON.stringify({
+        task_id: "12345678-1234-4abc-8def-1234567890ab",
+        kind: "codex", task_class: "read", state: "running", text: "ok",
+        worker: { kind: "codex" },
+      }) + "\n",
+      arguments: { text: "review the diff" },
+    },
+    {
+      output: JSON.stringify({
+        task_id: "12345678-1234-4abc-8def-1234567890ab",
+        delivery_id: "12345678-1234-4abc-8def-1234567890ab",
+        kind: "codex", task_class: "read", state: "missing", to: "build",
+        text: "maybe handed",
+      }) + "\n",
+      arguments: { text: "review the diff", to: "build" },
+    },
+    {
+      output: JSON.stringify({
+        task_id: "12345678-1234-4abc-8def-1234567890ab",
+        kind: "codex", task_class: "read", state: "running", timeout: 900,
+        text: "running", worker: {
+          kind: "codex", name: "worker-12345678",
+          directory: "/tmp/worker-12345678",
+        },
+        delivery_id: "12345678-1234-4abc-8def-1234567890ab",
+        to: "victim", tracking: "incomplete",
+      }) + "\n",
+      arguments: { text: "review the diff" },
+    },
+    {
+      output: JSON.stringify({
+        task_id: "12345678-1234-4abc-8def-1234567890ab",
+        kind: "codex", task_class: "read", state: "running", timeout: 900,
+        text: "running", worker: {
+          kind: "codex", name: "worker-12345678",
+          directory: "/tmp/worker-12345678", route: "private",
+        },
+      }) + "\n",
+      arguments: { text: "review the diff" },
+    },
+    {
+      output: JSON.stringify({
+        task_id: "12345678-1234-4abc-8def-1234567890ab",
+        delivery_id: "12345678-1234-4abc-8def-1234567890ab",
+        kind: "codex", task_class: "read", state: "handed", to: "build",
+        delivery_recorded: false, text: "handed",
+      }) + "\n",
+      arguments: { text: "review the diff", to: "build" },
+    },
+    {
+      output: JSON.stringify({
+        task_id: "12345678-1234-4abc-8def-1234567890ab",
+        delivery_id: "12345678-1234-4abc-8def-1234567890ab",
+        kind: "codex", task_class: "read", state: "tracking_incomplete",
+        tracking: "incomplete", to: "build", text: "tracking incomplete",
+        worker: { kind: "codex", name: "worker-12345678", directory: "/tmp/x" },
+      }) + "\n",
+      arguments: { text: "review the diff", to: "build" },
+    },
+  ];
+  for (const { output, arguments: delegateArguments } of badCases) {
+    const dir = await mkdtemp(join(tmpdir(), "antiphon-bad-delegate-"));
+    const stubDir = await mkdtemp(join(tmpdir(), "antiphon-bad-python-"));
+    writeFileSync(join(stubDir, "python3"), `#!${realPython}
+import os
+import sys
+
+if len(sys.argv) > 3 and sys.argv[2:4] == ["task", "delegate"]:
+    sys.stdin.read()
+    sys.stdout.write(os.environ["ANTIPHON_TEST_DELEGATE_STDOUT"])
+    raise SystemExit(0)
+real_python = os.environ["ANTIPHON_TEST_REAL_PYTHON"]
+os.execv(real_python, [real_python, *sys.argv[1:]])
+`, { mode: 0o755 });
+    const env = {
+      ...process.env,
+      ANTIPHON_CWD: dir,
+      ANTIPHON_NAME: "malformed-delegate",
+      HOME: dir,
+      PATH: `${stubDir}:${process.env.PATH}`,
+      ANTIPHON_TEST_DELEGATE_STDOUT: output,
+      ANTIPHON_TEST_REAL_PYTHON: realPython,
+    };
+    const badTransport = new StdioClientTransport({
+      command: "node", args: ["lib/channel.mjs"], env, stderr: "pipe",
+    });
+    const badClient = new Client({ name: "antiphon-test", version: "1.0.0" });
+    try {
+      await badClient.connect(badTransport);
+      await assert.rejects(
+        () => badClient.callTool({
+          name: "antiphon_delegate", arguments: delegateArguments,
+        }),
+        /invalid delegation response from the bridge/,
+        `exit-zero ${JSON.stringify(output)} is not a delegation`);
+    } finally {
+      await badClient.close().catch(() => {});
+      await rm(dir, { recursive: true, force: true }).catch(() => {});
+      await rm(stubDir, { recursive: true, force: true }).catch(() => {});
+    }
+  }
+  console.log("malformed delegate responses fail closed: ok");
+}
+
+await malformedDelegateResponsesAreNeverCalledDelegated();
+
+// Both incomplete handoff shapes are real: a successful transport whose final
+// tracking write fails has no delivery_recorded field, while an acknowledgement-
+// unknown transport reports whether its ledger row survived. Exact-key
+// validation must retain both and reject fields from every other branch.
+async function validIncompleteDelegateShapesStayStructured() {
+  const realPython = execFileSync("python3", [
+    "-c", "import sys; print(sys.executable)",
+  ], { encoding: "utf8" }).trim();
+  const dir = await mkdtemp(join(tmpdir(), "antiphon-incomplete-delegate-"));
+  const stubDir = await mkdtemp(join(tmpdir(), "antiphon-incomplete-python-"));
+  writeFileSync(join(stubDir, "python3"), `#!${realPython}
+import json
+import os
+import sys
+
+if len(sys.argv) > 3 and sys.argv[2:4] == ["task", "delegate"]:
+    request = json.load(sys.stdin)
+    answer = {
+        "task_id": "12345678-1234-4abc-8def-1234567890ab",
+        "delivery_id": "12345678-1234-4abc-8def-1234567890ab",
+        "state": "tracking_incomplete",
+        "tracking": "incomplete",
+        "to": request["to"],
+        "kind": request.get("kind") or "codex",
+        "task_class": request.get("task") or "read",
+        "text": "tracking is incomplete; do not retry automatically",
+    }
+    if request["text"] == "unknown transport":
+        answer["delivery_recorded"] = False
+    print(json.dumps(answer))
+    raise SystemExit(0)
+real_python = os.environ["ANTIPHON_TEST_REAL_PYTHON"]
+os.execv(real_python, [real_python, *sys.argv[1:]])
+`, { mode: 0o755 });
+  const env = {
+    ...process.env,
+    ANTIPHON_CWD: dir,
+    ANTIPHON_NAME: "incomplete-delegate",
+    HOME: dir,
+    PATH: `${stubDir}:${process.env.PATH}`,
+    ANTIPHON_TEST_REAL_PYTHON: realPython,
+  };
+  const incompleteTransport = new StdioClientTransport({
+    command: "node", args: ["lib/channel.mjs"], env, stderr: "pipe",
+  });
+  const incompleteClient = new Client({ name: "antiphon-test", version: "1.0.0" });
+  try {
+    await incompleteClient.connect(incompleteTransport);
+    for (const text of ["post-success tracking", "unknown transport"]) {
+      const result = await incompleteClient.callTool({
+        name: "antiphon_delegate", arguments: { text, to: "build" },
+      });
+      const answer = JSON.parse(result.content[0].text);
+      assert.equal(answer.state, "tracking_incomplete", text);
+      assert.equal(answer.tracking, "incomplete", text);
+      assert.equal(Object.hasOwn(answer, "delivery_recorded"),
+        text === "unknown transport", text);
+    }
+  } finally {
+    await incompleteClient.close().catch(() => {});
+    await rm(dir, { recursive: true, force: true }).catch(() => {});
+    await rm(stubDir, { recursive: true, force: true }).catch(() => {});
+  }
+  console.log("valid incomplete delegate shapes stay structured: ok");
+}
+
+await validIncompleteDelegateShapesStayStructured();
+
+// Python is the only layer that knows whether reply bytes were refused,
+// queued, delivered, or left with an unknown acknowledgement.  An exit-zero
+// child whose stdout does not carry that contract cannot be promoted into
+// success prose by the Node MCP wrapper, in either direction.
+async function malformedReplyResponsesNeverClaimDelivery() {
+  const realPython = execFileSync("python3", [
+    "-c", "import sys; print(sys.executable)",
+  ], { encoding: "utf8" }).trim();
+  const malformed = [
+    "",
+    "not-json\n",
+    JSON.stringify({
+      outcome: "unknown", id: "not-a-delivery-id", to: "peer",
+      recorded: true, dedupe_recorded: true, text: "maybe sent",
+    }) + "\n",
+    JSON.stringify({
+      outcome: "unknown", id: "12345678-1234-4abc-8def-1234567890ab",
+      to: "peer", attachment: null, recorded: true, dedupe_recorded: true,
+      text: "maybe sent", queued: true, delivered: true, proof: "channel",
+    }) + "\n",
+    JSON.stringify({
+      outcome: "received", id: "12345678-1234-4abc-8def-1234567890ab",
+      to: "peer", attachment: null, recorded: false, dedupe_recorded: true,
+      text: "receipt without a durable ledger row",
+    }) + "\n",
+    ...["/private/message.txt", "../message.txt"].map((attachment) =>
+      JSON.stringify({
+        outcome: "unknown", id: "12345678-1234-4abc-8def-1234567890ab",
+        to: "peer", attachment, recorded: true, dedupe_recorded: true,
+        text: "private attachment path",
+      }) + "\n"),
+    ...["", "12345678-1234-4ABC-8def-1234567890ab.txt"].map((attachment) =>
+      JSON.stringify({
+        outcome: "received", id: "12345678-1234-4abc-8def-1234567890ab",
+        to: "peer", attachment, recorded: true, dedupe_recorded: true,
+        text: "noncanonical attachment name",
+      }) + "\n"),
+  ];
+  for (const output of malformed) {
+    const dir = await mkdtemp(join(tmpdir(), "antiphon-bad-reply-"));
+    const stubDir = await mkdtemp(join(tmpdir(), "antiphon-bad-python-"));
+    writeFileSync(join(stubDir, "python3"), `#!${realPython}
+import os
+import sys
+
+if len(sys.argv) > 2 and sys.argv[2] == "reply":
+    sys.stdin.read()
+    sys.stdout.write(os.environ["ANTIPHON_TEST_REPLY_STDOUT"])
+    raise SystemExit(0)
+real_python = os.environ["ANTIPHON_TEST_REAL_PYTHON"]
+os.execv(real_python, [real_python, *sys.argv[1:]])
+`, { mode: 0o755 });
+    const env = {
+      ...process.env,
+      ANTIPHON_CWD: dir,
+      ANTIPHON_NAME: "malformed-reply",
+      HOME: dir,
+      PATH: `${stubDir}:${process.env.PATH}`,
+      ANTIPHON_TEST_REPLY_STDOUT: output,
+      ANTIPHON_TEST_REAL_PYTHON: realPython,
+    };
+    const badTransport = new StdioClientTransport({
+      command: "node", args: ["lib/channel.mjs"], env, stderr: "pipe",
+    });
+    const badClient = new Client({ name: "antiphon-test", version: "1.0.0" });
+    try {
+      await badClient.connect(badTransport);
+      for (const [name, to] of [
+        ["reply_to_codex", "peer"], ["reply_to_claude", "peer"],
+      ]) {
+        await assert.rejects(
+          () => badClient.callTool({ name, arguments: { text: "hello", to } }),
+          /invalid delivery response from the bridge.*no delivery was claimed/,
+          `${name} rejects exit-zero ${JSON.stringify(output)}`,
+        );
+      }
+    } finally {
+      await badClient.close().catch(() => {});
+      await rm(dir, { recursive: true, force: true }).catch(() => {});
+      await rm(stubDir, { recursive: true, force: true }).catch(() => {});
+    }
+  }
+  console.log("malformed reply responses fail closed: ok");
+}
+
+await malformedReplyResponsesNeverClaimDelivery();
+
+// A receipt can win the race before Python finishes recording an unknown
+// transport acknowledgement.  That is a structured `received` result, not a
+// generic success string; keep its id and truth state visible through MCP.
+async function aReceiptWonReplyStaysStructured() {
+  const realPython = execFileSync("python3", [
+    "-c", "import sys; print(sys.executable)",
+  ], { encoding: "utf8" }).trim();
+  const dir = await mkdtemp(join(tmpdir(), "antiphon-received-reply-"));
+  const stubDir = await mkdtemp(join(tmpdir(), "antiphon-received-python-"));
+  writeFileSync(join(stubDir, "python3"), `#!${realPython}
+import json
+import os
+import sys
+
+if len(sys.argv) > 2 and sys.argv[2] == "reply":
+    request = json.load(sys.stdin)
+    print(json.dumps({
+        "outcome": "received",
+        "id": "12345678-1234-4abc-8def-1234567890ab",
+        "to": request.get("to"),
+        "attachment": None,
+        "recorded": True,
+        "dedupe_recorded": True,
+        "text": "the peer transcript already proves receipt",
+    }))
+    raise SystemExit(0)
+real_python = os.environ["ANTIPHON_TEST_REAL_PYTHON"]
+os.execv(real_python, [real_python, *sys.argv[1:]])
+`, { mode: 0o755 });
+  const env = {
+    ...process.env,
+    ANTIPHON_CWD: dir,
+    ANTIPHON_NAME: "received-reply",
+    HOME: dir,
+    PATH: `${stubDir}:${process.env.PATH}`,
+    ANTIPHON_TEST_REAL_PYTHON: realPython,
+  };
+  const receivedTransport = new StdioClientTransport({
+    command: "node", args: ["lib/channel.mjs"], env, stderr: "pipe",
+  });
+  const receivedClient = new Client({ name: "antiphon-test", version: "1.0.0" });
+  try {
+    await receivedClient.connect(receivedTransport);
+    for (const name of ["reply_to_codex", "reply_to_claude"]) {
+      const result = await receivedClient.callTool({
+        name, arguments: { text: "hello", to: "peer" },
+      });
+      const answer = JSON.parse(result.content[0].text);
+      assert.equal(answer.outcome, "received", name);
+      assert.equal(answer.id, "12345678-1234-4abc-8def-1234567890ab", name);
+      assert.equal(answer.to, "peer", name);
+    }
+  } finally {
+    await receivedClient.close().catch(() => {});
+    await rm(dir, { recursive: true, force: true }).catch(() => {});
+    await rm(stubDir, { recursive: true, force: true }).catch(() => {});
+  }
+  console.log("receipt-won replies stay structured: ok");
+}
+
+await aReceiptWonReplyStaysStructured();
 
 // --- Task 4: the bridge payload must say which claim this is -------------
 // Initial and reassert carry different rules and today send an identical
@@ -2974,10 +3323,11 @@ async function aCurrentListenerOverADowngradedPythonWithdrawsItsOwnEndpoint() {
   }
 }
 
-// New Node in memory, old Python on disk, and a reply that succeeds: the old
-// bridge prints nothing on stdout, so the server's own words stand in for
-// the sentence Python would have composed — queued, never delivered.
-async function aNewListenerOverAnOldPythonSaysQueuedInItsOwnWords() {
+// New Node in memory, old Python on disk, and a reply that leaves bytes but
+// prints nothing: the wrapper has no authoritative outcome.  Mixed-version
+// compatibility cannot justify inventing queued success; fail closed while
+// leaving the already-written bytes untouched.
+async function aNewListenerOverAnOldPythonClaimsNoReplyOutcome() {
   const mixed = await materialiseLib({ node: "worktree", python: "f0c529f" });
   if (mixed.skipped) { console.log(`new listener over old python: skipped (${mixed.skipped})`); return; }
   const dir = await mkdtemp(join(tmpdir(), "antiphon-new-node-words-"));
@@ -2993,15 +3343,14 @@ async function aNewListenerOverAnOldPythonSaysQueuedInItsOwnWords() {
   const oldClient = new Client({ name: "antiphon-test", version: "1.0.0" });
   try {
     await oldClient.connect(oldTransport);
-    const answer = await oldClient.callTool({
-      name: "reply_to_codex", arguments: { text: "ship it", to: "review" },
-    });
-    assert.equal(answer.isError, undefined, JSON.stringify(answer));
-    assert.equal(answer.content[0].text,
-      "Queued for Codex peer 'review'; run antiphon status to see whether it was received.",
-      "the fallback wording, byte for byte");
+    await assert.rejects(
+      () => oldClient.callTool({
+        name: "reply_to_codex", arguments: { text: "ship it", to: "review" },
+      }),
+      /invalid delivery response from the bridge.*no delivery was claimed/,
+      "blank old-Python stdout cannot become a success claim");
     assert.match(readFileSync(codexStub.log, "utf8"), /ship it/, "and the old bridge did queue it");
-    console.log("a new listener over an old python says queued in its own words: ok");
+    console.log("a new listener over an old python claims no reply outcome: ok");
   } finally {
     await oldClient.close().catch(() => {});
     for (const p of [dir, mixed.dir, codexStub.dir]) await rm(p, { recursive: true, force: true }).catch(() => {});
@@ -3214,4 +3563,4 @@ await aMidLifeDowngradeIsRefusedOnceNotChurned();
 await aCurrentListenerOverADowngradedPythonWithdrawsItsOwnEndpoint();
 await anEndpointIsClassifiedNotCollapsed();
 await aWithdrawalThatDidNotHappenIsNotAnnounced();
-await aNewListenerOverAnOldPythonSaysQueuedInItsOwnWords();
+await aNewListenerOverAnOldPythonClaimsNoReplyOutcome();

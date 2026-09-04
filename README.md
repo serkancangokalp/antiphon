@@ -2,13 +2,19 @@
 
 **Two agents in one project, an open-identity bridge.** Claude Code and Codex CLI work side by side — one terminal each, or several on each side — and each sees the other's context and can wake the other when it needs to, without ever faking who the message is from.
 
-Antiphon doesn't dispatch work. It only carries messages between the sides while preserving whether they came from the human user, from Claude, or from Codex.
+Antiphon does not own your workflow. It carries messages between the sides
+while preserving whether they came from the human user, from Claude, or from
+Codex; its optional managed workers stay isolated and never merge their work.
 
 With one terminal per side there is nothing to configure beyond `antiphon setup`: Antiphon assigns an automatic alias when it can positively prove the host session, otherwise the peer stays honestly unnamed and the legacy single-peer road remains. With several sessions, address the automatic aliases shown by `status` or set explicit names — see [Many peers](#many-peers).
 
 ## How it works
 
-No shared log is kept. Both CLIs already write their own transcripts; Antiphon reads and derives from them, recording which messages each peer has already seen. An unnamed peer keeps its cursor at `.antiphon/cursor.json`; a named one owns `.antiphon/peers/<side>-<name>/cursor.json`, so two sessions on the same side never advance each other's place. Every direct send leaves one small file on a delivery ledger at `.antiphon/deliveries/<id>.json` — who sent, to whom, over what, the words' digest — and, for a refused line, its first 60 characters so the sender can recognise it; never the words otherwise — kept for a week, two for an entry with a notice its sender has not heard; receipts come from the peer's own transcript, read by the same reader that builds the pull page, which never looks behind the 24-hour page horizon, so a receipt older than that is never seen there and `status` says so; an automatic Codex alias's receipt is read off its own rollout after the session has exited; each session's own hook also reads the tail of its own transcript for the receipts it owes, horizon or not. An automatic Claude identity also records which session its owner runs now, one small file per owner under `.antiphon/identity/claude/`, named from a digest rather than from anything about the session. `doctor` reports that a proof could not be read or could not be trusted without naming the file; this is the directory it means, and removing the unreadable one costs nothing — the next turn writes it again.
+No shared log is kept. Both CLIs already write their own transcripts; Antiphon reads and derives from them, recording which messages each peer has already seen. An unnamed peer keeps its cursor at `.antiphon/cursor.json`; a named one owns `.antiphon/peers/<side>-<name>/cursor.json`, so two sessions on the same side never advance each other's place. Every direct send leaves one small file on a delivery ledger at `.antiphon/deliveries/<id>.json` — who sent, to whom, over what, the words' digest — and, for a refused or transport-outcome-unknown line, its first 60 characters so the sender can recognise it; never the words otherwise — kept for a week, two for an entry with a notice its sender has not heard. If the transport acknowledgement disappears after bytes may have left, the ledger says `unknown`, the caller is warned not to retry automatically, and any parked attachment is retained. A later receipt resolves that attempt to `sent` and removes its bounded preview; if that receipt already won the race while the sender was awaiting the acknowledgement, the direct result says `received` instead of contradicting the transcript with `unknown`.
+
+Receipts come from the peer's own transcript, read by the same reader that builds the pull page. A receiver can record a receipt before the sender returns from transport, so Antiphon first preserves that proof in a bounded sidecar under `.antiphon/deliveries/pending-receipts/`; the page cursor advances only after the proof or its ledger update is durable. Exact delivery-ID receipts are consumed when their immutable row appears. Attachment-read proofs remain for one ledger TTL so a late, older sender row can still reconcile, and apply only to matching attempts whose pre-transport `sent_at` is no later than the observed read — a later reuse of the same filename can never steal an earlier read. When one delayed page contains several opens around basename reuse, Antiphon applies every distinct read horizon in order and retains the latest, so each attempt receives its first qualifying proof. A shipped old sender timestamps after transport, so a mixed-version row whose time is later than its read remains conservatively unresolved; `status` and `doctor` show the retained proof instead of guessing. Invalid sidecars, a symlinked store, or an unreadable sidecar directory hold the page cursor and are diagnosed with the repair location; bounded expiry or capacity loss is counted. The exact Stop-outcome store uses the same fail-closed health reporting because unreadable suppression evidence cannot justify an automatic retry.
+
+The pull page never looks behind its 24-hour horizon, so a receipt older than that is never seen there and `status` says so; an automatic Codex alias's receipt is read off its own rollout after the session has exited; each session's own hook also reads the tail of its own transcript for the receipts it owes, horizon or not. An automatic Claude identity also records which session its owner runs now, one small file per owner under `.antiphon/identity/claude/`, named from a digest rather than from anything about the session. `doctor` reports that a proof could not be read or could not be trusted without naming the file; this is the directory it means, and removing the unreadable one costs nothing — the next turn writes it again.
 
 ### Pull — shared context, no wake
 
@@ -74,6 +80,22 @@ sender's next page, with the reason (at most eight notices per page, the rest
 on the following turns; a reason is kept to 400 characters), because the
 hook's own refusal reaches a debug log and not the agent.
 
+There is a fourth, deliberately non-binary result: `outcome: "unknown"`. It
+means the bytes may have left but the transport acknowledgement was lost.
+Antiphon returns the immutable attempt id, preserves any parked content,
+and says not to retry manually because the peer may already have received it.
+A direct mid-turn tool separately reports `dedupe_recorded: false` when its
+Stop-marker fingerprint could not be parked. A Stop send records an exact,
+content-bound outcome before promoting the live cursor; if that cursor write
+fails, the retained outcome suppresses the same turn automatically and both
+`status` and `doctor` expose it. If neither the cursor nor that exact outcome
+can be persisted, the hook exits nonzero and names the duplicate risk. A
+temporary outcome-sidecar failure is harmless after a successful cursor write
+and is not reported as a failed send. `status` keeps an unknown ledger state
+visible until the peer's transcript proves receipt; an unknown Stop outcome
+whose ledger entry itself cannot be written also makes the hook nonzero so the
+loss is not hidden on exit-0 stderr.
+
 ### Managed workers — one task, one worker of the other kind
 
 `antiphon_delegate(text, kind?, to?, task?, timeout?)`, on both servers, starts
@@ -110,7 +132,23 @@ that kind over the ordinary addressed send instead (parked as an attachment
 when too large, like any direct send), marked `[Antiphon task <id>]` and
 recorded on the ledger; a handed task has no worker here, so `result` and
 `cancel` are refused for it and only the peer can be told to stop, and a write
-task cannot be handed. At most four workers run per project, admitted and
+task cannot be handed. The recipient must be a valid public peer name before
+any record is written. The task marker and delivery ledger share one attempt
+ID, returned under both names. The task is prepared as `handing` and read back
+exactly before transport, without consuming a worker slot. Only exact read-back
+matches for every supplied task and ledger field make it `handed`. A definite
+transport refusal removes the preparation; if removal itself fails, the record
+becomes `delivery_refused` instead of looking in-flight. If bytes may have left
+but the acknowledgement is lost, or if either post-send final write is
+incomplete, the local ID remains as `tracking_incomplete` (or `handing` if even
+that recovery write fails), the result says tracking is incomplete, and it
+warns not to retry automatically because the peer may already act. An unknown
+transport attempt is also kept on the delivery ledger so a later transcript
+receipt can resolve it. Those states refuse local `result` and `cancel`. If an
+older Claude channel accepts a same-kind handoff but cannot preserve its Claude
+origin, the result keeps the successful handoff state and tells you to reconnect
+that recipient before relying on its displayed sender label;
+receipt still comes only from the peer's transcript. At most four workers run per project, admitted and
 recorded under one lock, and a worker that has exited gives its slot back the
 moment another is asked for; a worker is stopped at its timeout by the next
 `status`, `result`, hook sweep or a new delegation's admission; a task record
@@ -168,13 +206,32 @@ Automatic aliases identify individual peers; they do not pair a Claude peer with
 
 ## Many peers
 
-A name is an environment variable read at startup, so it goes in front of the
-command:
+A name is an environment variable read at startup. The guided launcher sets it
+alongside each host's Antiphon requirements:
 
-    ANTIPHON_NAME=ui claude --dangerously-load-development-channels server:antiphon
-    ANTIPHON_NAME=api claude --dangerously-load-development-channels server:antiphon
-    ANTIPHON_NAME=build codex
-    ANTIPHON_NAME=review codex
+    antiphon launch claude --name ui
+    antiphon launch claude --name api
+    antiphon launch codex --name build
+    antiphon launch codex --name review
+
+Put host arguments after an exact `--`, for example
+`antiphon launch claude --name ui -- --model opus`. The arguments retain their
+order and stay argv entries; no shell interprets them. Options that disable the
+configured bridge or move the host to another project are refused here: Claude
+`--bare`, `--restricted`, `--safe-mode`, `--strict-mcp-config`,
+`--no-session-persistence`, `--setting-sources`, and `--worktree`/`-w`; Codex
+`--cd`/`-C`. Truthy `CLAUDE_CODE_SAFE_MODE`, `CLAUDE_CODE_SIMPLE`, and
+`CLAUDE_CODE_RESTRICTED` environment modes are refused too. Remove the option
+or unset the mode to get the ready Antiphon session, or start the host manually
+when that incompatible behavior is intentional. For advanced/manual launches,
+the equivalent raw commands are
+`ANTIPHON_NAME=ui claude --dangerously-load-development-channels server:antiphon`
+and `ANTIPHON_NAME=build codex`.
+
+Launch also requires an inherited `ANTIPHON_CWD` to name the same real
+directory the process is currently in. A stale value pointing at another
+project is refused before host lookup or setup preflight, so one configured
+checkout cannot accidentally authorize a host started in another.
 
 Names must be unique per side within a project. Two Claude sessions configured
 with the same name both identify their own outgoing words by that name, but
@@ -280,7 +337,25 @@ where it comes from. Then, in the project the two agents share:
 
     cd /your/project
     antiphon setup
-    claude --dangerously-load-development-channels server:antiphon
+    antiphon launch claude        # terminal one
+    antiphon launch codex         # terminal two
+
+`launch` checks the complete project setup and resolves the selected host
+without changing project files. It then executes that host directly, adding
+Claude's required development channel flag. Use `--name NAME` when several sessions of one kind will run;
+put any host arguments after `--`. If setup is incomplete, or the host is not
+on `PATH`, launch refuses before starting anything and prints one remedy.
+Arguments after `--` are your direct interactive host request and are not
+filtered by the stricter managed-worker permission policy; autonomous workers
+remain read-only by default and keep their existing forbidden-flag checks. The
+only launcher guard is readiness: it refuses host flags that disable the
+configured hooks/MCP/transcript or move the session to another project, because
+otherwise a successful launch would not be the session it just preflighted.
+The guard applies only before the host's own exact `--`; later tokens are
+literal host content. It also refuses Claude's truthy safe, simple, and
+restricted environment modes, and an inherited `ANTIPHON_CWD` that resolves to
+a different directory than the launcher's current project. The raw host commands above remain the explicit
+escape hatch for an intentionally different configuration.
 
 `setup` writes `.claude/settings.json`, `.codex/hooks.json`,
 `.codex/config.toml`, `.mcp.json`, `.claude/settings.local.json`,
@@ -318,6 +393,12 @@ with a remedy — reconnect the Claude session, or reinstall so both sides
 match — rather than told it recovered. A record written by 0.4.0 before this
 change stays prunable by a 0.3.x reader until its owner rewrites it; `doctor`
 names such a record and the remedy by kind (reconnect Claude, restart Codex).
+Task and delivery records introduced by this release use schema v2; the new
+reader continues to read every shipped v1 worker, handed-task, sent and refused
+record. A pre-upgrade long-lived server does not understand v2 and must be
+restarted after installation. `doctor` compares each in-scope server's start
+time with the code it loaded and names that restart when on-disk code changed;
+`antiphon launch` always starts a fresh host process.
 
 ## Commands
 
@@ -326,6 +407,8 @@ antiphon status            # transcripts, cursors, live peers and channel status
 antiphon doctor            # read-only checkup: why is the bridge quiet?
 antiphon summary [side]    # show the context that would be injected
 antiphon setup             # (re)install the project setup
+antiphon launch claude [--name NAME] [-- HOST_ARGS...]  # start a ready Claude session
+antiphon launch codex [--name NAME] [-- HOST_ARGS...]   # start a ready Codex session
 antiphon catch-up [side]   # skip undelivered history: page cursors jump to the live edge
 antiphon sources scan      # finish or refresh the durable source catalog
 antiphon sources compact   # retire aged gone sources proved consumed by every relevant reader
@@ -398,15 +481,19 @@ turn ends.
 - Unix sockets only — there is no Windows support.
 - A same-vendor message (`@claude:name` from Claude, `@codex:name` from Codex, `reply_to_claude`, `antiphon_send(kind="codex")`) is always addressed, and the passive page gains no same-kind lane — two same-kind sessions need names or automatic aliases, and a session of one kind is told nothing of another's work unless it is sent. It is addressed, not confidential: a Stop-marker line is part of the sender's visible reply, which the other kind's page shows, and a same-kind tool call's arguments stay retrievable by their public id.
 - A managed worker is a subprocess of the other CLI (`claude -p` / `codex exec`), never a host-native subagent: it needs that CLI installed and logged in, is stopped at its timeout (at most an hour) by the next `status`, `result`, hook sweep or a new delegation's admission rather than by a clock of its own, appears in neither host's own agent UI, and its patch is evidence, never a merge. A worker cannot be resumed; a follow-up is a new task. It inherits the environment of the session that started it, as any subprocess of that session would. It is followed by its task id, and it is a peer only where its working directory carries the bridge's configuration — a task run in place, or a checkout that commits the generated files — and then a live named one, `worker-<id8>`, for its duration; in a worktree without that configuration it registers nothing and appears on no page. Measured on Codex CLI 0.152.1: `codex exec -s workspace-write` (a write task) records the project's root as trusted in `~/.codex/config.toml`, the way an interactive `codex` would after its own prompt; `-s read-only` does not. The bridge does not undo that in your projects — it is the host's own record of your project — and says so here.
-- A tool result is a statement about the transport, never about the peer. `reply_to_codex` says queued and `antiphon_send` says delivered to the channel; a queued row in a thread that never takes a turn is not read, and only the peer's transcript proves receipt — `antiphon status` shows what still waits, `antiphon doctor` notes what has waited more than ten minutes. A bare reply refused among several peers names the last unanswered sender as advice; the bridge itself still never chooses.
+- A tool result is a statement about the transport, never about the peer. `reply_to_codex` says queued and `antiphon_send` says delivered to the channel; if the acknowledgement disappears after bytes may have left, either returns the attempt id, says not to retry, and reports `outcome: "unknown"` unless the peer's transcript already proves receipt — then it truthfully reports `outcome: "received"`. On a direct tool result, `dedupe_recorded: false` means the mid-turn Stop-marker fingerprint could not be persisted, so remove the same addressed marker from the turn or it may repeat. A Stop send instead retains an exact outcome if its cursor promotion fails and suppresses that exact turn; `status` and `doctor` show the retained protection. A queued row in a thread that never takes a turn is not read, and only the peer's transcript proves receipt — `antiphon status` shows what still waits, `antiphon doctor` notes what has waited more than ten minutes. A bare reply refused among several peers names the last unanswered sender as advice; the bridge itself still never chooses.
 
 ### Passive pull pages, and what it still cannot promise
 
 The pull path delivers the other side's transcript as pages of completed
 records, oldest first. An ordinary full page targets 8,000 UTF-8 bytes and at
 most 40 completed source records — the byte number is measured against the
-installed hosts' injection limits, not a permanent host guarantee. Non-tool
-records are no longer cut or flattened: line structure, indentation, code and
+installed hosts' injection limits, not a permanent host guarantee. Records
+from the page's current local date use `[HH:MM]`; records from any other date
+use `[YYYY-MM-DD HH:MM]`, so overnight history and replay cannot look current.
+If the host timestamp cannot be rendered, the label is `[time unavailable]`.
+The longer label is part of the same 8,000-byte budget. Non-tool records are no
+longer cut or flattened: line structure, indentation, code and
 SQL formatting travel intact, and a record is never split across pages.
 Tool calls appear as compact events with ids. Claude tool entries retain the
 pre-existing selected `file_path`, `command` or `pattern` value as a compact
@@ -600,7 +687,12 @@ a read receipt is collected one hour after the read; a file without one waits
 out the 7 days and then expires unread, and its sender hears that on its next
 page. A resent message with the same words, from the same sender to the same
 peer, is reused: the envelope names the file that already exists and the
-store holds one copy. `antiphon status` counts the parked files with and
-without a read receipt.
+store holds one copy. The read applies to every matching attempt already begun
+at the receipt time, never to a later reuse of that basename. Read-grace
+collection starts from the latest read only when every ledger attempt naming
+the file is read and the file was not touched at or after that proof; an unread
+reuse, or a reuse whose process died before writing its row, waits for the full
+file TTL. `antiphon status` uses the same conservative rule when it counts the
+parked files with and without a read receipt.
 
 MIT.

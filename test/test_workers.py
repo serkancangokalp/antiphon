@@ -11,6 +11,7 @@ import os
 import tempfile
 import time
 import unittest
+from unittest.mock import patch
 
 SHA = hashlib.sha256(b"review the diff").hexdigest()
 
@@ -32,7 +33,7 @@ class TaskStoreTest(unittest.TestCase):
                               record["parent"], record["timeout"], record["hop"],
                               record["pid"], record["started_at"], record["finished_at"],
                               record["exit_code"], record["collected_at"]),
-                             (workers.TASK_VERSION, "codex", "read", "accepted", SHA, 15,
+                             (workers.LEGACY_TASK_VERSION, "codex", "read", "accepted", SHA, 15,
                               None, 900, 1, None, None, None, None, None))
             self.assertIsInstance(record["created_at"], float)
             again = workers.read_task(project, record["id"])
@@ -48,6 +49,9 @@ class TaskStoreTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as project:
             self.assertEqual(self._new(project, timeout=99_999)["timeout"], workers.MAX_TIMEOUT)
             self.assertEqual(self._new(project, timeout=0)["timeout"], workers.DEFAULT_TIMEOUT)
+            for timeout in (float("inf"), float("-inf"), float("nan")):
+                self.assertEqual(self._new(project, timeout=timeout)["timeout"],
+                                 workers.DEFAULT_TIMEOUT)
             with self.assertRaises(ValueError):
                 self._new(project, task_class="deploy")
             with self.assertRaises(ValueError):
@@ -71,6 +75,61 @@ class TaskStoreTest(unittest.TestCase):
                 self.assertIsNone(workers.read_task(project, "2e6b14f1-1659-544a-98d4-56d6eca8fa48"),
                                   content[:40])
                 self.assertEqual([t["id"] for t in workers.tasks(project)], [good["id"]])
+
+    def test_a_deeply_nested_record_is_skipped_never_raised(self):
+        """A small JSON document can exceed the decoder's recursion limit;
+        malformed task state remains data, never control flow out of readers.
+        """
+        bad_id = "2e6b14f1-1659-544a-98d4-56d6eca8fa48"
+        with tempfile.TemporaryDirectory() as project:
+            good = self._new(project)
+            path = os.path.join(workers.tasks_dir(project), bad_id + ".json")
+            with open(path, "w", encoding="ascii") as stream:
+                stream.write("[" * 1_500 + "0" + "]" * 1_500)
+            self.assertLess(os.path.getsize(path), workers.RECORD_CEILING)
+            self.assertIsNone(workers.read_task(project, bad_id))
+            self.assertEqual([task["id"] for task in workers.tasks(project)],
+                             [good["id"]])
+
+        with tempfile.TemporaryDirectory() as project:
+            good = self._new(project)
+            with patch.object(workers.json, "loads",
+                              side_effect=RecursionError("decoder limit")):
+                self.assertIsNone(workers.read_task(project, good["id"]))
+
+    def test_non_utf8_task_metadata_is_invalid_and_writer_cleanup_is_total(self):
+        with tempfile.TemporaryDirectory() as project:
+            record = self._new(project)
+            path = os.path.join(workers.tasks_dir(project), record["id"] + ".json")
+            poisoned = dict(record, birth="bad\ud800birth")
+            with open(path, "w", encoding="ascii") as stream:
+                json.dump(poisoned, stream)
+            self.assertIsNone(workers.read_task(project, record["id"]))
+
+        with tempfile.TemporaryDirectory() as project:
+            record = self._new(project)
+            directory = workers.tasks_dir(project)
+            before = set(os.listdir(directory))
+            with patch.object(workers.json, "dump",
+                              side_effect=RuntimeError("serializer failed")):
+                with self.assertRaisesRegex(RuntimeError, "serializer failed"):
+                    workers._write(project, record)
+            self.assertEqual(set(os.listdir(directory)), before,
+                             "a failed serializer leaves no temporary file")
+
+    def test_non_utf8_peer_metadata_in_a_legacy_running_task_is_inert(self):
+        """Every durable string is a UTF-8 boundary, not only v2 handoffs.
+        Otherwise status accepts this v1 row and crashes while finishing it."""
+        with tempfile.TemporaryDirectory() as project:
+            record = self._new(project)
+            poisoned = dict(record, state="running", pid=999_999,
+                            started_at=1_000.0, to="bad\ud800peer")
+            path = os.path.join(workers.tasks_dir(project), record["id"] + ".json")
+            with open(path, "w", encoding="ascii") as stream:
+                json.dump(poisoned, stream)
+
+            self.assertIsNone(workers.read_task(project, record["id"]))
+            self.assertIsNone(workers.status(project, record["id"], now=2_000.0))
 
     def test_an_update_is_validated_and_locked(self):
         with tempfile.TemporaryDirectory() as project:
@@ -97,6 +156,20 @@ class TaskStoreTest(unittest.TestCase):
             self.assertFalse(workers.update_task(project, record["id"], broken),
                              "an update that breaks the record is refused, not written")
             self.assertEqual(workers.read_task(project, record["id"])["state"], "running")
+
+    def test_an_update_lock_failure_is_a_false_result_not_an_exception(self):
+        """Callers may already have put the task id in a peer's hands.  A
+        kernel lock refusal must leave the prepared row intact and let those
+        callers return their structured incomplete state.
+        """
+        with tempfile.TemporaryDirectory() as project:
+            record = self._new(project)
+            with patch.object(workers.fcntl, "flock",
+                              side_effect=OSError("lock unavailable")):
+                self.assertFalse(workers.update_task(
+                    project, record["id"],
+                    lambda changed: changed.update(state="running")))
+            self.assertEqual(workers.read_task(project, record["id"]), record)
 
     def test_prune_removes_only_what_is_older_than_the_ttl_and_not_running(self):
         with tempfile.TemporaryDirectory() as project:
@@ -311,6 +384,102 @@ class AdapterTest(unittest.TestCase):
             workers.update_task(project, ids[0],
                                 lambda c: c.update(state="completed", finished_at=2.0))
             workers.admit(project)
+
+    def test_handoffs_in_flight_do_not_consume_worker_capacity(self):
+        with tempfile.TemporaryDirectory() as project:
+            for _ in range(workers.MAX_WORKERS):
+                workers.new_task(
+                    project, kind="codex", task_class="read", sha256=SHA,
+                    size=1, to="build", state="handing")
+
+            accepted = workers.accept(
+                project, kind="claude", task_class="read", sha256=SHA, size=1)
+
+        self.assertEqual(accepted["state"], "accepted")
+
+    def test_an_in_flight_handoff_is_not_swept_as_a_dead_worker_start(self):
+        with tempfile.TemporaryDirectory() as project:
+            record = workers.new_task(
+                project, kind="codex", task_class="read", sha256=SHA,
+                size=1, to="build", state="handing")
+
+            workers.sweep(
+                project, record["created_at"] + workers.START_PATIENCE + 1)
+            after = workers.read_task(project, record["id"])
+
+        self.assertIsNotNone(after)
+        self.assertEqual(after["state"], "handing")
+
+    def test_a_peer_handoff_state_requires_a_named_recipient(self):
+        with tempfile.TemporaryDirectory() as project:
+            with self.assertRaisesRegex(ValueError, "must name its peer"):
+                workers.new_task(
+                    project, kind="codex", task_class="read", sha256=SHA,
+                    size=1, state="handing")
+
+            record = workers.new_task(
+                project, kind="codex", task_class="read", sha256=SHA, size=1)
+            changed = workers.update_task(
+                project, record["id"],
+                lambda candidate: candidate.update(state="tracking_incomplete"))
+
+        self.assertFalse(changed)
+
+        with tempfile.TemporaryDirectory() as project:
+            with self.assertRaisesRegex(ValueError, "task record is not valid"):
+                workers.new_task(
+                    project, kind="codex", task_class="read", sha256=SHA,
+                    size=1, to="bad name", state="handing")
+
+    def test_task_schema_v2_names_handoff_states_and_still_reads_v1_workers(self):
+        self.assertEqual(workers.TASK_VERSION, 2,
+                         "new states must not masquerade as the v1 schema")
+        with tempfile.TemporaryDirectory() as project:
+            current = workers.new_task(
+                project, kind="codex", task_class="read", sha256=SHA,
+                size=1, to="build", state="handing")
+            self.assertEqual(workers.read_task(project, current["id"])["version"], 2)
+
+            ordinary = workers.new_task(
+                project, kind="claude", task_class="read", sha256=SHA, size=1)
+            self.assertEqual(ordinary["version"], 1,
+                             "unchanged worker states remain visible to v1 readers")
+            workers.update_task(
+                project, current["id"],
+                lambda candidate: candidate.update(state="handed"))
+            self.assertEqual(workers.read_task(project, current["id"])["version"], 1,
+                             "v1 already understands a completed handoff")
+
+            legacy = dict(current, id="2e6b14f1-1659-544a-98d4-56d6eca8fa48",
+                          version=1, state="accepted", to=None)
+            workers._write(project, legacy)
+            self.assertEqual(workers.read_task(project, legacy["id"]), legacy)
+
+            legacy_handed = dict(legacy, state="handed", to="build")
+            workers._write(project, legacy_handed)
+            self.assertEqual(workers.read_task(project, legacy["id"]), legacy_handed,
+                             "v1 already shipped the handed state")
+
+            impossible_v1 = dict(legacy, state="handing", to="build")
+            workers._write(project, impossible_v1)
+            self.assertIsNone(workers.read_task(project, legacy["id"]),
+                              "v1 never defined the peer-handoff states")
+
+    def test_an_unfinished_handoff_never_claims_the_send_is_still_running(self):
+        with tempfile.TemporaryDirectory() as project:
+            record = workers.new_task(
+                project, kind="codex", task_class="read", sha256=SHA,
+                size=1, to="build", state="handing")
+            refusals = []
+            for action in (workers.result, workers.cancel):
+                with self.assertRaises(workers.Refused) as refused:
+                    action(project, record["id"])
+                refusals.append(str(refused.exception))
+
+        for refusal in refusals:
+            self.assertIn("hand-off tracking is incomplete", refusal)
+            self.assertIn("peer may already act", refusal)
+            self.assertNotIn("still being handed", refusal)
 
     def test_admission_and_the_record_are_one_locked_step(self):
         """Review 2026-09-03: eight concurrent delegations started seven

@@ -5,7 +5,7 @@
   "description": "A bridge between Claude Code and Codex CLI: each side sees the other's context and can wake it, without ever faking the sender's identity.",
   "license": "MIT",
   "bin": {
-    "antiphon": "bin/antiphon.mjs"
+    "antiphon": "bin/antiphon"
   },
   "files": [
     "bin/",
