@@ -109,9 +109,9 @@ at HEAD under `.antiphon/workers/<id>/work/`, so nothing it does touches your
 tree and nothing uncommitted in your tree is visible to it: a worker asked to
 review "the current changes" reviews HEAD. The log and a compatibility copy
 of the exit code sit beside that worktree; the current reader trusts neither
-for lifecycle authority. A supervisor-only `.antiphon/tasks/<id>.live` marker
-binds the final exit code beside the task record, where a too-large diff also
-sits as `.antiphon/tasks/<id>.diff`; the one file the
+for lifecycle authority. A supervisor-only `.antiphon/tasks-v2/<id>.live`
+marker binds the final exit code beside the task record, where a too-large
+diff also sits as `.antiphon/tasks-v2/<id>.diff`; the one file the
 worker writes for the bridge, its test summary, sits inside it at
 `.antiphon/tests.txt`, where a write task's sandbox can reach it and where git
 ignores it. A read task (the default) runs under the host's read-only class
@@ -158,19 +158,90 @@ after an `admit` → `ready` → `commit` handshake, so a refused start cannot r
 its adapter later. A worker whose exit is proved gives its slot back the
 moment another is asked for; one whose exact process identity is proved is
 stopped at its timeout by the next `status`, `result`, hook sweep or new
-delegation. A final protected-marker read after identity verification is the
-stop action's boundary: an outcome already published there wins; otherwise
-the timeout or cancel owns any later publication. If liveness or ownership
-cannot be proved after the deadline, the
-durable v1 record deliberately remains `running`: Antiphon invents no terminal
+delegation. A final protected-marker read after identity verification prevents
+a stop from acting on an already-published outcome. The stop intent is durable
+before any signal, and the supervisor's authenticated publication says whether
+it exited naturally or observed that stop. The supervisor blocks SIGTERM
+before sampling that bit and keeps it blocked through the marker fsync: a stop
+observed before that publication fence is signed, while one arriving after the
+fence loses to the publication already in progress. A natural publication still wins
+when no signal reached the supervisor; a stopped publication resolves to the
+first durable timeout or cancel intent. If the whole process group is
+positively dead but no authenticated publication survived, the task is
+`outcome_unknown`; a later authenticated publication, or the caller that
+proved its own stop completed, can refine that conservative result. Process-
+table absence proves death only from a successful, completely parsed snapshot;
+birth and state for one pid come from the same canonical C-locale row, so a
+recycled pid cannot splice two owners into signal authority. Any malformed
+nonblank row makes the observation unknown. The supervisor gives a transient
+unreadable group snapshot one bounded retry window; status/admission use the
+same rule when releasing a finished slot, and persistent uncertainty still
+withholds publication or terminal state. If
+liveness or ownership cannot be proved after the deadline, the current record
+deliberately remains `running`: Antiphon invents no terminal
 outcome and sends no unverified signal, retaining its work directory and one
 of the four slots indefinitely. A later trustworthy published exit or restored
 observation reconciles it automatically; otherwise operator intervention
 outside Antiphon is required, with no unsafe force-reclaim command. An
 ordinary terminal task record lives a week under
-`.antiphon/tasks/`, and a worker's directory is swept once its evidence was
-collected — its worktree forgotten by its own entry, never by a prune of your
-repository's other worktrees. Every worker is asked to keep `[Antiphon worker
+`.antiphon/tasks-v2/`, and a worker's directory is swept once its evidence was
+collected; a durable `cancelled` row needs no result evidence and authorizes a
+later sweep to retry directory cleanup after a crash. Reading
+`outcome_unknown` never collects a possible future result;
+refinement exposes its evidence first. Expiry revalidates the exact row under
+the task lock. Git-backed work writes its durable cleanup witness before
+`git worktree add`, covering a crash before `base` reaches the accepted row,
+and fsyncs the containing worker-directory entry before Git is touched; it
+revalidates the added worktree's base before admitting the adapter. A visible
+witness is freshly fsynced again before it can authorize retirement. Git alone
+removes the exact worktree registration; Antiphon only verifies the bounded,
+regular, one-line `gitdir` namespace and retains the witness when any entry is
+malformed or unreadable. It also fsyncs Git's common directory when removal of
+the last worktree removes the admin directory itself. External work is deleted
+only afterwards, so a crash can
+leave only an orphan directory that a later prune retries — its worktree
+removed by exact path, never by deleting an admin pathname or pruning your
+repository's other worktrees. An explicit `cancel` reports success only after
+both the worker directory and
+its own Git worktree entry are proved absent; a partial cleanup keeps the
+terminal row and refuses with a safe retry instead. Task-id creation and the
+whole Git/filesystem cleanup transaction share the task-store lock; a new row
+cannot reuse an id while its current or legacy row, lifecycle marker, retained
+diff or worker directory remains. Record-first cleanup requires those state
+markers to stay absent, while terminal cleanup retains its row. `cancel` reads
+that same generation again before releasing the cleanup lock, so a concurrent
+authenticated refinement of `outcome_unknown` is not reported stale and a
+later same-id task cannot become the answer.
+The worktree-add lease is held by a small Python guardian whose environment,
+user-site and `sitecustomize` startup paths are disabled. Git cannot cross its
+one-byte gate until the exact Git pid/birth recovery marker is durable, and
+neither Git nor its hook descendants inherit the lease. The guardian drains
+stdout and stderr into bounded memory while waiting for the direct Git child,
+then closes those pipes without waiting for detached hook copies, so neither
+pipe EOF nor post-return output can retain resources. Its durable marker,
+written only after it directly observes that return (success or failure), is
+the sole completion receipt. A timeout, signal, guardian loss or later process-death
+observation never substitutes for it: the accepted row, cleanup witness, work
+and worker slot remain, `status`, `task list` and `doctor` name the uncertainty,
+and automatic retry is withheld until operator intervention outside Antiphon.
+A deliberately detached same-UID Git or hook process that keeps mutating after
+the direct Git command returns is outside this cooperative boundary.
+On the first current-protocol worker admission,
+Antiphon inspects the previous `.antiphon/tasks/` store under its old lock. It
+refuses while an old worker, unresolved old process group or uncollected old
+write result remains. A newly prepared lock-free legacy hand-off receives a
+60-second cooperative settlement window before it is treated as crash-stale
+incomplete evidence; this is a reclamation policy, not proof about an
+arbitrarily wedged old process. Once quiescent, Antiphon makes that directory
+read-only (`0500`) and records the completed fence in its lock file before
+admitting current work.
+Old history remains visible as `legacy:<state>` in `antiphon task list`, but
+current commands never mutate it and a pinned old client can no longer publish
+there. Finish and collect old work with the client that created it before the
+transition, then retry. This local fence relies on non-root POSIX owner-mode
+enforcement; root or arbitrary same-user code that deliberately restores write
+permission is outside the file protocol's threat boundary. Every worker is
+asked to keep `[Antiphon worker
 <kind>:<id>]` at the start of its final message, so nothing it says reads as
 the parent's own. A worker is followed by its task id — `status`, `result`,
 the log. Whether it is also a peer depends on where it runs. In a worktree

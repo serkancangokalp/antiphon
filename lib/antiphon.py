@@ -6940,6 +6940,14 @@ def _worker_report(cwd):
     if uncertain:
         noun = "worker has" if uncertain == 1 else "workers have"
         line += f"; {uncertain} running {noun} unknown liveness after the task deadline"
+    missing_receipts = sum(
+        1 for record in records
+        if workers.accepted_start_recovery(cwd, record)
+        == "git_completion_receipt_missing")
+    if missing_receipts:
+        noun = "task has" if missing_receipts == 1 else "tasks have"
+        line += (f"; {missing_receipts} accepted {noun} an unresolved Git "
+                 "completion receipt (manual intervention required)")
     return line
 
 
@@ -11178,8 +11186,9 @@ def _doctor_deliveries(report, cwd):
 
 def _doctor_workers(report, cwd):
     """Name visible worker uncertainty without reconciling or signalling."""
+    records = workers.tasks(cwd)
     uncertain = sum(
-        1 for record in workers.tasks(cwd)
+        1 for record in records
         if workers.liveness_unknown(cwd, record))
     if uncertain:
         noun = "worker has" if uncertain == 1 else "workers have"
@@ -11187,6 +11196,32 @@ def _doctor_workers(report, cwd):
             f"workers: {uncertain} running {noun} unknown liveness after the "
             "task deadline; no terminal outcome is claimed, and each work directory "
             "and worker slot are kept")
+    recoveries = collections.Counter(
+        workers.accepted_start_recovery(cwd, record) for record in records)
+    missing = recoveries["git_completion_receipt_missing"]
+    if missing:
+        noun = "task has" if missing == 1 else "tasks have"
+        report.note(
+            f"workers: {missing} accepted {noun} no durable Git completion "
+            "receipt; each accepted row, cleanup witness, work and worker "
+            "slot is kept; do not retry automatically; operator intervention "
+            "outside Antiphon is required")
+    unknown = recoveries["unknown"]
+    if unknown:
+        noun = "task has" if unknown == 1 else "tasks have"
+        report.note(
+            f"workers: {unknown} accepted {noun} unreadable start-recovery "
+            "evidence; each record, work and worker slot is kept; do not retry "
+            "automatically")
+    health = workers.start_recovery_health(cwd)
+    unresolved = health["orphaned"] + health["row_unreadable"]
+    if unresolved:
+        report.bad(
+            f"workers: {unresolved} unresolved lifecycle evidence file"
+            f"{'s have' if unresolved != 1 else ' has'} no readable task row "
+            f"({health['orphaned']} absent, {health['row_unreadable']} "
+            "unreadable); automatic cleanup is withheld — inspect "
+            ".antiphon/tasks-v2 and reconcile it manually")
 
 
 def _doctor_codex_tool_shapes(report, cwd):
@@ -12719,6 +12754,10 @@ def _delegate_tool(cwd, arguments, sender, side):
 
 # Seconds the Codex MCP server may wait inside one antiphon_task result call.
 SERVER_WAIT_CAP = 5
+LEGACY_TASK_MESSAGE = (
+    "task belongs to the previous managed-worker protocol; the current client "
+    "shows it only in `antiphon task list` and will not mutate it; use the "
+    "Antiphon client that created it for any remaining result or cleanup")
 
 
 def _guarded(action):
@@ -12733,6 +12772,8 @@ def _guarded(action):
 def _task_tool(cwd, arguments):
     task_id, action = arguments.get("id"), arguments.get("action")
     if not isinstance(task_id, str) or workers.read_task(cwd, task_id) is None:
+        if isinstance(task_id, str) and workers.legacy_task(cwd, task_id) is not None:
+            return _tool_error(LEGACY_TASK_MESSAGE)
         return _tool_error("unknown task id")
     if action == "status":
         record = workers.reported_status(cwd, task_id)
@@ -12747,9 +12788,12 @@ def _task_tool(cwd, arguments):
         except workers.Refused as refusal:
             return _tool_error(str(refusal))
         text = json.dumps(answer, indent=1, ensure_ascii=False)
-        if answer and answer.get("state") not in workers.TERMINAL:
+        if answer and answer.get("state") == "running":
             text += (f"\n(still running; this server waits at most {SERVER_WAIT_CAP} s "
                      "per call — poll again)")
+        elif (answer and answer.get("state") == "accepted"
+              and "start_recovery" not in answer):
+            text += "\n(still starting — poll again)"
         return {"content": [{"type": "text", "text": text}]}
     if action == "cancel":
         try:
@@ -12760,15 +12804,22 @@ def _task_tool(cwd, arguments):
     return _tool_error("action must be status, result or cancel")
 
 
-def _task_lines(records):
+def _task_lines(records, cwd=None):
     """One line per task: id, kind, class, state, and when it started."""
     lines = []
     for record in records:
         started = record["started_at"]
         when = (time.strftime("%Y-%m-%dT%H:%M:%S", time.localtime(started))
                 if started else "-")
-        lines.append(f"{record['id']}  {record['kind']:<6} {record['task_class']:<5} "
-                     f"{record['state']:<9} {when}")
+        line = (f"{record['id']}  {record['kind']:<6} {record['task_class']:<5} "
+                f"{record['state']:<9} {when}")
+        recovery = (workers.accepted_start_recovery(cwd, record)
+                    if cwd is not None else None)
+        if recovery == "git_completion_receipt_missing":
+            line += "  [Git completion receipt missing; manual intervention required]"
+        elif recovery == "unknown":
+            line += "  [start-recovery evidence unreadable; do not retry]"
+        lines.append(line)
     return lines
 
 
@@ -12781,8 +12832,14 @@ def task(*args):
         return 1
     cwd = project_dir()
     if action == "list":
-        for line in _task_lines(workers.tasks(cwd)):
+        for line in _task_lines(workers.tasks(cwd), cwd):
             print(line)
+        for record in workers.legacy_tasks(cwd):
+            started = record["started_at"]
+            when = (time.strftime("%Y-%m-%dT%H:%M:%S", time.localtime(started))
+                    if started else "-")
+            print(f"{record['id']}  {record['kind']:<6} {record['task_class']:<5} "
+                  f"legacy:{record['state']} {when}")
         return 0
     if action == "delegate":
         try:
@@ -12812,6 +12869,9 @@ def task(*args):
         return 0
     task_id = args[1] if len(args) > 1 else None
     if not isinstance(task_id, str) or workers.read_task(cwd, task_id) is None:
+        if isinstance(task_id, str) and workers.legacy_task(cwd, task_id) is not None:
+            print(f"task: {LEGACY_TASK_MESSAGE}", file=sys.stderr)
+            return 1
         print("task: unknown task id", file=sys.stderr)
         return 1
     try:

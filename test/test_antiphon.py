@@ -4388,6 +4388,20 @@ class ManagedWorkerToolTest(unittest.TestCase):
             code = antiphon.task(*args)
         return code, out.getvalue(), err.getvalue()
 
+    def _cancel_eventually(self, project, task_id, patience=3.0):
+        """Test cleanup respects the product's retryable unknown-liveness
+        result instead of turning one transient process-table read into a
+        suite failure.
+        """
+        deadline = time.time() + patience
+        while True:
+            try:
+                return workers.cancel(project, task_id)
+            except workers.Refused:
+                if time.time() >= deadline:
+                    raise
+                time.sleep(0.05)
+
     def test_delegate_starts_a_fresh_worker_and_says_so(self):
         with tempfile.TemporaryDirectory() as project, tempfile.TemporaryDirectory() as bin_dir:
             env = {"PATH": self._stub_path(bin_dir)}
@@ -4667,7 +4681,7 @@ class ManagedWorkerToolTest(unittest.TestCase):
                 result = antiphon._delegate_tool(project, {"text": "x"}, "worker-abcdef12", "codex")
             self.assertIsNot(result.get("isError"), True, result)
             for task_id in [t["id"] for t in workers.tasks(project)]:
-                workers.cancel(project, task_id)
+                self._cancel_eventually(project, task_id)
 
     def test_the_cli_road_fails_closed_on_the_workers_own_name(self):
         """Second review 2026-09-03: the name-based fail-closed lived on the
@@ -4697,7 +4711,7 @@ class ManagedWorkerToolTest(unittest.TestCase):
             self.assertEqual(json.loads(out)["hop"] if "hop" in json.loads(out) else
                              workers.read_task(project, json.loads(out)["task_id"])["hop"], 2)
             for task_id in [t["id"] for t in workers.tasks(project)]:
-                workers.cancel(project, task_id)
+                self._cancel_eventually(project, task_id)
 
     def test_a_write_task_cannot_be_handed(self):
         """A handed task has no worktree; the class would be a promise the
@@ -4754,6 +4768,39 @@ class ManagedWorkerToolTest(unittest.TestCase):
             self.assertEqual([line.split()[3] for line in out.splitlines()],
                              ["cancelled", "cancelled"])
 
+    def test_previous_protocol_tasks_are_named_but_never_mutated(self):
+        with tempfile.TemporaryDirectory() as project:
+            legacy = workers.new_task(
+                project, kind="codex", task_class="read", sha256="a" * 64,
+                size=1)
+            workers.update_task(project, legacy["id"], lambda changed: changed.update(
+                state="failed", exit_code=7, started_at=1.0, finished_at=2.0))
+            os.makedirs(
+                os.path.join(project, ".antiphon", workers.LEGACY_TASK_STORE),
+                mode=0o700)
+            os.replace(
+                os.path.join(workers.tasks_dir(project), legacy["id"] + ".json"),
+                os.path.join(project, ".antiphon", workers.LEGACY_TASK_STORE,
+                             legacy["id"] + ".json"))
+            before = workers.legacy_task(project, legacy["id"])
+            self.assertIsNotNone(before)
+
+            code, out, err = self._task(project, ("list",))
+            self.assertEqual((code, err), (0, ""))
+            self.assertRegex(
+                out, rf"^{legacy['id']}\s+codex\s+read\s+legacy:failed\s+")
+            for action in ("status", "result", "cancel"):
+                code, out, err = self._task(project, (action, legacy["id"]))
+                self.assertEqual((code, out), (1, ""), action)
+                self.assertIn("previous managed-worker protocol", err)
+                self.assertIn("only in `antiphon task list`", err)
+                answer = antiphon._task_tool(
+                    project, {"id": legacy["id"], "action": action})
+                self.assertTrue(answer.get("isError"), action)
+                self.assertIn("previous managed-worker protocol",
+                              answer["content"][0]["text"])
+            self.assertEqual(workers.legacy_task(project, legacy["id"]), before)
+
     def test_status_counts_the_workers_on_record(self):
         with tempfile.TemporaryDirectory() as project:
             self.assertEqual(antiphon._worker_report(project), "Workers:            none")
@@ -4796,6 +4843,55 @@ class ManagedWorkerToolTest(unittest.TestCase):
                 "no terminal outcome is claimed, and each work directory and worker slot "
                 "are kept",
                 out.getvalue())
+
+    def test_worker_surfaces_name_a_missing_git_completion_receipt(self):
+        with tempfile.TemporaryDirectory() as project:
+            record = workers.new_task(
+                project, kind="codex", task_class="write",
+                sha256="a" * 64, size=1)
+            os.makedirs(workers.worker_dir(project, record["id"]))
+            self.assertTrue(
+                workers._write_git_cleanup_witness(project, record["id"]))
+            birth = workers._process_start(os.getpid())
+            self.assertIsNotNone(birth)
+            descriptor = os.open(
+                workers.live_path(project, record["id"]),
+                os.O_CREAT | os.O_RDWR, 0o600)
+            try:
+                workers._write_live_marker(
+                    descriptor,
+                    workers._git_mutator_marker(os.getpid(), birth))
+            finally:
+                os.close(descriptor)
+
+            self.assertIn(
+                "1 accepted task has an unresolved Git completion receipt "
+                "(manual intervention required)",
+                antiphon._worker_report(project))
+            self.assertIn(
+                "[Git completion receipt missing; manual intervention required]",
+                antiphon._task_lines(workers.tasks(project), project)[0])
+            result = antiphon._task_tool(
+                project, {"id": record["id"], "action": "result"})
+            rendered = result["content"][0]["text"]
+            self.assertIn("git_completion_receipt_missing", rendered)
+            self.assertNotIn("poll again", rendered)
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out):
+                antiphon._doctor_workers(antiphon._Report(), project)
+            text = out.getvalue()
+            self.assertIn("no durable Git completion receipt", text)
+            self.assertIn("do not retry automatically", text)
+            self.assertIn("operator intervention outside Antiphon", text)
+
+            os.unlink(os.path.join(
+                workers.tasks_dir(project), record["id"] + ".json"))
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out):
+                antiphon._doctor_workers(antiphon._Report(), project)
+            self.assertIn(
+                "1 unresolved lifecycle evidence file has no readable task row "
+                "(1 absent, 0 unreadable)", out.getvalue())
 
     def test_a_refused_hand_off_leaves_no_record(self):
         with tempfile.TemporaryDirectory() as project:
@@ -5318,7 +5414,7 @@ class ManagedWorkerToolTest(unittest.TestCase):
             self.assertTrue(result.get("isError"))
             self.assertIn("the task text is empty", result["content"][0]["text"])
             for task_id in [t["id"] for t in workers.tasks(project)]:
-                workers.cancel(project, task_id)
+                self._cancel_eventually(project, task_id)
 
 
 class SameVendorTest(unittest.TestCase):
