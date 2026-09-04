@@ -193,11 +193,11 @@
 - Consumes: the complete feature diff and independent Claude/subagent findings.
 - Produces: a clean feature commit with recorded review dispositions and exact test evidence.
 
-- [ ] **Step 1: Run focused Python tests under `/usr/bin/python3` and the current `python3`, then the entire Python suite under both.** Record exact counts and skips.
-- [ ] **Step 2: Run `node test/channel.test.mjs`, `git diff --check`, and `npm pack --dry-run --json`.** Confirm the package contains every runtime module and no `.antiphon` state or research-only files.
-- [ ] **Step 3: Install the generated tarball into a fresh temporary npm prefix and run `antiphon --version`, `antiphon --help`, launch parse refusal smoke tests, and MCP initialization from outside the repository.** Verify resolution uses installed bytes.
-- [ ] **Step 4: Ask Claude Opus for an independent correctness/security/UX review of the exact diff.** Resolve every concrete finding or document the technical reason it is not accepted, then request a re-review if code changes.
-- [ ] **Step 5: Run final verification again, inspect `git diff --stat`, `git diff --check`, and `git status --short`, then commit on `codex/ux-foundation`.** Do not merge, push, publish, or tag.
+- [x] **Step 1: Run focused Python tests under `/usr/bin/python3` and the current `python3`, then the entire Python suite under both.** Record exact counts and skips.
+- [x] **Step 2: Run `node test/channel.test.mjs`, `git diff --check`, and `npm pack --dry-run --json`.** Confirm the package contains every runtime module and no `.antiphon` state or research-only files.
+- [x] **Step 3: Install the generated tarball into a fresh temporary npm prefix and run `antiphon --version`, `antiphon --help`, launch parse refusal smoke tests, and MCP initialization from outside the repository.** Verify resolution uses installed bytes.
+- [x] **Step 4: Ask Claude Opus for an independent correctness/security/UX review of the exact diff.** Resolve every concrete finding or document the technical reason it is not accepted, then request a re-review if code changes.
+- [x] **Step 5: Run final verification again, inspect `git diff --stat`, `git diff --check`, and `git status --short`, then commit on `codex/ux-foundation`.** Do not merge, push, publish, or tag.
 
 ## Self-review
 

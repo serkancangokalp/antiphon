@@ -35,9 +35,29 @@ shared message-content database.
   schedules, and installed CLI packaging. Their concrete findings were either
   reproduced by a failing test and fixed or retained as an explicit release
   boundary below.
-- A final read-only code reviewer is auditing the integrated working tree. Its
-  resolved findings so far are recorded below; exact-commit review remains a
-  completion gate.
+- Claude Opus reviewed the successive exact candidates through six gates. Its
+  final request was delivered under `7520cd54-8de6-4d79-8c75-31b740cc9a11`
+  with the corrected full SHA under
+  `365677b4-6288-43c6-8ceb-3447a0c95aa4`; it returned an explicit PASS for
+  `0865227e79adf6053ca6d66fffd86753eb27d829` after reproducing both final
+  mutation controls in an isolated archive copy.
+- A separate read-only agent also returned PASS for that exact SHA and tree
+  after four discriminating Node mutations, the complete test suite, syntax,
+  contract, repository-connectivity, and clean-tree checks. Neither reviewer
+  edited the feature worktree.
+
+## Exact candidate
+
+The reviewed runtime-and-test candidate is
+`0865227e79adf6053ca6d66fffd86753eb27d829`, tree
+`a14d69c7f284a935782c4ef64aa1122a3e0b62d8`, based on
+`8ae369230365c856ee48a9628321c64cf71b54d2`. Its five commits are:
+
+1. `e501a1cea43350cf21d176e4163ec79665590969` — UX and delivery foundation.
+2. `39cad45660ee2d83aa60fd57a58c39a5a3c7caaa` — CI matrix and installed artifact proof.
+3. `59076649f03d66f99507379c2e21d865a775f934` — delegation and census boundary fixes.
+4. `acf4793f0c8e301265828434476de13f7d6ced1d` — mutation-gap fixes.
+5. `0865227e79adf6053ca6d66fffd86753eb27d829` — discriminating Node boundary tests.
 
 ## Resolved findings
 
@@ -72,6 +92,12 @@ shared message-content database.
 - Node validates exact Python reply/delegate result shapes. It rejects
   contradictory fields, false receipt persistence, malformed IDs, and any
   attachment value other than a canonical UUID basename.
+- Delegation defaults apply only when `kind` or `task` is absent. Explicit
+  null/empty values are rejected before Python is spawned; a PATH stub proves
+  that Python's later validation cannot mask a Node regression.
+- `handing`, `missing`, and `tracking_incomplete` are all exercised through the
+  real Node MCP boundary. Removing any one accepted state makes the suite fail,
+  preventing a successful peer handoff from becoming a false refusal/retry.
 - Claude channel success requires literal `ok: true` and the exact attempt ID.
   Missing, stale, or mismatched acknowledgements are post-write unknown, never
   success or a retry invitation.
@@ -86,6 +112,11 @@ shared message-content database.
 - The host-wrapper census measures production-admitted and excluded corpora
   separately, rejects invalid UTF-8 path names, merges repeated path refusals,
   and behaves consistently across Python 3.9 and 3.14 JSON recursion limits.
+- Census prompt sources use a closed, bounded vocabulary while retaining the
+  observed `queued` and `suggestion_accepted` categories. Tag names have
+  separate length and cardinality ceilings: currently observed names such as
+  `subagent_notification` remain visible, while excess distinct names are
+  explicitly accumulated under `<additional-tags>`.
 - Cross-root server diagnosis compares bounded complete code signatures rather
   than trusting matching versions or mtimes.
 - Hostile task/ledger JSON, lock acquisition/unlock failures, and deep decoded
@@ -93,20 +124,36 @@ shared message-content database.
 
 ## Verification evidence
 
-Evidence below is from the uncommitted integrated tree and will be repeated for
-the exact commit before this record is final.
+Evidence below is from a clean detached clone of exact candidate
+`0865227e79adf6053ca6d66fffd86753eb27d829`, except where the parent is named
+explicitly.
 
-- Python 3.9.6: `1404` tests, `3` skipped, all passing.
-- Python 3.14.7: `1404` tests, `1` skipped, all passing.
-- Node channel/MCP integration suite: all scenarios passing.
+- Python 3.9.6: `1408` tests, `3` skipped, all passing.
+- Python 3.14.7: `1408` tests, `1` skipped, all passing.
+- Node 26.7.0 channel/MCP integration suite: all scenarios passing, including
+  both new process-boundary mutation gates.
 - CI verifier unit suite: `18` tests passing under both Python runtimes.
 - Installed tarball smoke: version/help, parse refusals, both MCP initialises,
   exact installed-byte comparison, and `11` first-party files passing from an
   empty workspace outside the checkout.
-- `npm pack --dry-run --json`: exactly `11` intended package files; no project
-  `.antiphon` state, tests, research notes, or CI files.
+- The exact-SHA tarball SHA-256 is
+  `9831a45469937f276968dc9ec6eebf531a4748513c216dd3c70d789decb70780`.
+  `npm pack --dry-run --json` reports exactly `11` intended package files; no
+  project `.antiphon` state, tests, research notes, or CI files.
+- The real fresh-user flow passed `112/112` on exact parent
+  `acf4793f0c8e301265828434476de13f7d6ced1d`. The child changes only
+  `test/channel.test.mjs`; an exact diff proves all production and package bytes
+  are identical, so model-backed E2E was not repeated merely to spend calls.
+- The final live wrapper census measured Claude `98` production and `450`
+  excluded files, and Codex `299` production files. Both sides reported zero
+  refused paths, zero refused files, and zero malformed lines.
 - Static Python compilation, Node syntax checks, shell syntax checks, and
-  `git diff --check`: passing.
+  full-range `git diff --check`: passing. The exact checkout stayed clean.
+- Claude's earlier unexplained, output-discarded Node exit `1` did not recur in
+  `26` subsequent output-preserving runs, including eight isolated serial runs
+  and three Python-then-Node chains. There is no reproduced product failure;
+  retaining unexpected-rejection output in the harness remains a useful
+  diagnostics follow-up.
 
 ## Release-engineering follow-up
 
@@ -118,5 +165,6 @@ checkout and verifies every installed byte before exercising the CLI and MCP
 servers.
 
 No publication is authorised by this review. Before a release, choose and bump
-a new version, rerun exact-SHA review and all gates on those final bytes, then
-verify the registry directly after any publish attempt.
+a new version (`npm view antiphon version` still reports the already-published
+`0.5.0`), rerun exact-SHA review and all gates on those final bytes, then verify
+the registry directly after any publish attempt.
