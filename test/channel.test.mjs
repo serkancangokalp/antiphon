@@ -1942,6 +1942,83 @@ try {
   await rm(stubDir, { recursive: true, force: true }).catch(() => {});
 }
 
+// Schema validation by a well-behaved client is not a process boundary. The
+// channel itself must reject explicit null/empty enum values before spawning
+// Python: a later Python refusal cannot prove that this wrapper did not invoke
+// a side-effecting implementation first.
+async function invalidDelegateEnumsNeverReachPython() {
+  const realPython = execFileSync("python3", [
+    "-c", "import sys; print(sys.executable)",
+  ], { encoding: "utf8" }).trim();
+  const dir = await mkdtemp(join(tmpdir(), "antiphon-delegate-guard-"));
+  const pythonDir = await mkdtemp(join(tmpdir(), "antiphon-python-guard-"));
+  const calls = join(pythonDir, "delegate-calls");
+  writeFileSync(join(pythonDir, "python3"), `#!${realPython}
+import json
+import os
+import sys
+
+if len(sys.argv) > 3 and sys.argv[2:4] == ["task", "delegate"]:
+    request = json.load(sys.stdin)
+    with open(os.environ["ANTIPHON_TEST_DELEGATE_CALLS"], "a", encoding="utf-8") as log:
+        log.write("called\\n")
+    task_id = "12345678-1234-4abc-8def-1234567890ab"
+    print(json.dumps({
+        "task_id": task_id,
+        "state": "running",
+        "kind": request.get("kind") or "codex",
+        "task_class": request.get("task") or "read",
+        "timeout": 900,
+        "worker": {
+            "kind": request.get("kind") or "codex",
+            "name": "worker-12345678",
+            "directory": "/tmp/worker-12345678",
+        },
+        "text": "running",
+    }))
+    raise SystemExit(0)
+real_python = os.environ["ANTIPHON_TEST_REAL_PYTHON"]
+os.execv(real_python, [real_python, *sys.argv[1:]])
+`, { mode: 0o755 });
+  const env = {
+    ...process.env,
+    ANTIPHON_CWD: dir,
+    ANTIPHON_NAME: "delegate-guard",
+    HOME: dir,
+    PATH: `${pythonDir}:${process.env.PATH}`,
+    ANTIPHON_TEST_DELEGATE_CALLS: calls,
+    ANTIPHON_TEST_REAL_PYTHON: realPython,
+  };
+  const guardedTransport = new StdioClientTransport({
+    command: "node", args: ["lib/channel.mjs"], env, stderr: "pipe",
+  });
+  const guardedClient = new Client({ name: "antiphon-test", version: "1.0.0" });
+  try {
+    await guardedClient.connect(guardedTransport);
+    for (const [arguments_, refusal] of [
+      [{ text: "look", task: "" }, /task must be read or write/],
+      [{ text: "look", task: null }, /task must be read or write/],
+      [{ text: "look", kind: "" }, /name a kind/],
+      [{ text: "look", kind: null }, /name a kind/],
+    ]) {
+      await assert.rejects(
+        () => guardedClient.callTool({
+          name: "antiphon_delegate", arguments: arguments_,
+        }),
+        refusal);
+    }
+    assert.ok(!existsSync(calls),
+      "invalid delegation enums must not invoke Python task delegate");
+  } finally {
+    await guardedClient.close().catch(() => {});
+    await rm(dir, { recursive: true, force: true }).catch(() => {});
+    await rm(pythonDir, { recursive: true, force: true }).catch(() => {});
+  }
+  console.log("invalid delegation enums never reach Python: ok");
+}
+
+await invalidDelegateEnumsNeverReachPython();
+
 // An exit-zero child is not delegation evidence. In particular, an older or
 // broken Python dispatcher can print nothing or diagnostics that are not the
 // durable task object; the Claude-facing wrapper must fail closed rather than
@@ -2077,10 +2154,16 @@ import sys
 
 if len(sys.argv) > 3 and sys.argv[2:4] == ["task", "delegate"]:
     request = json.load(sys.stdin)
+    states = {
+        "handing state": "handing",
+        "missing state": "missing",
+        "post-success tracking": "tracking_incomplete",
+        "unknown transport": "tracking_incomplete",
+    }
     answer = {
         "task_id": "12345678-1234-4abc-8def-1234567890ab",
         "delivery_id": "12345678-1234-4abc-8def-1234567890ab",
-        "state": "tracking_incomplete",
+        "state": states[request["text"]],
         "tracking": "incomplete",
         "to": request["to"],
         "kind": request.get("kind") or "codex",
@@ -2108,15 +2191,21 @@ os.execv(real_python, [real_python, *sys.argv[1:]])
   const incompleteClient = new Client({ name: "antiphon-test", version: "1.0.0" });
   try {
     await incompleteClient.connect(incompleteTransport);
-    for (const text of ["post-success tracking", "unknown transport"]) {
+    const cases = [
+      ["handing state", "handing", false],
+      ["missing state", "missing", false],
+      ["post-success tracking", "tracking_incomplete", false],
+      ["unknown transport", "tracking_incomplete", true],
+    ];
+    for (const [text, state, hasDeliveryRecord] of cases) {
       const result = await incompleteClient.callTool({
         name: "antiphon_delegate", arguments: { text, to: "build" },
       });
       const answer = JSON.parse(result.content[0].text);
-      assert.equal(answer.state, "tracking_incomplete", text);
+      assert.equal(answer.state, state, text);
       assert.equal(answer.tracking, "incomplete", text);
       assert.equal(Object.hasOwn(answer, "delivery_recorded"),
-        text === "unknown transport", text);
+        hasDeliveryRecord, text);
     }
   } finally {
     await incompleteClient.close().catch(() => {});
