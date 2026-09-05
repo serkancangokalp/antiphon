@@ -595,6 +595,22 @@ class HostWrapperCensusTest(unittest.TestCase):
         self.assertEqual(result["claude"]["production"]["shapes"], {
             "compact_summary": 1, "interruption_literal": 1})
 
+    def test_measured_codex_metadata_has_a_bounded_shape_and_matches_production(self):
+        for kinds, expected in (
+                (["skills.selected_skill_instructions"], ["host_content_metadata"]),
+                (["additional_content.codex_apps_writing_block_edits"], ["host_content_metadata"]),
+                (["skills.selected_skill_instructions", "text"], []),
+                (["/private/not-a-shape"], []),
+                ([], []), (None, []), ([{}], [])):
+            payload = {"type": "message", "role": "user",
+                       "content": [{"type": "input_text", "text": "visible text"}],
+                       "internal_chat_message_metadata_passthrough": {
+                           "content_item_kinds": kinds}}
+            with self.subTest(kinds=kinds):
+                self.assertEqual(census.codex_shapes({
+                    "type": "response_item", "payload": payload}), expected)
+                self.assertEqual(antiphon._is_codex_host_metadata(payload), bool(expected))
+
     def test_an_unclosed_agents_draft_is_not_a_host_block(self):
         record = {"type": "response_item", "payload": {"type": "message",
                   "role": "user", "content": [{"type": "input_text", "text":
@@ -621,6 +637,7 @@ class HostWrapperCensusTest(unittest.TestCase):
         release check counts a shape the reader does not filter."""
         self.assertEqual(census.CLAUDE_HOST_LITERALS, antiphon.CLAUDE_HOST_LITERALS)
         self.assertEqual(census.AGENTS_INJECTION_HEAD, antiphon.AGENTS_INJECTION_HEAD)
+        self.assertEqual(census.CODEX_HOST_CONTENT_KINDS, antiphon.CODEX_HOST_CONTENT_KINDS)
         self.assertEqual(census.EXTERNAL_AGENT_CALL.pattern,
                          antiphon.EXTERNAL_AGENT_CALL.pattern)
         self.assertEqual(census.EXTERNAL_AGENT_RESULT_HEAD,

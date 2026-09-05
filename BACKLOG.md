@@ -1,8 +1,33 @@
 # Antiphon product backlog
 
-Last reviewed: 2026-09-04
+Last reviewed: 2026-09-05
 
 ## Start here
+
+**Current work: 1.0.0 release preparation (2026-09-05).** The user resumed the
+parked follow-up and explicitly chose 1.0.0, not 0.6.0. Lifecycle `95dd045`
+has Claude's exact-SHA PASS; discovery/census `ed6f932` is integrated with the
+task-schema work `5c77564` on isolated `codex/release-1.0.0`. Task-schema gate
+findings concerned two unprotected test branches, not a reproduced product
+defect; the release candidate strengthens those tests before the final gate.
+CI now retains failed stdout/stderr, release notes explain the legacy worker
+epoch and linked-install migration, and doctor identifies unobservable tasks.
+See [the release checklist](docs/superpowers/plans/2026-09-05-release-1.0.0.md)
+and [1.0.0 notes](CHANGELOG.md). Main integration, push, tag and npm publication
+remain separate decisions; none is implied by a release-readiness review.
+
+The production-scope census on 2026-09-05 read 99 Claude candidates (466 deeper
+files excluded) and 372 Codex candidates, with no malformed/refused files or
+unknown Claude prompt-source values. It found two new explicit Codex metadata
+kinds: 5 writing-block edit notifications and 2 selected-skill injections.
+Those host-only messages now advance the ordinary scanned frontier without
+rendering as user speech. One shared metadata predicate drives the reader and
+the census's bounded `host_content_metadata` count; mixed/unknown/malformed
+metadata remains visible. No generic `<skill>` filter was added. These are
+production-scope numbers, not comparable to the old recursive all-files totals.
+
+The dated entries below retain the historical evidence and publication record;
+they are not claims that the new release branch has already shipped.
 
 **Where this stands (2026-09-03).** `main` carries **0.5.0**: the final
 campaign of 2026-09-02/03 melted every open item — the mixed-version endpoint

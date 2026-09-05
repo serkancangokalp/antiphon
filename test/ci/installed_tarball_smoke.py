@@ -24,6 +24,7 @@ import tempfile
 
 EXPECTED_FILES = frozenset({
     "BACKLOG.md",
+    "CHANGELOG.md",
     "LICENSE",
     "README.md",
     "bin/antiphon",

@@ -716,6 +716,24 @@ def _is_host_record(text, wrappers, prompt_source=None):
 # somebody is still writing — the host writes the whole file at once.
 AGENTS_INJECTION_HEAD = "# AGENTS.md instructions for "
 
+# Measured in production rollouts, 2026-09-05: the host explicitly identifies
+# these injected content items. Do not infer ownership from a generic <skill>
+# tag, or silence a joined message that also contains an unknown/user item.
+CODEX_HOST_CONTENT_KINDS = (
+    "skills.selected_skill_instructions",
+    "additional_content.codex_apps_writing_block_edits",
+)
+
+
+def _is_codex_host_metadata(payload):
+    metadata = payload.get("internal_chat_message_metadata_passthrough")
+    if not isinstance(metadata, dict):
+        return False
+    kinds = metadata.get("content_item_kinds")
+    return (isinstance(kinds, list) and bool(kinds)
+            and all(isinstance(kind, str) and kind in CODEX_HOST_CONTENT_KINDS
+                    for kind in kinds))
+
 
 def _is_codex_host_block(text):
     if not isinstance(text, str) or not text.startswith(AGENTS_INJECTION_HEAD):
@@ -4035,6 +4053,7 @@ def codex_events(cwd, positions=None, since=None, visible_record_limit=None,
                             if role == "user":
                                 if (not _is_host_record(text, CODEX_WRAPPER_OPENING)
                                         and not _is_codex_host_block(text)
+                                        and not _is_codex_host_metadata(payload)
                                         and not _is_self_injected(text)):
                                     events.append((ts, path, next(position),
                                                   Event(ts, "you", text, sid, gen,
@@ -11220,15 +11239,18 @@ def _doctor_deliveries(report, cwd):
 def _doctor_workers(report, cwd):
     """Name visible worker uncertainty without reconciling or signalling."""
     records = workers.tasks(cwd)
-    uncertain = sum(
-        1 for record in records
-        if workers.liveness_unknown(cwd, record))
+    uncertain_records = [record for record in records
+                         if workers.liveness_unknown(cwd, record)]
+    uncertain = len(uncertain_records)
     if uncertain:
         noun = "worker has" if uncertain == 1 else "workers have"
         report.note(
             f"workers: {uncertain} running {noun} unknown liveness after the "
             "task deadline; no terminal outcome is claimed, and each work directory "
-            "and worker slot are kept")
+            "and worker slot are kept "
+            f"({', '.join(record['id'] for record in uncertain_records)}); "
+            "run `antiphon task status <id>`; restore process/lock observation "
+            "and do not delete lifecycle evidence to free a slot")
     recoveries = collections.defaultdict(list)
     for record in records:
         recovery = workers.accepted_start_recovery(cwd, record)

@@ -16,6 +16,7 @@
     "lib/ledger.py",
     "lib/workers.py",
     "README.md",
+    "CHANGELOG.md",
     "BACKLOG.md",
     "LICENSE"
   ],

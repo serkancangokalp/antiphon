@@ -20,6 +20,7 @@ SPEC.loader.exec_module(smoke)
 
 EXPECTED = {
     "BACKLOG.md",
+    "CHANGELOG.md",
     "LICENSE",
     "README.md",
     "bin/antiphon",

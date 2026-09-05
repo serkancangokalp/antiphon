@@ -2248,7 +2248,7 @@ async function taskResponsesAreActionSpecificAndFailClosed() {
   ], { encoding: "utf8" }).trim();
   const dir = await mkdtemp(join(tmpdir(), "antiphon-task-schema-"));
   const stubDir = await mkdtemp(join(tmpdir(), "antiphon-task-python-"));
-  const ids = Array.from({ length: 55 }, (_unused, index) =>
+  const ids = Array.from({ length: 61 }, (_unused, index) =>
     `12345678-1234-4abc-8def-${String(index + 1).padStart(12, "0")}`);
   const taskRecord = (id, state = "completed") => ({
     version: 1, id, kind: "codex", task_class: "read", state,
@@ -2406,6 +2406,13 @@ async function taskResponsesAreActionSpecificAndFailClosed() {
     start_recovery: "guess", recovery_detail: "not a writer enum",
   };
   const unresolvedCancel = taskRecord(ids[54], "outcome_unknown");
+  const unsafeHop = { ...taskRecord(ids[55]), hop: 2 ** 53 };
+  const negativeHop = { ...taskRecord(ids[56]), hop: -1 };
+  const stringHop = { ...taskRecord(ids[57]), hop: "1" };
+  const exponentialHop = JSON.stringify(taskRecord(ids[58])).replace(
+    '"hop":1', '"hop":1e3');
+  const safeBoundaryHop = { ...taskRecord(ids[59]), hop: 2 ** 53 - 1 };
+  const unknownWithExit = { ...taskResult(ids[60], "outcome_unknown"), exit_code: 0 };
   const outputs = {
     [ids[0]]: `${JSON.stringify(validStatus)}\n`,
     [ids[1]]: `${JSON.stringify(validResult)}\n`,
@@ -2462,6 +2469,12 @@ async function taskResponsesAreActionSpecificAndFailClosed() {
     [ids[52]]: `${JSON.stringify(wrongRecoveryEnumStatus)}\n`,
     [ids[53]]: `${JSON.stringify(wrongRecoveryEnumResult)}\n`,
     [ids[54]]: `${JSON.stringify(unresolvedCancel)}\n`,
+    [ids[55]]: `${JSON.stringify(unsafeHop)}\n`,
+    [ids[56]]: `${JSON.stringify(negativeHop)}\n`,
+    [ids[57]]: `${JSON.stringify(stringHop)}\n`,
+    [ids[58]]: `${exponentialHop}\n`,
+    [ids[59]]: `${JSON.stringify(safeBoundaryHop)}\n`,
+    [ids[60]]: `${JSON.stringify(unknownWithExit)}\n`,
   };
   writeFileSync(join(stubDir, "python3"), `#!${realPython}
 import json
@@ -2496,7 +2509,8 @@ os.execv(real_python, [real_python, *sys.argv[1:]])
                                 [ids[13], "status"], [ids[14], "result"],
                                 [ids[22], "result"], [ids[26], "result"],
                                 [ids[36], "status"], [ids[37], "result"],
-                                [ids[38], "result"]]) {
+                                [ids[38], "result"], [ids[54], "status"],
+                                [ids[59], "status"]]) {
       const response = await taskClient.callTool({
         name: "antiphon_task", arguments: { id, action },
       });
@@ -2526,7 +2540,9 @@ os.execv(real_python, [real_python, *sys.argv[1:]])
                                 [ids[48], "result"], [ids[49], "result"],
                                 [ids[50], "result"], [ids[51], "result"],
                                 [ids[52], "status"], [ids[53], "result"],
-                                [ids[54], "cancel"]]) {
+                                [ids[54], "cancel"], [ids[55], "status"],
+                                [ids[56], "status"], [ids[57], "status"],
+                                [ids[58], "status"], [ids[60], "result"]]) {
       await assert.rejects(
         () => taskClient.callTool({
           name: "antiphon_task", arguments: { id, action },

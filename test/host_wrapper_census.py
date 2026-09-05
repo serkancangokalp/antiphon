@@ -8,6 +8,10 @@ import json
 import os
 import re
 import stat
+import sys
+
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "lib"))
+from antiphon import CODEX_HOST_CONTENT_KINDS, _is_codex_host_metadata
 
 
 OPENING_TAG = re.compile(r"^\s*<([A-Za-z][A-Za-z0-9_-]*)(?=[\s>/])")
@@ -148,6 +152,8 @@ def codex_shapes(record):
     for text, _source in codex_user_blocks(record):
         if _is_codex_host_block(text):
             shapes.append("agents_md_block")
+        if _is_codex_host_metadata(record["payload"]):
+            shapes.append("host_content_metadata")
     for text in codex_assistant_blocks(record):
         if EXTERNAL_AGENT_CALL.match(text):
             shapes.append("external_agent_call")

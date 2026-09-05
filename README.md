@@ -8,6 +8,31 @@ Codex; its optional managed workers stay isolated and never merge their work.
 
 With one terminal per side there is nothing to configure beyond `antiphon setup`: Antiphon assigns an automatic alias when it can positively prove the host session, otherwise the peer stays honestly unnamed and the legacy single-peer road remains. With several sessions, address the automatic aliases shown by `status` or set explicit names — see [Many peers](#many-peers).
 
+## Quick start
+
+Install Node 20+, Python 3.9+, and logged-in Claude Code and Codex CLI hosts
+([host requirements and detailed setup](#install)). Then:
+
+```sh
+npm install -g antiphon
+cd /your/project
+antiphon setup
+antiphon launch claude   # terminal one
+# In terminal two, in the same project:
+antiphon launch codex
+```
+
+Ask one agent to send the other a greeting. `antiphon status` shows peer
+aliases and delivery receipts; `antiphon doctor` explains an incomplete setup
+or a session that needs restarting. A queued/delivered result is transport
+acceptance, not proof that the other agent has read it. With several sessions,
+use `antiphon launch claude --name reviewer` and
+`antiphon launch codex --name builder`, then address those names explicitly.
+
+See [what changes in 1.0.0](CHANGELOG.md) and the [upgrade checklist](#update)
+before upgrading an existing project. Antiphon carries context and messages;
+you still decide who leads, reviews, merges and publishes.
+
 ## How it works
 
 No shared log is kept. Both CLIs already write their own transcripts; Antiphon reads and derives from them, recording which messages each peer has already seen. An unnamed peer keeps its cursor at `.antiphon/cursor.json`; a named one owns `.antiphon/peers/<side>-<name>/cursor.json`, so two sessions on the same side never advance each other's place. Every direct send leaves one small file on a delivery ledger at `.antiphon/deliveries/<id>.json` — who sent, to whom, over what, the words' digest — and, for a refused or transport-outcome-unknown line, its first 60 characters so the sender can recognise it; never the words otherwise — kept for a week, two for an entry with a notice its sender has not heard. If the transport acknowledgement disappears after bytes may have left, the ledger says `unknown`, the caller is warned not to retry automatically, and any parked attachment is retained. A later receipt resolves that attempt to `sent` and removes its bounded preview; if that receipt already won the race while the sender was awaiting the acknowledgement, the direct result says `received` instead of contradicting the transcript with `unknown`.
@@ -33,6 +58,14 @@ traffic — is never rendered as either agent's speech. When a page interleaves 
 a current named peer carry that peer's label; older, unnamed or unjoinable
 blocks remain honestly unlabelled. Do not read pull context as a private line
 between two particular peers.
+
+Codex's measured host metadata also identifies selected-skill instructions and
+writing-block edit notifications. A message is suppressed by this rule only
+when its nonempty `content_item_kinds` list contains exclusively those two
+known host kinds. Missing, malformed, mixed or unknown metadata does not
+silence a person's message; a literal `<skill>` tag is not proof. This is a
+measured rollout shape in the local Codex 0.15x corpus, not a promise about
+future host formats. The census counts it separately as `host_content_metadata`.
 
 ### Push — addressed, live wake
 
@@ -175,8 +208,10 @@ positively dead but no authenticated publication survived, the task is
 proved its own stop completed, can refine that conservative result. Process-
 table absence proves death only from a successful, completely parsed snapshot;
 birth and state for one pid come from the same canonical C-locale row, so a
-recycled pid cannot splice two owners into signal authority. Any malformed
-nonblank row makes the observation unknown. The supervisor gives a transient
+recycled pid cannot splice two owners into signal authority. An unclassifiable
+pid/group row or malformed target-group state makes the observation unknown.
+Once a row is proved to belong to another group, its transient state cannot
+poison this group's observation. The supervisor gives a transient
 unreadable group snapshot one bounded retry window; status/admission use the
 same rule when releasing a finished slot, and persistent uncertainty still
 withholds publication or terminal state. If
@@ -199,7 +234,8 @@ its durable cleanup witness before
 `git worktree add`, covering a crash before `base` reaches the accepted row,
 and fsyncs the containing worker-directory entry before Git is touched; it
 revalidates the added worktree's base before admitting the adapter. A visible
-witness is freshly fsynced again before it can authorize retirement. Git alone
+witness is freshly fsynced again before it can authorize expiry retirement
+of a record with a saved base. Git alone
 removes the exact worktree registration; Antiphon only verifies the bounded,
 regular, one-line `gitdir` namespace and retains the witness when any entry is
 malformed or unreadable. It also fsyncs Git's common directory when removal of
@@ -243,25 +279,33 @@ Git or one of its hooks still has unpublished work. Use the task id printed by
 1. Confirm the state with `antiphon task status <id>`. Do not retry, cancel or
    delete the task while its mutation boundary is uncertain, and stop starting
    new Antiphon workers in this checkout during the investigation.
+   Its retained `accepted` (or unverified `running`) JSON row holds the slot.
+   Never hand-edit its state: changing JSON does not stop Git or a worker and
+   can admit new work while the old process is still mutating files.
 2. Before changing anything, copy `.antiphon/tasks-v2/<id>.json`,
    `.antiphon/tasks-v2/<id>.live`, any `<id>.diff`, the complete
    `.antiphon/workers/<id>/` directory and the output of
    `git -C <project> worktree list --porcelain` to a location outside the
-   project. These files are the recovery evidence.
+   project. Preserve `.antiphon/workers/<id>/.git-cleanup` and its `work/`
+   worktree as part of that directory. These files are the recovery evidence.
 3. Establish quiescence with operating-system process and open-file tools.
    The stored pid, its birth time or the death of one process-group leader is
    not sufficient: stop if any Git, hook or descendant process might still
    mutate the project or worker worktree.
 4. If the exact worker worktree exists, inspect and preserve its status and
-   diff first. Remove its registration only through Git, using its exact
+   diff first (normally `.antiphon/workers/<id>/work`). Remove its registration only through Git, using its exact
    absolute path (`git -C <project> worktree remove --force
    <absolute-worker-worktree>`), then verify that path is absent from
    `git worktree list --porcelain`. Never delete an entry under
    `.git/worktrees` by hand.
 5. Removing the retained task state is an informed operator decision, not an
    Antiphon recovery claim. Only after quiescence and evidence preservation,
-   remove paths for that exact id, with its JSON row last; never use a glob or
-   remove the whole `.antiphon` or `.git` tree. Finish by checking
+   remove only that id's worker directory (including its `.git-cleanup`
+   witness, after Git registration removal), then `.antiphon/tasks-v2/<id>.diff`,
+   then `<id>.live`, then `<id>.json`, skipping files that are absent. Never
+   remove a locked `.live` file, use a glob, or remove the whole `.antiphon`
+   or `.git` tree. Removing the JSON last releases the retained admission slot;
+   it does not claim a successful task outcome. Finish by checking
    `antiphon task list` and `antiphon doctor`. If quiescence cannot be proved,
    leave the evidence in place; Antiphon intentionally has no force-reclaim
    command.
@@ -278,9 +322,10 @@ admitting current work.
 Old history remains visible as `legacy:<state>` in `antiphon task list`, but
 current commands never mutate it and a pinned old client can no longer publish
 there. Finish and collect old work with the client that created it before the
-transition, then retry. This local fence relies on non-root POSIX owner-mode
-enforcement; root or arbitrary same-user code that deliberately restores write
-permission is outside the file protocol's threat boundary. Every worker is
+transition, then retry. On every admission Antiphon probes that the legacy
+store actually rejects writes; root and filesystems that do not enforce its
+POSIX owner mode are refused. Arbitrary same-user code that deliberately
+restores write permission is outside the file protocol's threat boundary. Every worker is
 asked to keep `[Antiphon worker
 <kind>:<id>]` at the start of its final message, so nothing it says reads as
 the parent's own. A worker is followed by its task id — `status`, `result`,
@@ -480,8 +525,9 @@ otherwise a successful launch would not be the session it just preflighted.
 The guard applies only before the host's own exact `--`; later tokens are
 literal host content. It also refuses Claude's truthy safe, simple, and
 restricted environment modes, and an inherited `ANTIPHON_CWD` that resolves to
-a different directory than the launcher's current project. The raw host commands above remain the explicit
-escape hatch for an intentionally different configuration.
+a different directory than the launcher's current project. Running the hosts
+directly (`codex`, or `claude --dangerously-load-development-channels server:antiphon`)
+remains the explicit escape hatch for an intentionally different configuration.
 
 `setup` writes `.claude/settings.json`, `.codex/hooks.json`,
 `.codex/config.toml`, `.mcp.json`, `.claude/settings.local.json`,
@@ -494,6 +540,12 @@ live in this repository — they are generated per project. Approve the
 Codex hooks once when Codex first shows them.
 
 ## Update
+
+Before moving from 0.5.x to 1.0.0, finish and collect existing managed-worker
+results with the version that created them. After installing, run `setup` in
+each project and restart **both** host sessions; then run `antiphon doctor`.
+Old worker history stays visible as `legacy:<state>`, but 1.0.0 does not collect
+or cancel it. The new worker store fences the old store before admitting work.
 
     npm i -g github:serkancangokalp/antiphon      # from the repository
     npm i -g antiphon@latest                      # from npm
@@ -510,6 +562,14 @@ wording, a heading of your own inside it, or a second Antiphon heading is
 left alone, and `setup` and `doctor` print the same remedy. Until `setup` is re-run, a `.codex/config.toml` from before 0.5.0
 still pre-approves every tool, the worker tools included; `doctor` names it.
 
+For a developer installation made with `npm link`, run `npm link` again from
+the updated repository before `setup`. The launcher moved from
+`bin/antiphon.mjs` to `bin/antiphon`; an old global link can otherwise dangle,
+and doctor reports that hooks call `antiphon` but PATH has none. Ordinary npm
+installation recreates the link automatically. Generated `AGENTS.md` and
+`CLAUDE.md` sections are local setup output, not a reason to overwrite your
+own instructions or force-add ignored files to Git.
+
 A long-lived bridge server keeps the code it loaded, so an upgrade on disk
 runs beside sessions still using the old reader for a while. That is safe in
 both directions: a 0.3.x reader keeps a current endpoint record on its pid
@@ -519,10 +579,11 @@ with a remedy — reconnect the Claude session, or reinstall so both sides
 match — rather than told it recovered. A record written by 0.4.0 before this
 change stays prunable by a 0.3.x reader until its owner rewrites it; `doctor`
 names such a record and the remedy by kind (reconnect Claude, restart Codex).
-Task and delivery records introduced by this release use schema v2; the new
-reader continues to read every shipped v1 worker, handed-task, sent and refused
-record. A pre-upgrade long-lived server does not understand v2 and must be
-restarted after installation. `doctor` compares each in-scope server's start
+Delivery records remain backward-readable where their version permits;
+managed workers use the separate current-protocol store described above.
+Legacy worker rows are listed without being mutated. A pre-upgrade long-lived
+server must be restarted after installation: lifecycle safety improvements
+cannot change code already loaded into an old process. `doctor` compares each in-scope server's start
 time with the code it loaded and names that restart when on-disk code changed;
 `antiphon launch` always starts a fresh host process.
 

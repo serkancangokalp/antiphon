@@ -2440,14 +2440,66 @@ class AntiphonTest(unittest.TestCase):
             return [e[2] for e in events]
 
     @staticmethod
-    def _codex_user_texts(text):
+    def _codex_user_texts(text, **payload_fields):
         line = json.dumps({"type": "response_item", "timestamp": "2026-08-30T10:00:00.000Z",
                            "payload": {"type": "message", "role": "user",
-                                       "content": [{"type": "input_text", "text": text}]}})
+                                       "content": [{"type": "input_text", "text": text}],
+                                       **payload_fields}})
         with patch.object(antiphon, "codex_rollout_files", return_value=["r.jsonl"]), \
              patch.object(antiphon, "read_records", side_effect=_as_records([line])):
             events, _ = antiphon.codex_events("/tmp/project")
             return [e[2] for e in events]
+
+    def test_codex_measured_host_content_kinds_never_become_user_speech(self):
+        kinds = ("skills.selected_skill_instructions",
+                 "additional_content.codex_apps_writing_block_edits")
+        for values in ([kinds[0]], [kinds[1]], list(kinds)):
+            with self.subTest(values=values):
+                self.assertEqual(self._codex_user_texts(
+                    "host-injected text", internal_chat_message_metadata_passthrough={
+                        "content_item_kinds": values}), [])
+
+    def test_codex_uncertain_or_mixed_content_kinds_preserve_the_users_words(self):
+        text = "<skill>my own markup</skill>"
+        for metadata in (None, False, [], "host", {},
+                         {"content_item_kinds": None},
+                         {"content_item_kinds": "skills.selected_skill_instructions"},
+                         {"content_item_kinds": []},
+                         {"content_item_kinds": [None]},
+                         {"content_item_kinds": [{}]},
+                         {"content_item_kinds": ["future.host.kind"]},
+                         {"content_item_kinds": ["skills.selected_skill_instructions", "text"]}):
+            with self.subTest(metadata=metadata):
+                self.assertEqual(self._codex_user_texts(
+                    text, internal_chat_message_metadata_passthrough=metadata), [text])
+        self.assertEqual(self._codex_user_texts(text), [text])
+
+    def test_codex_host_metadata_advances_the_same_durable_source_frontier(self):
+        sid = "12345678-1234-4abc-8def-123456789012"
+        with tempfile.TemporaryDirectory() as root:
+            path = os.path.join(root, "rollout-2026-09-05T00-00-00-" + sid + ".jsonl")
+            records = [{"type": "session_meta", "payload": {"cwd": root}},
+                       {"type": "response_item", "payload": {
+                           "type": "message", "role": "user",
+                           "content": [{"type": "input_text", "text": "human words"}]}},
+                       {"type": "response_item", "payload": {
+                           "type": "message", "role": "user",
+                           "content": [{"type": "input_text", "text": "host words"}],
+                           "internal_chat_message_metadata_passthrough": {
+                               "content_item_kinds": ["skills.selected_skill_instructions"]}}}]
+            with open(path, "w", encoding="utf-8") as stream:
+                for record in records:
+                    stream.write(json.dumps(record) + "\n")
+            candidate = antiphon.DiscoveredSourcePath(
+                path, root, antiphon.SourceCandidate("codex", os.path.basename(path), sid))
+            events, reached = antiphon.codex_events(root, source_paths=[candidate])
+            self.assertEqual([event.text for event in events], ["human words"])
+            self.assertEqual(reached[sid]["offset"], os.path.getsize(path))
+            self.assertIsNotNone(reached[sid]["anchor"])
+            again, resumed = antiphon.codex_events(root, positions=reached,
+                                                  source_paths=[candidate])
+            self.assertEqual(again, [])
+            self.assertEqual(resumed, reached)
 
     def test_a_user_message_naming_the_tool_is_not_swallowed(self):
         """A bare substring test over the first 40 characters silently dropped a
@@ -4874,6 +4926,9 @@ class ManagedWorkerToolTest(unittest.TestCase):
                 "no terminal outcome is claimed, and each work directory and worker slot "
                 "are kept",
                 out.getvalue())
+            self.assertIn(record["id"], out.getvalue())
+            self.assertIn("antiphon task status <id>", out.getvalue())
+            self.assertIn("do not delete lifecycle evidence", out.getvalue())
 
     def test_worker_surfaces_name_a_missing_git_completion_receipt(self):
         with tempfile.TemporaryDirectory() as project:
