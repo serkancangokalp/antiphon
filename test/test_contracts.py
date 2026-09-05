@@ -143,7 +143,7 @@ class CrossBoundaryContractTest(unittest.TestCase):
                          "binding must happen in exactly one place")
         serve_body = source[source.index("async function serveSocket()"):]
         self.assertLess(serve_body.index("socketServer.listen("),
-                        serve_body.index("\nawait mkdir("),
+                        serve_body.index("\nconst MAX_MESSAGE_BYTES"),
                         "the bind must sit inside serveSocket, after the claim")
 
     def test_the_id_read_off_a_rollout_is_one_the_registry_will_store(self):

@@ -12,6 +12,8 @@ import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
 import { checkoutHistory, materialiseLib, pinnedAvailability } from "./fixtures/mixed_lib.mjs";
 
+await import("./channel-startup.test.mjs");
+
 // The socket name derives from the project directory. Using process.cwd() here
 // would mean stealing the socket of a live session running in the repo dir: the
 // server unlinks and takes it over on startup, breaking the bridge when the test
