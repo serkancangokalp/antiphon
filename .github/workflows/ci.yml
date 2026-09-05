@@ -14,46 +14,6 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  diagnose-linux:
-    name: TEMPORARY Linux process and socket evidence
-    runs-on: ubuntu-24.04
-    timeout-minutes: 5
-    steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
-        with:
-          persist-credentials: false
-      - name: Capture platform facts without changing product behavior
-        run: |
-          python3 - <<'PY'
-          import errno, os, socket, subprocess, sys, tempfile
-          from unittest.mock import patch
-          from types import SimpleNamespace
-          sys.path.insert(0, "lib")
-          import workers
-          done = subprocess.run(["ps", "-axo", "pid=,pgid=,stat="],
-                                capture_output=True, text=True, check=True)
-          print("PROCESS TABLE (pid, pgid, state only):", flush=True)
-          print(done.stdout, flush=True)
-          target = os.getpgrp()
-          with patch.object(workers.subprocess, "run", return_value=done):
-              print("observed group", target, "members:", workers._group_members(target))
-          rows = done.stdout.splitlines()
-          zero = [line for line in rows if len(line.split()) >= 2 and line.split()[1] == "0"]
-          print("zero-group rows:", zero)
-          without_zero = SimpleNamespace(returncode=0, stdout="\n".join(line for line in rows if line not in zero))
-          with patch.object(workers.subprocess, "run", return_value=without_zero):
-              print("same snapshot, only zero-group rows omitted:", workers._group_members(target))
-          with tempfile.TemporaryDirectory() as root:
-              path = os.path.join(root, "ordinary-file")
-              with open(path, "w") as stream:
-                  stream.write("not a socket")
-              with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as sock:
-                  try:
-                      sock.connect(path)
-                  except OSError as error:
-                      print("regular-file connect errno:", error.errno, errno.errorcode.get(error.errno))
-          PY
-
   test:
     name: test / ${{ matrix.name }}
     runs-on: ${{ matrix.os }}
