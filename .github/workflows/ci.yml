@@ -75,6 +75,7 @@ jobs:
         run: npm ci --ignore-scripts --audit=false --fund=false
 
       - name: Run the Python and MCP protocol suites
+        id: protocol_suites
         env:
           PYTHONUTF8: "1"
           TZ: UTC
@@ -82,9 +83,31 @@ jobs:
           set -euo pipefail
           test_home="$RUNNER_TEMP/antiphon-test-home"
           test_tmp="$RUNNER_TEMP/antiphon-test-tmp"
+          suite_log="$RUNNER_TEMP/antiphon-test-output.log"
           mkdir -p "$test_home" "$test_tmp"
-          HOME="$test_home" TMPDIR="$test_tmp" npm test
-          python3 -m unittest discover -v -s test/ci -p 'test_*.py'
+          set +e
+          (
+            set -euo pipefail
+            HOME="$test_home" TMPDIR="$test_tmp" npm test
+            python3 -m unittest discover -v -s test/ci -p 'test_*.py'
+          ) 2>&1 | tee "$suite_log"
+          suite_status=("${PIPESTATUS[@]}")
+          set -e
+          if (( suite_status[0] != 0 )); then
+            exit "${suite_status[0]}"
+          fi
+          if (( suite_status[1] != 0 )); then
+            exit "${suite_status[1]}"
+          fi
+
+      - name: Upload failing protocol-suite output
+        if: ${{ failure() && steps.protocol_suites.outcome == 'failure' }}
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
+        with:
+          name: antiphon-test-output-${{ matrix.name }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/antiphon-test-output.log
+          if-no-files-found: error
+          retention-days: 3
 
       - name: Prove tests did not change tracked bytes
         run: |
