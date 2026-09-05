@@ -83,3 +83,22 @@ unreadable. No liveness, signaling, or outcome policy is relaxed.
   even with unrelated kernel rows in the snapshot.
 - The same hosted diagnostic measures errno 111 (ECONNREFUSED) for a regular
   file at an AF_UNIX path. The doctor portability correction is a separate slice.
+
+## D — portable refused-socket diagnosis
+
+The hosted regular-file probe above confirms Linux returns ECONNREFUSED, not
+ENOTSOCK. After a refused connection, `_probe_channel` now asks the filesystem
+whether the path is a socket. Only a positively observed non-socket is normalized
+to ENOTSOCK. A failed stat preserves the original connection error. A successful
+connection still requires an actual channel-shaped reply; stat cannot certify
+a live channel. No paths are modified.
+
+The forced-Linux-errno test failed before the change and passes afterwards;
+an unreadable-stat case preserves ECONNREFUSED. Doctor-focused tests: 57 OK.
+The pre-existing real four-state doctor test is retained unchanged, including
+the distinction between an ordinary file and an abandoned socket.
+
+The first branch CI run now passes the installed Node-20/Linux tarball smoke.
+macOS Python also passes 1,587 tests; Node exposes one more automatic-identity
+fixture that supplies a fake probe but still depends on a real CLI owner.
+That fixture-only follow-up remains required before the final matrix.

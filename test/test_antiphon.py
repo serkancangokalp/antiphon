@@ -8125,6 +8125,29 @@ class CatchUpTest(unittest.TestCase):
         self.assertIn("antiphon catch-up", antiphon.__doc__)
 
 
+class ChannelProbePortabilityTest(unittest.TestCase):
+    def test_connection_refused_on_a_regular_file_is_not_a_dead_socket(self):
+        # Linux reports ECONNREFUSED where macOS reports ENOTSOCK. Force that
+        # boundary while keeping the actual filesystem classification real.
+        with tempfile.TemporaryDirectory() as root:
+            path = os.path.join(root, "channel")
+            pathlib.Path(path).write_text("ordinary file")
+            with patch.object(antiphon.socket.socket, "connect",
+                              side_effect=OSError(errno.ECONNREFUSED, "refused")):
+                probe = antiphon._probe_channel(path, False)
+            self.assertEqual(probe, antiphon.Probe(errno.ENOTSOCK, False))
+
+    def test_unobservable_refused_path_is_not_claimed_to_be_a_regular_file(self):
+        with tempfile.TemporaryDirectory() as root:
+            path = os.path.join(root, "channel")
+            pathlib.Path(path).write_text("ordinary file")
+            with patch.object(antiphon.socket.socket, "connect",
+                              side_effect=OSError(errno.ECONNREFUSED, "refused")), \
+                 patch.object(antiphon.os, "stat", side_effect=PermissionError):
+                probe = antiphon._probe_channel(path, False)
+            self.assertEqual(probe, antiphon.Probe(errno.ECONNREFUSED, False))
+
+
 class DoctorTest(unittest.TestCase):
     """`antiphon doctor` explains a quiet bridge without touching it.
 

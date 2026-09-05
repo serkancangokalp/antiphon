@@ -10403,11 +10403,21 @@ def _probe_channel(path, patient):
             sock.connect(path)
         except OSError as error:
             sock.close()
-            if (patient and error.errno in NOT_LISTENING_YET
+            observed_error = error.errno
+            if observed_error == errno.ECONNREFUSED:
+                # Linux uses ECONNREFUSED for a regular file too; macOS uses
+                # ENOTSOCK. Classify only after a failed connect, so a healthy
+                # listener is still proved by its reply, never by stat alone.
+                try:
+                    if not stat.S_ISSOCK(os.stat(path).st_mode):
+                        observed_error = errno.ENOTSOCK
+                except OSError:
+                    pass  # An unreadable/replaced path proves no file type.
+            if (patient and observed_error in NOT_LISTENING_YET
                     and time.monotonic() < deadline):
                 time.sleep(CONNECT_RETRY_DELAY)
                 continue
-            return Probe(error.errno, False)
+            return Probe(observed_error, False)
         break
     try:
         with sock:
