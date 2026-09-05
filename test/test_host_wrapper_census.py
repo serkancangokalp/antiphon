@@ -203,6 +203,61 @@ class HostWrapperCensusTest(unittest.TestCase):
         self.assertEqual(side["excluded"]["refused_files"], 1)
         self.assertNotEqual(hidden, visible)
 
+    def test_claude_candidate_scope_matches_both_production_enumerators(self):
+        """One fixture drives recent discovery, durable enumeration, and the
+        release census.  Immediate dot-prefixed and empty JSONL files are
+        candidates; nested JSONL is excluded and other suffixes are ignored.
+        """
+        with tempfile.TemporaryDirectory() as root:
+            project = os.path.join(root, "workspace")
+            claude = os.path.join(root, "claude")
+            codex = os.path.join(root, "codex")
+            os.makedirs(project)
+            os.makedirs(codex)
+            host_dir = os.path.join(claude, antiphon._claude_slug(project))
+            os.makedirs(host_dir)
+            visible = self.write_lines(
+                host_dir, "visible.jsonl", [{"type": "assistant"}])
+            hidden = self.write_lines(
+                host_dir, ".hidden.jsonl", [{
+                    "type": "user", "promptSource": "system",
+                    "message": {"content": "<hidden-candidate>\nkept"},
+                }])
+            empty = self.write_lines(host_dir, "empty.jsonl", [])
+            hidden_empty = self.write_lines(
+                host_dir, ".hidden-empty.jsonl", [])
+            self.write_lines(
+                host_dir, "subagents/nested.jsonl", [{"type": "assistant"}])
+            self.write_lines(
+                host_dir, "not-a-transcript.txt", [{"type": "assistant"}])
+            os.symlink(visible, os.path.join(host_dir, "linked.jsonl"))
+            os.mkfifo(os.path.join(host_dir, "pipe.jsonl"))
+            os.mkdir(os.path.join(host_dir, "directory.jsonl"))
+
+            with patch.object(antiphon, "CLAUDE_PROJECTS", claude):
+                recent = antiphon.claude_transcripts(project)
+                catalog = antiphon._enumerate_catalog_candidates(
+                    project, "claude")
+            census_result = census.census(claude, codex)["claude"]
+
+        expected = {
+            os.path.relpath(path, claude)
+            for path in (visible, hidden, empty, hidden_empty)
+        }
+        unsafe = {
+            os.path.relpath(os.path.join(host_dir, name), claude)
+            for name in ("linked.jsonl", "pipe.jsonl", "directory.jsonl")
+        }
+        self.assertEqual(
+            {item.candidate.relative_path for item in recent}, expected | unsafe)
+        self.assertEqual(set(catalog.relative_paths), expected | unsafe)
+        self.assertEqual(census_result["production"]["files"], 4)
+        self.assertEqual(census_result["production"]["refused_files"], 3)
+        self.assertEqual(census_result["excluded"]["files"], 1)
+        self.assertEqual(
+            census_result["production"]["tags"]["hidden-candidate"]["system"], 1)
+        self.assertNotIn("not-a-transcript", census_result["excluded"]["tags"])
+
     def test_symlinked_files_and_directories_are_refused_not_aggregated(self):
         """The census must not learn from paths production will refuse."""
         with tempfile.TemporaryDirectory() as root:

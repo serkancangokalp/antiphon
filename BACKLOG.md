@@ -2256,6 +2256,14 @@ as production's recursive glob does. They will go
 stale as each host adds, renames or drops its own wrapper tags. Re-run before
 every release with:
 
+The 2026-09-04 follow-up also removed a split inside Claude production
+discovery: recent fallback had applied Python glob's dotfile rule and omitted
+zero-length files while the monotone catalog and census admitted both. All
+three now use the catalog's immediate `.jsonl` suffix rule; filesystem-safe,
+visible, non-empty regular transcripts keep fallback priority. The live corpus contained 98
+immediate candidates, with zero dot-prefixed, zero empty, and zero symlink
+entries, so this clarification changed no measured production count.
+
 Unsafe inventory entries contribute to the side-wide `refused_paths` total;
 candidate-shaped entries also contribute to their would-be scope's
 `refused_files`, together with open races. Those refusal counts overlap and

@@ -401,38 +401,46 @@ def _stats(root, files, blocks_for, shapes_for, inventory_refusals=0):
     }
 
 
+def _production_member(kind, path):
+    """Whether one safely inventoried regular JSONL is a host candidate."""
+    parts = path.split(os.sep)
+    basename = parts[-1] if parts else ""
+    if kind == "claude":
+        # Production selects one immediate project directory, then every
+        # immediate name ending in `.jsonl`. Dot-prefixed and empty regular
+        # files are still candidates; content parsing may simply yield zero.
+        return len(parts) == 2 and basename.endswith(".jsonl")
+    return (all(not part.startswith(".") for part in parts)
+            and basename.startswith("rollout-")
+            and basename.endswith(".jsonl"))
+
+
+def _production_refusal(kind, item):
+    """Whether one unsafe inventory entry falls inside candidate scope."""
+    path, may_be_directory = item
+    parts = path.split(os.sep)
+    basename = parts[-1] if parts else ""
+    if kind == "claude":
+        return ((len(parts) == 2 and basename.endswith(".jsonl"))
+                or (len(parts) == 1 and may_be_directory))
+    # Codex discovers matching leaves recursively. Any visible symlink may be
+    # a directory containing such leaves, regardless of its own suffix.
+    visible = all(not part.startswith(".") for part in parts)
+    return visible and ((basename.startswith("rollout-")
+                        and basename.endswith(".jsonl"))
+                       or may_be_directory)
+
+
 def _side_census(root, kind, blocks_for, shapes_for):
     """Split the host inventory at production's exact candidate boundary."""
     all_files, refused, unsupported, root_error = _safe_inventory(root)
 
-    def production_member(path):
-        if kind == "claude":
-            # `root` is ~/.claude/projects: production first selects one
-            # immediate project directory, then only its immediate
-            # transcripts. Nested subagent transcripts are not candidates.
-            return len(path.split(os.sep)) == 2
-        parts = path.split(os.sep)
-        return (all(not part.startswith(".") for part in parts)
-                and os.path.basename(path).startswith("rollout-"))
-
-    def production_refusal(item):
-        path, may_be_directory = item
-        parts = path.split(os.sep)
-        basename = parts[-1] if parts else ""
-        if kind == "claude":
-            return ((len(parts) == 2 and basename.endswith(".jsonl"))
-                    or (len(parts) == 1 and may_be_directory))
-        # Codex discovers matching leaves recursively. Any symlink may be a
-        # directory containing such leaves, regardless of its own suffix.
-        visible = all(not part.startswith(".") for part in parts)
-        return visible and ((basename.startswith("rollout-")
-                            and basename.endswith(".jsonl"))
-                           or may_be_directory)
-
-    admitted = [path for path in all_files if production_member(path)]
+    admitted = [path for path in all_files
+                if _production_member(kind, path)]
     admitted_set = set(admitted)
     excluded = [path for path in all_files if path not in admitted_set]
-    refused_production = sum(1 for item in refused if production_refusal(item))
+    refused_production = sum(
+        1 for item in refused if _production_refusal(kind, item))
     refused_excluded = len(refused) - refused_production
     return {
         "all_files": len(all_files),

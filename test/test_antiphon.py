@@ -3351,6 +3351,37 @@ class AntiphonTest(unittest.TestCase):
             with patch.object(antiphon, "CLAUDE_PROJECTS", projects):
                 self.assertEqual(antiphon.claude_transcripts("/tmp/wanted"), [transcript])
 
+    def test_claude_directory_fallback_uses_the_same_dotfile_candidate_rule(self):
+        """A renamed host directory must not apply a fourth, narrower source
+        policy before the shared recent/catalog enumeration even begins."""
+        with tempfile.TemporaryDirectory() as projects:
+            renamed = os.path.join(projects, "a-rule-we-do-not-know")
+            os.makedirs(renamed)
+            transcript = self._write_claude_transcript(
+                renamed, ".only-transcript.jsonl", "/tmp/wanted")
+
+            with patch.object(antiphon, "CLAUDE_PROJECTS", projects):
+                self.assertEqual(
+                    antiphon.claude_transcripts("/tmp/wanted"), [transcript])
+
+    def test_unsafe_recent_names_cannot_spend_the_fallback_probe_budget(self):
+        with tempfile.TemporaryDirectory() as projects:
+            renamed = os.path.join(projects, "a-rule-we-do-not-know")
+            os.makedirs(renamed)
+            transcript = self._write_claude_transcript(
+                renamed, "real.jsonl", "/tmp/wanted")
+            os.utime(transcript, (1, 1))
+            for number in range(3):
+                os.symlink(transcript, os.path.join(
+                    renamed, f"unsafe-{number}.jsonl"))
+
+            with patch.object(antiphon, "CLAUDE_PROJECTS", projects):
+                candidates = antiphon.claude_transcripts("/tmp/wanted")
+
+            self.assertEqual(candidates[0], transcript)
+            self.assertEqual(len(candidates), 4,
+                             "unsafe names remain candidates for explicit refusal")
+
     @staticmethod
     def _write_claude_transcript(directory, name, cwd):
         """A minimal Claude transcript: the cwd sits in the head, as it really does."""
@@ -11065,6 +11096,66 @@ class SourceCatalogStateTest(unittest.TestCase):
         loaded = antiphon._read_source_catalog(self.project)
         self.assertEqual(loaded.status, "valid")
         return loaded.state
+
+    def test_claude_recent_discovery_and_catalog_share_one_candidate_set(self):
+        """The catalog is the durable authority, so fallback discovery may
+        prioritize ordinary host files but cannot silently apply a narrower
+        name or size policy.  In particular, dot-prefixed and zero-length
+        immediate JSONL entries remain candidates on both roads.
+        """
+        visible = [self._source(number)[1] for number in (1, 2, 3)]
+        hidden = os.path.join(self.directory, ".hidden.jsonl")
+        empty = os.path.join(self.directory, "empty.jsonl")
+        hidden_empty = os.path.join(self.directory, ".hidden-empty.jsonl")
+        with open(hidden, "w", encoding="utf-8") as f:
+            f.write("{}\n")
+        open(empty, "a").close()
+        open(hidden_empty, "a").close()
+        for number, path in enumerate(visible, 1):
+            os.utime(path, (100 + number, 100 + number))
+        for number, path in enumerate((hidden, empty, hidden_empty), 1):
+            os.utime(path, (1_000 + number, 1_000 + number))
+
+        recent = antiphon.claude_transcripts(self.project)
+        enumeration = antiphon._enumerate_catalog_candidates(
+            self.project, "claude")
+        recent_relatives = {item.candidate.relative_path for item in recent}
+        expected = {
+            os.path.relpath(path, self.host)
+            for path in visible + [hidden, empty, hidden_empty]
+        }
+
+        self.assertEqual(recent_relatives, expected)
+        self.assertEqual(set(enumeration.relative_paths), expected)
+        self.assertEqual(
+            [os.path.basename(item) for item in recent[:3]],
+            [os.path.basename(path) for path in reversed(visible)],
+            "ordinary non-empty host transcripts keep fallback priority")
+
+    def test_unsafe_names_cannot_hide_a_real_source_from_degraded_discovery(self):
+        source_id, real = self._source(41, "real source survives")
+        os.utime(real, (1, 1))
+        for number in (51, 52):
+            os.symlink(real, os.path.join(
+                self.directory,
+                f"{number:08x}-1111-4111-8111-{number:012x}.jsonl"))
+        os.mkdir(os.path.join(
+            self.directory, "00000035-1111-4111-8111-000000000035.jsonl"))
+        snapshot = antiphon.CatalogSnapshot(
+            None, antiphon.CatalogView(
+                "degraded", 0, (), "forced degraded discovery"))
+
+        discovery = antiphon._discover_sources(
+            self.project, "claude", "codex", {}, None,
+            catalog_snapshot=snapshot)
+        events, reached = antiphon.claude_events(
+            self.project, {}, since=0, source_paths=discovery.sources)
+
+        self.assertIn(source_id, reached)
+        self.assertEqual([event.text for event in events],
+                         ["real source survives"])
+        self.assertEqual(discovery.state, "degraded",
+                         "unsafe candidates remain visible as refusals")
 
     def test_malformed_and_newer_catalogs_are_preserved_byte_for_byte(self):
         root = os.path.join(self.project, ".antiphon", "sources")
