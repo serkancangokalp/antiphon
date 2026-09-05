@@ -2440,14 +2440,66 @@ class AntiphonTest(unittest.TestCase):
             return [e[2] for e in events]
 
     @staticmethod
-    def _codex_user_texts(text):
+    def _codex_user_texts(text, **payload_fields):
         line = json.dumps({"type": "response_item", "timestamp": "2026-08-30T10:00:00.000Z",
                            "payload": {"type": "message", "role": "user",
-                                       "content": [{"type": "input_text", "text": text}]}})
+                                       "content": [{"type": "input_text", "text": text}],
+                                       **payload_fields}})
         with patch.object(antiphon, "codex_rollout_files", return_value=["r.jsonl"]), \
              patch.object(antiphon, "read_records", side_effect=_as_records([line])):
             events, _ = antiphon.codex_events("/tmp/project")
             return [e[2] for e in events]
+
+    def test_codex_measured_host_content_kinds_never_become_user_speech(self):
+        kinds = ("skills.selected_skill_instructions",
+                 "additional_content.codex_apps_writing_block_edits")
+        for values in ([kinds[0]], [kinds[1]], list(kinds)):
+            with self.subTest(values=values):
+                self.assertEqual(self._codex_user_texts(
+                    "host-injected text", internal_chat_message_metadata_passthrough={
+                        "content_item_kinds": values}), [])
+
+    def test_codex_uncertain_or_mixed_content_kinds_preserve_the_users_words(self):
+        text = "<skill>my own markup</skill>"
+        for metadata in (None, False, [], "host", {},
+                         {"content_item_kinds": None},
+                         {"content_item_kinds": "skills.selected_skill_instructions"},
+                         {"content_item_kinds": []},
+                         {"content_item_kinds": [None]},
+                         {"content_item_kinds": [{}]},
+                         {"content_item_kinds": ["future.host.kind"]},
+                         {"content_item_kinds": ["skills.selected_skill_instructions", "text"]}):
+            with self.subTest(metadata=metadata):
+                self.assertEqual(self._codex_user_texts(
+                    text, internal_chat_message_metadata_passthrough=metadata), [text])
+        self.assertEqual(self._codex_user_texts(text), [text])
+
+    def test_codex_host_metadata_advances_the_same_durable_source_frontier(self):
+        sid = "12345678-1234-4abc-8def-123456789012"
+        with tempfile.TemporaryDirectory() as root:
+            path = os.path.join(root, "rollout-2026-09-05T00-00-00-" + sid + ".jsonl")
+            records = [{"type": "session_meta", "payload": {"cwd": root}},
+                       {"type": "response_item", "payload": {
+                           "type": "message", "role": "user",
+                           "content": [{"type": "input_text", "text": "human words"}]}},
+                       {"type": "response_item", "payload": {
+                           "type": "message", "role": "user",
+                           "content": [{"type": "input_text", "text": "host words"}],
+                           "internal_chat_message_metadata_passthrough": {
+                               "content_item_kinds": ["skills.selected_skill_instructions"]}}}]
+            with open(path, "w", encoding="utf-8") as stream:
+                for record in records:
+                    stream.write(json.dumps(record) + "\n")
+            candidate = antiphon.DiscoveredSourcePath(
+                path, root, antiphon.SourceCandidate("codex", os.path.basename(path), sid))
+            events, reached = antiphon.codex_events(root, source_paths=[candidate])
+            self.assertEqual([event.text for event in events], ["human words"])
+            self.assertEqual(reached[sid]["offset"], os.path.getsize(path))
+            self.assertIsNotNone(reached[sid]["anchor"])
+            again, resumed = antiphon.codex_events(root, positions=reached,
+                                                  source_paths=[candidate])
+            self.assertEqual(again, [])
+            self.assertEqual(resumed, reached)
 
     def test_a_user_message_naming_the_tool_is_not_swallowed(self):
         """A bare substring test over the first 40 characters silently dropped a
@@ -3350,6 +3402,37 @@ class AntiphonTest(unittest.TestCase):
 
             with patch.object(antiphon, "CLAUDE_PROJECTS", projects):
                 self.assertEqual(antiphon.claude_transcripts("/tmp/wanted"), [transcript])
+
+    def test_claude_directory_fallback_uses_the_same_dotfile_candidate_rule(self):
+        """A renamed host directory must not apply a fourth, narrower source
+        policy before the shared recent/catalog enumeration even begins."""
+        with tempfile.TemporaryDirectory() as projects:
+            renamed = os.path.join(projects, "a-rule-we-do-not-know")
+            os.makedirs(renamed)
+            transcript = self._write_claude_transcript(
+                renamed, ".only-transcript.jsonl", "/tmp/wanted")
+
+            with patch.object(antiphon, "CLAUDE_PROJECTS", projects):
+                self.assertEqual(
+                    antiphon.claude_transcripts("/tmp/wanted"), [transcript])
+
+    def test_unsafe_recent_names_cannot_spend_the_fallback_probe_budget(self):
+        with tempfile.TemporaryDirectory() as projects:
+            renamed = os.path.join(projects, "a-rule-we-do-not-know")
+            os.makedirs(renamed)
+            transcript = self._write_claude_transcript(
+                renamed, "real.jsonl", "/tmp/wanted")
+            os.utime(transcript, (1, 1))
+            for number in range(3):
+                os.symlink(transcript, os.path.join(
+                    renamed, f"unsafe-{number}.jsonl"))
+
+            with patch.object(antiphon, "CLAUDE_PROJECTS", projects):
+                candidates = antiphon.claude_transcripts("/tmp/wanted")
+
+            self.assertEqual(candidates[0], transcript)
+            self.assertEqual(len(candidates), 4,
+                             "unsafe names remain candidates for explicit refusal")
 
     @staticmethod
     def _write_claude_transcript(directory, name, cwd):
@@ -4388,6 +4471,20 @@ class ManagedWorkerToolTest(unittest.TestCase):
             code = antiphon.task(*args)
         return code, out.getvalue(), err.getvalue()
 
+    def _cancel_eventually(self, project, task_id, patience=3.0):
+        """Test cleanup respects the product's retryable unknown-liveness
+        result instead of turning one transient process-table read into a
+        suite failure.
+        """
+        deadline = time.time() + patience
+        while True:
+            try:
+                return workers.cancel(project, task_id)
+            except workers.Refused:
+                if time.time() >= deadline:
+                    raise
+                time.sleep(0.05)
+
     def test_delegate_starts_a_fresh_worker_and_says_so(self):
         with tempfile.TemporaryDirectory() as project, tempfile.TemporaryDirectory() as bin_dir:
             env = {"PATH": self._stub_path(bin_dir)}
@@ -4667,7 +4764,7 @@ class ManagedWorkerToolTest(unittest.TestCase):
                 result = antiphon._delegate_tool(project, {"text": "x"}, "worker-abcdef12", "codex")
             self.assertIsNot(result.get("isError"), True, result)
             for task_id in [t["id"] for t in workers.tasks(project)]:
-                workers.cancel(project, task_id)
+                self._cancel_eventually(project, task_id)
 
     def test_the_cli_road_fails_closed_on_the_workers_own_name(self):
         """Second review 2026-09-03: the name-based fail-closed lived on the
@@ -4697,7 +4794,7 @@ class ManagedWorkerToolTest(unittest.TestCase):
             self.assertEqual(json.loads(out)["hop"] if "hop" in json.loads(out) else
                              workers.read_task(project, json.loads(out)["task_id"])["hop"], 2)
             for task_id in [t["id"] for t in workers.tasks(project)]:
-                workers.cancel(project, task_id)
+                self._cancel_eventually(project, task_id)
 
     def test_a_write_task_cannot_be_handed(self):
         """A handed task has no worktree; the class would be a promise the
@@ -4754,13 +4851,49 @@ class ManagedWorkerToolTest(unittest.TestCase):
             self.assertEqual([line.split()[3] for line in out.splitlines()],
                              ["cancelled", "cancelled"])
 
+    def test_previous_protocol_tasks_are_named_but_never_mutated(self):
+        with tempfile.TemporaryDirectory() as project:
+            legacy = workers.new_task(
+                project, kind="codex", task_class="read", sha256="a" * 64,
+                size=1)
+            workers.update_task(project, legacy["id"], lambda changed: changed.update(
+                state="failed", exit_code=7, started_at=1.0, finished_at=2.0))
+            os.makedirs(
+                os.path.join(project, ".antiphon", workers.LEGACY_TASK_STORE),
+                mode=0o700)
+            os.replace(
+                os.path.join(workers.tasks_dir(project), legacy["id"] + ".json"),
+                os.path.join(project, ".antiphon", workers.LEGACY_TASK_STORE,
+                             legacy["id"] + ".json"))
+            before = workers.legacy_task(project, legacy["id"])
+            self.assertIsNotNone(before)
+
+            code, out, err = self._task(project, ("list",))
+            self.assertEqual((code, err), (0, ""))
+            self.assertRegex(
+                out, rf"^{legacy['id']}\s+codex\s+read\s+legacy:failed\s+")
+            for action in ("status", "result", "cancel"):
+                code, out, err = self._task(project, (action, legacy["id"]))
+                self.assertEqual((code, out), (1, ""), action)
+                self.assertIn("previous managed-worker protocol", err)
+                self.assertIn("only in `antiphon task list`", err)
+                answer = antiphon._task_tool(
+                    project, {"id": legacy["id"], "action": action})
+                self.assertTrue(answer.get("isError"), action)
+                self.assertIn("previous managed-worker protocol",
+                              answer["content"][0]["text"])
+            self.assertEqual(workers.legacy_task(project, legacy["id"]), before)
+
     def test_status_counts_the_workers_on_record(self):
         with tempfile.TemporaryDirectory() as project:
             self.assertEqual(antiphon._worker_report(project), "Workers:            none")
             first = workers.new_task(project, kind="codex", task_class="read", sha256="a" * 64, size=1)
             workers.new_task(project, kind="codex", task_class="read", sha256="a" * 64, size=1)
             workers.update_task(project, first["id"],
-                                lambda c: c.update(state="running", pid=1, started_at=1.0))
+                                lambda c: c.update(
+                                    state="running", pid=os.getpid(),
+                                    birth=workers._process_start(os.getpid()),
+                                    started_at=time.time()))
             self.assertEqual(antiphon._worker_report(project),
                              "Workers:            1 accepted, 1 running (as recorded; antiphon task list)")
             out = io.StringIO()
@@ -4771,6 +4904,82 @@ class ManagedWorkerToolTest(unittest.TestCase):
                  contextlib.redirect_stdout(out):
                 self.assertEqual(antiphon.status(), 0)
             self.assertIn("Workers:            1 accepted, 1 running", out.getvalue())
+
+    def test_status_names_a_worker_whose_outcome_could_not_be_observed(self):
+        with tempfile.TemporaryDirectory() as project:
+            record = workers.new_task(
+                project, kind="codex", task_class="read", sha256="a" * 64, size=1)
+            workers.update_task(project, record["id"], lambda changed: changed.update(
+                state="running", pid=4242, birth="recorded birth",
+                started_at=1.0, timeout=1))
+            with patch.object(workers, "_worker_liveness", return_value="live"), \
+                 patch.object(workers, "_signal_authorized", return_value=False):
+                self.assertEqual(
+                    antiphon._worker_report(project),
+                    "Workers:            1 running (as recorded; antiphon task list); "
+                    "1 running worker has unknown liveness after the task deadline")
+                out = io.StringIO()
+                with contextlib.redirect_stdout(out):
+                    antiphon._doctor_workers(antiphon._Report(), project)
+            self.assertIn(
+                "· workers: 1 running worker has unknown liveness after the task deadline; "
+                "no terminal outcome is claimed, and each work directory and worker slot "
+                "are kept",
+                out.getvalue())
+            self.assertIn(record["id"], out.getvalue())
+            self.assertIn("antiphon task status <id>", out.getvalue())
+            self.assertIn("do not delete lifecycle evidence", out.getvalue())
+
+    def test_worker_surfaces_name_a_missing_git_completion_receipt(self):
+        with tempfile.TemporaryDirectory() as project:
+            record = workers.new_task(
+                project, kind="codex", task_class="write",
+                sha256="a" * 64, size=1)
+            os.makedirs(workers.worker_dir(project, record["id"]))
+            self.assertTrue(
+                workers._write_git_cleanup_witness(project, record["id"]))
+            birth = workers._process_start(os.getpid())
+            self.assertIsNotNone(birth)
+            descriptor = os.open(
+                workers.live_path(project, record["id"]),
+                os.O_CREAT | os.O_RDWR, 0o600)
+            try:
+                workers._write_live_marker(
+                    descriptor,
+                    workers._git_mutator_marker(os.getpid(), birth))
+            finally:
+                os.close(descriptor)
+
+            self.assertIn(
+                "1 accepted task has an unresolved Git completion receipt "
+                "(manual intervention required)",
+                antiphon._worker_report(project))
+            self.assertIn(
+                "[Git completion receipt missing; manual intervention required]",
+                antiphon._task_lines(workers.tasks(project), project)[0])
+            result = antiphon._task_tool(
+                project, {"id": record["id"], "action": "result"})
+            rendered = result["content"][0]["text"]
+            self.assertIn("git_completion_receipt_missing", rendered)
+            self.assertNotIn("poll again", rendered)
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out):
+                antiphon._doctor_workers(antiphon._Report(), project)
+            text = out.getvalue()
+            self.assertIn("no durable Git completion receipt", text)
+            self.assertIn(record["id"], text)
+            self.assertIn("do not retry or delete it automatically", text)
+            self.assertIn("antiphon task status <id>", text)
+            self.assertIn("Recovering a missing Git completion receipt", text)
+
+            os.unlink(os.path.join(
+                workers.tasks_dir(project), record["id"] + ".json"))
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out):
+                antiphon._doctor_workers(antiphon._Report(), project)
+            self.assertIn(
+                "1 unresolved lifecycle evidence file has no readable task row "
+                "(1 absent, 0 unreadable)", out.getvalue())
 
     def test_a_refused_hand_off_leaves_no_record(self):
         with tempfile.TemporaryDirectory() as project:
@@ -5293,7 +5502,7 @@ class ManagedWorkerToolTest(unittest.TestCase):
             self.assertTrue(result.get("isError"))
             self.assertIn("the task text is empty", result["content"][0]["text"])
             for task_id in [t["id"] for t in workers.tasks(project)]:
-                workers.cancel(project, task_id)
+                self._cancel_eventually(project, task_id)
 
 
 class SameVendorTest(unittest.TestCase):
@@ -10942,6 +11151,66 @@ class SourceCatalogStateTest(unittest.TestCase):
         loaded = antiphon._read_source_catalog(self.project)
         self.assertEqual(loaded.status, "valid")
         return loaded.state
+
+    def test_claude_recent_discovery_and_catalog_share_one_candidate_set(self):
+        """The catalog is the durable authority, so fallback discovery may
+        prioritize ordinary host files but cannot silently apply a narrower
+        name or size policy.  In particular, dot-prefixed and zero-length
+        immediate JSONL entries remain candidates on both roads.
+        """
+        visible = [self._source(number)[1] for number in (1, 2, 3)]
+        hidden = os.path.join(self.directory, ".hidden.jsonl")
+        empty = os.path.join(self.directory, "empty.jsonl")
+        hidden_empty = os.path.join(self.directory, ".hidden-empty.jsonl")
+        with open(hidden, "w", encoding="utf-8") as f:
+            f.write("{}\n")
+        open(empty, "a").close()
+        open(hidden_empty, "a").close()
+        for number, path in enumerate(visible, 1):
+            os.utime(path, (100 + number, 100 + number))
+        for number, path in enumerate((hidden, empty, hidden_empty), 1):
+            os.utime(path, (1_000 + number, 1_000 + number))
+
+        recent = antiphon.claude_transcripts(self.project)
+        enumeration = antiphon._enumerate_catalog_candidates(
+            self.project, "claude")
+        recent_relatives = {item.candidate.relative_path for item in recent}
+        expected = {
+            os.path.relpath(path, self.host)
+            for path in visible + [hidden, empty, hidden_empty]
+        }
+
+        self.assertEqual(recent_relatives, expected)
+        self.assertEqual(set(enumeration.relative_paths), expected)
+        self.assertEqual(
+            [os.path.basename(item) for item in recent[:3]],
+            [os.path.basename(path) for path in reversed(visible)],
+            "ordinary non-empty host transcripts keep fallback priority")
+
+    def test_unsafe_names_cannot_hide_a_real_source_from_degraded_discovery(self):
+        source_id, real = self._source(41, "real source survives")
+        os.utime(real, (1, 1))
+        for number in (51, 52):
+            os.symlink(real, os.path.join(
+                self.directory,
+                f"{number:08x}-1111-4111-8111-{number:012x}.jsonl"))
+        os.mkdir(os.path.join(
+            self.directory, "00000035-1111-4111-8111-000000000035.jsonl"))
+        snapshot = antiphon.CatalogSnapshot(
+            None, antiphon.CatalogView(
+                "degraded", 0, (), "forced degraded discovery"))
+
+        discovery = antiphon._discover_sources(
+            self.project, "claude", "codex", {}, None,
+            catalog_snapshot=snapshot)
+        events, reached = antiphon.claude_events(
+            self.project, {}, since=0, source_paths=discovery.sources)
+
+        self.assertIn(source_id, reached)
+        self.assertEqual([event.text for event in events],
+                         ["real source survives"])
+        self.assertEqual(discovery.state, "degraded",
+                         "unsafe candidates remain visible as refusals")
 
     def test_malformed_and_newer_catalogs_are_preserved_byte_for_byte(self):
         root = os.path.join(self.project, ".antiphon", "sources")

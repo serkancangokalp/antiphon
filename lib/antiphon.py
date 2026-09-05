@@ -716,6 +716,24 @@ def _is_host_record(text, wrappers, prompt_source=None):
 # somebody is still writing — the host writes the whole file at once.
 AGENTS_INJECTION_HEAD = "# AGENTS.md instructions for "
 
+# Measured in production rollouts, 2026-09-05: the host explicitly identifies
+# these injected content items. Do not infer ownership from a generic <skill>
+# tag, or silence a joined message that also contains an unknown/user item.
+CODEX_HOST_CONTENT_KINDS = (
+    "skills.selected_skill_instructions",
+    "additional_content.codex_apps_writing_block_edits",
+)
+
+
+def _is_codex_host_metadata(payload):
+    metadata = payload.get("internal_chat_message_metadata_passthrough")
+    if not isinstance(metadata, dict):
+        return False
+    kinds = metadata.get("content_item_kinds")
+    return (isinstance(kinds, list) and bool(kinds)
+            and all(isinstance(kind, str) and kind in CODEX_HOST_CONTENT_KINDS
+                    for kind in kinds))
+
 
 def _is_codex_host_block(text):
     if not isinstance(text, str) or not text.startswith(AGENTS_INJECTION_HEAD):
@@ -2514,6 +2532,46 @@ def _directory_stamp(path):
         return None
 
 
+def _claude_candidate_names(directory):
+    """Return every immediate name ending in ``.jsonl``.
+
+    The durable catalog has always treated the suffix as the candidate rule,
+    including dot-prefixed and zero-length entries. Keeping the rule at the
+    name boundary also preserves catalog enumeration's names-only contract.
+    """
+    try:
+        with os.scandir(directory) as stream:
+            return [entry.name for entry in stream
+                    if entry.name.endswith(".jsonl")]
+    except OSError:
+        return None
+
+
+def _ordered_claude_candidate_paths(directory):
+    """Order the shared candidate set for bounded fallback discovery."""
+    names = _claude_candidate_names(directory)
+    if names is None:
+        return None
+    candidates = []
+    for name in names:
+        path = os.path.join(directory, name)
+        try:
+            info = os.lstat(path)
+            mtime = info.st_mtime
+            ordinary = (_filesystem_safe_relative(name)
+                        and not name.startswith(".")
+                        and stat.S_ISREG(info.st_mode)
+                        and info.st_size > 0)
+        except OSError:
+            # The name is still a candidate.  The descriptor-safe opener owns
+            # the final classification and will report the raced metadata.
+            mtime = 0.0
+            ordinary = False
+        candidates.append((path, mtime, ordinary))
+    candidates.sort(key=lambda item: (not item[2], -item[1], item[0]))
+    return [path for path, _mtime, _ordinary in candidates]
+
+
 def _enumerate_catalog_candidates(cwd, kind):
     """Capture names only; transcript descriptors are opened by the batch."""
     if kind == "claude":
@@ -2521,10 +2579,8 @@ def _enumerate_catalog_candidates(cwd, kind):
         if not directory:
             return CatalogEnumeration(kind, (), None)
         prefix = os.path.relpath(directory, CLAUDE_PROJECTS)
-        try:
-            names = [entry.name for entry in os.scandir(directory)
-                     if entry.name.endswith(".jsonl")]
-        except OSError:
+        names = _claude_candidate_names(directory)
+        if names is None:
             return None
         relative = tuple(sorted(os.path.join(prefix, name) for name in names))
         return CatalogEnumeration(kind, relative, _directory_stamp(directory))
@@ -3605,8 +3661,9 @@ def _find_claude_project_dir(cwd):
     candidates.sort(key=mtime, reverse=True)               # most recently used first
     for directory in candidates:
         prefix = os.path.relpath(directory, CLAUDE_PROJECTS)
-        transcripts = sorted(glob.glob(os.path.join(directory, "*.jsonl")),
-                             key=mtime, reverse=True)
+        transcripts = _ordered_claude_candidate_paths(directory)
+        if transcripts is None:
+            continue
         for path in transcripts[:3]:
             discovered = _discovered_source_path(
                 path, CLAUDE_PROJECTS, "claude", prefix)
@@ -3635,18 +3692,12 @@ def claude_transcripts(cwd):
     directory = claude_project_dir(cwd)
     if not directory:
         return []
-    files = []
-    for path in glob.glob(os.path.join(directory, "*.jsonl")):
-        try:
-            info = os.lstat(path)
-        except OSError:
-            continue
-        if info.st_size > 0 or stat.S_ISLNK(info.st_mode):
-            files.append((info.st_mtime, path))
-    files.sort(key=lambda item: item[0], reverse=True)
+    paths = _ordered_claude_candidate_paths(directory)
+    if paths is None:
+        return []
     prefix = os.path.relpath(directory, CLAUDE_PROJECTS)
     return [_discovered_source_path(path, CLAUDE_PROJECTS, "claude", prefix)
-            for _mtime, path in files]
+            for path in paths]
 
 
 def claude_events(cwd, positions=None, since=None, visible_record_limit=None,
@@ -4002,6 +4053,7 @@ def codex_events(cwd, positions=None, since=None, visible_record_limit=None,
                             if role == "user":
                                 if (not _is_host_record(text, CODEX_WRAPPER_OPENING)
                                         and not _is_codex_host_block(text)
+                                        and not _is_codex_host_metadata(payload)
                                         and not _is_self_injected(text)):
                                     events.append((ts, path, next(position),
                                                   Event(ts, "you", text, sid, gen,
@@ -6935,7 +6987,20 @@ def _worker_report(cwd):
         return "Workers:            none"
     counts = collections.Counter(record["state"] for record in records)
     parts = [f"{counts[state]} {state}" for state in workers.STATES if counts[state]]
-    return "Workers:            " + ", ".join(parts) + " (as recorded; antiphon task list)"
+    line = "Workers:            " + ", ".join(parts) + " (as recorded; antiphon task list)"
+    uncertain = sum(1 for record in records if workers.liveness_unknown(cwd, record))
+    if uncertain:
+        noun = "worker has" if uncertain == 1 else "workers have"
+        line += f"; {uncertain} running {noun} unknown liveness after the task deadline"
+    missing_receipts = sum(
+        1 for record in records
+        if workers.accepted_start_recovery(cwd, record)
+        == workers.START_RECOVERY_GIT_MISSING)
+    if missing_receipts:
+        noun = "task has" if missing_receipts == 1 else "tasks have"
+        line += (f"; {missing_receipts} accepted {noun} an unresolved Git "
+                 "completion receipt (manual intervention required)")
+    return line
 
 
 def _delivery_report(cwd, now=None):
@@ -11171,6 +11236,55 @@ def _doctor_deliveries(report, cwd):
             "retry is suppressed")
 
 
+def _doctor_workers(report, cwd):
+    """Name visible worker uncertainty without reconciling or signalling."""
+    records = workers.tasks(cwd)
+    uncertain_records = [record for record in records
+                         if workers.liveness_unknown(cwd, record)]
+    uncertain = len(uncertain_records)
+    if uncertain:
+        noun = "worker has" if uncertain == 1 else "workers have"
+        report.note(
+            f"workers: {uncertain} running {noun} unknown liveness after the "
+            "task deadline; no terminal outcome is claimed, and each work directory "
+            "and worker slot are kept "
+            f"({', '.join(record['id'] for record in uncertain_records)}); "
+            "run `antiphon task status <id>`; restore process/lock observation "
+            "and do not delete lifecycle evidence to free a slot")
+    recoveries = collections.defaultdict(list)
+    for record in records:
+        recovery = workers.accepted_start_recovery(cwd, record)
+        if recovery is not None:
+            recoveries[recovery].append(record)
+    missing_records = recoveries[workers.START_RECOVERY_GIT_MISSING]
+    missing = len(missing_records)
+    if missing:
+        noun = "task has" if missing == 1 else "tasks have"
+        task_ids = ", ".join(record["id"] for record in missing_records)
+        report.note(
+            f"workers: {missing} accepted {noun} no durable Git completion "
+            f"receipt ({task_ids}); each accepted row, cleanup witness, work "
+            "and worker slot is kept; do not retry or delete it automatically; "
+            "run `antiphon task status <id>` and follow README `Recovering a "
+            "missing Git completion receipt`")
+    unknown = len(recoveries[workers.START_RECOVERY_UNKNOWN])
+    if unknown:
+        noun = "task has" if unknown == 1 else "tasks have"
+        report.note(
+            f"workers: {unknown} accepted {noun} unreadable start-recovery "
+            "evidence; each record, work and worker slot is kept; do not retry "
+            "automatically")
+    health = workers.start_recovery_health(cwd)
+    unresolved = health["orphaned"] + health["row_unreadable"]
+    if unresolved:
+        report.bad(
+            f"workers: {unresolved} unresolved lifecycle evidence file"
+            f"{'s have' if unresolved != 1 else ' has'} no readable task row "
+            f"({health['orphaned']} absent, {health['row_unreadable']} "
+            "unreadable); automatic cleanup is withheld — inspect "
+            ".antiphon/tasks-v2 and reconcile it manually")
+
+
 def _doctor_codex_tool_shapes(report, cwd):
     """Expose fail-closed Codex schema drift without printing its payload."""
     count = _codex_tool_shape_count(cwd)
@@ -11270,6 +11384,7 @@ def _doctor_readonly():
     _doctor_channel(report, cwd, live)
     _doctor_codex(report, cwd)
     _doctor_deliveries(report, cwd)
+    _doctor_workers(report, cwd)
     _doctor_sources(report, cwd)
     _doctor_codex_tool_shapes(report, cwd)
     _doctor_replay(report, cwd)
@@ -12700,6 +12815,10 @@ def _delegate_tool(cwd, arguments, sender, side):
 
 # Seconds the Codex MCP server may wait inside one antiphon_task result call.
 SERVER_WAIT_CAP = 5
+LEGACY_TASK_MESSAGE = (
+    "task belongs to the previous managed-worker protocol; the current client "
+    "shows it only in `antiphon task list` and will not mutate it; use the "
+    "Antiphon client that created it for any remaining result or cleanup")
 
 
 def _guarded(action):
@@ -12714,9 +12833,11 @@ def _guarded(action):
 def _task_tool(cwd, arguments):
     task_id, action = arguments.get("id"), arguments.get("action")
     if not isinstance(task_id, str) or workers.read_task(cwd, task_id) is None:
+        if isinstance(task_id, str) and workers.legacy_task(cwd, task_id) is not None:
+            return _tool_error(LEGACY_TASK_MESSAGE)
         return _tool_error("unknown task id")
     if action == "status":
-        record = workers.status(cwd, task_id)
+        record = workers.reported_status(cwd, task_id)
         return {"content": [{"type": "text", "text": json.dumps(record, indent=1)}]}
     if action == "result":
         wait = arguments.get("wait")
@@ -12728,9 +12849,12 @@ def _task_tool(cwd, arguments):
         except workers.Refused as refusal:
             return _tool_error(str(refusal))
         text = json.dumps(answer, indent=1, ensure_ascii=False)
-        if answer and answer.get("state") not in workers.TERMINAL:
+        if answer and answer.get("state") == "running":
             text += (f"\n(still running; this server waits at most {SERVER_WAIT_CAP} s "
                      "per call — poll again)")
+        elif (answer and answer.get("state") == "accepted"
+              and "start_recovery" not in answer):
+            text += "\n(still starting — poll again)"
         return {"content": [{"type": "text", "text": text}]}
     if action == "cancel":
         try:
@@ -12741,15 +12865,22 @@ def _task_tool(cwd, arguments):
     return _tool_error("action must be status, result or cancel")
 
 
-def _task_lines(records):
+def _task_lines(records, cwd=None):
     """One line per task: id, kind, class, state, and when it started."""
     lines = []
     for record in records:
         started = record["started_at"]
         when = (time.strftime("%Y-%m-%dT%H:%M:%S", time.localtime(started))
                 if started else "-")
-        lines.append(f"{record['id']}  {record['kind']:<6} {record['task_class']:<5} "
-                     f"{record['state']:<9} {when}")
+        line = (f"{record['id']}  {record['kind']:<6} {record['task_class']:<5} "
+                f"{record['state']:<9} {when}")
+        recovery = (workers.accepted_start_recovery(cwd, record)
+                    if cwd is not None else None)
+        if recovery == workers.START_RECOVERY_GIT_MISSING:
+            line += "  [Git completion receipt missing; manual intervention required]"
+        elif recovery == workers.START_RECOVERY_UNKNOWN:
+            line += "  [start-recovery evidence unreadable; do not retry]"
+        lines.append(line)
     return lines
 
 
@@ -12762,8 +12893,14 @@ def task(*args):
         return 1
     cwd = project_dir()
     if action == "list":
-        for line in _task_lines(workers.tasks(cwd)):
+        for line in _task_lines(workers.tasks(cwd), cwd):
             print(line)
+        for record in workers.legacy_tasks(cwd):
+            started = record["started_at"]
+            when = (time.strftime("%Y-%m-%dT%H:%M:%S", time.localtime(started))
+                    if started else "-")
+            print(f"{record['id']}  {record['kind']:<6} {record['task_class']:<5} "
+                  f"legacy:{record['state']} {when}")
         return 0
     if action == "delegate":
         try:
@@ -12793,11 +12930,14 @@ def task(*args):
         return 0
     task_id = args[1] if len(args) > 1 else None
     if not isinstance(task_id, str) or workers.read_task(cwd, task_id) is None:
+        if isinstance(task_id, str) and workers.legacy_task(cwd, task_id) is not None:
+            print(f"task: {LEGACY_TASK_MESSAGE}", file=sys.stderr)
+            return 1
         print("task: unknown task id", file=sys.stderr)
         return 1
     try:
         if action == "status":
-            answer = workers.status(cwd, task_id)
+            answer = workers.reported_status(cwd, task_id)
         elif action == "result":
             try:
                 wait = float(args[2]) if len(args) > 2 else 0.0

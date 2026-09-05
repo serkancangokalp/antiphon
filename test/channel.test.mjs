@@ -1560,7 +1560,7 @@ try {
   await assert.rejects(
     () => client.callTool({ name: "antiphon_delegate", arguments: { text: "  " } }),
     /the task text is empty/, "refused before any process starts");
-  const tasksDir = join(projectDir, ".antiphon", "tasks");
+  const tasksDir = join(projectDir, ".antiphon", "tasks-v2");
   const tasksBeforeBadTimeout = existsSync(tasksDir) ? readdirSync(tasksDir) : [];
   await assert.rejects(
     () => client.callTool({
@@ -1596,6 +1596,12 @@ try {
     `a fresh codex worker by default from this side: ${delegatedText}`);
   assert.equal(delegatedPayload.state, "running");
   assert.match(delegatedPayload.text, /to a fresh codex worker/);
+  const statusResponse = await client.callTool({
+    name: "antiphon_task", arguments: { id: taskId, action: "status" },
+  });
+  assert.equal(statusResponse.isError, undefined, JSON.stringify(statusResponse));
+  const statusPayload = JSON.parse(statusResponse.content[0].text);
+  assert.equal(statusPayload.id, taskId, "real status keeps the requested id");
   const collected = await client.callTool({
     name: "antiphon_task", arguments: { id: taskId, action: "result", wait: 20 },
   });
@@ -1605,6 +1611,22 @@ try {
   assert.equal(result.worker.kind, "codex");
   assert.match(readFileSync(queueLog, "utf8"), /exec -s read-only --color never \[Antiphon worker codex:/,
     "the stub saw the worker's own argv: read-only, labelled");
+  writeFileSync(join(stubDir, "codex"),
+    `#!/bin/sh\nprintf '%s\\n' "$*" >> ${JSON.stringify(queueLog)}\nsleep 30\n`,
+    { mode: 0o755 });
+  const delegatedToCancel = await client.callTool({
+    name: "antiphon_delegate", arguments: { text: "hold for cancellation" },
+  });
+  const cancelId = JSON.parse(delegatedToCancel.content[0].text).task_id;
+  const cancelled = await client.callTool({
+    name: "antiphon_task", arguments: { id: cancelId, action: "cancel" },
+  });
+  const cancelledPayload = JSON.parse(cancelled.content[0].text);
+  assert.equal(cancelledPayload.id, cancelId, "real cancel keeps the requested id");
+  assert.equal(cancelledPayload.state, "cancelled");
+  writeFileSync(join(stubDir, "codex"),
+    `#!/bin/sh\nprintf '%s\\n' "$*" >> ${JSON.stringify(queueLog)}\nexit 0\n`,
+    { mode: 0o755 });
   const claudeTool = tools.tools.find((tool) => tool.name === "reply_to_claude");
   assert.deepEqual(claudeTool.inputSchema.required, ["text", "to"],
     "a same-kind message is always named");
@@ -2216,6 +2238,543 @@ os.execv(real_python, [real_python, *sys.argv[1:]])
 }
 
 await validIncompleteDelegateShapesStayStructured();
+
+// Task actions can stop work or collect evidence before their response crosses
+// this language boundary. Exit zero is therefore not enough: stdout must be
+// one action-specific JSON object, with the requested id and no hidden fields.
+async function taskResponsesAreActionSpecificAndFailClosed() {
+  const realPython = execFileSync("python3", [
+    "-c", "import sys; print(sys.executable)",
+  ], { encoding: "utf8" }).trim();
+  const dir = await mkdtemp(join(tmpdir(), "antiphon-task-schema-"));
+  const stubDir = await mkdtemp(join(tmpdir(), "antiphon-task-python-"));
+  const ids = Array.from({ length: 61 }, (_unused, index) =>
+    `12345678-1234-4abc-8def-${String(index + 1).padStart(12, "0")}`);
+  const taskRecord = (id, state = "completed") => ({
+    version: 1, id, kind: "codex", task_class: "read", state,
+    sha256: "a".repeat(64), size: 12, parent: null, timeout: 900, hop: 1,
+    created_at: 1, pid: state === "accepted" ? null : 4242,
+    birth: state === "accepted" ? null : "recorded birth", base: null,
+    exit_code: state === "completed" ? 0 : null, to: null,
+    started_at: state === "accepted" ? null : 2,
+    finished_at: ["accepted", "running"].includes(state) ? null : 3,
+    collected_at: null,
+  });
+  const taskResult = (id, state = "completed", taskClass = "read") => ({
+    id, state, exit_code: state === "completed" ? 0 : null,
+    log_path: "/tmp/log", log_tail: "ok",
+    worker: {
+      kind: "codex", name: `worker-${id.slice(0, 8)}`,
+      directory: "/tmp/worker", work: taskClass === "write" ? "/tmp/work" : null,
+      task_class: taskClass,
+    },
+  });
+  const validStatus = taskRecord(ids[0], "running");
+  validStatus.worker_liveness = "unknown";
+  validStatus.liveness_detail = "process table unavailable; task and slot kept";
+  const validResult = {
+    ...taskResult(ids[1]), tests: "1400 tests OK", diff: "diff --git a/a b/a\n",
+  };
+  validResult.worker.task_class = "write";
+  validResult.worker.work = "/tmp/work";
+  const validCancel = taskRecord(ids[2], "cancelled");
+  const validAccepted = taskResult(ids[10], "accepted");
+  const validDiffPath = {
+    ...taskResult(ids[11], "completed", "write"), diff_path: "/tmp/task.diff",
+  };
+  const validDiffMissing = {
+    ...taskResult(ids[12], "completed", "write"),
+    diff_missing: "the diff could not be produced; work is kept",
+  };
+  const validHanded = { ...taskRecord(ids[13], "handed"), to: "build" };
+  const validFailedTests = {
+    ...taskResult(ids[14], "failed"), tests: "failure reproduced",
+  };
+  const privateWorkerStatus = {
+    ...taskRecord(ids[15], "running"), to: "antiphon-local:private-control",
+  };
+  const invalidHanded = {
+    ...taskRecord(ids[16], "handed"), to: "antiphon-local:private-control",
+  };
+  const runningWithEvidence = {
+    ...taskResult(ids[17], "running"), tests: "not terminal",
+  };
+  const readWithDiff = {
+    ...taskResult(ids[18]), diff: "must belong only to completed writes",
+  };
+  const failedWriteWithDiff = {
+    ...taskResult(ids[19], "failed", "write"), diff: "not a completed write",
+  };
+  const conflictingEvidence = {
+    ...taskResult(ids[20], "completed", "write"),
+    diff: "one", diff_path: "/tmp/two",
+  };
+  const malformedWorker = taskResult(ids[21]);
+  malformedWorker.worker = { ...malformedWorker.worker, private_key: "hidden" };
+  const readWithWorktree = taskResult(ids[22]);
+  readWithWorktree.worker.work = "/tmp/private-worktree";
+  const duplicateId = `{"id":"${ids[23]}",${JSON.stringify(
+    taskResult(ids[23])).slice(1)}`;
+  const fractionalVersion = JSON.stringify(taskRecord(ids[24])).replace(
+    '"version":1', '"version":1.0');
+  const oversizedLog = { ...taskResult(ids[25]), log_tail: "x".repeat(4_097) };
+  const validUnicode = {
+    ...taskResult(ids[26], "completed", "write"),
+    log_tail: "ready 😀", diff: "😀", tests: "passed ✅",
+  };
+  const escapedDuplicateId = `{"\\u0069d":"${ids[27]}",${JSON.stringify(
+    taskResult(ids[27])).slice(1)}`;
+  const nestedDuplicateWorker = JSON.stringify(taskResult(ids[28])).replace(
+    '"worker":{"kind":"codex"',
+    '"worker":{"kind":"codex","k\\u0069nd":"claude"');
+  const fractionalExit = JSON.stringify(taskResult(ids[29])).replace(
+    '"exit_code":0', '"exit_code":0.0');
+  const exponentialSize = JSON.stringify(taskRecord(ids[30])).replace(
+    '"size":12', '"size":12e0');
+  const oversizedPath = {
+    ...taskResult(ids[31]), log_path: `/${"x".repeat(16 * 1_024)}`,
+  };
+  const completedWriteWithoutEvidence = taskResult(
+    ids[32], "completed", "write");
+  const acceptedWithTests = {
+    ...taskResult(ids[33], "accepted"), tests: "not terminal",
+  };
+  const unknownWithDiff = {
+    ...taskResult(ids[34], "outcome_unknown", "write"), diff: "unproved",
+  };
+  const fractionalPid = JSON.stringify(taskRecord(ids[35], "running")).replace(
+    '"pid":4242', '"pid":4242.0');
+  const validRecoveryStatus = {
+    ...taskRecord(ids[36], "accepted"),
+    start_recovery: "git_completion_receipt_missing",
+    recovery_detail: "Git completion receipt is missing; work and slot are kept",
+  };
+  const validRecoveryResult = {
+    ...taskResult(ids[37], "accepted"),
+    start_recovery: "unknown",
+    recovery_detail: "accepted-start recovery evidence is unreadable",
+  };
+  const validRunningResult = {
+    ...taskResult(ids[38], "running"),
+    worker_liveness: "unknown",
+    liveness_detail: "process ownership is unknown; work and slot are kept",
+  };
+  const partialRecoveryStatus = {
+    ...taskRecord(ids[39], "accepted"), start_recovery: "unknown",
+  };
+  const wrongStateRecoveryStatus = {
+    ...taskRecord(ids[40], "completed"),
+    start_recovery: "unknown", recovery_detail: "wrong state",
+  };
+  const conflictingStatusQualifications = {
+    ...taskRecord(ids[41], "running"),
+    worker_liveness: "unknown", liveness_detail: "unreadable",
+    start_recovery: "unknown", recovery_detail: "conflicting",
+  };
+  const partialRecoveryResult = {
+    ...taskResult(ids[42], "accepted"), recovery_detail: "missing enum",
+  };
+  const wrongStateRecoveryResult = {
+    ...taskResult(ids[43], "completed"),
+    start_recovery: "unknown", recovery_detail: "wrong state",
+  };
+  const conflictingResultQualifications = {
+    ...taskResult(ids[44], "running"),
+    worker_liveness: "unknown", liveness_detail: "unreadable",
+    start_recovery: "unknown", recovery_detail: "conflicting",
+  };
+  const wrongResultId = taskResult(ids[0]);
+  const extraResultKey = { ...taskResult(ids[46]), private_route: "/tmp/private" };
+  const statusObjectAsResult = taskRecord(ids[47], "completed");
+  const readWorkWrongType = taskResult(ids[48]);
+  readWorkWrongType.worker.work = 7;
+  const readWorkOverlong = taskResult(ids[49]);
+  readWorkOverlong.worker.work = `/${"x".repeat(16 * 1_024)}`;
+  const partialResultLiveness = {
+    ...taskResult(ids[50], "running"), worker_liveness: "unknown",
+  };
+  const wrongStateResultLiveness = {
+    ...taskResult(ids[51], "completed"),
+    worker_liveness: "unknown", liveness_detail: "wrong state",
+  };
+  const wrongRecoveryEnumStatus = {
+    ...taskRecord(ids[52], "accepted"),
+    start_recovery: "guess", recovery_detail: "not a writer enum",
+  };
+  const wrongRecoveryEnumResult = {
+    ...taskResult(ids[53], "accepted"),
+    start_recovery: "guess", recovery_detail: "not a writer enum",
+  };
+  const unresolvedCancel = taskRecord(ids[54], "outcome_unknown");
+  const unsafeHop = { ...taskRecord(ids[55]), hop: 2 ** 53 };
+  const negativeHop = { ...taskRecord(ids[56]), hop: -1 };
+  const stringHop = { ...taskRecord(ids[57]), hop: "1" };
+  const exponentialHop = JSON.stringify(taskRecord(ids[58])).replace(
+    '"hop":1', '"hop":1e3');
+  const safeBoundaryHop = { ...taskRecord(ids[59]), hop: 2 ** 53 - 1 };
+  const unknownWithExit = { ...taskResult(ids[60], "outcome_unknown"), exit_code: 0 };
+  const outputs = {
+    [ids[0]]: `${JSON.stringify(validStatus)}\n`,
+    [ids[1]]: `${JSON.stringify(validResult)}\n`,
+    [ids[2]]: `${JSON.stringify(validCancel)}\n`,
+    [ids[3]]: "null\n",
+    [ids[4]]: `${JSON.stringify({ ...taskRecord(ids[4]), private_route: "/tmp/x" })}\n`,
+    [ids[5]]: `${JSON.stringify(taskRecord(ids[0]))}\n`,
+    [ids[6]]: `diagnostic on stdout\n${JSON.stringify(taskRecord(ids[6]))}\n`,
+    [ids[7]]: `${JSON.stringify(taskResult(ids[7]))}\n`,
+    [ids[8]]: `${JSON.stringify(taskRecord(ids[8], "running"))}\n`,
+    [ids[9]]: "[]\n",
+    [ids[10]]: `${JSON.stringify(validAccepted)}\n`,
+    [ids[11]]: `${JSON.stringify(validDiffPath)}\n`,
+    [ids[12]]: `${JSON.stringify(validDiffMissing)}\n`,
+    [ids[13]]: `${JSON.stringify(validHanded)}\n`,
+    [ids[14]]: `${JSON.stringify(validFailedTests)}\n`,
+    [ids[15]]: `${JSON.stringify(privateWorkerStatus)}\n`,
+    [ids[16]]: `${JSON.stringify(invalidHanded)}\n`,
+    [ids[17]]: `${JSON.stringify(runningWithEvidence)}\n`,
+    [ids[18]]: `${JSON.stringify(readWithDiff)}\n`,
+    [ids[19]]: `${JSON.stringify(failedWriteWithDiff)}\n`,
+    [ids[20]]: `${JSON.stringify(conflictingEvidence)}\n`,
+    [ids[21]]: `${JSON.stringify(malformedWorker)}\n`,
+    [ids[22]]: `${JSON.stringify(readWithWorktree)}\n`,
+    [ids[23]]: `${duplicateId}\n`,
+    [ids[24]]: `${fractionalVersion}\n`,
+    [ids[25]]: `${JSON.stringify(oversizedLog)}\n`,
+    [ids[26]]: `${JSON.stringify(validUnicode)}\n`,
+    [ids[27]]: `${escapedDuplicateId}\n`,
+    [ids[28]]: `${nestedDuplicateWorker}\n`,
+    [ids[29]]: `${fractionalExit}\n`,
+    [ids[30]]: `${exponentialSize}\n`,
+    [ids[31]]: `${JSON.stringify(oversizedPath)}\n`,
+    [ids[32]]: `${JSON.stringify(completedWriteWithoutEvidence)}\n`,
+    [ids[33]]: `${JSON.stringify(acceptedWithTests)}\n`,
+    [ids[34]]: `${JSON.stringify(unknownWithDiff)}\n`,
+    [ids[35]]: `${fractionalPid}\n`,
+    [ids[36]]: `${JSON.stringify(validRecoveryStatus)}\n`,
+    [ids[37]]: `${JSON.stringify(validRecoveryResult)}\n`,
+    [ids[38]]: `${JSON.stringify(validRunningResult)}\n`,
+    [ids[39]]: `${JSON.stringify(partialRecoveryStatus)}\n`,
+    [ids[40]]: `${JSON.stringify(wrongStateRecoveryStatus)}\n`,
+    [ids[41]]: `${JSON.stringify(conflictingStatusQualifications)}\n`,
+    [ids[42]]: `${JSON.stringify(partialRecoveryResult)}\n`,
+    [ids[43]]: `${JSON.stringify(wrongStateRecoveryResult)}\n`,
+    [ids[44]]: `${JSON.stringify(conflictingResultQualifications)}\n`,
+    [ids[45]]: `${JSON.stringify(wrongResultId)}\n`,
+    [ids[46]]: `${JSON.stringify(extraResultKey)}\n`,
+    [ids[47]]: `${JSON.stringify(statusObjectAsResult)}\n`,
+    [ids[48]]: `${JSON.stringify(readWorkWrongType)}\n`,
+    [ids[49]]: `${JSON.stringify(readWorkOverlong)}\n`,
+    [ids[50]]: `${JSON.stringify(partialResultLiveness)}\n`,
+    [ids[51]]: `${JSON.stringify(wrongStateResultLiveness)}\n`,
+    [ids[52]]: `${JSON.stringify(wrongRecoveryEnumStatus)}\n`,
+    [ids[53]]: `${JSON.stringify(wrongRecoveryEnumResult)}\n`,
+    [ids[54]]: `${JSON.stringify(unresolvedCancel)}\n`,
+    [ids[55]]: `${JSON.stringify(unsafeHop)}\n`,
+    [ids[56]]: `${JSON.stringify(negativeHop)}\n`,
+    [ids[57]]: `${JSON.stringify(stringHop)}\n`,
+    [ids[58]]: `${exponentialHop}\n`,
+    [ids[59]]: `${JSON.stringify(safeBoundaryHop)}\n`,
+    [ids[60]]: `${JSON.stringify(unknownWithExit)}\n`,
+  };
+  writeFileSync(join(stubDir, "python3"), `#!${realPython}
+import json
+import os
+import sys
+
+if len(sys.argv) > 4 and sys.argv[2] == "task" and sys.argv[3] in {
+        "status", "result", "cancel"}:
+    sys.stdout.write(json.loads(os.environ["ANTIPHON_TEST_TASK_STDOUT"])[sys.argv[4]])
+    raise SystemExit(0)
+real_python = os.environ["ANTIPHON_TEST_REAL_PYTHON"]
+os.execv(real_python, [real_python, *sys.argv[1:]])
+`, { mode: 0o755 });
+  const env = {
+    ...process.env,
+    ANTIPHON_CWD: dir,
+    ANTIPHON_NAME: "task-schema",
+    HOME: dir,
+    PATH: `${stubDir}:${process.env.PATH}`,
+    ANTIPHON_TEST_REAL_PYTHON: realPython,
+    ANTIPHON_TEST_TASK_STDOUT: JSON.stringify(outputs),
+  };
+  const taskTransport = new StdioClientTransport({
+    command: "node", args: ["lib/channel.mjs"], env, stderr: "pipe",
+  });
+  const taskClient = new Client({ name: "antiphon-test", version: "1.0.0" });
+  try {
+    await taskClient.connect(taskTransport);
+    for (const [id, action] of [[ids[0], "status"], [ids[1], "result"],
+                                [ids[2], "cancel"], [ids[10], "result"],
+                                [ids[11], "result"], [ids[12], "result"],
+                                [ids[13], "status"], [ids[14], "result"],
+                                [ids[22], "result"], [ids[26], "result"],
+                                [ids[36], "status"], [ids[37], "result"],
+                                [ids[38], "result"], [ids[54], "status"],
+                                [ids[59], "status"]]) {
+      const response = await taskClient.callTool({
+        name: "antiphon_task", arguments: { id, action },
+      });
+      const answer = JSON.parse(response.content[0].text);
+      assert.equal(answer.id, id, action);
+      assert.equal(response.content[0].text, JSON.stringify(answer, null, 1),
+        `${action} returns one canonical JSON object`);
+    }
+    for (const [id, action] of [[ids[3], "status"], [ids[4], "status"],
+                                [ids[5], "status"], [ids[6], "status"],
+                                [ids[7], "status"], [ids[8], "cancel"],
+                                [ids[9], "result"], [ids[15], "status"],
+                                [ids[16], "status"], [ids[17], "result"],
+                                [ids[18], "result"], [ids[19], "result"],
+                                [ids[20], "result"], [ids[21], "result"],
+                                [ids[23], "result"], [ids[24], "status"],
+                                [ids[25], "result"],
+                                [ids[27], "result"], [ids[28], "result"],
+                                [ids[29], "result"], [ids[30], "status"],
+                                [ids[31], "result"], [ids[32], "result"],
+                                [ids[33], "result"], [ids[34], "result"],
+                                [ids[35], "status"], [ids[39], "status"],
+                                [ids[40], "status"], [ids[41], "status"],
+                                [ids[42], "result"], [ids[43], "result"],
+                                [ids[44], "result"], [ids[45], "result"],
+                                [ids[46], "result"], [ids[47], "result"],
+                                [ids[48], "result"], [ids[49], "result"],
+                                [ids[50], "result"], [ids[51], "result"],
+                                [ids[52], "status"], [ids[53], "result"],
+                                [ids[54], "cancel"], [ids[55], "status"],
+                                [ids[56], "status"], [ids[57], "status"],
+                                [ids[58], "status"], [ids[60], "result"]]) {
+      await assert.rejects(
+        () => taskClient.callTool({
+          name: "antiphon_task", arguments: { id, action },
+        }),
+        /invalid task response from the bridge; the action outcome is unknown; do not retry automatically/,
+        `${action} rejects malformed exit-zero stdout for ${id}`);
+    }
+  } finally {
+    await taskClient.close().catch(() => {});
+    await rm(dir, { recursive: true, force: true }).catch(() => {});
+    await rm(stubDir, { recursive: true, force: true }).catch(() => {});
+  }
+  console.log("task action responses are exact and fail closed: ok");
+}
+
+await taskResponsesAreActionSpecificAndFailClosed();
+
+async function gitBackedReadResultCrossesTheExactSchema() {
+  const dir = await mkdtemp(join(tmpdir(), "antiphon-task-git-read-"));
+  const stubDir = await mkdtemp(join(tmpdir(), "antiphon-task-git-stub-"));
+  execFileSync("git", ["init", "-q", dir]);
+  execFileSync("git", ["-C", dir, "-c", "user.email=a@b",
+    "-c", "user.name=a", "commit", "-q", "--allow-empty", "-m", "root"]);
+  writeFileSync(join(stubDir, "codex"), "#!/bin/sh\nexit 0\n", { mode: 0o755 });
+  const env = {
+    ...process.env,
+    ANTIPHON_CWD: dir,
+    ANTIPHON_NAME: "task-git-read",
+    HOME: dir,
+    PATH: `${stubDir}:${process.env.PATH}`,
+  };
+  const transport = new StdioClientTransport({
+    command: "node", args: ["lib/channel.mjs"], env, stderr: "pipe",
+  });
+  const client = new Client({ name: "antiphon-test", version: "1.0.0" });
+  try {
+    await client.connect(transport);
+    const delegated = await client.callTool({
+      name: "antiphon_delegate", arguments: { text: "inspect the checkout" },
+    });
+    const taskId = JSON.parse(delegated.content[0].text).task_id;
+    const response = await client.callTool({
+      name: "antiphon_task", arguments: { id: taskId, action: "result", wait: 20 },
+    });
+    const answer = JSON.parse(response.content[0].text);
+    assert.equal(answer.state, "completed", JSON.stringify(answer));
+    assert.equal(answer.worker.task_class, "read");
+    assert.equal(typeof answer.worker.work, "string",
+      "a Git-backed read worker reports its isolated worktree");
+    assert.ok(answer.worker.work.length > 0);
+  } finally {
+    await client.close().catch(() => {});
+    await rm(dir, { recursive: true, force: true }).catch(() => {});
+    await rm(stubDir, { recursive: true, force: true }).catch(() => {});
+  }
+  console.log("Git-backed read task result crosses the exact schema: ok");
+}
+
+await gitBackedReadResultCrossesTheExactSchema();
+
+async function taskResponseBytesAndEvidenceAreBounded() {
+  const realPython = execFileSync("python3", [
+    "-c", "import sys; print(sys.executable)",
+  ], { encoding: "utf8" }).trim();
+  const dir = await mkdtemp(join(tmpdir(), "antiphon-task-bytes-"));
+  const stubDir = await mkdtemp(join(tmpdir(), "antiphon-task-byte-python-"));
+  const responseDir = await mkdtemp(join(tmpdir(), "antiphon-task-responses-"));
+  const ids = Array.from({ length: 16 }, (_unused, index) =>
+    `87654321-4321-4abc-8def-${String(index + 1).padStart(12, "0")}`);
+  const result = (id) => ({
+    id, state: "completed", exit_code: 0, log_path: "/tmp/log",
+    log_tail: "\u0001".repeat(4_096),
+    worker: {
+      kind: "codex", name: `worker-${id.slice(0, 8)}`,
+      directory: "/tmp/worker", work: "/tmp/work", task_class: "write",
+    },
+  });
+  const largestValid = {
+    ...result(ids[0]), diff: "\u0001".repeat(256 * 1_024),
+    tests: "\u0001".repeat(256 * 1_024),
+  };
+  const largestBytes = Buffer.from(JSON.stringify(largestValid));
+  assert.ok(largestBytes.length > 2 * 1_024 * 1_024,
+    "the valid Python result can exceed the old transport ceiling");
+  assert.ok(largestBytes.length < 4 * 1_024 * 1_024,
+    "the replacement ceiling is above the maximum valid evidence payload");
+  writeFileSync(join(responseDir, `${ids[0]}.out`), largestBytes);
+
+  const invalidUtf8 = JSON.stringify({
+    ...result(ids[1]), log_tail: "ok", diff: "ok",
+  });
+  const marker = '"log_tail":"ok"';
+  const markerAt = invalidUtf8.indexOf(marker);
+  writeFileSync(join(responseDir, `${ids[1]}.out`), Buffer.concat([
+    Buffer.from(`${invalidUtf8.slice(0, markerAt)}"log_tail":"`),
+    Buffer.from([0xff]),
+    Buffer.from(`"${invalidUtf8.slice(markerAt + marker.length)}`),
+  ]));
+  writeFileSync(join(responseDir, `${ids[2]}.out`), JSON.stringify({
+    ...result(ids[2]), diff: "x".repeat(256 * 1_024 + 1),
+  }));
+  writeFileSync(join(responseDir, `${ids[3]}.out`), JSON.stringify({
+    ...result(ids[3]), diff: "ok", tests: "x".repeat(256 * 1_024 + 1),
+  }));
+  writeFileSync(join(responseDir, `${ids[4]}.out`), JSON.stringify({
+    ...result(ids[4]), diff: "ok", log_tail: "\ud800",
+  }));
+  writeFileSync(join(responseDir, `${ids[5]}.out`), JSON.stringify({
+    ...result(ids[5]), diff: "ok", log_tail: "\udfff",
+  }));
+  const validUnicode = {
+    ...result(ids[6]), diff: "😀", tests: "passed ✅", log_tail: "ready 😀",
+  };
+  writeFileSync(join(responseDir, `${ids[6]}.out`), JSON.stringify(validUnicode));
+  writeFileSync(join(responseDir, `${ids[7]}.out`), Buffer.concat([
+    Buffer.from([0xef, 0xbb, 0xbf]),
+    Buffer.from(JSON.stringify({ ...result(ids[7]), diff: "ok" })),
+  ]));
+  writeFileSync(join(responseDir, `${ids[8]}.out`), Buffer.concat([
+    Buffer.from([0xc2, 0xa0]),
+    Buffer.from(JSON.stringify({ ...result(ids[8]), diff: "ok" })),
+  ]));
+  const escapedPair = JSON.stringify({
+    ...result(ids[9]), diff: "ok", log_tail: "PAIR",
+  }).replace('"log_tail":"PAIR"', '"log_tail":"\\ud83d\\ude00"');
+  writeFileSync(join(responseDir, `${ids[9]}.out`), escapedPair);
+  const overTransportCeiling = Buffer.concat([
+    Buffer.from(JSON.stringify({ ...result(ids[10]), diff: "ok" })),
+    Buffer.alloc(4 * 1_024 * 1_024, 0x20),
+  ]);
+  assert.ok(overTransportCeiling.length > 4 * 1_024 * 1_024);
+  writeFileSync(join(responseDir, `${ids[10]}.out`), overTransportCeiling);
+  writeFileSync(join(responseDir, `${ids[11]}.out`), "__ANTIPHON_SIGNAL__");
+  writeFileSync(join(responseDir, `${ids[12]}.out`), "__ANTIPHON_REFUSE__");
+  const largestDiagnostic = {
+    ...result(ids[13]), diff_missing: "x".repeat(16 * 1_024 + 512),
+  };
+  writeFileSync(
+    join(responseDir, `${ids[13]}.out`), JSON.stringify(largestDiagnostic));
+  writeFileSync(join(responseDir, `${ids[14]}.out`), JSON.stringify({
+    ...result(ids[14]), diff_missing: "x".repeat(16 * 1_024 + 513),
+  }));
+  writeFileSync(join(responseDir, `${ids[15]}.out`), "__ANTIPHON_CRASH__");
+  writeFileSync(join(stubDir, "python3"), `#!${realPython}
+import os
+import signal
+import sys
+
+if len(sys.argv) > 4 and sys.argv[2] == "task" and sys.argv[3] == "result":
+    response_path = os.path.join(
+        os.environ["ANTIPHON_TEST_TASK_RESPONSES"], sys.argv[4] + ".out")
+    with open(response_path, "rb") as response:
+        output = response.read()
+    if output == b"__ANTIPHON_SIGNAL__":
+        os.kill(os.getpid(), signal.SIGKILL)
+    if output == b"__ANTIPHON_REFUSE__":
+        print("task: exact refusal from Python", file=sys.stderr)
+        raise SystemExit(1)
+    if output == b"__ANTIPHON_CRASH__":
+        with open(response_path + ".acted", "w") as marker:
+            marker.write("the action may already have happened")
+        print("task: injected post-action failure", file=sys.stderr)
+        raise SystemExit(2)
+    sys.stdout.buffer.write(output)
+    raise SystemExit(0)
+real_python = os.environ["ANTIPHON_TEST_REAL_PYTHON"]
+os.execv(real_python, [real_python, *sys.argv[1:]])
+`, { mode: 0o755 });
+  const env = {
+    ...process.env,
+    ANTIPHON_CWD: dir,
+    ANTIPHON_NAME: "task-byte-schema",
+    HOME: dir,
+    PATH: `${stubDir}:${process.env.PATH}`,
+    ANTIPHON_TEST_REAL_PYTHON: realPython,
+    ANTIPHON_TEST_TASK_RESPONSES: responseDir,
+  };
+  const transport = new StdioClientTransport({
+    command: "node", args: ["lib/channel.mjs"], env, stderr: "pipe",
+  });
+  const client = new Client({ name: "antiphon-test", version: "1.0.0" });
+  try {
+    await client.connect(transport);
+    for (const [id, expected] of [[ids[0], largestValid], [ids[6], validUnicode],
+                                  [ids[9], {
+                                    ...result(ids[9]), diff: "ok", log_tail: "😀",
+                                  }], [ids[13], largestDiagnostic]]) {
+      const accepted = await client.callTool({
+        name: "antiphon_task", arguments: { id, action: "result" },
+      });
+      assert.deepEqual(JSON.parse(accepted.content[0].text), expected,
+        "valid bounded Unicode survives the language boundary");
+    }
+    for (const id of [ids[1], ids[2], ids[3], ids[4], ids[5], ids[7], ids[8],
+                      ids[14]]) {
+      await assert.rejects(
+        () => client.callTool({
+          name: "antiphon_task", arguments: { id, action: "result" },
+        }),
+        /invalid task response from the bridge; the action outcome is unknown; do not retry automatically/,
+        `invalid task bytes or evidence are rejected for ${id}`);
+    }
+    for (const id of [ids[10], ids[11], ids[15]]) {
+      await assert.rejects(
+        () => client.callTool({
+          name: "antiphon_task", arguments: { id, action: "result" },
+        }),
+        /action outcome is unknown; do not retry automatically/,
+        `post-action transport failure stays nonblank and conservative for ${id}`);
+    }
+    assert.ok(existsSync(join(responseDir, `${ids[15]}.out.acted`)),
+      "the unexpected numeric exit happened after the simulated side effect");
+    await assert.rejects(
+      () => client.callTool({
+        name: "antiphon_task", arguments: { id: ids[12], action: "result" },
+      }),
+      (error) => {
+        assert.match(error.message, /exact refusal from Python/);
+        assert.doesNotMatch(error.message, /do not retry automatically/);
+        return true;
+      },
+      "an ordinary Python refusal keeps its own diagnostic");
+  } finally {
+    await client.close().catch(() => {});
+    await rm(dir, { recursive: true, force: true }).catch(() => {});
+    await rm(stubDir, { recursive: true, force: true }).catch(() => {});
+    await rm(responseDir, { recursive: true, force: true }).catch(() => {});
+  }
+  console.log("task response bytes and evidence are bounded: ok");
+}
+
+await taskResponseBytesAndEvidenceAreBounded();
 
 // Python is the only layer that knows whether reply bytes were refused,
 // queued, delivered, or left with an unknown acknowledgement.  An exit-zero

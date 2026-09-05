@@ -1,8 +1,33 @@
 # Antiphon product backlog
 
-Last reviewed: 2026-09-04
+Last reviewed: 2026-09-05
 
 ## Start here
+
+**Current work: 1.0.0 release preparation (2026-09-05).** The user resumed the
+parked follow-up and explicitly chose 1.0.0, not 0.6.0. Lifecycle `95dd045`
+has Claude's exact-SHA PASS; discovery/census `ed6f932` is integrated with the
+task-schema work `5c77564` on isolated `codex/release-1.0.0`. Task-schema gate
+findings concerned two unprotected test branches, not a reproduced product
+defect; the release candidate strengthens those tests before the final gate.
+CI now retains failed stdout/stderr, release notes explain the legacy worker
+epoch and linked-install migration, and doctor identifies unobservable tasks.
+See [the release checklist](docs/superpowers/plans/2026-09-05-release-1.0.0.md)
+and [1.0.0 notes](CHANGELOG.md). Main integration, push, tag and npm publication
+remain separate decisions; none is implied by a release-readiness review.
+
+The production-scope census on 2026-09-05 read 99 Claude candidates (466 deeper
+files excluded) and 372 Codex candidates, with no malformed/refused files or
+unknown Claude prompt-source values. It found two new explicit Codex metadata
+kinds: 5 writing-block edit notifications and 2 selected-skill injections.
+Those host-only messages now advance the ordinary scanned frontier without
+rendering as user speech. One shared metadata predicate drives the reader and
+the census's bounded `host_content_metadata` count; mixed/unknown/malformed
+metadata remains visible. No generic `<skill>` filter was added. These are
+production-scope numbers, not comparable to the old recursive all-files totals.
+
+The dated entries below retain the historical evidence and publication record;
+they are not claims that the new release branch has already shipped.
 
 **Where this stands (2026-09-03).** `main` carries **0.5.0**: the final
 campaign of 2026-09-02/03 melted every open item — the mixed-version endpoint
@@ -1949,12 +1974,18 @@ project, so whatever it records lands in the project's store. Seeding a
 worktree with the bridge's configuration on purpose is the follow-up, not
 built (round 2 of the release gate corrected the earlier claim that a fresh
 directory's hooks need the host's trust: the E2E shows `codex exec` running
-the project hooks in an untrusted directory). Exit
-codes come from the worker's own exit file (a shell wrapper writes it; the
-asking process never started the worker), liveness from the pid and its start
-time, timeouts by SIGTERM then SIGKILL on the worker's session. Measured on
-macOS: a zombie session leader makes `killpg(pgid, 0)` answer EPERM, read as
-gone. Not in the MVP: native subagent UI on either host, resume, native worker
+the project hooks in an untrusted directory). Exit codes now come from a
+Python supervisor that binds the value into its task-store live marker before
+unlocking; the worker-directory copy exists only for rolling old readers. The
+adapter crosses an `admit` → `ready` → `commit` barrier only
+after the compatible v1 `running` record and exact process birth are durable.
+Timeout and cancel signals require that exact identity; ambiguous liveness
+keeps the record, directory and one of four slots indefinitely rather than
+inventing failure or risking an unrelated process. A later trustworthy exit
+or restored observation reconciles it; there is no unsafe force-reclaim. A
+final protected-marker read after identity is the stop boundary: an already
+published outcome wins, otherwise the action owns the later publication.
+Not in the MVP: native subagent UI on either host, resume, native worker
 APIs — the portable contract is the task id, the lifecycle and the evidence.
 
 Reviewed 2026-09-03 by an independent read-only pass (five Critical, seven
@@ -1966,8 +1997,9 @@ under the parent's own permission mode in the parent's tree — read tasks run
 under `--permission-mode plan` and, in a checkout, in a worktree of their own;
 the diff was taken against the index (blind to staged and committed work,
 and shipping the bridge's own files for loose work) — it is taken against the
-recorded base, and the bridge's files sit beside the worktree, never inside
-it; the Codex server's blanket tool approval covered the two process tools —
+recorded base, while the worker-visible log sits beside the worktree and the
+trusted lifecycle marker sits beside the task record, never inside the work;
+the Codex server's blanket tool approval covered the two process tools —
 they ask first; the hook's sweep could spend ten seconds per stuck worker —
 it sends the signals and moves on; a result without its evidence is not
 collected; the test summary path is named to the worker; a refusal on any
@@ -2248,6 +2280,14 @@ scope check also excludes Codex rollouts below dot-prefixed directories, just
 as production's recursive glob does. They will go
 stale as each host adds, renames or drops its own wrapper tags. Re-run before
 every release with:
+
+The 2026-09-04 follow-up also removed a split inside Claude production
+discovery: recent fallback had applied Python glob's dotfile rule and omitted
+zero-length files while the monotone catalog and census admitted both. All
+three now use the catalog's immediate `.jsonl` suffix rule; filesystem-safe,
+visible, non-empty regular transcripts keep fallback priority. The live corpus contained 98
+immediate candidates, with zero dot-prefixed, zero empty, and zero symlink
+entries, so this clarification changed no measured production count.
 
 Unsafe inventory entries contribute to the side-wide `refused_paths` total;
 candidate-shaped entries also contribute to their would-be scope's

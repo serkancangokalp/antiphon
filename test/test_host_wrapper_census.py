@@ -203,6 +203,61 @@ class HostWrapperCensusTest(unittest.TestCase):
         self.assertEqual(side["excluded"]["refused_files"], 1)
         self.assertNotEqual(hidden, visible)
 
+    def test_claude_candidate_scope_matches_both_production_enumerators(self):
+        """One fixture drives recent discovery, durable enumeration, and the
+        release census.  Immediate dot-prefixed and empty JSONL files are
+        candidates; nested JSONL is excluded and other suffixes are ignored.
+        """
+        with tempfile.TemporaryDirectory() as root:
+            project = os.path.join(root, "workspace")
+            claude = os.path.join(root, "claude")
+            codex = os.path.join(root, "codex")
+            os.makedirs(project)
+            os.makedirs(codex)
+            host_dir = os.path.join(claude, antiphon._claude_slug(project))
+            os.makedirs(host_dir)
+            visible = self.write_lines(
+                host_dir, "visible.jsonl", [{"type": "assistant"}])
+            hidden = self.write_lines(
+                host_dir, ".hidden.jsonl", [{
+                    "type": "user", "promptSource": "system",
+                    "message": {"content": "<hidden-candidate>\nkept"},
+                }])
+            empty = self.write_lines(host_dir, "empty.jsonl", [])
+            hidden_empty = self.write_lines(
+                host_dir, ".hidden-empty.jsonl", [])
+            self.write_lines(
+                host_dir, "subagents/nested.jsonl", [{"type": "assistant"}])
+            self.write_lines(
+                host_dir, "not-a-transcript.txt", [{"type": "assistant"}])
+            os.symlink(visible, os.path.join(host_dir, "linked.jsonl"))
+            os.mkfifo(os.path.join(host_dir, "pipe.jsonl"))
+            os.mkdir(os.path.join(host_dir, "directory.jsonl"))
+
+            with patch.object(antiphon, "CLAUDE_PROJECTS", claude):
+                recent = antiphon.claude_transcripts(project)
+                catalog = antiphon._enumerate_catalog_candidates(
+                    project, "claude")
+            census_result = census.census(claude, codex)["claude"]
+
+        expected = {
+            os.path.relpath(path, claude)
+            for path in (visible, hidden, empty, hidden_empty)
+        }
+        unsafe = {
+            os.path.relpath(os.path.join(host_dir, name), claude)
+            for name in ("linked.jsonl", "pipe.jsonl", "directory.jsonl")
+        }
+        self.assertEqual(
+            {item.candidate.relative_path for item in recent}, expected | unsafe)
+        self.assertEqual(set(catalog.relative_paths), expected | unsafe)
+        self.assertEqual(census_result["production"]["files"], 4)
+        self.assertEqual(census_result["production"]["refused_files"], 3)
+        self.assertEqual(census_result["excluded"]["files"], 1)
+        self.assertEqual(
+            census_result["production"]["tags"]["hidden-candidate"]["system"], 1)
+        self.assertNotIn("not-a-transcript", census_result["excluded"]["tags"])
+
     def test_symlinked_files_and_directories_are_refused_not_aggregated(self):
         """The census must not learn from paths production will refuse."""
         with tempfile.TemporaryDirectory() as root:
@@ -540,6 +595,22 @@ class HostWrapperCensusTest(unittest.TestCase):
         self.assertEqual(result["claude"]["production"]["shapes"], {
             "compact_summary": 1, "interruption_literal": 1})
 
+    def test_measured_codex_metadata_has_a_bounded_shape_and_matches_production(self):
+        for kinds, expected in (
+                (["skills.selected_skill_instructions"], ["host_content_metadata"]),
+                (["additional_content.codex_apps_writing_block_edits"], ["host_content_metadata"]),
+                (["skills.selected_skill_instructions", "text"], []),
+                (["/private/not-a-shape"], []),
+                ([], []), (None, []), ([{}], [])):
+            payload = {"type": "message", "role": "user",
+                       "content": [{"type": "input_text", "text": "visible text"}],
+                       "internal_chat_message_metadata_passthrough": {
+                           "content_item_kinds": kinds}}
+            with self.subTest(kinds=kinds):
+                self.assertEqual(census.codex_shapes({
+                    "type": "response_item", "payload": payload}), expected)
+                self.assertEqual(antiphon._is_codex_host_metadata(payload), bool(expected))
+
     def test_an_unclosed_agents_draft_is_not_a_host_block(self):
         record = {"type": "response_item", "payload": {"type": "message",
                   "role": "user", "content": [{"type": "input_text", "text":
@@ -566,6 +637,7 @@ class HostWrapperCensusTest(unittest.TestCase):
         release check counts a shape the reader does not filter."""
         self.assertEqual(census.CLAUDE_HOST_LITERALS, antiphon.CLAUDE_HOST_LITERALS)
         self.assertEqual(census.AGENTS_INJECTION_HEAD, antiphon.AGENTS_INJECTION_HEAD)
+        self.assertEqual(census.CODEX_HOST_CONTENT_KINDS, antiphon.CODEX_HOST_CONTENT_KINDS)
         self.assertEqual(census.EXTERNAL_AGENT_CALL.pattern,
                          antiphon.EXTERNAL_AGENT_CALL.pattern)
         self.assertEqual(census.EXTERNAL_AGENT_RESULT_HEAD,

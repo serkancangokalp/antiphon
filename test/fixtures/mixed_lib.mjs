@@ -1,10 +1,25 @@
 import { execFileSync } from "node:child_process";
 import { copyFileSync, mkdirSync, readdirSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { mkdtemp } from "node:fs/promises";
-import { join, resolve } from "node:path";
+import { basename, dirname, join, resolve } from "node:path";
 import { tmpdir } from "node:os";
+import { fileURLToPath } from "node:url";
 
 const NODE_FILES = ["channel.mjs", "identity.mjs"];
+
+// A linked worktree normally has no node_modules of its own. Resolve the
+// dependency through this running fixture, then give a materialised lib the
+// same package root instead of assuming `${repoRoot}/node_modules` exists.
+function installedNodeModules() {
+  let candidate = dirname(fileURLToPath(
+    import.meta.resolve("@modelcontextprotocol/sdk/client/index.js")));
+  while (basename(candidate) !== "node_modules") {
+    const parent = dirname(candidate);
+    if (parent === candidate) throw new Error("the MCP SDK has no node_modules ancestor");
+    candidate = parent;
+  }
+  return candidate;
+}
 
 function git(repoRoot, args) {
   return execFileSync("git", args, { cwd: repoRoot, stdio: ["ignore", "pipe", "pipe"] })
@@ -125,7 +140,7 @@ export async function materialiseLib({ node, python }, repoRoot = process.cwd())
   mkdirSync(lib);
   if (!place(repoRoot, lib, node, NODE_FILES)) return { skipped: "no git" };
   if (!placePython(repoRoot, lib, python)) return { skipped: "no git" };
-  symlinkSync(resolve(repoRoot, "node_modules"), join(dir, "node_modules"), "dir");
+  symlinkSync(installedNodeModules(), join(dir, "node_modules"), "dir");
   return {
     dir, lib,
     swapPython: (source) => placePython(repoRoot, lib, source),
