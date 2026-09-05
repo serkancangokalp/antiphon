@@ -1,4 +1,6 @@
 import assert from "node:assert/strict";
+import fs from "node:fs";
+import { syncBuiltinESMExports } from "node:module";
 import { createHash } from "node:crypto";
 import { execFileSync, spawn } from "node:child_process";
 import { chmodSync, existsSync, mkdirSync, readdirSync, readFileSync, statSync, symlinkSync, writeFileSync } from "node:fs";
@@ -421,9 +423,49 @@ function registeredPeers(dir) {
   if (!existsSync(root)) return [];
   return readdirSync(root)
     .map((entry) => join(root, entry, "endpoint.json"))
-    .filter((path) => existsSync(path))
-    .map((path) => JSON.parse(readFileSync(path, "utf8")));
+    .flatMap((path) => {
+      try { return [JSON.parse(readFileSync(path, "utf8"))]; }
+      catch (error) {
+        if (error?.code === "ENOENT" || error?.code === "ENOTDIR") return [];
+        throw error;
+      }
+    });
 }
+
+// The real channel withdraws endpoint.json concurrently with these polls.
+// A preflight existsSync cannot make the later read atomic. Delete the actual
+// file at that boundary to protect the fixture from the observed ENOENT race.
+async function aWithdrawnEndpointDoesNotBreakTheRegistryPoll() {
+  const dir = await mkdtemp(join(tmpdir(), "antiphon-registry-poll-"));
+  const peer = join(dir, ".antiphon", "peers", "claude-test");
+  const endpoint = join(peer, "endpoint.json");
+  mkdirSync(peer, { recursive: true });
+  writeFileSync(join(dir, ".antiphon", "peers", ".lock"), "");
+  writeFileSync(endpoint, "{}");
+  const read = fs.readFileSync;
+  try {
+    fs.readFileSync = (path, ...args) => {
+      if (path === endpoint) fs.unlinkSync(endpoint);
+      return read(path, ...args);
+    };
+    syncBuiltinESMExports();
+    assert.deepEqual(registeredPeers(dir), [], "withdrawal is absence, not a test error");
+    writeFileSync(endpoint, "{}");
+    fs.readFileSync = (path, ...args) => {
+      if (path === endpoint) throw Object.assign(new Error("unreadable"), { code: "EACCES" });
+      return read(path, ...args);
+    };
+    syncBuiltinESMExports();
+    assert.throws(() => registeredPeers(dir), { code: "EACCES" },
+      "a broken fixture must not silently look like an empty registry");
+  } finally {
+    fs.readFileSync = read;
+    syncBuiltinESMExports();
+    await rm(dir, { recursive: true, force: true });
+  }
+}
+
+await aWithdrawnEndpointDoesNotBreakTheRegistryPoll();
 
 function endpointFor(dir, name) {
   return join(dir, ".antiphon", "peers", `claude-${name}`, "endpoint.json");

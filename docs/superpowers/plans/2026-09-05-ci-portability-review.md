@@ -40,3 +40,24 @@ Evidence, full logs under `/tmp/antiphon-ci-b-*.log`:
 Local green is not hosted-CI green. Run 33968789080 remains the known failing
 baseline. A and C, an independent exact-SHA review, and a new hosted matrix
 are still required before integration or a 1.1.0 release candidate.
+
+## A — fixture ownership is explicit, not inherited from a CLI
+
+Registry and doctor fixtures now use the test process's observed PID and birth
+as explicit owner data. `peers.owner_key`, its real ancestry walk and its
+no-owner refusals are unchanged. Two hook tests inject only their own owner
+discovery boundary; there is no global test-suite patch or fake CLI launcher.
+`OwnerKeyTest` still exercises the discovery implementation, including refusal
+without a CLI ancestor and the separately named real-CLI optional check.
+
+- RED: four existing rotation/doctor/hook cases run under a scoped unavailable
+  CLI owner all fail; after fixture repair the same regression is green without
+  skips. This checks the fixture behavior, not just its helper's return value.
+- Python full suite: 1,587 OK, 3 named skips; peers 193 OK; CI helpers 20 OK.
+- The Node registry poll also handles an endpoint removed between listing and
+  reading. A deterministic real unlink at the read boundary reproduced ENOENT
+  before repair. Only missing/not-a-directory paths are absent; EACCES and bad
+  JSON still fail loudly. The fixture includes the registry's real `.lock` file.
+
+No runtime, package, or workflow bytes change in slice A. Hosted Linux evidence
+and the complete GitHub matrix remain the next gate, not implied by local green.
