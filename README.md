@@ -1,39 +1,150 @@
+<p align="center">
+  <img src="docs/assets/antiphon-banner.svg" alt="Antiphon connects Claude Code and Codex CLI: two agents, one conversation. You choose who builds and who reviews." width="1000">
+</p>
+
 # Antiphon
 
-**Two agents in one project, an open-identity bridge.** Claude Code and Codex CLI work side by side — one terminal each, or several on each side — and each sees the other's context and can wake the other when it needs to, without ever faking who the message is from.
+### Claude Code × Codex. One project. Connected.
 
-Antiphon does not own your workflow. It carries messages between the sides
-while preserving whether they came from the human user, from Claude, or from
-Codex; its optional managed workers stay isolated and never merge their work.
+Let your coding agents talk to each other — without carrying every message
+between terminals. **Antiphon connects Claude Code and Codex CLI in the same
+project**, sharing recent context and carrying addressed messages while
+preserving who said what.
 
-With one terminal per side there is nothing to configure beyond `antiphon setup`: Antiphon assigns an automatic alias when it can positively prove the host session, otherwise the peer stays honestly unnamed and the legacy single-peer road remains. With several sessions, address the automatic aliases shown by `status` or set explicit names — see [Many peers](#many-peers).
+Keep the tools you use. Choose who builds and who reviews. Stay in charge of
+what ships.
+
+**[Get started](#quick-start)** · **[See the workflow](#one-task-two-perspectives)** ·
+**[Explore the bridge](#how-it-works)** · **[Upgrade to 1.0.0](#update)** ·
+**[Release notes](CHANGELOG.md)**
+
+[MIT licensed](LICENSE) · Node 20+ · Python 3.9+ · Runs alongside your local CLIs
+
+## Why Antiphon?
+
+- **Less copy-paste, more collaboration.** Recent context arrives with each
+  turn; either agent can send a message to a specific peer when it needs help.
+- **Two perspectives, your workflow.** Ask one agent to implement and another
+  to review, compare approaches, or hand off a focused investigation. Roles
+  are yours to choose, not built into the bridge.
+- **Clear authorship and delivery evidence.** Agent messages stay agent
+  messages, not human instructions. Receipts distinguish a transport accepting
+  a message from the peer's transcript actually showing it.
+- **Optional workers, isolated changes.** Delegate a bounded task to a fresh
+  worker; in a committed Git project it gets its own worktree. Write tasks
+  return a diff for review. Antiphon never merges it for you.
 
 ## Quick start
 
-Install Node 20+, Python 3.9+, and logged-in Claude Code and Codex CLI hosts
-([host requirements and detailed setup](#install)). Then:
+You need Node 20+, Python 3.9+, and logged-in Claude Code and Codex CLI hosts.
+The Claude channel is a **research preview** and requires Claude Code 2.1.80+
+(the host may require a newer Node version). See [full requirements](#install).
+
+**1. Install and connect your project.**
 
 ```sh
 npm install -g antiphon
 cd /your/project
 antiphon setup
-antiphon launch claude   # terminal one
-# In terminal two, in the same project:
-antiphon launch codex
 ```
 
-Ask one agent to send the other a greeting. `antiphon status` shows peer
-aliases and delivery receipts; `antiphon doctor` explains an incomplete setup
-or a session that needs restarting. A queued/delivered result is transport
-acceptance, not proof that the other agent has read it. With several sessions,
-use `antiphon launch claude --name reviewer` and
-`antiphon launch codex --name builder`, then address those names explicitly.
+**2. Open two terminals in that project.**
+
+Terminal one:
+
+```sh
+antiphon launch claude --name reviewer
+```
+
+Terminal two:
+
+```sh
+antiphon launch codex --name builder
+```
+
+Approve the host's setup prompts, including Codex's hooks when first shown.
+`launch` adds Claude's required channel flag and checks the project setup
+before starting the host. `setup` writes project configuration and agent
+instructions; see [exactly which files](#install).
+
+**3. Start a conversation across the bridge.**
+
+Ask Codex:
+
+> Send a greeting to the Claude peer named reviewer and ask it to reply.
+
+Then inspect the connection:
+
+```sh
+antiphon status   # peers and delivery receipts
+antiphon doctor   # setup checks and actionable diagnostics
+```
+
+A queued/delivered result is transport acceptance, **not proof that the peer
+has read the words**. Look for a receipt or the reply. If a host was already
+open before setup or an upgrade, restart that session.
+
+Names are optional with one terminal per side: you can simply run
+`antiphon launch claude` and `antiphon launch codex`. Automatic aliases are
+assigned only when the session can be proved; ambiguous recipients are
+refused, never guessed. See [many peers](#many-peers) when adding sessions.
 
 See [what changes in 1.0.0](CHANGELOG.md) and the [upgrade checklist](#update)
 before upgrading an existing project. Antiphon carries context and messages;
 you still decide who leads, reviews, merges and publishes.
 
+## One task, two perspectives
+
+An example workflow — **not a fixed orchestrator or an automatic pipeline**:
+
+1. **You set the brief.** Ask Codex to implement a change and invite the
+   named Claude peer to critique the approach.
+2. **The agents exchange context.** Codex sends the task, boundaries and
+   relevant commit. Claude replies with findings; Codex can address them
+   without you relaying every message.
+3. **You decide what ships.** Review the evidence and authorize integration.
+   Antiphon carries the conversation; it does not grant release permission.
+
+For a Git review, give the reviewer an exact commit or a clearly identified
+diff. A fresh managed worker sees its own checkout of HEAD, **not uncommitted
+changes in your working tree**. Keep one writer per checkout, or use separate
+worktrees. Swap the agents' roles whenever it suits the task.
+
+## Find your next step
+
+| I want to… | Start here |
+|---|---|
+| Connect two terminals | [Quick start](#quick-start) |
+| Understand context, messages and workers | [How it works](#how-it-works) |
+| Use several Claude or Codex sessions | [Many peers](#many-peers) |
+| Install or upgrade an existing project | [Install](#install) · [Update](#update) |
+| Find a command or diagnose a connection | [Commands](#commands) · `antiphon doctor` |
+| Understand guarantees and boundaries | [Limits](#limits) |
+
+Antiphon is an independent, MIT-licensed project, not an official product of
+Anthropic or OpenAI. Your agents still use their host accounts and permissions;
+the bridge does not replace either CLI or its safety settings.
+
+---
+
 ## How it works
+
+There are three complementary ways to collaborate:
+
+- **Context on your next turn:** pull pages share recent project activity
+  without waking another agent.
+- **Messages to one peer:** push sends an addressed message. Claude receives
+  a channel event; Codex queues it for its next turn. A receipt is a separate
+  observation, not the send result.
+- **A fresh worker for one task:** optional delegation starts an isolated
+  worker, tracks the task and returns evidence for review.
+
+The bridge derives context from the hosts' own transcripts. It preserves
+authorship, refuses ambiguous routing and reports uncertainty rather than
+inventing a successful delivery or worker result.
+
+<details>
+<summary><strong>Technical reference — transport, receipts, worker lifecycle and identity</strong></summary>
 
 No shared log is kept. Both CLIs already write their own transcripts; Antiphon reads and derives from them, recording which messages each peer has already seen. An unnamed peer keeps its cursor at `.antiphon/cursor.json`; a named one owns `.antiphon/peers/<side>-<name>/cursor.json`, so two sessions on the same side never advance each other's place. Every direct send leaves one small file on a delivery ledger at `.antiphon/deliveries/<id>.json` — who sent, to whom, over what, the words' digest — and, for a refused or transport-outcome-unknown line, its first 60 characters so the sender can recognise it; never the words otherwise — kept for a week, two for an entry with a notice its sender has not heard. If the transport acknowledgement disappears after bytes may have left, the ledger says `unknown`, the caller is warned not to retry automatically, and any parked attachment is retained. A later receipt resolves that attempt to `sent` and removes its bounded preview; if that receipt already won the race while the sender was awaiting the acknowledgement, the direct result says `received` instead of contradicting the transcript with `unknown`.
 
@@ -374,6 +485,8 @@ A Codex → Claude message never pastes text into the terminal and never imperso
 Claude Code's interface shows this as an incoming channel event, and Claude treats the message as the words of the Codex agent, not of the human user. It sends its reply back with the `reply_to_codex` MCP tool, passing `sender_alias` as `to` whenever it is a name rather than the literal `<unnamed>`. A bare reply works where no Codex peer is registered, or where one positively live automatic peer is the only candidate. It is refused when an explicit named peer or multiple positive candidates are live, because an unnamed Codex session before its first hook cannot be ruled out. A `sender_alias` of `<unnamed>` is a peer with no name — it cannot be addressed by name, and a bare reply reaches it only in the no-registered-peer case; passing `<unnamed>` as `to` is the same as leaving it out.
 
 Automatic aliases identify individual peers; they do not pair a Claude peer with a Codex peer. There is no automatic Claude↔Codex partnership and no reply correlation: a message is routed only by the alias written on it, except for the explicitly bounded bare-send cases above.
+
+</details>
 
 ## Many peers
 

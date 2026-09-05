@@ -15,6 +15,7 @@
     "lib/peers.py",
     "lib/ledger.py",
     "lib/workers.py",
+    "docs/assets/antiphon-banner.svg",
     "README.md",
     "CHANGELOG.md",
     "BACKLOG.md",

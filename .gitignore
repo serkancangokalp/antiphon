@@ -17,3 +17,8 @@ AGENTS.md
 docs/*
 !docs/superpowers/
 !docs/superpowers/**
+
+# The README cover ships with the package; other draft assets stay local.
+!docs/assets/
+docs/assets/*
+!docs/assets/antiphon-banner.svg
