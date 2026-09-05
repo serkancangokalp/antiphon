@@ -15,7 +15,7 @@ Keep the tools you use. Choose who builds and who reviews. Stay in charge of
 what ships.
 
 **[Get started](#quick-start)** · **[See the workflow](#one-task-two-perspectives)** ·
-**[Explore the bridge](#how-it-works)** · **[Upgrade to 1.0.0](#update)** ·
+**[Explore the bridge](#how-it-works)** · **[Upgrade to 1.1.0](#update)** ·
 **[Release notes](CHANGELOG.md)**
 
 [MIT licensed](LICENSE) · Node 20+ · Python 3.9+ · Runs alongside your local CLIs
@@ -89,7 +89,7 @@ Names are optional with one terminal per side: you can simply run
 assigned only when the session can be proved; ambiguous recipients are
 refused, never guessed. See [many peers](#many-peers) when adding sessions.
 
-See [what changes in 1.0.0](CHANGELOG.md) and the [upgrade checklist](#update)
+See [what changes in 1.1.0](CHANGELOG.md) and the [upgrade checklist](#update)
 before upgrading an existing project. Antiphon carries context and messages;
 you still decide who leads, reviews, merges and publishes.
 
@@ -654,10 +654,10 @@ Codex hooks once when Codex first shows them.
 
 ## Update
 
-Before moving from 0.5.x to 1.0.0, finish and collect existing managed-worker
+Before moving from 0.5.x to 1.1.0, finish and collect existing managed-worker
 results with the version that created them. After installing, run `setup` in
 each project and restart **both** host sessions; then run `antiphon doctor`.
-Old worker history stays visible as `legacy:<state>`, but 1.0.0 does not collect
+Old worker history stays visible as `legacy:<state>`, but 1.1.0 does not collect
 or cancel it. The new worker store fences the old store before admitting work.
 
     npm i -g github:serkancangokalp/antiphon      # from the repository
