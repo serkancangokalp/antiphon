@@ -1,0 +1,62 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1280" height="640" viewBox="0 0 1280 640" role="img" aria-labelledby="title desc">
+  <title id="title">Antiphon — two agents, one conversation</title>
+  <desc id="desc">Claude Code and Codex CLI connected through Antiphon. Context and addressed messages travel between two terminals. You choose the roles and decide what ships.</desc>
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop stop-color="#111e33"/>
+      <stop offset="1" stop-color="#080f1d"/>
+    </linearGradient>
+    <linearGradient id="bridge" x1="0" y1="0" x2="1" y2="0">
+      <stop stop-color="#f4ae8a"/>
+      <stop offset="1" stop-color="#83e5c4"/>
+    </linearGradient>
+    <radialGradient id="halo">
+      <stop stop-color="#83e5c4" stop-opacity=".12"/>
+      <stop offset="1" stop-color="#83e5c4" stop-opacity="0"/>
+    </radialGradient>
+    <pattern id="grid" width="40" height="40" patternUnits="userSpaceOnUse">
+      <path d="M40 0H0V40" fill="none" stroke="#91a5bc" stroke-opacity=".06"/>
+    </pattern>
+  </defs>
+  <rect width="1280" height="640" rx="24" fill="url(#bg)"/>
+  <rect x="1" y="1" width="1278" height="638" rx="23" fill="url(#grid)" stroke="#28374d"/>
+  <ellipse cx="1035" cy="205" rx="320" ry="245" fill="url(#halo)"/>
+  <g font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif">
+    <g transform="translate(64 53)" fill="none" stroke-width="3.5" stroke-linecap="round" stroke-linejoin="round">
+      <path d="M15 0 0 12l15 12" stroke="#f4ae8a"/>
+      <path d="m29 0 15 12-15 12" stroke="#83e5c4"/>
+      <path d="M17 12h10" stroke="#d9e5f3"/>
+    </g>
+    <text x="128" y="76" fill="#e7edf7" font-size="25" font-weight="650" letter-spacing="5">ANTIPHON</text>
+    <text x="1216" y="73" text-anchor="end" fill="#a4b3c9" font-size="17" letter-spacing="2">THE CROSS-AGENT BRIDGE</text>
+    <text x="64" y="174" fill="#f4f7fc" font-size="65" font-weight="700" letter-spacing="-2">Two agents.</text>
+    <text x="64" y="250" fill="#83e5c4" font-size="65" font-weight="700" letter-spacing="-2">One conversation.</text>
+    <text x="66" y="295" fill="#acbbce" font-size="23">Keep your tools. Connect your context. Choose what ships.</text>
+
+    <rect x="64" y="345" width="488" height="196" rx="16" fill="#142135" stroke="#435064"/>
+    <path d="M65 400h486" stroke="#354158"/>
+    <circle cx="91" cy="373" r="5" fill="#f4ae8a"/>
+    <circle cx="109" cy="373" r="5" fill="#56637a"/>
+    <circle cx="127" cy="373" r="5" fill="#56637a"/>
+    <text x="157" y="380" fill="#f4ae8a" font-size="21" font-weight="600">Claude Code</text>
+    <text x="95" y="448" fill="#eef2f9" font-size="27" font-weight="600">A second perspective.</text>
+    <text x="95" y="489" fill="#a8b8cc" font-size="21">Review. Question. Refine.</text>
+
+    <rect x="728" y="345" width="488" height="196" rx="16" fill="#142135" stroke="#435064"/>
+    <path d="M729 400h486" stroke="#354158"/>
+    <circle cx="755" cy="373" r="5" fill="#83e5c4"/>
+    <circle cx="773" cy="373" r="5" fill="#56637a"/>
+    <circle cx="791" cy="373" r="5" fill="#56637a"/>
+    <text x="821" y="380" fill="#83e5c4" font-size="21" font-weight="600">Codex CLI</text>
+    <text x="759" y="448" fill="#eef2f9" font-size="27" font-weight="600">An idea in motion.</text>
+    <text x="759" y="489" fill="#a8b8cc" font-size="21">Build. Explain. Iterate.</text>
+
+    <path d="M552 431h176M728 463H552" fill="none" stroke="url(#bridge)" stroke-width="2"/>
+    <path d="m718 425 10 6-10 6M562 457l-10 6 10 6" fill="none" stroke-width="2" stroke="#a7d9c0" stroke-linecap="round" stroke-linejoin="round"/>
+    <circle cx="640" cy="447" r="32" fill="#0f1a2c" stroke="#668779"/>
+    <path d="m632 437-10 10 10 10m16-20 10 10-10 10m-11-10h6" fill="none" stroke="#d3eadf" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"/>
+
+    <text x="64" y="591" fill="#9aaec6" font-size="17" letter-spacing="1.5">AN EXAMPLE PAIRING. YOU CHOOSE THE ROLES.</text>
+    <text x="1216" y="591" text-anchor="end" fill="#83e5c4" font-size="17" letter-spacing="1.5">OPEN SOURCE / MIT</text>
+  </g>
+</svg>

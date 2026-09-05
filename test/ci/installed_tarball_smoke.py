@@ -28,6 +28,7 @@ EXPECTED_FILES = frozenset({
     "LICENSE",
     "README.md",
     "bin/antiphon",
+    "docs/assets/antiphon-banner.svg",
     "lib/antiphon.py",
     "lib/channel.mjs",
     "lib/identity.mjs",
