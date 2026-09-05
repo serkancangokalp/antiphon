@@ -102,3 +102,23 @@ The first branch CI run now passes the installed Node-20/Linux tarball smoke.
 macOS Python also passes 1,587 tests; Node exposes one more automatic-identity
 fixture that supplies a fake probe but still depends on a real CLI owner.
 That fixture-only follow-up remains required before the final matrix.
+
+## A follow-up — simulated automatic hosts own their fixtures
+
+Run 33970819933 confirms the Python fixture correction on hosted macOS
+(1,587 OK, 2 named skips), then exposes the same dependency in Node's automatic
+host doubles: the probe reports a simulated host identity, but forwarding to
+the real bridge still asks for the outer developer's CLI owner.
+
+Four Python doubles now forward to a test-only runner that executes the real
+bridge via runpy, injecting only owner discovery for the live parent Node
+listener's PID and observed birth. Registration, fingerprinting, identity proof,
+signing, routing, and release remain real. Ordinary channels, the real owner
+unit tests, and the four independently parented CLI sessions are not wrapped.
+
+A local Node run was actually reparented outside the CLI tree (PPID 1, verified
+`peers.owner_key() is None`), without faking the suite's process name. Before
+repair it reproduces the hosted automatic-endpoint assertion. After repair it
+completes all Node checks, including the four-session ownership assertions and
+mixed-version paths. Logs: `/tmp/antiphon-ci-a-node-no-cli-{red,green}.log`.
+The final hosted matrix, without the temporary diagnostic job, is still required.

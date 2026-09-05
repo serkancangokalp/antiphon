@@ -9,12 +9,15 @@ import { Socket, connect, createServer } from "node:net";
 import { once } from "node:events";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { fileURLToPath } from "node:url";
 
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
 import { checkoutHistory, materialiseLib, pinnedAvailability } from "./fixtures/mixed_lib.mjs";
 
 await import("./channel-startup.test.mjs");
+
+const fixtureOwnerRunner = fileURLToPath(new URL("./fixtures/bridge_owner.py", import.meta.url));
 
 // The socket name derives from the project directory. Using process.cwd() here
 // would mean stealing the socket of a live session running in the repo dir: the
@@ -242,7 +245,7 @@ if command == "claude_identity":
 
 if command == "register_peer":
     payload = sys.stdin.read()
-    result = subprocess.run([real_python, *sys.argv[1:]], input=payload,
+    result = subprocess.run([real_python, os.environ["ANTIPHON_TEST_OWNER_RUNNER"], str(os.getppid()), *sys.argv[1:]], input=payload,
                             text=True, capture_output=True)
     sys.stderr.write(result.stderr)
     if result.returncode == 0:
@@ -252,7 +255,7 @@ if command == "register_peer":
         print(json.dumps({"birth": None, "fingerprint_field": "process_birth"}))
     raise SystemExit(result.returncode)
 
-os.execv(real_python, [real_python, *sys.argv[1:]])
+os.execv(real_python, [real_python, os.environ["ANTIPHON_TEST_OWNER_RUNNER"], str(os.getppid()), *sys.argv[1:]])
 `, { mode: 0o755 });
   return {
     dir,
@@ -260,6 +263,7 @@ os.execv(real_python, [real_python, *sys.argv[1:]])
       PATH: `${dir}:${process.env.PATH}`,
       ANTIPHON_TEST_IDENTITY_RESULT: JSON.stringify(identity),
       ANTIPHON_TEST_REAL_PYTHON: realPython,
+      ANTIPHON_TEST_OWNER_RUNNER: fixtureOwnerRunner,
     },
   };
 }
@@ -288,10 +292,10 @@ if command == "unregister_peer":
     open(os.environ["ANTIPHON_TEST_UNREGISTER_STARTED"], "w").close()
     while not os.path.exists(os.environ["ANTIPHON_TEST_UNREGISTER_RELEASE"]):
         time.sleep(0.01)
-    result = subprocess.run([real_python, *sys.argv[1:]])
+    result = subprocess.run([real_python, os.environ["ANTIPHON_TEST_OWNER_RUNNER"], str(os.getppid()), *sys.argv[1:]])
     raise SystemExit(result.returncode)
 
-os.execv(real_python, [real_python, *sys.argv[1:]])
+os.execv(real_python, [real_python, os.environ["ANTIPHON_TEST_OWNER_RUNNER"], str(os.getppid()), *sys.argv[1:]])
 `, { mode: 0o755 });
   return {
     dir,
@@ -303,6 +307,7 @@ os.execv(real_python, [real_python, *sys.argv[1:]])
       ANTIPHON_TEST_UNREGISTER_STARTED: unregisterStarted,
       ANTIPHON_TEST_UNREGISTER_RELEASE: releaseUnregister,
       ANTIPHON_TEST_REAL_PYTHON: realPython,
+      ANTIPHON_TEST_OWNER_RUNNER: fixtureOwnerRunner,
     },
   };
 }
@@ -325,7 +330,7 @@ if command == "claude_identity":
     raise SystemExit(0)
 
 real_python = os.environ["ANTIPHON_TEST_REAL_PYTHON"]
-os.execv(real_python, [real_python, *sys.argv[1:]])
+os.execv(real_python, [real_python, os.environ["ANTIPHON_TEST_OWNER_RUNNER"], str(os.getppid()), *sys.argv[1:]])
 `, { mode: 0o755 });
   return {
     dir,
@@ -335,6 +340,7 @@ os.execv(real_python, [real_python, *sys.argv[1:]])
       ANTIPHON_TEST_IDENTITY_CALLS: calls,
       ANTIPHON_TEST_IDENTITY_RESULT: JSON.stringify(identity),
       ANTIPHON_TEST_REAL_PYTHON: realPython,
+      ANTIPHON_TEST_OWNER_RUNNER: fixtureOwnerRunner,
     },
   };
 }
@@ -2994,7 +3000,7 @@ if command == "register_peer":
     raise SystemExit(0)
 
 real_python = os.environ["ANTIPHON_TEST_REAL_PYTHON"]
-os.execv(real_python, [real_python, *sys.argv[1:]])
+os.execv(real_python, [real_python, os.environ["ANTIPHON_TEST_OWNER_RUNNER"], str(os.getppid()), *sys.argv[1:]])
 `, { mode: 0o755 });
   return {
     dir,
@@ -3004,6 +3010,7 @@ os.execv(real_python, [real_python, *sys.argv[1:]])
       ANTIPHON_TEST_MODE_PAYLOADS: payloads,
       ANTIPHON_TEST_IDENTITY_RESULT: JSON.stringify(identity),
       ANTIPHON_TEST_REAL_PYTHON: realPython,
+      ANTIPHON_TEST_OWNER_RUNNER: fixtureOwnerRunner,
     },
   };
 }
