@@ -2321,6 +2321,33 @@ class LifecycleTest(unittest.TestCase):
                     workers._group_process_liveness(4242),
                     "live" if expected else "dead")
 
+    def test_linux_kernel_rows_do_not_hide_worker_group_liveness(self):
+        # GitHub ubuntu-24.04 actually emits these zero-PGID kernel rows.
+        # Rejecting them as malformed poisoned every target group's snapshot.
+        for rows, expected in (("2 0 S\n4 0 I<\n4242 4242 S\n", "live"),
+                               ("2 0 S\n4 0 I<\n", "dead")):
+            snapshot = subprocess.CompletedProcess(["ps"], 0, stdout=rows)
+            with self.subTest(rows=rows), \
+                 patch.object(workers.subprocess, "run", return_value=snapshot):
+                self.assertEqual(workers._group_process_liveness(4242), expected)
+                self.assertIsNone(workers._group_members(0),
+                                  "zero is not a worker group to signal or query")
+
+    def test_published_worker_finishes_in_snapshot_with_kernel_rows(self):
+        with tempfile.TemporaryDirectory() as project:
+            record = workers.new_task(
+                project, kind="codex", task_class="read", sha256=SHA, size=1)
+            workers.update_task(project, record["id"], lambda changed: changed.update(
+                state="running", pid=4242, birth="recorded birth",
+                started_at=time.time()))
+            snapshot = subprocess.CompletedProcess(["ps"], 0, stdout="2 0 S\n4 0 I<\n")
+            with patch.object(workers, "_lock_observation",
+                              return_value=("published", (0, False))), \
+                 patch.object(workers.subprocess, "run", return_value=snapshot):
+                final = workers.status(project, record["id"])
+            self.assertEqual((final["state"], final["exit_code"]), ("completed", 0))
+            self.assertEqual(len(workers._admitted(project)), 0)
+
     def test_adapter_drain_tolerates_one_unreadable_process_snapshot(self):
         """A transient `ps` failure must not abandon descendants and leave
         the supervisor without an authenticated outcome.

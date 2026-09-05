@@ -61,3 +61,25 @@ without a CLI ancestor and the separately named real-CLI optional check.
 
 No runtime, package, or workflow bytes change in slice A. Hosted Linux evidence
 and the complete GitHub matrix remain the next gate, not implied by local green.
+
+## C — Linux zero-group kernel rows
+
+Hosted evidence: run `33970819933`, job `101318887481`, ubuntu-24.04,
+commit `faf7fb34d9ae464518f7433ed07ece297a85f093`. Its actual `ps` output
+contains `2 0 S`, `4 0 I<` and other kernel rows with PGID zero. Replaying that
+same snapshot returned None for the real positive group 2024. Omitting only
+zero-group rows returned eight valid members. This confirms the mechanism,
+not merely a synthetic Linux hypothesis.
+
+The row parser now accepts nonnegative group IDs, excluding group zero as
+unrelated to every valid requested worker group. The requested PGID must still
+be strictly positive; negative/malformed IDs and malformed target states remain
+unreadable. No liveness, signaling, or outcome policy is relaxed.
+
+- Two named tests first fail three assertions: kernel rows hide both live and
+  absent groups, and an authenticated successful worker remains running.
+- After the one-comparison correction, both pass; the complete worker suite
+  runs 214 tests, OK. Publication now completes and releases its admission slot
+  even with unrelated kernel rows in the snapshot.
+- The same hosted diagnostic measures errno 111 (ECONNREFUSED) for a regular
+  file at an AF_UNIX path. The doctor portability correction is a separate slice.
