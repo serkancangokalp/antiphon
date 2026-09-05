@@ -12,6 +12,8 @@ explicit instead of inviting duplicate work or premature cleanup.
   host, adds Claude's channel flag, and supports explicit peer names.
 - Passive records from another day carry their date; an unrepresentable
   timestamp cannot crash a whole page. No guessed relative age is added.
+  Today's records use `[HH:MM]`, other days `[YYYY-MM-DD HH:MM]`, and an
+  unrepresentable timestamp says `time unavailable`.
 - Explicit Codex host-content metadata keeps injected skill instructions and
   writing-block bookkeeping out of human speech; mixed or unknown kinds remain
   visible rather than being guessed away.
@@ -24,10 +26,17 @@ explicit instead of inviting duplicate work or premature cleanup.
   writes hold the read cursor; bounded loss and expiry are diagnosable.
 - Prepare handed tasks before transport and retain evidence after uncertain
   delivery/tracking outcomes. Callers are told not to retry automatically.
+  `handing` means a hand-off is being prepared; `tracking_incomplete` retains
+  uncertain local tracking after transport. Delivery-ledger `unknown` means
+  transport may have happened without a trustworthy acknowledgement; a later
+  receipt can resolve it.
 - Managed workers use authenticated supervisor publication, conservative
   process-group observation, ordered stop intent and Git recovery evidence.
   Transient activity in unrelated groups no longer poisons liveness checks.
-- Node validates task status/result/cancel responses, exact identifiers and
+  `outcome_unknown` means the process group is proved dead but no authenticated
+  outcome survived; missing liveness proof instead keeps a task `running`
+  with its work and slot retained.
+- The Node `antiphon_task` tool validates status/result/cancel responses, exact identifiers and
   cross-runtime limits. Invalid or truncated success output is an unknown
   outcome, not proof that no action occurred.
 - Doctor names uncertain tasks; documented recovery preserves work and never
@@ -49,8 +58,11 @@ explicit instead of inviting duplicate work or premature cleanup.
 Finish and collect old managed work before upgrading. Install the new version,
 run `antiphon setup` in each project, restart both host sessions, and check
 `antiphon doctor`. Old worker rows remain listable but cannot be collected or
-cancelled by the new protocol. Current workers use `.antiphon/tasks-v2/` and
-admission verifies the previous store's write fence.
+cancelled by the new protocol. Current workers use `.antiphon/tasks-v2/`.
+The previous `.antiphon/tasks/` store must be quiescent before its transition
+to a read-only `0500` fence; each new admission verifies that writes really
+are refused. An old server does not gain the new protocol by changing files
+on disk: restart both hosts after installation and setup.
 
 Developer `npm link` installations need `npm link` again: the executable moved
 from `bin/antiphon.mjs` to `bin/antiphon`. Ordinary npm installs relink it.
