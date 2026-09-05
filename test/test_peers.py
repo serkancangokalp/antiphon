@@ -1,6 +1,7 @@
 import sys, os
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "lib"))
 import peers
+from fixtures.owner import current_process_owner
 
 import contextlib
 import errno
@@ -2612,7 +2613,7 @@ class RetiredHalfTombstoneTest(unittest.TestCase):
     B = "0199a1b2-2222-7000-8000-00000000000b"
 
     def _owner(self):
-        owner = peers.owner_key()
+        owner = current_process_owner()
         self.assertIsNotNone(owner)
         return owner
 
@@ -2760,7 +2761,7 @@ class TombstoneIsPositiveEvidenceTest(unittest.TestCase):
 
     def _rotated(self, project):
         """The real state: A joined, rotation to B, tombstone left behind."""
-        owner = peers.owner_key()
+        owner = current_process_owner()
         alias, digest = peers.auto_identity(self.A)
         peers.register(project, "claude", alias,
                        os.path.join(project, alias + ".sock"),
@@ -2846,7 +2847,7 @@ class TombstoneIsPositiveEvidenceTest(unittest.TestCase):
         fixture meant to protect the owner, kind or digest check protects
         nothing, and dropping that check leaves the whole suite green.
         """
-        owner = peers.owner_key()
+        owner = current_process_owner()
         alias, digest = peers.auto_identity(self.A)
         peers.register(project, "claude", alias,
                        os.path.join(project, alias + ".sock"),
@@ -2914,7 +2915,7 @@ class TombstoneIsPositiveEvidenceTest(unittest.TestCase):
         """A crash between the two recreates the bug the tombstone fixes, and
         the rotation would have reported the withdrawal as done."""
         with tempfile.TemporaryDirectory() as project:
-            owner = peers.owner_key()
+            owner = current_process_owner()
             alias, digest = peers.auto_identity(self.A)
             peers.register(project, "claude", alias,
                            os.path.join(project, alias + ".sock"),
@@ -2989,7 +2990,7 @@ class WithdrawalPathValidationTest(unittest.TestCase):
 
     def test_withdrawal_ignores_a_peer_directory_with_an_unusable_name(self):
         with tempfile.TemporaryDirectory() as project:
-            owner = peers.owner_key()
+            owner = current_process_owner()
             bad = os.path.join(peers.peers_dir(project), "claude-Not A Name")
             os.makedirs(bad, exist_ok=True)
             with open(os.path.join(bad, "session.json"), "w",
@@ -3029,7 +3030,7 @@ class TombstoneReadSkewTest(unittest.TestCase):
 
     def test_tombstone_read_skew_a_moved_proof_is_not_a_rotation(self):
         with tempfile.TemporaryDirectory() as project:
-            owner = peers.owner_key()
+            owner = current_process_owner()
             alias, digest = peers.auto_identity(self.A)
             peers.register(project, "claude", alias,
                            os.path.join(project, alias + ".sock"),
@@ -3073,7 +3074,7 @@ class WithdrawalRequiresAValidAutomaticHalfTest(unittest.TestCase):
         return path
 
     def test_withdrawal_leaves_a_half_it_cannot_structurally_trust(self):
-        owner = peers.owner_key()
+        owner = current_process_owner()
         alias, digest = peers.auto_identity(self.A)
         cases = {
             "not marked automatic": {
@@ -3121,7 +3122,7 @@ class WithdrawalRequiresAValidAutomaticHalfTest(unittest.TestCase):
     def test_withdrawal_still_takes_a_structurally_valid_stale_half(self):
         """The positive control: the case it is meant to take, it still takes."""
         with tempfile.TemporaryDirectory() as project:
-            owner = peers.owner_key()
+            owner = current_process_owner()
             alias, digest = peers.auto_identity(self.A)
             # With no endpoint the tombstone has no reader and is collected on
             # the same pass that writes it, which is right — so the positive
@@ -3156,7 +3157,7 @@ class SweepWindowIsBoundedTest(unittest.TestCase):
 
     def test_sweep_window_examines_at_most_eight_records_per_rotation(self):
         with tempfile.TemporaryDirectory() as project:
-            owner = peers.owner_key()
+            owner = current_process_owner()
             for n in range(1, 26):
                 peers.write_identity_proof(
                     project, f"{os.getpid()}:v1:Mon Sep  1 00:00:{n:02d} 2026",

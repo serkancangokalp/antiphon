@@ -1,4 +1,6 @@
 import assert from "node:assert/strict";
+import fs from "node:fs";
+import { syncBuiltinESMExports } from "node:module";
 import { createHash } from "node:crypto";
 import { execFileSync, spawn } from "node:child_process";
 import { chmodSync, existsSync, mkdirSync, readdirSync, readFileSync, statSync, symlinkSync, writeFileSync } from "node:fs";
@@ -7,10 +9,15 @@ import { Socket, connect, createServer } from "node:net";
 import { once } from "node:events";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { fileURLToPath } from "node:url";
 
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
 import { checkoutHistory, materialiseLib, pinnedAvailability } from "./fixtures/mixed_lib.mjs";
+
+await import("./channel-startup.test.mjs");
+
+const fixtureOwnerRunner = fileURLToPath(new URL("./fixtures/bridge_owner.py", import.meta.url));
 
 // The socket name derives from the project directory. Using process.cwd() here
 // would mean stealing the socket of a live session running in the repo dir: the
@@ -238,7 +245,7 @@ if command == "claude_identity":
 
 if command == "register_peer":
     payload = sys.stdin.read()
-    result = subprocess.run([real_python, *sys.argv[1:]], input=payload,
+    result = subprocess.run([real_python, os.environ["ANTIPHON_TEST_OWNER_RUNNER"], str(os.getppid()), *sys.argv[1:]], input=payload,
                             text=True, capture_output=True)
     sys.stderr.write(result.stderr)
     if result.returncode == 0:
@@ -248,7 +255,7 @@ if command == "register_peer":
         print(json.dumps({"birth": None, "fingerprint_field": "process_birth"}))
     raise SystemExit(result.returncode)
 
-os.execv(real_python, [real_python, *sys.argv[1:]])
+os.execv(real_python, [real_python, os.environ["ANTIPHON_TEST_OWNER_RUNNER"], str(os.getppid()), *sys.argv[1:]])
 `, { mode: 0o755 });
   return {
     dir,
@@ -256,6 +263,7 @@ os.execv(real_python, [real_python, *sys.argv[1:]])
       PATH: `${dir}:${process.env.PATH}`,
       ANTIPHON_TEST_IDENTITY_RESULT: JSON.stringify(identity),
       ANTIPHON_TEST_REAL_PYTHON: realPython,
+      ANTIPHON_TEST_OWNER_RUNNER: fixtureOwnerRunner,
     },
   };
 }
@@ -284,10 +292,10 @@ if command == "unregister_peer":
     open(os.environ["ANTIPHON_TEST_UNREGISTER_STARTED"], "w").close()
     while not os.path.exists(os.environ["ANTIPHON_TEST_UNREGISTER_RELEASE"]):
         time.sleep(0.01)
-    result = subprocess.run([real_python, *sys.argv[1:]])
+    result = subprocess.run([real_python, os.environ["ANTIPHON_TEST_OWNER_RUNNER"], str(os.getppid()), *sys.argv[1:]])
     raise SystemExit(result.returncode)
 
-os.execv(real_python, [real_python, *sys.argv[1:]])
+os.execv(real_python, [real_python, os.environ["ANTIPHON_TEST_OWNER_RUNNER"], str(os.getppid()), *sys.argv[1:]])
 `, { mode: 0o755 });
   return {
     dir,
@@ -299,6 +307,7 @@ os.execv(real_python, [real_python, *sys.argv[1:]])
       ANTIPHON_TEST_UNREGISTER_STARTED: unregisterStarted,
       ANTIPHON_TEST_UNREGISTER_RELEASE: releaseUnregister,
       ANTIPHON_TEST_REAL_PYTHON: realPython,
+      ANTIPHON_TEST_OWNER_RUNNER: fixtureOwnerRunner,
     },
   };
 }
@@ -321,7 +330,7 @@ if command == "claude_identity":
     raise SystemExit(0)
 
 real_python = os.environ["ANTIPHON_TEST_REAL_PYTHON"]
-os.execv(real_python, [real_python, *sys.argv[1:]])
+os.execv(real_python, [real_python, os.environ["ANTIPHON_TEST_OWNER_RUNNER"], str(os.getppid()), *sys.argv[1:]])
 `, { mode: 0o755 });
   return {
     dir,
@@ -331,6 +340,7 @@ os.execv(real_python, [real_python, *sys.argv[1:]])
       ANTIPHON_TEST_IDENTITY_CALLS: calls,
       ANTIPHON_TEST_IDENTITY_RESULT: JSON.stringify(identity),
       ANTIPHON_TEST_REAL_PYTHON: realPython,
+      ANTIPHON_TEST_OWNER_RUNNER: fixtureOwnerRunner,
     },
   };
 }
@@ -419,9 +429,49 @@ function registeredPeers(dir) {
   if (!existsSync(root)) return [];
   return readdirSync(root)
     .map((entry) => join(root, entry, "endpoint.json"))
-    .filter((path) => existsSync(path))
-    .map((path) => JSON.parse(readFileSync(path, "utf8")));
+    .flatMap((path) => {
+      try { return [JSON.parse(readFileSync(path, "utf8"))]; }
+      catch (error) {
+        if (error?.code === "ENOENT" || error?.code === "ENOTDIR") return [];
+        throw error;
+      }
+    });
 }
+
+// The real channel withdraws endpoint.json concurrently with these polls.
+// A preflight existsSync cannot make the later read atomic. Delete the actual
+// file at that boundary to protect the fixture from the observed ENOENT race.
+async function aWithdrawnEndpointDoesNotBreakTheRegistryPoll() {
+  const dir = await mkdtemp(join(tmpdir(), "antiphon-registry-poll-"));
+  const peer = join(dir, ".antiphon", "peers", "claude-test");
+  const endpoint = join(peer, "endpoint.json");
+  mkdirSync(peer, { recursive: true });
+  writeFileSync(join(dir, ".antiphon", "peers", ".lock"), "");
+  writeFileSync(endpoint, "{}");
+  const read = fs.readFileSync;
+  try {
+    fs.readFileSync = (path, ...args) => {
+      if (path === endpoint) fs.unlinkSync(endpoint);
+      return read(path, ...args);
+    };
+    syncBuiltinESMExports();
+    assert.deepEqual(registeredPeers(dir), [], "withdrawal is absence, not a test error");
+    writeFileSync(endpoint, "{}");
+    fs.readFileSync = (path, ...args) => {
+      if (path === endpoint) throw Object.assign(new Error("unreadable"), { code: "EACCES" });
+      return read(path, ...args);
+    };
+    syncBuiltinESMExports();
+    assert.throws(() => registeredPeers(dir), { code: "EACCES" },
+      "a broken fixture must not silently look like an empty registry");
+  } finally {
+    fs.readFileSync = read;
+    syncBuiltinESMExports();
+    await rm(dir, { recursive: true, force: true });
+  }
+}
+
+await aWithdrawnEndpointDoesNotBreakTheRegistryPoll();
 
 function endpointFor(dir, name) {
   return join(dir, ".antiphon", "peers", `claude-${name}`, "endpoint.json");
@@ -2950,7 +3000,7 @@ if command == "register_peer":
     raise SystemExit(0)
 
 real_python = os.environ["ANTIPHON_TEST_REAL_PYTHON"]
-os.execv(real_python, [real_python, *sys.argv[1:]])
+os.execv(real_python, [real_python, os.environ["ANTIPHON_TEST_OWNER_RUNNER"], str(os.getppid()), *sys.argv[1:]])
 `, { mode: 0o755 });
   return {
     dir,
@@ -2960,6 +3010,7 @@ os.execv(real_python, [real_python, *sys.argv[1:]])
       ANTIPHON_TEST_MODE_PAYLOADS: payloads,
       ANTIPHON_TEST_IDENTITY_RESULT: JSON.stringify(identity),
       ANTIPHON_TEST_REAL_PYTHON: realPython,
+      ANTIPHON_TEST_OWNER_RUNNER: fixtureOwnerRunner,
     },
   };
 }

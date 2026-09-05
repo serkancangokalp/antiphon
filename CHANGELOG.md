@@ -1,6 +1,25 @@
 # Changelog
 
-## 1.0.0
+## 1.1.0
+
+This is the release following 0.5.0. The planned 1.0.0 package was not published
+by this project: npm retains an earlier publication of that version from 2014,
+so the version number cannot be reused. This candidate also includes the
+portability fixes found by the first hosted CI runs.
+
+### Linux, macOS, and CI
+
+- Closing stdin during channel startup now shuts the server down cleanly,
+  including when EOF arrived before its listeners were installed. It cannot
+  leave a socket or registry claim behind merely because startup was awaiting
+  filesystem work.
+- Linux kernel threads with process-group ID zero no longer obscure managed
+  worker liveness or keep completed work occupying a slot.
+- Doctor distinguishes an ordinary file from an abandoned Unix socket on both
+  Linux and macOS, despite their different connection error codes.
+- Test fixtures no longer require a developer's live Claude/Codex ancestor.
+  The hosted matrix covers Node 20/Python 3.9 and current runtimes on Linux,
+  plus macOS ARM and an installed-tarball smoke test outside the checkout.
 
 This release makes the
 Claude Code / Codex bridge easier to start and makes uncertain outcomes

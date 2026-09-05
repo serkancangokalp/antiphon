@@ -2146,7 +2146,9 @@ def _group_process_liveness(pgid):
 def _group_members(pgid):
     """The bounded process-table members of one group, or None if unreadable.
 
-    Every row must identify a positive pid and process group.  Once a row's
+    Every row must identify a positive pid and nonnegative process group.
+    Linux kernel threads have PGID 0; they cannot belong to a positive worker
+    group and must not poison its observation. Once a row's
     process group is proved different, its state is irrelevant to this group;
     target-group rows still need a fully valid state before the snapshot can
     prove liveness or absence.
@@ -2176,7 +2178,7 @@ def _group_members(pgid):
             member_pid, member_group = int(pieces[0]), int(pieces[1])
         except ValueError:
             return None
-        if member_pid <= 0 or member_group <= 0:
+        if member_pid <= 0 or member_group < 0:
             return None
         if member_group != pgid:
             continue

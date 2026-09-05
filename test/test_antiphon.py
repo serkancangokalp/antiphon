@@ -3,6 +3,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "lib"))
 import antiphon
 import ledger
 import workers
+from fixtures.owner import current_process_owner
 
 import contextlib
 import errno
@@ -8122,6 +8123,29 @@ class CatchUpTest(unittest.TestCase):
     def test_catch_up_is_a_command_with_usage(self):
         self.assertIs(antiphon.COMMANDS["catch-up"], antiphon.catch_up)
         self.assertIn("antiphon catch-up", antiphon.__doc__)
+
+
+class ChannelProbePortabilityTest(unittest.TestCase):
+    def test_connection_refused_on_a_regular_file_is_not_a_dead_socket(self):
+        # Linux reports ECONNREFUSED where macOS reports ENOTSOCK. Force that
+        # boundary while keeping the actual filesystem classification real.
+        with tempfile.TemporaryDirectory() as root:
+            path = os.path.join(root, "channel")
+            pathlib.Path(path).write_text("ordinary file")
+            with patch.object(antiphon.socket.socket, "connect",
+                              side_effect=OSError(errno.ECONNREFUSED, "refused")):
+                probe = antiphon._probe_channel(path, False)
+            self.assertEqual(probe, antiphon.Probe(errno.ENOTSOCK, False))
+
+    def test_unobservable_refused_path_is_not_claimed_to_be_a_regular_file(self):
+        with tempfile.TemporaryDirectory() as root:
+            path = os.path.join(root, "channel")
+            pathlib.Path(path).write_text("ordinary file")
+            with patch.object(antiphon.socket.socket, "connect",
+                              side_effect=OSError(errno.ECONNREFUSED, "refused")), \
+                 patch.object(antiphon.os, "stat", side_effect=PermissionError):
+                probe = antiphon._probe_channel(path, False)
+            self.assertEqual(probe, antiphon.Probe(errno.ECONNREFUSED, False))
 
 
 class DoctorTest(unittest.TestCase):
@@ -23859,7 +23883,7 @@ class IdentityPrivacyTest(unittest.TestCase):
         process start time — this session's own, not a peer's to publish."""
         with self.project() as project:
             antiphon.peers.register(project, "claude", "ui", "/tmp/ui.sock",
-                                    owner_key=antiphon.peers.owner_key())
+                                    owner_key=current_process_owner())
             printed = io.StringIO()
             with patch.dict(os.environ, {"ANTIPHON_NAME": "ui"}), \
                  patch.object(antiphon.peers, "owner_key",
@@ -24036,7 +24060,7 @@ class ReconnectNoticeTest(unittest.TestCase):
 
     def _owner(self):
         """This process's own current-generation key, so liveness is positive."""
-        owner = antiphon.peers.owner_key()
+        owner = current_process_owner()
         self.assertIsNotNone(owner, "the test needs a real current owner key")
         return owner
 
@@ -24181,6 +24205,8 @@ class ProofLifecycleSurfaceTest(unittest.TestCase):
             self.assertTrue(os.path.exists(stale))
             env = {k: v for k, v in os.environ.items() if k != "ANTIPHON_NAME"}
             with patch.dict(os.environ, env, clear=True), \
+                 patch.object(antiphon.peers, "owner_key",
+                              return_value=current_process_owner()), \
                  contextlib.redirect_stderr(io.StringIO()):
                 antiphon.record_claude_session(project, self.B, "/t/b.jsonl")
             self.assertFalse(os.path.exists(stale),
@@ -24212,11 +24238,13 @@ class TornProofDoesNotWedgeTheHookTest(unittest.TestCase):
             alias, digest = antiphon.peers.auto_identity(self.B)
             antiphon.peers.register(
                 project, "claude", alias, os.path.join(project, alias + ".sock"),
-                pid=os.getpid(), owner_key=antiphon.peers.owner_key(),
+                pid=os.getpid(), owner_key=current_process_owner(),
                 identity_digest=digest, mode="initial")
             env = {k: v for k, v in os.environ.items() if k != "ANTIPHON_NAME"}
             printed = io.StringIO()
             with patch.dict(os.environ, env, clear=True), \
+                 patch.object(antiphon.peers, "owner_key",
+                              return_value=current_process_owner()), \
                  contextlib.redirect_stderr(printed):
                 recorded = antiphon.record_claude_session(
                     project, self.B, "/t/b.jsonl")
@@ -24306,10 +24334,10 @@ class DoctorRemedyMatchesTheVerdictTest(unittest.TestCase):
             antiphon.peers.register(
                 project, "claude", alias,
                 os.path.join(project, alias + ".sock"),
-                pid=os.getpid(), owner_key=antiphon.peers.owner_key(),
+                pid=os.getpid(), owner_key=current_process_owner(),
                 identity_digest=digest, mode="initial")
             antiphon.peers.write_identity_proof(
-                project, antiphon.peers.owner_key(), self.B, digest)
+                project, current_process_owner(), self.B, digest)
             line = self._doctor_line(project, alias)
         self.assertNotIn(antiphon.RECONNECT_REMEDY, line, line)
         self.assertIn("waiting for its first turn", line, line)
@@ -24322,7 +24350,7 @@ class DoctorRemedyMatchesTheVerdictTest(unittest.TestCase):
                 antiphon.peers.register(
                     project, "claude", alias,
                     os.path.join(project, alias + ".sock"),
-                    pid=os.getpid(), owner_key=antiphon.peers.owner_key(),
+                    pid=os.getpid(), owner_key=current_process_owner(),
                     identity_digest=digest, mode="initial")
                 line = self._doctor_line(project, alias)
         self.assertIn(antiphon.RECONNECT_REMEDY, line, line)
@@ -24361,7 +24389,7 @@ class DoctorFingerprintNotesTest(unittest.TestCase):
     def _register_migration_spelling(self, project, kind, name):
         """What 0.4.0-on-main wrote: `birth` under the canon beside the
         integer `birth_version: 1`, and no sibling."""
-        owner = antiphon.peers.owner_key()
+        owner = current_process_owner()
         address = None if kind == "codex" else os.path.join(project, name + ".sock")
         ok, detail = antiphon.peers.register(project, kind, name, address,
                                              pid=os.getpid(), owner_key=owner)
@@ -24378,7 +24406,7 @@ class DoctorFingerprintNotesTest(unittest.TestCase):
 
     def _register_automatic(self, project, kind="claude"):
         alias, digest = antiphon.peers.auto_identity(self.A)
-        owner = antiphon.peers.owner_key()
+        owner = current_process_owner()
         address = None if kind == "codex" else os.path.join(project, alias + ".sock")
         ok, detail = antiphon.peers.register(
             project, kind, alias, address, pid=os.getpid(), owner_key=owner,
